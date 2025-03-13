@@ -53,7 +53,7 @@ As the project is in its early stages, no stable release is available. Future in
 
 ## Contributing
 
-Contributions are welcome. Since the project is in early development, feedback and testing will be particularly valuable. A contributing guide will be added as development progresses.
+By contributing to this project, you agree that your code will be released under the GNU General Public License v3 (GPLv3). Ensure your contributions are compatible with the project's license. If you have questions, open an issue in the repository.
 
 ## License
 
