@@ -165,11 +165,13 @@ export default class ShadowLinkPlugin extends Plugin {
         });
         this.currentFile = file;
 
-        const color = this.colorFromId(this.provider.awareness.clientID);
+        const clientId = this.provider.awareness.clientID;
+        const hue = clientId % 360;
+        const color = this.colorFromId(clientId);
         this.provider.awareness.setLocalStateField('user', {
             name: this.settings.username,
             color,
-            colorLight: color + '33'
+            colorLight: `hsla(${hue}, 80%, 50%, 0.2)`
         });
         if (this.statusHandler) {
             this.provider.on('status', this.statusHandler);
