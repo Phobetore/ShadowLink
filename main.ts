@@ -1,6 +1,9 @@
-import { App, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TFile } from 'obsidian';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
+import { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
+import { keymap, EditorView } from '@codemirror/view';
+import type { Extension } from '@codemirror/state';
 
 interface ShadowLinkSettings {
     serverUrl: string;
@@ -14,6 +17,7 @@ export default class ShadowLinkPlugin extends Plugin {
     settings: ShadowLinkSettings;
     doc: Y.Doc | null = null;
     provider: WebsocketProvider | null = null;
+    collabExtensions: Extension[] = [];
 
     async onload() {
         await this.loadSettings();
@@ -24,6 +28,11 @@ export default class ShadowLinkPlugin extends Plugin {
             'shadowlink',
             this.doc
         );
+
+        this.registerEditorExtension(this.collabExtensions);
+        this.registerEvent(this.app.workspace.on('file-open', this.handleFileOpen.bind(this)));
+        // Initialize with the currently active file if any
+        this.handleFileOpen(this.app.workspace.getActiveFile());
 
         this.addSettingTab(new ShadowLinkSettingTab(this.app, this));
         console.log('ShadowLink: connected to', this.settings.serverUrl);
@@ -40,6 +49,31 @@ export default class ShadowLinkPlugin extends Plugin {
 
     async saveSettings() {
         await this.saveData(this.settings);
+    }
+
+    private handleFileOpen(file: TFile | null) {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!file || !view || !this.doc || !this.provider) return;
+
+        const ytext = this.doc.getText(file.path);
+
+        if (ytext.length === 0) {
+            ytext.insert(0, view.editor.getValue());
+        } else {
+            view.editor.setValue(ytext.toString());
+        }
+
+        this.collabExtensions.length = 0;
+        this.collabExtensions.push(
+            yCollab(ytext, this.provider.awareness),
+            keymap.of(yUndoManagerKeymap)
+        );
+        this.app.workspace.updateOptions();
+
+        const cm = (view.editor as any).cm as EditorView | undefined;
+        if (cm) {
+            cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: ytext.toString() } });
+        }
     }
 }
 
