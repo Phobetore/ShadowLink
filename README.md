@@ -1,84 +1,54 @@
-# ShadowLink – Real-Time Collaborative Editing for Obsidian
+# ShadowLink
 
-ShadowLink is an open-source Obsidian plugin that enables **real-time collaborative editing** on Markdown files. Inspired by **Relay**, it allows multiple users to edit notes simultaneously, with seamless synchronization and no data conflicts.
+**Real-Time Collaboration for Obsidian**
 
-## Features (Planned)
+ShadowLink brings live collaborative editing to [Obsidian](https://obsidian.md). Multiple users can work on the same notes simultaneously while changes sync automatically through a lightweight WebSocket server. The project is in early development but already provides the core building blocks for conflict‑free collaboration.
 
-- **Real-Time Collaboration** – Multiple users can edit the same note simultaneously.
-- **Conflict-Free Synchronization** – Built on Yjs (CRDT) to ensure smooth merging of edits.
-- **Offline Mode** – Changes are stored locally in IndexedDB and loaded before
-  connecting to the server. Once a document has synchronized, the persisted
-  updates are cleared.
-- **Minimal Storage** – Yjs stores only incremental updates; IndexedDB
-  persistence keeps just unsynced changes so memory overhead stays small.
-- **Shared Folders** – Collaborate across multiple notes within a shared directory.
-- **Self-Hostable WebSocket Server** – No reliance on third-party services.
-- **Live Cursor Tracking** – View collaborator cursors in real time.
-- **User Names & Colors** – Each collaborator chooses a name displayed above their colored cursor.
-- **End-to-End Encryption** *(Planned)* – Secure note sharing without exposing data to the server.
+## Features
 
-## Project Status
+- **Real-time collaboration** powered by [Yjs](https://github.com/yjs/yjs)
+- **Conflict-free syncing** using CRDTs
+- **Offline support** – unsynced updates are stored in IndexedDB and applied when the server reconnects
+- **Minimal storage footprint** – only incremental updates are persisted
+- **Self-hostable relay server** included in this repository
+- **Live cursors** with user names and colors
+- **Planned**: shared folders and end-to-end encryption
 
-ShadowLink is currently in **early prototyping**. The focus is on:
-- Implementing basic **synchronization** using Yjs.
-- Establishing a **WebSocket-based communication layer**.
-- Integrating real-time edits with **Obsidian’s CodeMirror editor**.
+## Getting Started
 
-## Installation (Not Available Yet)
+### Build the plugin
 
-As the project is in its early stages, no stable release is available. Future installation instructions will be provided once a working version is ready.
+1. Install dependencies
+   ```bash
+   npm install
+   ```
+2. Build the plugin
+   ```bash
+   npm run build
+   ```
+   The build creates `main.js` alongside `manifest.json` and `styles.css`.
 
-## Development
+### Install into Obsidian
 
-### Tech Stack
+1. Create a folder called `shadowlink` inside your vault's `.obsidian/plugins` directory.
+2. Copy `manifest.json`, `main.js` and `styles.css` into that folder.
+3. Launch Obsidian and enable **ShadowLink** from *Settings → Community Plugins*.
 
-- **Language**: TypeScript
-- **Editor Integration**: CodeMirror (Obsidian API)
-- **Real-Time Engine**: Yjs (CRDT)
-- **Networking**: WebSocket (Node.js server)
-- **Offline Storage**: IndexedDB via Yjs `IndexeddbPersistence`
+### Run the relay server
 
-### Building the Plugin
-
-Install dependencies and build the plugin with:
-
-```bash
-npm install
-npm run build
-```
-
-This creates a bundled `main.js` file that Obsidian loads as the plugin.
-
-### Running the Relay Server
-
-The repository includes a minimal WebSocket relay for local testing. Start it with:
+The plugin expects a WebSocket relay at `localhost:1234` by default. You can run the bundled server with:
 
 ```bash
 npm run server
 ```
 
-The plugin connects to `localhost:1234` by default. If your server uses TLS a
-secure `wss://` connection is chosen automatically. Documents are persisted on
-the server by default in a `yjs_data` directory next to the server script. Set
-the `YPERSISTENCE` environment variable to choose a different location or clear
-it to disable persistence entirely. Each Obsidian vault is assigned a short
-identifier derived from its path so multiple vaults can sync to the same server
-without collisions.
-Set `WS_AUTH_TOKEN` to require a shared secret; connections without the token
-are rejected.
+Environment variables:
+- `PORT` – change the listening port (defaults to `1234`)
+- `YPERSISTENCE` – directory for document storage; leave empty to disable persistence
+- `WS_AUTH_TOKEN` – optional token required from all clients
+- `SSL_CERT` / `SSL_KEY` – enable TLS with your certificate and key
 
-### Offline Persistence
-
-When opening a note, ShadowLink loads any pending updates from IndexedDB using
-`IndexeddbPersistence` before connecting to the relay server. As soon as the
-document finishes syncing with the server, these local updates are cleared from
-IndexedDB to avoid duplication. Because Yjs only stores differences between
-states, the amount of data kept in the browser is minimal.
-
-### Standalone Server
-
-If you only need the relay server, a trimmed-down package is provided in the
-`server/` directory. Install dependencies and start the server with:
+A trimmed-down standalone server is available in the `server/` folder:
 
 ```bash
 cd server
@@ -86,40 +56,35 @@ npm install
 npm start
 ```
 
-The server listens on port `1234` unless the `PORT` environment variable is set.
-For HTTPS, provide your certificate and key via `SSL_CERT` and `SSL_KEY`. When
-both variables are present the server uses TLS and announces a `wss://` URL.
-By default documents are stored under `server/yjs_data`. Use `YPERSISTENCE` to
-specify another directory or leave it empty to disable persistence. The plugin
-automatically switches to `wss://` when it detects a TLS-enabled server.
-Set `WS_AUTH_TOKEN` to enforce a token for clients just like the main server.
+### Using ShadowLink
 
-### Roadmap
+1. In Obsidian, open *Settings → ShadowLink* to configure:
+   - **Server URL** – address of your WebSocket relay
+   - **Username** – name shown to collaborators
+   - **Auth Token** – required if the server enforces a token
+2. Open any Markdown file and start editing. Other users connected to the same document will see your changes in real time.
 
-1. **Prototype Phase**
-   - [x] Set up Obsidian plugin structure.
-   - [x] Implement Yjs-based text synchronization.
-   - [x] Establish a WebSocket relay server.
-   - [x] Synchronize simple text edits between two Obsidian instances.
+## How It Works
 
-2. **Collaboration Core**
-   - [ ] Improve synchronization performance.
-   - [ ] Support multiple simultaneous collaborators.
-   - [ ] Implement live cursor tracking.
+ShadowLink uses Yjs to represent each note as a Conflict-free Replicated Data Type. Edits are transmitted over the WebSocket server and merged on all clients without conflicts. While offline, updates accumulate in IndexedDB. As soon as the connection is restored, the pending changes sync and the local cache is cleared. Each vault is assigned a unique identifier so multiple vaults can share a single server without collisions.
 
-3. **Extended Features**
-   - [ ] Shared folder support.
-   - [ ] Offline mode with automatic merging.
-   - [ ] End-to-end encryption.
+## Roadmap
+
+- [x] Prototype with basic Yjs synchronization
+- [ ] Improve performance and support large numbers of collaborators
+- [ ] Live cursor tracking
+- [ ] Shared folder synchronization
+- [ ] End-to-end encryption
 
 ## Contributing
 
-By contributing to this project, you agree that your code will be released under the GNU General Public License v3 or later (GPLv3+). Ensure your contributions are compatible with the project's license. If you have questions, open an issue in the repository.
+Contributions are welcome! By submitting code, you agree to release it under the [GNU General Public License v3 or later](LICENSE). Please open an issue to discuss any major changes before submitting a pull request.
 
 ## License
 
-ShadowLink is open-source under the GNU General Public License v3 or later (GPLv3+).
+ShadowLink is distributed under the terms of the [GPL‑3.0-or-later](LICENSE).
 
 ## Contact
 
-For updates and discussions, visit the [GitHub Issues](https://github.com/Phobetore/ShadowLink/issues) section.
+For help or to follow development, visit the [GitHub Issues](https://github.com/Phobetore/ShadowLink/issues) page.
+
