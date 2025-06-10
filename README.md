@@ -10,6 +10,7 @@ ShadowLink is an open-source Obsidian plugin that enables **real-time collaborat
 - **Shared Folders** – Collaborate across multiple notes within a shared directory.
 - **Self-Hostable WebSocket Server** – No reliance on third-party services.
 - **Live Cursor Tracking** – View collaborator cursors in real time.
+- **User Names & Colors** – Each collaborator chooses a name displayed above their colored cursor.
 - **End-to-End Encryption** *(Planned)* – Secure note sharing without exposing data to the server.
 
 ## Project Status

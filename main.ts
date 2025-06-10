@@ -10,11 +10,13 @@ interface ShadowLinkSettings {
      * Server address. May include ws:// or wss:// but the scheme is optional.
      */
     serverUrl: string;
+    username: string;
 }
 
 const DEFAULT_SETTINGS: ShadowLinkSettings = {
     // Default without protocol so the plugin can decide between ws:// and wss://
-    serverUrl: 'localhost:1234'
+    serverUrl: 'localhost:1234',
+    username: 'Anonymous'
 };
 
 export default class ShadowLinkPlugin extends Plugin {
@@ -22,6 +24,8 @@ export default class ShadowLinkPlugin extends Plugin {
     doc: Y.Doc | null = null;
     provider: WebsocketProvider | null = null;
     collabExtensions: Extension[] = [];
+    statusBarItemEl: HTMLElement | null = null;
+    statusHandler?: (event: { status: string }) => void;
 
     async onload() {
         await this.loadSettings();
@@ -34,6 +38,30 @@ export default class ShadowLinkPlugin extends Plugin {
             this.doc
         );
 
+        const color = this.colorFromId(this.provider.awareness.clientID);
+        this.provider.awareness.setLocalStateField('user', {
+            name: this.settings.username,
+            color,
+            colorLight: color + '33'
+        });
+
+        this.statusBarItemEl = this.addStatusBarItem();
+        this.statusBarItemEl.setText('ShadowLink: connecting');
+        this.statusHandler = (event: { status: string }) => {
+            if (!this.statusBarItemEl) return;
+            switch (event.status) {
+                case 'connected':
+                    this.statusBarItemEl.setText('ShadowLink: connected');
+                    break;
+                case 'disconnected':
+                    this.statusBarItemEl.setText('ShadowLink: disconnected');
+                    break;
+                default:
+                    this.statusBarItemEl.setText('ShadowLink: ' + event.status);
+            }
+        };
+        this.provider.on('status', this.statusHandler);
+
         this.registerEditorExtension(this.collabExtensions);
         this.registerEvent(this.app.workspace.on('file-open', this.handleFileOpen.bind(this)));
         // Initialize with the currently active file if any
@@ -44,8 +72,12 @@ export default class ShadowLinkPlugin extends Plugin {
     }
 
     onunload() {
+        if (this.provider && this.statusHandler) {
+            this.provider.off('status', this.statusHandler);
+        }
         this.provider?.destroy();
         this.doc?.destroy();
+        this.statusBarItemEl?.remove();
     }
 
     async loadSettings() {
@@ -74,6 +106,11 @@ export default class ShadowLinkPlugin extends Plugin {
             return scheme + url.slice(2);
         }
         return scheme + url;
+    }
+
+    private colorFromId(id: number): string {
+        const hue = id % 360;
+        return `hsl(${hue}, 80%, 50%)`;
     }
 
     private handleFileOpen(file: TFile | null) {
@@ -122,6 +159,17 @@ class ShadowLinkSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.serverUrl)
                 .onChange(async (value) => {
                     this.plugin.settings.serverUrl = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Username')
+            .setDesc('Displayed to collaborators')
+            .addText(text => text
+                .setPlaceholder('Anonymous')
+                .setValue(this.plugin.settings.username)
+                .onChange(async (value) => {
+                    this.plugin.settings.username = value;
                     await this.plugin.saveSettings();
                 }));
     }
