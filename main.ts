@@ -26,6 +26,8 @@ export default class ShadowLinkPlugin extends Plugin {
     collabExtensions: Extension[] = [];
     statusBarItemEl: HTMLElement | null = null;
     statusHandler?: (event: { status: string }) => void;
+    pendingSyncHandler?: (isSynced: boolean) => void;
+    currentText: Y.Text | null = null;
 
     async onload() {
         await this.loadSettings();
@@ -64,6 +66,7 @@ export default class ShadowLinkPlugin extends Plugin {
 
         this.registerEditorExtension(this.collabExtensions);
         this.registerEvent(this.app.workspace.on('file-open', this.handleFileOpen.bind(this)));
+        this.registerEvent(this.app.vault.on('delete', this.handleFileDelete.bind(this)));
         // Initialize with the currently active file if any
         this.handleFileOpen(this.app.workspace.getActiveFile());
 
@@ -113,11 +116,23 @@ export default class ShadowLinkPlugin extends Plugin {
         return `hsl(${hue}, 80%, 50%)`;
     }
 
+    private handleFileDelete(file: TFile) {
+        if (!this.doc) return;
+        const ytext = this.doc.getText(file.path);
+        ytext.delete(0, ytext.length);
+    }
+
     private handleFileOpen(file: TFile | null) {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!file || !view || !this.doc || !this.provider) return;
 
+        if (this.pendingSyncHandler) {
+            this.provider.off('sync', this.pendingSyncHandler);
+            this.pendingSyncHandler = undefined;
+        }
+
         const ytext = this.doc.getText(file.path);
+        this.currentText = ytext;
 
         const initializeText = () => {
             if (ytext.length === 0) {
@@ -130,13 +145,14 @@ export default class ShadowLinkPlugin extends Plugin {
         if (this.provider.synced) {
             initializeText();
         } else {
-            const syncHandler = (isSynced: boolean) => {
-                if (isSynced) {
+            this.pendingSyncHandler = (isSynced: boolean) => {
+                if (isSynced && this.currentText === ytext) {
                     initializeText();
-                    this.provider?.off('sync', syncHandler);
+                    this.provider?.off('sync', this.pendingSyncHandler!);
+                    this.pendingSyncHandler = undefined;
                 }
             };
-            this.provider.on('sync', syncHandler);
+            this.provider.on('sync', this.pendingSyncHandler);
         }
 
         this.collabExtensions.length = 0;
