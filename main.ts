@@ -31,6 +31,7 @@ export default class ShadowLinkPlugin extends Plugin {
     collabExtensions: Extension[] = [];
     statusBarItemEl: HTMLElement | null = null;
     statusHandler?: (event: { status: string }) => void;
+    connectionCloseHandler?: (event: CloseEvent) => void;
     pendingSyncHandler?: (isSynced: boolean) => void;
     currentText: Y.Text | null = null;
 
@@ -56,6 +57,11 @@ export default class ShadowLinkPlugin extends Plugin {
                 default:
                     this.statusBarItemEl.setText('ShadowLink: ' + event.status);
             }
+        };
+        this.connectionCloseHandler = (event: CloseEvent) => {
+            if (!this.statusBarItemEl) return;
+            const reason = event?.reason ? `: ${event.reason}` : '';
+            this.statusBarItemEl.setText(`ShadowLink: disconnected${reason}`);
         };
         this.registerEditorExtension(this.collabExtensions);
         this.registerEvent(this.app.workspace.on('file-open', (file) => { void this.handleFileOpen(file); }));
@@ -120,6 +126,9 @@ export default class ShadowLinkPlugin extends Plugin {
     private cleanupCurrent() {
         if (this.provider && this.statusHandler) {
             this.provider.off('status', this.statusHandler);
+        }
+        if (this.provider && this.connectionCloseHandler) {
+            this.provider.off('connection-close', this.connectionCloseHandler);
         }
         this.provider?.destroy();
         this.doc?.destroy();
@@ -195,6 +204,9 @@ export default class ShadowLinkPlugin extends Plugin {
         });
         if (this.statusHandler) {
             this.provider.on('status', this.statusHandler);
+        }
+        if (this.connectionCloseHandler) {
+            this.provider.on('connection-close', this.connectionCloseHandler);
         }
         if (this.pendingSyncHandler) {
             this.provider.off('sync', this.pendingSyncHandler);
