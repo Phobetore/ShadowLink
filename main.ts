@@ -1,5 +1,5 @@
 import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TFile, TAbstractFile } from 'obsidian';
-import { createHash } from 'crypto';
+import { randomUUID } from 'crypto';
 import type * as Y from 'yjs';
 import type { WebsocketProvider } from 'y-websocket';
 import type { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
@@ -13,13 +13,15 @@ interface ShadowLinkSettings {
     serverUrl: string;
     username: string;
     authToken: string;
+    vaultId: string;
 }
 
 const DEFAULT_SETTINGS: ShadowLinkSettings = {
     // Default without protocol so the plugin can decide between ws:// and wss://
     serverUrl: 'localhost:1234',
     username: 'Anonymous',
-    authToken: ''
+    authToken: '',
+    vaultId: ''
 };
 
 export default class ShadowLinkPlugin extends Plugin {
@@ -44,8 +46,11 @@ export default class ShadowLinkPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
 
-        const basePath = (this.app.vault.adapter as any).basePath || this.app.vault.getName();
-        this.vaultId = createHash('sha256').update(basePath).digest('hex').slice(0, 8);
+        if (!this.settings.vaultId) {
+            this.settings.vaultId = randomUUID();
+            await this.saveSettings();
+        }
+        this.vaultId = this.settings.vaultId;
 
         const url = this.resolveServerUrl(this.settings.serverUrl);
 
@@ -335,6 +340,18 @@ class ShadowLinkSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.authToken)
                 .onChange(async (value) => {
                     this.plugin.settings.authToken = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Vault ID')
+            .setDesc('Identifier for this vault')
+            .addText(text => text
+                .setPlaceholder('auto')
+                .setValue(this.plugin.settings.vaultId)
+                .onChange(async (value) => {
+                    this.plugin.settings.vaultId = value;
+                    this.plugin.vaultId = value;
                     await this.plugin.saveSettings();
                 }));
     }
