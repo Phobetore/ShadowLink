@@ -1,4 +1,5 @@
 import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TFile } from 'obsidian';
+import { createHash } from 'crypto';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
@@ -23,6 +24,8 @@ export default class ShadowLinkPlugin extends Plugin {
     settings: ShadowLinkSettings;
     doc: Y.Doc | null = null;
     provider: WebsocketProvider | null = null;
+    currentFile: TFile | null = null;
+    vaultId = '';
     collabExtensions: Extension[] = [];
     statusBarItemEl: HTMLElement | null = null;
     statusHandler?: (event: { status: string }) => void;
@@ -32,20 +35,27 @@ export default class ShadowLinkPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
 
-        this.doc = new Y.Doc();
-        const url = this.resolveServerUrl(this.settings.serverUrl);
-        this.provider = new WebsocketProvider(
-            url,
-            'shadowlink',
-            this.doc
-        );
+        const basePath = (this.app.vault.adapter as any).basePath || this.app.vault.getName();
+        this.vaultId = createHash('sha256').update(basePath).digest('hex').slice(0, 8);
 
-        const color = this.colorFromId(this.provider.awareness.clientID);
-        this.provider.awareness.setLocalStateField('user', {
-            name: this.settings.username,
-            color,
-            colorLight: color + '33'
-        });
+        const url = this.resolveServerUrl(this.settings.serverUrl);
+
+        this.statusBarItemEl = this.addStatusBarItem();
+        this.statusBarItemEl.setText('ShadowLink: idle');
+
+        this.statusHandler = (event: { status: string }) => {
+            if (!this.statusBarItemEl) return;
+            switch (event.status) {
+                case 'connected':
+                    this.statusBarItemEl.setText('ShadowLink: connected');
+                    break;
+                case 'disconnected':
+                    this.statusBarItemEl.setText('ShadowLink: disconnected');
+                    break;
+                default:
+                    this.statusBarItemEl.setText('ShadowLink: ' + event.status);
+            }
+        };
 
         this.statusBarItemEl = this.addStatusBarItem();
         this.statusBarItemEl.setText('ShadowLink: connecting');
@@ -62,8 +72,6 @@ export default class ShadowLinkPlugin extends Plugin {
                     this.statusBarItemEl.setText('ShadowLink: ' + event.status);
             }
         };
-        this.provider.on('status', this.statusHandler);
-
         this.registerEditorExtension(this.collabExtensions);
         this.registerEvent(this.app.workspace.on('file-open', (file) => { void this.handleFileOpen(file); }));
         this.registerEvent(this.app.vault.on('delete', this.handleFileDelete.bind(this)));
@@ -71,15 +79,11 @@ export default class ShadowLinkPlugin extends Plugin {
         void this.handleFileOpen(this.app.workspace.getActiveFile());
 
         this.addSettingTab(new ShadowLinkSettingTab(this.app, this));
-        console.log('ShadowLink: connected to', url);
+        console.log('ShadowLink: ready, server', url);
     }
 
     onunload() {
-        if (this.provider && this.statusHandler) {
-            this.provider.off('status', this.statusHandler);
-        }
-        this.provider?.destroy();
-        this.doc?.destroy();
+        this.cleanupCurrent();
         this.statusBarItemEl?.remove();
     }
 
@@ -123,31 +127,81 @@ export default class ShadowLinkPlugin extends Plugin {
         return new Promise(resolve => requestAnimationFrame(() => resolve()));
     }
 
+    private docNameForFile(file: TFile): string {
+        return `${this.vaultId}/${file.path}`;
+    }
+
+    private cleanupCurrent() {
+        if (this.provider && this.statusHandler) {
+            this.provider.off('status', this.statusHandler);
+        }
+        this.provider?.destroy();
+        this.doc?.destroy();
+        this.provider = null;
+        this.doc = null;
+        this.currentText = null;
+        this.currentFile = null;
+    }
     private handleFileDelete(file: TFile) {
-        if (!this.doc) return;
-        const ytext = this.doc.getText(file.path);
-        ytext.delete(0, ytext.length);
+        if (this.currentFile && file.path === this.currentFile.path) {
+            this.cleanupCurrent();
+        }
+        // Optionally inform the server about the deletion
+        const doc = new Y.Doc();
+        const url = this.resolveServerUrl(this.settings.serverUrl);
+        const provider = new WebsocketProvider(url, this.docNameForFile(file), doc);
+        const text = doc.getText('content');
+        provider.once('sync', () => {
+            text.delete(0, text.length);
+            provider.destroy();
+            doc.destroy();
+        });
     }
 
     private async handleFileOpen(file: TFile | null) {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!file || !view || !this.doc || !this.provider) return;
+        if (!file || !view) {
+            this.cleanupCurrent();
+            return;
+        }
 
+        if (this.currentFile && this.currentFile.path === file.path) {
+            return;
+        }
+
+        this.cleanupCurrent();
+
+        const url = this.resolveServerUrl(this.settings.serverUrl);
+        this.doc = new Y.Doc();
+        this.provider = new WebsocketProvider(url, this.docNameForFile(file), this.doc);
+        this.currentFile = file;
+
+        const color = this.colorFromId(this.provider.awareness.clientID);
+        this.provider.awareness.setLocalStateField('user', {
+            name: this.settings.username,
+            color,
+            colorLight: color + '33'
+        });
+        if (this.statusHandler) {
+            this.provider.on('status', this.statusHandler);
+        }
         if (this.pendingSyncHandler) {
             this.provider.off('sync', this.pendingSyncHandler);
             this.pendingSyncHandler = undefined;
         }
 
-        const ytext = this.doc.getText(file.path);
+        const ytext = this.doc.getText('content');
         this.currentText = ytext;
 
         const initializeText = async () => {
             if (ytext.length === 0) {
                 ytext.insert(0, view.editor.getValue());
             } else {
+                const newValue = ytext.toString();
+                if (view.editor.getValue() === newValue) return;
                 await this.defer();
                 if (this.currentText !== ytext) return;
-                view.editor.setValue(ytext.toString());
+                view.editor.setValue(newValue);
             }
         };
 
@@ -173,9 +227,12 @@ export default class ShadowLinkPlugin extends Plugin {
 
         const cm = (view.editor as any).cm as EditorView | undefined;
         if (cm) {
-            await this.defer();
-            if (this.currentText !== ytext) return;
-            cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: ytext.toString() } });
+            const newValue = ytext.toString();
+            if (cm.state.doc.toString() !== newValue) {
+                await this.defer();
+                if (this.currentText !== ytext) return;
+                cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: newValue } });
+            }
         }
     }
 }

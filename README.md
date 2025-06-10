@@ -42,9 +42,13 @@ The repository includes a minimal WebSocket relay for local testing. Start it wi
 npm run server
 ```
 
-The plugin will connect to `localhost:1234` by default. If your server uses
-TLS, a secure `wss://` connection is selected automatically, otherwise `ws://`
-is used.
+The plugin connects to `localhost:1234` by default. If your server uses TLS a
+secure `wss://` connection is chosen automatically. Documents are persisted on
+the server by default in a `yjs_data` directory next to the server script. Set
+the `YPERSISTENCE` environment variable to choose a different location or clear
+it to disable persistence entirely. Each Obsidian vault is assigned a short
+identifier derived from its path so multiple vaults can sync to the same server
+without collisions.
 
 ### Standalone Server
 
@@ -58,10 +62,11 @@ npm start
 ```
 
 The server listens on port `1234` unless the `PORT` environment variable is set.
-For HTTPS, provide file paths to your certificate and key via `SSL_CERT` and
-`SSL_KEY`. When both variables are present the server will use TLS and announce a
-`wss://` URL. The plugin automatically switches to `wss://` when it detects a
-TLS-enabled server.
+For HTTPS, provide your certificate and key via `SSL_CERT` and `SSL_KEY`. When
+both variables are present the server uses TLS and announces a `wss://` URL.
+By default documents are stored under `server/yjs_data`. Use `YPERSISTENCE` to
+specify another directory or leave it empty to disable persistence. The plugin
+automatically switches to `wss://` when it detects a TLS-enabled server.
 
 ### Roadmap
 
