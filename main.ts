@@ -139,18 +139,21 @@ export default class ShadowLinkPlugin extends Plugin {
 
     private async loadCollabModules(): Promise<void> {
         if (!this.modulesPromise) {
+            const viewPromise = typeof require !== 'undefined'
+                ? Promise.resolve(require('@codemirror/view'))
+                : import('@codemirror/view');
             this.modulesPromise = Promise.all([
                 import('yjs'),
                 import('y-websocket'),
                 import('y-codemirror.next'),
-                import('@codemirror/view'),
+                viewPromise,
                 import('y-indexeddb')
             ]).then(([Y, yws, ycm, view, yidb]) => {
                 this.Y = Y as typeof import('yjs');
                 this.WebsocketProviderClass = yws.WebsocketProvider;
                 this.yCollab = ycm.yCollab;
                 this.yUndoManagerKeymap = ycm.yUndoManagerKeymap;
-                this.cmKeymap = view.keymap;
+                this.cmKeymap = (view as typeof import('@codemirror/view')).keymap;
                 this.IndexeddbPersistenceClass = yidb.IndexeddbPersistence;
             });
         }
