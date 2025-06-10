@@ -36,7 +36,7 @@ As the project is in its early stages, no stable release is available. Future in
 ### Roadmap
 
 1. **Prototype Phase**
-   - [ ] Set up Obsidian plugin structure.
+   - [x] Set up Obsidian plugin structure.
    - [ ] Implement Yjs-based text synchronization.
    - [ ] Establish a WebSocket relay server.
    - [ ] Synchronize simple text edits between two Obsidian instances.
