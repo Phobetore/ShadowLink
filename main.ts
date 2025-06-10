@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TFile } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TFile, TAbstractFile } from 'obsidian';
 import { createHash } from 'crypto';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
@@ -60,6 +60,7 @@ export default class ShadowLinkPlugin extends Plugin {
         this.registerEditorExtension(this.collabExtensions);
         this.registerEvent(this.app.workspace.on('file-open', (file) => { void this.handleFileOpen(file); }));
         this.registerEvent(this.app.vault.on('delete', this.handleFileDelete.bind(this)));
+        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => { void this.handleFileRename(file, oldPath); }));
         // Initialize with the currently active file if any
         void this.handleFileOpen(this.app.workspace.getActiveFile());
 
@@ -143,6 +144,25 @@ export default class ShadowLinkPlugin extends Plugin {
             provider.destroy();
             doc.destroy();
         });
+    }
+
+    private async handleFileRename(file: TAbstractFile, oldPath: string) {
+        if (!(file instanceof TFile)) return;
+        if (this.currentFile && oldPath === this.currentFile.path) {
+            this.cleanupCurrent();
+            const doc = new Y.Doc();
+            const url = this.resolveServerUrl(this.settings.serverUrl);
+            const provider = new WebsocketProvider(url, `${this.vaultId}/${oldPath}`, doc, {
+                params: { token: this.settings.authToken }
+            });
+            const text = doc.getText('content');
+            provider.once('sync', () => {
+                text.delete(0, text.length);
+                provider.destroy();
+                doc.destroy();
+            });
+            await this.handleFileOpen(file);
+        }
     }
 
     private async handleFileOpen(file: TFile | null) {
