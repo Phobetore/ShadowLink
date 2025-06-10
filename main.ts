@@ -22,6 +22,8 @@ export default class ShadowLinkPlugin extends Plugin {
     doc: Y.Doc | null = null;
     provider: WebsocketProvider | null = null;
     collabExtensions: Extension[] = [];
+    statusBarItemEl: HTMLElement | null = null;
+    statusHandler?: (event: { status: string }) => void;
 
     async onload() {
         await this.loadSettings();
@@ -34,6 +36,23 @@ export default class ShadowLinkPlugin extends Plugin {
             this.doc
         );
 
+        this.statusBarItemEl = this.addStatusBarItem();
+        this.statusBarItemEl.setText('ShadowLink: connecting');
+        this.statusHandler = (event: { status: string }) => {
+            if (!this.statusBarItemEl) return;
+            switch (event.status) {
+                case 'connected':
+                    this.statusBarItemEl.setText('ShadowLink: connected');
+                    break;
+                case 'disconnected':
+                    this.statusBarItemEl.setText('ShadowLink: disconnected');
+                    break;
+                default:
+                    this.statusBarItemEl.setText('ShadowLink: ' + event.status);
+            }
+        };
+        this.provider.on('status', this.statusHandler);
+
         this.registerEditorExtension(this.collabExtensions);
         this.registerEvent(this.app.workspace.on('file-open', this.handleFileOpen.bind(this)));
         // Initialize with the currently active file if any
@@ -44,8 +63,12 @@ export default class ShadowLinkPlugin extends Plugin {
     }
 
     onunload() {
+        if (this.provider && this.statusHandler) {
+            this.provider.off('status', this.statusHandler);
+        }
         this.provider?.destroy();
         this.doc?.destroy();
+        this.statusBarItemEl?.remove();
     }
 
     async loadSettings() {
