@@ -39,6 +39,8 @@ export default class ShadowLinkPlugin extends Plugin {
     private yCollab?: typeof import('y-codemirror.next').yCollab;
     private yUndoManagerKeymap?: typeof import('y-codemirror.next').yUndoManagerKeymap;
     private cmKeymap?: typeof import('@codemirror/view').keymap;
+    private IndexeddbPersistenceClass?: typeof import('y-indexeddb').IndexeddbPersistence;
+    private idb: import('y-indexeddb').IndexeddbPersistence | null = null;
     private modulesPromise: Promise<void> | null = null;
 
     async onload() {
@@ -131,13 +133,15 @@ export default class ShadowLinkPlugin extends Plugin {
                 import('yjs'),
                 import('y-websocket'),
                 import('y-codemirror.next'),
-                import('@codemirror/view')
-            ]).then(([Y, yws, ycm, view]) => {
+                import('@codemirror/view'),
+                import('y-indexeddb')
+            ]).then(([Y, yws, ycm, view, yidb]) => {
                 this.Y = Y as typeof import('yjs');
                 this.WebsocketProviderClass = yws.WebsocketProvider;
                 this.yCollab = ycm.yCollab;
                 this.yUndoManagerKeymap = ycm.yUndoManagerKeymap;
                 this.cmKeymap = view.keymap;
+                this.IndexeddbPersistenceClass = yidb.IndexeddbPersistence;
             });
         }
         await this.modulesPromise;
@@ -155,8 +159,10 @@ export default class ShadowLinkPlugin extends Plugin {
             this.provider.off('connection-close', this.connectionCloseHandler);
         }
         this.provider?.destroy();
+        this.idb?.destroy();
         this.doc?.destroy();
         this.provider = null;
+        this.idb = null;
         this.doc = null;
         this.currentText = null;
         this.currentFile = null;
@@ -184,9 +190,9 @@ export default class ShadowLinkPlugin extends Plugin {
         if (!(file instanceof TFile)) return;
         if (this.currentFile && oldPath === this.currentFile.path) {
             this.cleanupCurrent();
-            const doc = new Y.Doc();
+            const doc = new this.Y!.Doc();
             const url = this.resolveServerUrl(this.settings.serverUrl);
-            const provider = new WebsocketProvider(url, `${this.vaultId}/${oldPath}`, doc, {
+            const provider = new this.WebsocketProviderClass!(url, `${this.vaultId}/${oldPath}`, doc, {
                 params: { token: this.settings.authToken }
             });
             const text = doc.getText('content');
@@ -214,9 +220,15 @@ export default class ShadowLinkPlugin extends Plugin {
         this.cleanupCurrent();
 
         const url = this.resolveServerUrl(this.settings.serverUrl);
+        const docName = this.docNameForFile(file);
         this.doc = new this.Y!.Doc();
-        this.provider = new this.WebsocketProviderClass!(url, this.docNameForFile(file), this.doc, {
+        this.idb = new this.IndexeddbPersistenceClass!(docName, this.doc);
+        await this.idb.whenSynced;
+        this.provider = new this.WebsocketProviderClass!(url, docName, this.doc, {
             params: { token: this.settings.authToken }
+        });
+        this.provider.once('sync', async () => {
+            await this.idb?.clearData();
         });
         this.currentFile = file;
 
