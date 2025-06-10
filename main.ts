@@ -119,10 +119,24 @@ export default class ShadowLinkPlugin extends Plugin {
 
         const ytext = this.doc.getText(file.path);
 
-        if (ytext.length === 0) {
-            ytext.insert(0, view.editor.getValue());
+        const initializeText = () => {
+            if (ytext.length === 0) {
+                ytext.insert(0, view.editor.getValue());
+            } else {
+                view.editor.setValue(ytext.toString());
+            }
+        };
+
+        if (this.provider.synced) {
+            initializeText();
         } else {
-            view.editor.setValue(ytext.toString());
+            const syncHandler = (isSynced: boolean) => {
+                if (isSynced) {
+                    initializeText();
+                    this.provider?.off('sync', syncHandler);
+                }
+            };
+            this.provider.on('sync', syncHandler);
         }
 
         this.collabExtensions.length = 0;
@@ -171,6 +185,13 @@ class ShadowLinkSettingTab extends PluginSettingTab {
                 .onChange(async (value) => {
                     this.plugin.settings.username = value;
                     await this.plugin.saveSettings();
+                    if (this.plugin.provider) {
+                        const current = this.plugin.provider.awareness.getLocalState() || {};
+                        this.plugin.provider.awareness.setLocalStateField('user', {
+                            ...current.user,
+                            name: value
+                        });
+                    }
                 }));
     }
 }
