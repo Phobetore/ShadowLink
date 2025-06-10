@@ -49,7 +49,7 @@ The plugin will connect to `ws://localhost:1234` by default.
    - [x] Set up Obsidian plugin structure.
    - [x] Implement Yjs-based text synchronization.
    - [x] Establish a WebSocket relay server.
-   - [ ] Synchronize simple text edits between two Obsidian instances.
+   - [x] Synchronize simple text edits between two Obsidian instances.
 
 2. **Collaboration Core**
    - [ ] Improve synchronization performance.
