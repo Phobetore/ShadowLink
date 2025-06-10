@@ -10,11 +10,13 @@ interface ShadowLinkSettings {
      * Server address. May include ws:// or wss:// but the scheme is optional.
      */
     serverUrl: string;
+    username: string;
 }
 
 const DEFAULT_SETTINGS: ShadowLinkSettings = {
     // Default without protocol so the plugin can decide between ws:// and wss://
-    serverUrl: 'localhost:1234'
+    serverUrl: 'localhost:1234',
+    username: 'Anonymous'
 };
 
 export default class ShadowLinkPlugin extends Plugin {
@@ -35,6 +37,13 @@ export default class ShadowLinkPlugin extends Plugin {
             'shadowlink',
             this.doc
         );
+
+        const color = this.colorFromId(this.provider.awareness.clientID);
+        this.provider.awareness.setLocalStateField('user', {
+            name: this.settings.username,
+            color,
+            colorLight: color + '33'
+        });
 
         this.statusBarItemEl = this.addStatusBarItem();
         this.statusBarItemEl.setText('ShadowLink: connecting');
@@ -99,6 +108,11 @@ export default class ShadowLinkPlugin extends Plugin {
         return scheme + url;
     }
 
+    private colorFromId(id: number): string {
+        const hue = id % 360;
+        return `hsl(${hue}, 80%, 50%)`;
+    }
+
     private handleFileOpen(file: TFile | null) {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!file || !view || !this.doc || !this.provider) return;
@@ -145,6 +159,17 @@ class ShadowLinkSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.serverUrl)
                 .onChange(async (value) => {
                     this.plugin.settings.serverUrl = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Username')
+            .setDesc('Displayed to collaborators')
+            .addText(text => text
+                .setPlaceholder('Anonymous')
+                .setValue(this.plugin.settings.username)
+                .onChange(async (value) => {
+                    this.plugin.settings.username = value;
                     await this.plugin.saveSettings();
                 }));
     }
