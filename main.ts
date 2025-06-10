@@ -28,6 +28,8 @@ export default class ShadowLinkPlugin extends Plugin {
     provider: WebsocketProvider | null = null;
     currentFile: TFile | null = null;
     vaultId = '';
+    metadataDoc: Y.Doc | null = null;
+    metadataProvider: WebsocketProvider | null = null;
     collabExtensions: Extension[] = [];
     statusBarItemEl: HTMLElement | null = null;
     statusHandler?: (event: { status: string }) => void;
@@ -69,10 +71,12 @@ export default class ShadowLinkPlugin extends Plugin {
             const reason = event?.reason ? `: ${event.reason}` : '';
             this.statusBarItemEl.setText(`ShadowLink: disconnected${reason}`);
         };
+        await this.connectMetadata();
         this.registerEditorExtension(this.collabExtensions);
         this.registerEvent(this.app.workspace.on('file-open', (file) => { void this.handleFileOpen(file); }));
         this.registerEvent(this.app.vault.on('delete', this.handleFileDelete.bind(this)));
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => { void this.handleFileRename(file, oldPath); }));
+        this.registerEvent(this.app.vault.on('create', (file) => { void this.handleFileCreate(file); }));
         // Initialize with the currently active file if any
         void this.handleFileOpen(this.app.workspace.getActiveFile());
 
@@ -82,6 +86,7 @@ export default class ShadowLinkPlugin extends Plugin {
 
     onunload() {
         this.cleanupCurrent();
+        this.cleanupMetadata();
         this.statusBarItemEl?.remove();
     }
 
@@ -147,6 +152,10 @@ export default class ShadowLinkPlugin extends Plugin {
         return `${this.vaultId}/${file.path}`;
     }
 
+    private metadataDocName(): string {
+        return `${this.vaultId}/vault-metadata`;
+    }
+
     private cleanupCurrent() {
         if (this.provider && this.statusHandler) {
             this.provider.off('status', this.statusHandler);
@@ -161,10 +170,63 @@ export default class ShadowLinkPlugin extends Plugin {
         this.currentText = null;
         this.currentFile = null;
     }
+
+    private cleanupMetadata() {
+        this.metadataProvider?.destroy();
+        this.metadataDoc?.destroy();
+        this.metadataProvider = null;
+        this.metadataDoc = null;
+    }
+
+    private async connectMetadata(): Promise<void> {
+        await this.loadCollabModules();
+        const url = this.resolveServerUrl(this.settings.serverUrl);
+        this.metadataDoc = new this.Y!.Doc();
+        this.metadataProvider = new this.WebsocketProviderClass!(url, this.metadataDocName(), this.metadataDoc, {
+            params: { token: this.settings.authToken }
+        });
+        const onSync = async (synced: boolean) => {
+            if (synced) {
+                await this.syncLocalWithMetadata();
+                this.metadataProvider?.off('sync', onSync);
+            }
+        };
+        if (this.metadataProvider.synced) {
+            await this.syncLocalWithMetadata();
+        } else {
+            this.metadataProvider.on('sync', onSync);
+        }
+    }
+
+    private async syncLocalWithMetadata() {
+        if (!this.metadataDoc) return;
+        const arr = this.metadataDoc.getArray<string>('paths');
+        const remote = new Set(arr.toArray());
+        const localFiles = this.app.vault.getFiles();
+        const localSet = new Set(localFiles.map(f => f.path));
+        for (const p of remote) {
+            if (!localSet.has(p)) {
+                await this.app.vault.create(p, '');
+            }
+        }
+        for (const p of localSet) {
+            if (!remote.has(p)) {
+                const f = this.app.vault.getAbstractFileByPath(p);
+                if (f instanceof TFile) {
+                    await this.app.vault.delete(f);
+                }
+            }
+        }
+    }
     private async handleFileDelete(file: TFile) {
         await this.loadCollabModules();
         if (this.currentFile && file.path === this.currentFile.path) {
             this.cleanupCurrent();
+        }
+        if (this.metadataDoc) {
+            const arr = this.metadataDoc.getArray<string>('paths');
+            const idx = arr.toArray().indexOf(file.path);
+            if (idx >= 0) arr.delete(idx, 1);
         }
         // Optionally inform the server about the deletion
         const doc = new this.Y!.Doc();
@@ -180,13 +242,23 @@ export default class ShadowLinkPlugin extends Plugin {
         });
     }
 
+    private async handleFileCreate(file: TAbstractFile) {
+        if (!(file instanceof TFile)) return;
+        if (this.metadataDoc) {
+            const arr = this.metadataDoc.getArray<string>('paths');
+            if (!arr.toArray().includes(file.path)) {
+                arr.push([file.path]);
+            }
+        }
+    }
+
     private async handleFileRename(file: TAbstractFile, oldPath: string) {
         if (!(file instanceof TFile)) return;
         if (this.currentFile && oldPath === this.currentFile.path) {
             this.cleanupCurrent();
-            const doc = new Y.Doc();
+            const doc = new this.Y!.Doc();
             const url = this.resolveServerUrl(this.settings.serverUrl);
-            const provider = new WebsocketProvider(url, `${this.vaultId}/${oldPath}`, doc, {
+            const provider = new this.WebsocketProviderClass!(url, `${this.vaultId}/${oldPath}`, doc, {
                 params: { token: this.settings.authToken }
             });
             const text = doc.getText('content');
@@ -196,6 +268,13 @@ export default class ShadowLinkPlugin extends Plugin {
                 doc.destroy();
             });
             await this.handleFileOpen(file);
+        }
+        if (this.metadataDoc) {
+            const arr = this.metadataDoc.getArray<string>('paths');
+            const list = arr.toArray();
+            const oldIdx = list.indexOf(oldPath);
+            if (oldIdx >= 0) arr.delete(oldIdx, 1);
+            if (!list.includes(file.path)) arr.push([file.path]);
         }
     }
 
