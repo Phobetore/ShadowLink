@@ -12,12 +12,14 @@ interface ShadowLinkSettings {
      */
     serverUrl: string;
     username: string;
+    authToken: string;
 }
 
 const DEFAULT_SETTINGS: ShadowLinkSettings = {
     // Default without protocol so the plugin can decide between ws:// and wss://
     serverUrl: 'localhost:1234',
-    username: 'Anonymous'
+    username: 'Anonymous',
+    authToken: ''
 };
 
 export default class ShadowLinkPlugin extends Plugin {
@@ -149,7 +151,9 @@ export default class ShadowLinkPlugin extends Plugin {
         // Optionally inform the server about the deletion
         const doc = new Y.Doc();
         const url = this.resolveServerUrl(this.settings.serverUrl);
-        const provider = new WebsocketProvider(url, this.docNameForFile(file), doc);
+        const provider = new WebsocketProvider(url, this.docNameForFile(file), doc, {
+            params: { token: this.settings.authToken }
+        });
         const text = doc.getText('content');
         provider.once('sync', () => {
             text.delete(0, text.length);
@@ -173,7 +177,9 @@ export default class ShadowLinkPlugin extends Plugin {
 
         const url = this.resolveServerUrl(this.settings.serverUrl);
         this.doc = new Y.Doc();
-        this.provider = new WebsocketProvider(url, this.docNameForFile(file), this.doc);
+        this.provider = new WebsocketProvider(url, this.docNameForFile(file), this.doc, {
+            params: { token: this.settings.authToken }
+        });
         this.currentFile = file;
 
         const color = this.colorFromId(this.provider.awareness.clientID);
@@ -276,6 +282,17 @@ class ShadowLinkSettingTab extends PluginSettingTab {
                             name: value
                         });
                     }
+                }));
+
+        new Setting(containerEl)
+            .setName('Auth Token')
+            .setDesc('Shared secret required by the server')
+            .addText(text => text
+                .setPlaceholder('optional')
+                .setValue(this.plugin.settings.authToken)
+                .onChange(async (value) => {
+                    this.plugin.settings.authToken = value;
+                    await this.plugin.saveSettings();
                 }));
     }
 }
