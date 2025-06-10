@@ -34,6 +34,17 @@ As the project is in its early stages, no stable release is available. Future in
 - **Networking**: WebSocket (Node.js server)
 - **Offline Storage**: IndexedDB
 
+### Building the Plugin
+
+Install dependencies and build the plugin with:
+
+```bash
+npm install
+npm run build
+```
+
+This creates a bundled `main.js` file that Obsidian loads as the plugin.
+
 ### Running the Relay Server
 
 The repository includes a minimal WebSocket relay for local testing. Start it with:
