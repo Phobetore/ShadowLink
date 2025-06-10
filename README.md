@@ -49,6 +49,8 @@ the `YPERSISTENCE` environment variable to choose a different location or clear
 it to disable persistence entirely. Each Obsidian vault is assigned a short
 identifier derived from its path so multiple vaults can sync to the same server
 without collisions.
+Set `WS_AUTH_TOKEN` to require a shared secret; connections without the token
+are rejected.
 
 ### Standalone Server
 
@@ -67,6 +69,7 @@ both variables are present the server uses TLS and announces a `wss://` URL.
 By default documents are stored under `server/yjs_data`. Use `YPERSISTENCE` to
 specify another directory or leave it empty to disable persistence. The plugin
 automatically switches to `wss://` when it detects a TLS-enabled server.
+Set `WS_AUTH_TOKEN` to enforce a token for clients just like the main server.
 
 ### Roadmap
 
