@@ -33,12 +33,22 @@ As the project is in its early stages, no stable release is available. Future in
 - **Networking**: WebSocket (Node.js server)
 - **Offline Storage**: IndexedDB
 
+### Running the Relay Server
+
+The repository includes a minimal WebSocket relay for local testing. Start it with:
+
+```bash
+npm run server
+```
+
+The plugin will connect to `ws://localhost:1234` by default.
+
 ### Roadmap
 
 1. **Prototype Phase**
    - [x] Set up Obsidian plugin structure.
    - [x] Implement Yjs-based text synchronization.
-   - [ ] Establish a WebSocket relay server.
+   - [x] Establish a WebSocket relay server.
    - [ ] Synchronize simple text edits between two Obsidian instances.
 
 2. **Collaboration Core**
