@@ -41,7 +41,26 @@ The repository includes a minimal WebSocket relay for local testing. Start it wi
 npm run server
 ```
 
-The plugin will connect to `ws://localhost:1234` by default.
+The plugin will connect to `localhost:1234` by default. If your server uses
+TLS, a secure `wss://` connection is selected automatically, otherwise `ws://`
+is used.
+
+### Standalone Server
+
+If you only need the relay server, a trimmed-down package is provided in the
+`server/` directory. Install dependencies and start the server with:
+
+```bash
+cd server
+npm install
+npm start
+```
+
+The server listens on port `1234` unless the `PORT` environment variable is set.
+For HTTPS, provide file paths to your certificate and key via `SSL_CERT` and
+`SSL_KEY`. When both variables are present the server will use TLS and announce a
+`wss://` URL. The plugin automatically switches to `wss://` when it detects a
+TLS-enabled server.
 
 ### Roadmap
 

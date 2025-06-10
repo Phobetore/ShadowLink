@@ -6,11 +6,15 @@ import { keymap, EditorView } from '@codemirror/view';
 import type { Extension } from '@codemirror/state';
 
 interface ShadowLinkSettings {
+    /**
+     * Server address. May include ws:// or wss:// but the scheme is optional.
+     */
     serverUrl: string;
 }
 
 const DEFAULT_SETTINGS: ShadowLinkSettings = {
-    serverUrl: 'ws://localhost:1234'
+    // Default without protocol so the plugin can decide between ws:// and wss://
+    serverUrl: 'localhost:1234'
 };
 
 export default class ShadowLinkPlugin extends Plugin {
@@ -23,8 +27,9 @@ export default class ShadowLinkPlugin extends Plugin {
         await this.loadSettings();
 
         this.doc = new Y.Doc();
+        const url = this.resolveServerUrl(this.settings.serverUrl);
         this.provider = new WebsocketProvider(
-            this.settings.serverUrl,
+            url,
             'shadowlink',
             this.doc
         );
@@ -35,7 +40,7 @@ export default class ShadowLinkPlugin extends Plugin {
         this.handleFileOpen(this.app.workspace.getActiveFile());
 
         this.addSettingTab(new ShadowLinkSettingTab(this.app, this));
-        console.log('ShadowLink: connected to', this.settings.serverUrl);
+        console.log('ShadowLink: connected to', url);
     }
 
     onunload() {
@@ -49,6 +54,26 @@ export default class ShadowLinkPlugin extends Plugin {
 
     async saveSettings() {
         await this.saveData(this.settings);
+    }
+
+    /**
+     * Resolve the final WebSocket URL. If the provided value includes a
+     * protocol it is used as-is. Otherwise the scheme is selected based on the
+     * current page (wss for https, ws otherwise).
+     */
+    private resolveServerUrl(url: string): string {
+        if (/^wss?:\/\//.test(url)) {
+            return url;
+        }
+        if (/^https?:\/\//.test(url)) {
+            const rest = url.replace(/^https?:\/\//, '');
+            return url.startsWith('https://') ? `wss://${rest}` : `ws://${rest}`;
+        }
+        const scheme = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        if (url.startsWith('//')) {
+            return scheme + url.slice(2);
+        }
+        return scheme + url;
     }
 
     private handleFileOpen(file: TFile | null) {
@@ -93,7 +118,7 @@ class ShadowLinkSettingTab extends PluginSettingTab {
             .setName('Server URL')
             .setDesc('WebSocket server used for collaboration')
             .addText(text => text
-                .setPlaceholder('ws://localhost:1234')
+                .setPlaceholder('localhost:1234')
                 .setValue(this.plugin.settings.serverUrl)
                 .onChange(async (value) => {
                     this.plugin.settings.serverUrl = value;
