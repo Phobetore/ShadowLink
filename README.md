@@ -91,11 +91,11 @@ Set `WS_AUTH_TOKEN` to enforce a token for clients just like the main server.
 
 ## Contributing
 
-By contributing to this project, you agree that your code will be released under the GNU General Public License v3 (GPLv3). Ensure your contributions are compatible with the project's license. If you have questions, open an issue in the repository.
+By contributing to this project, you agree that your code will be released under the GNU General Public License v3 or later (GPLv3+). Ensure your contributions are compatible with the project's license. If you have questions, open an issue in the repository.
 
 ## License
 
-ShadowLink is open-source under the MIT License.
+ShadowLink is open-source under the GNU General Public License v3 or later (GPLv3+).
 
 ## Contact
 
