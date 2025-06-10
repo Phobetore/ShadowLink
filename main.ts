@@ -142,7 +142,6 @@ export default class ShadowLinkPlugin extends Plugin {
         this.currentText = null;
         this.currentFile = null;
     }
-
     private handleFileDelete(file: TFile) {
         if (this.currentFile && file.path === this.currentFile.path) {
             this.cleanupCurrent();
