@@ -1,10 +1,14 @@
 const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const https = require('https');
 const WebSocket = require('ws');
-const { setupWSConnection } = require('y-websocket/bin/utils');
+const { setupWSConnection, getPersistence } = require('y-websocket/bin/utils');
 
 const port = process.env.PORT || 1234;
+if (!process.env.YPERSISTENCE) {
+    process.env.YPERSISTENCE = path.join(__dirname, 'yjs_data');
+}
 const useTls = process.env.SSL_KEY && process.env.SSL_CERT;
 
 let server;
@@ -26,5 +30,8 @@ wss.on('connection', (conn, req) => {
 
 server.listen(port, () => {
     const protocol = useTls ? 'wss' : 'ws';
-    console.log(`ShadowLink relay server running on ${protocol}://localhost:${port}`);
+    const persist = getPersistence()
+        ? `with persistence at ${process.env.YPERSISTENCE}`
+        : 'without persistence';
+    console.log(`ShadowLink relay server running on ${protocol}://localhost:${port} ${persist}`);
 });
