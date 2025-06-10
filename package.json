@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
-	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+        "name": "shadowlink",
+        "version": "0.1.0",
+        "description": "Real-time collaborative editing plugin for Obsidian",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
@@ -11,7 +11,7 @@
 	"keywords": [],
 	"author": "",
 	"license": "MIT",
-	"devDependencies": {
+        "devDependencies": {
 		"@types/node": "^16.11.6",
 		"@typescript-eslint/eslint-plugin": "5.29.0",
 		"@typescript-eslint/parser": "5.29.0",
@@ -19,6 +19,9 @@
 		"esbuild": "0.17.3",
 		"obsidian": "latest",
 		"tslib": "2.4.0",
-		"typescript": "4.7.4"
-	}
+                "typescript": "4.7.4",
+                "yjs": "^13.6.27",
+                "y-websocket": "^3.0.0",
+                "y-codemirror.next": "^0.3.5"
+        }
 }
