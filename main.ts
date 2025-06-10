@@ -146,6 +146,7 @@ export default class ShadowLinkPlugin extends Plugin {
                 ytext.insert(0, view.editor.getValue());
             } else {
                 await this.defer();
+                if (this.currentText !== ytext) return;
                 view.editor.setValue(ytext.toString());
             }
         };
@@ -173,6 +174,7 @@ export default class ShadowLinkPlugin extends Plugin {
         const cm = (view.editor as any).cm as EditorView | undefined;
         if (cm) {
             await this.defer();
+            if (this.currentText !== ytext) return;
             cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: ytext.toString() } });
         }
     }
