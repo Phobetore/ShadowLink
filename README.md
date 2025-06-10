@@ -6,7 +6,11 @@ ShadowLink is an open-source Obsidian plugin that enables **real-time collaborat
 
 - **Real-Time Collaboration** – Multiple users can edit the same note simultaneously.
 - **Conflict-Free Synchronization** – Built on Yjs (CRDT) to ensure smooth merging of edits.
-- **Offline Mode** – Changes are stored locally and synced when reconnected.
+- **Offline Mode** – Changes are stored locally in IndexedDB and loaded before
+  connecting to the server. Once a document has synchronized, the persisted
+  updates are cleared.
+- **Minimal Storage** – Yjs stores only incremental updates; IndexedDB
+  persistence keeps just unsynced changes so memory overhead stays small.
 - **Shared Folders** – Collaborate across multiple notes within a shared directory.
 - **Self-Hostable WebSocket Server** – No reliance on third-party services.
 - **Live Cursor Tracking** – View collaborator cursors in real time.
@@ -32,7 +36,7 @@ As the project is in its early stages, no stable release is available. Future in
 - **Editor Integration**: CodeMirror (Obsidian API)
 - **Real-Time Engine**: Yjs (CRDT)
 - **Networking**: WebSocket (Node.js server)
-- **Offline Storage**: IndexedDB
+- **Offline Storage**: IndexedDB via Yjs `IndexeddbPersistence`
 
 ### Building the Plugin
 
@@ -62,6 +66,14 @@ identifier derived from its path so multiple vaults can sync to the same server
 without collisions.
 Set `WS_AUTH_TOKEN` to require a shared secret; connections without the token
 are rejected.
+
+### Offline Persistence
+
+When opening a note, ShadowLink loads any pending updates from IndexedDB using
+`IndexeddbPersistence` before connecting to the relay server. As soon as the
+document finishes syncing with the server, these local updates are cleared from
+IndexedDB to avoid duplication. Because Yjs only stores differences between
+states, the amount of data kept in the browser is minimal.
 
 ### Standalone Server
 
