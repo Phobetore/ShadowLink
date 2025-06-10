@@ -43,23 +43,6 @@ export default class ShadowLinkPlugin extends Plugin {
         const url = this.resolveServerUrl(this.settings.serverUrl);
 
         this.statusBarItemEl = this.addStatusBarItem();
-        this.statusBarItemEl.setText('ShadowLink: idle');
-
-        this.statusHandler = (event: { status: string }) => {
-            if (!this.statusBarItemEl) return;
-            switch (event.status) {
-                case 'connected':
-                    this.statusBarItemEl.setText('ShadowLink: connected');
-                    break;
-                case 'disconnected':
-                    this.statusBarItemEl.setText('ShadowLink: disconnected');
-                    break;
-                default:
-                    this.statusBarItemEl.setText('ShadowLink: ' + event.status);
-            }
-        };
-
-        this.statusBarItemEl = this.addStatusBarItem();
         this.statusBarItemEl.setText('ShadowLink: connecting');
         this.statusHandler = (event: { status: string }) => {
             if (!this.statusBarItemEl) return;
