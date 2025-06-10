@@ -1,9 +1,9 @@
 import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TFile } from 'obsidian';
 import { createHash } from 'crypto';
-import * as Y from 'yjs';
-import { WebsocketProvider } from 'y-websocket';
-import { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
-import { keymap, EditorView } from '@codemirror/view';
+import type * as Y from 'yjs';
+import type { WebsocketProvider } from 'y-websocket';
+import type { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
+import type { keymap, EditorView } from '@codemirror/view';
 import type { Extension } from '@codemirror/state';
 
 interface ShadowLinkSettings {
@@ -33,6 +33,12 @@ export default class ShadowLinkPlugin extends Plugin {
     statusHandler?: (event: { status: string }) => void;
     pendingSyncHandler?: (isSynced: boolean) => void;
     currentText: Y.Text | null = null;
+    private Y?: typeof import('yjs');
+    private WebsocketProviderClass?: typeof import('y-websocket').WebsocketProvider;
+    private yCollab?: typeof import('y-codemirror.next').yCollab;
+    private yUndoManagerKeymap?: typeof import('y-codemirror.next').yUndoManagerKeymap;
+    private cmKeymap?: typeof import('@codemirror/view').keymap;
+    private modulesPromise: Promise<void> | null = null;
 
     async onload() {
         await this.loadSettings();
@@ -112,6 +118,24 @@ export default class ShadowLinkPlugin extends Plugin {
         return new Promise(resolve => requestAnimationFrame(() => resolve()));
     }
 
+    private async loadCollabModules(): Promise<void> {
+        if (!this.modulesPromise) {
+            this.modulesPromise = Promise.all([
+                import('yjs'),
+                import('y-websocket'),
+                import('y-codemirror.next'),
+                import('@codemirror/view')
+            ]).then(([Y, yws, ycm, view]) => {
+                this.Y = Y as typeof import('yjs');
+                this.WebsocketProviderClass = yws.WebsocketProvider;
+                this.yCollab = ycm.yCollab;
+                this.yUndoManagerKeymap = ycm.yUndoManagerKeymap;
+                this.cmKeymap = view.keymap;
+            });
+        }
+        await this.modulesPromise;
+    }
+
     private docNameForFile(file: TFile): string {
         return `${this.vaultId}/${file.path}`;
     }
@@ -127,14 +151,15 @@ export default class ShadowLinkPlugin extends Plugin {
         this.currentText = null;
         this.currentFile = null;
     }
-    private handleFileDelete(file: TFile) {
+    private async handleFileDelete(file: TFile) {
+        await this.loadCollabModules();
         if (this.currentFile && file.path === this.currentFile.path) {
             this.cleanupCurrent();
         }
         // Optionally inform the server about the deletion
-        const doc = new Y.Doc();
+        const doc = new this.Y!.Doc();
         const url = this.resolveServerUrl(this.settings.serverUrl);
-        const provider = new WebsocketProvider(url, this.docNameForFile(file), doc, {
+        const provider = new this.WebsocketProviderClass!(url, this.docNameForFile(file), doc, {
             params: { token: this.settings.authToken }
         });
         const text = doc.getText('content');
@@ -146,6 +171,7 @@ export default class ShadowLinkPlugin extends Plugin {
     }
 
     private async handleFileOpen(file: TFile | null) {
+        await this.loadCollabModules();
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!file || !view) {
             this.cleanupCurrent();
@@ -159,8 +185,8 @@ export default class ShadowLinkPlugin extends Plugin {
         this.cleanupCurrent();
 
         const url = this.resolveServerUrl(this.settings.serverUrl);
-        this.doc = new Y.Doc();
-        this.provider = new WebsocketProvider(url, this.docNameForFile(file), this.doc, {
+        this.doc = new this.Y!.Doc();
+        this.provider = new this.WebsocketProviderClass!(url, this.docNameForFile(file), this.doc, {
             params: { token: this.settings.authToken }
         });
         this.currentFile = file;
@@ -209,8 +235,8 @@ export default class ShadowLinkPlugin extends Plugin {
 
         this.collabExtensions.length = 0;
         this.collabExtensions.push(
-            yCollab(ytext, this.provider.awareness),
-            keymap.of(yUndoManagerKeymap)
+            this.yCollab!(ytext, this.provider.awareness),
+            this.cmKeymap!.of(this.yUndoManagerKeymap!)
         );
         this.app.workspace.updateOptions();
 
