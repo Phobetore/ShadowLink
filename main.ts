@@ -1172,7 +1172,22 @@ export default class ShadowLinkPlugin extends Plugin {
                 }
             } else {
                 const newValue = ytext.toString();
-                if (view.editor.getValue() === newValue) return;
+                const currentEditorValue = view.editor.getValue();
+                
+                // Don't overwrite content if values are the same
+                if (currentEditorValue === newValue) return;
+                
+                // Prevent overwriting valid content with empty content unless intentional
+                if (newValue.trim() === '' && currentEditorValue.trim() !== '') {
+                    console.warn('ShadowLink: Preventing empty content overwrite for', this.currentFile?.path);
+                    // Instead, update the Yjs document with current content
+                    ytext.delete(0, ytext.length);
+                    ytext.insert(0, currentEditorValue);
+                    if (this.currentFile) {
+                        this.documentVersions.set(this.currentFile.path, currentEditorValue);
+                    }
+                    return;
+                }
                 
                 // Check for conflicts before applying remote changes
                 if (this.currentFile && this.conflictResolver) {
@@ -1184,7 +1199,12 @@ export default class ShadowLinkPlugin extends Plugin {
                 }
                 
                 await this.defer();
-                if (this.currentText !== ytext) return;
+                // Enhanced race condition check - ensure we're still on the right file
+                if (this.currentText !== ytext || this.currentFile?.path !== file?.path) {
+                    console.warn('ShadowLink: Race condition detected, aborting content update');
+                    return;
+                }
+                
                 view.editor.setValue(newValue);
                 
                 // Store the new version
@@ -1198,8 +1218,13 @@ export default class ShadowLinkPlugin extends Plugin {
             await initializeText();
         } else {
             this.pendingSyncHandler = async (isSynced: boolean) => {
-                if (isSynced && this.currentText === ytext) {
+                // Additional check to ensure we're still on the same file when sync completes
+                if (isSynced && this.currentText === ytext && this.currentFile?.path === file?.path) {
                     await initializeText();
+                    this.provider?.off('sync', this.pendingSyncHandler!);
+                    this.pendingSyncHandler = undefined;
+                } else if (isSynced) {
+                    console.warn('ShadowLink: Sync completed but file changed, skipping initialization');
                     this.provider?.off('sync', this.pendingSyncHandler!);
                     this.pendingSyncHandler = undefined;
                 }
@@ -1214,12 +1239,25 @@ export default class ShadowLinkPlugin extends Plugin {
         );
         this.app.workspace.updateOptions();
 
+        // Final content synchronization using CodeMirror
+        // This ensures the editor state is fully synchronized after the collaboration setup
         const cm = (view.editor as any).cm as EditorView | undefined;
         if (cm) {
+            // Add a small delay to ensure the collaboration extensions are properly initialized
+            await this.defer();
+            
             const newValue = ytext.toString();
-            if (cm.state.doc.toString() !== newValue) {
-                await this.defer();
-                if (this.currentText !== ytext) return;
+            const currentValue = cm.state.doc.toString();
+            
+            // Only update if content differs and prevent empty content overwrite
+            if (currentValue !== newValue && !(newValue.trim() === '' && currentValue.trim() !== '')) {
+                // Final race condition check before applying changes
+                if (this.currentText !== ytext || this.currentFile?.path !== file?.path) {
+                    console.warn('ShadowLink: Race condition detected in final content sync, aborting');
+                    return;
+                }
+                
+                console.log('ShadowLink: Final content synchronization for', file.path);
                 cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: newValue } });
             }
         }
