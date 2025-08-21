@@ -6,3 +6,158 @@ available in the app when your plugin is enabled.
 If your plugin does not need CSS, delete this file.
 
 */
+
+/* Main plugin styles */
+.shadowlink-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.shadowlink-status .status-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--text-muted);
+}
+
+.shadowlink-status .status-indicator.online {
+  background-color: var(--color-green);
+}
+
+.shadowlink-status .status-indicator.offline {
+  background-color: var(--color-red);
+}
+
+/* Conflict resolution modal styles */
+.conflict-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.conflict-modal-content {
+  background-color: var(--background-primary);
+  border-radius: 8px;
+  padding: 24px;
+  max-width: 600px;
+  width: 90%;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--background-modifier-border);
+}
+
+.conflict-modal h2 {
+  margin-top: 0;
+  color: var(--color-red);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.conflict-modal h2::before {
+  content: "⚠️";
+  font-size: 1.2em;
+}
+
+.conflict-buttons {
+  display: flex;
+  gap: 12px;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+
+.conflict-buttons button {
+  padding: 8px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.conflict-buttons button:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.conflict-buttons button.mod-cta {
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+
+.conflict-buttons button.mod-cta:hover {
+  background-color: var(--interactive-accent-hover);
+}
+
+.conflict-buttons button.mod-warning {
+  background-color: var(--color-orange);
+  color: white;
+  border-color: var(--color-orange);
+}
+
+.conflict-buttons button.mod-warning:hover {
+  background-color: var(--color-red);
+}
+
+/* Offline queue indicator */
+.offline-queue-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background-color: var(--color-orange);
+  color: white;
+  border-radius: 12px;
+  font-size: 0.8em;
+  font-weight: 500;
+}
+
+.offline-queue-indicator::before {
+  content: "📥";
+  font-size: 0.9em;
+}
+
+/* Settings enhancements */
+.shadowlink-settings h3 {
+  margin-top: 24px;
+  margin-bottom: 12px;
+  color: var(--text-accent);
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 4px;
+}
+
+.shadowlink-settings .setting-item-description {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+/* Success/Error notifications */
+.shadowlink-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shadowlink-notice.success::before {
+  content: "✅";
+}
+
+.shadowlink-notice.error::before {
+  content: "❌";
+}
+
+.shadowlink-notice.warning::before {
+  content: "⚠️";
+}
+
+.shadowlink-notice.info::before {
+  content: "ℹ️";
+}
