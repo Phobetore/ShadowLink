@@ -14,6 +14,8 @@ interface ShadowLinkSettings {
     username: string;
     authToken: string;
     vaultId: string;
+    sharedVaults: string[]; // List of vault IDs this user has access to
+    userId: string; // Unique user identifier for collaboration
 }
 
 const DEFAULT_SETTINGS: ShadowLinkSettings = {
@@ -21,7 +23,9 @@ const DEFAULT_SETTINGS: ShadowLinkSettings = {
     serverUrl: 'localhost:1234',
     username: 'Anonymous',
     authToken: '',
-    vaultId: ''
+    vaultId: '',
+    sharedVaults: [],
+    userId: ''
 };
 
 export default class ShadowLinkPlugin extends Plugin {
@@ -46,12 +50,22 @@ export default class ShadowLinkPlugin extends Plugin {
     private IndexeddbPersistenceClass?: typeof import('y-indexeddb').IndexeddbPersistence;
     private idb: import('y-indexeddb').IndexeddbPersistence | null = null;
     private modulesPromise: Promise<void> | null = null;
+    
+    // Race condition prevention
+    private fileOpenQueue: Promise<void> = Promise.resolve();
+    private currentFileOpenRequest: string | null = null;
+    private debounceTimeout: NodeJS.Timeout | null = null;
+    private isCleaningUp = false;
 
     async onload() {
         await this.loadSettings();
 
         if (!this.settings.vaultId) {
             this.settings.vaultId = randomUUID();
+            await this.saveSettings();
+        }
+        if (!this.settings.userId) {
+            this.settings.userId = randomUUID();
             await this.saveSettings();
         }
         this.vaultId = this.settings.vaultId;
@@ -80,18 +94,22 @@ export default class ShadowLinkPlugin extends Plugin {
         };
         await this.connectMetadata();
         this.registerEditorExtension(this.collabExtensions);
-        this.registerEvent(this.app.workspace.on('file-open', (file) => { void this.handleFileOpen(file); }));
+        this.registerEvent(this.app.workspace.on('file-open', (file) => { void this.handleFileOpenDebounced(file); }));
         this.registerEvent(this.app.vault.on('delete', this.handleFileDelete.bind(this)));
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => { void this.handleFileRename(file, oldPath); }));
         this.registerEvent(this.app.vault.on('create', (file) => { void this.handleFileCreate(file); }));
         // Initialize with the currently active file if any
-        void this.handleFileOpen(this.app.workspace.getActiveFile());
+        void this.handleFileOpenDebounced(this.app.workspace.getActiveFile());
 
         this.addSettingTab(new ShadowLinkSettingTab(this.app, this));
         console.log('ShadowLink: ready, server', url);
     }
 
     onunload() {
+        this.isCleaningUp = true;
+        if (this.debounceTimeout) {
+            clearTimeout(this.debounceTimeout);
+        }
         this.cleanupCurrent();
         this.cleanupMetadata();
         this.statusBarItemEl?.remove();
@@ -169,6 +187,8 @@ export default class ShadowLinkPlugin extends Plugin {
     }
 
     private cleanupCurrent() {
+        if (this.isCleaningUp) return; // Prevent recursive cleanup
+        
         if (this.provider && this.statusHandler) {
             this.provider.off('status', this.statusHandler);
         }
@@ -197,7 +217,11 @@ export default class ShadowLinkPlugin extends Plugin {
         const url = this.resolveServerUrl(this.settings.serverUrl);
         this.metadataDoc = new this.Y!.Doc();
         this.metadataProvider = new this.WebsocketProviderClass!(url, this.metadataDocName(), this.metadataDoc, {
-            params: { token: this.settings.authToken }
+            params: { 
+                token: this.settings.authToken,
+                vaultId: this.vaultId,
+                userId: this.settings.userId
+            }
         });
         const onSync = async (synced: boolean) => {
             if (synced) {
@@ -246,7 +270,11 @@ export default class ShadowLinkPlugin extends Plugin {
         const doc = new this.Y!.Doc();
         const url = this.resolveServerUrl(this.settings.serverUrl);
         const provider = new this.WebsocketProviderClass!(url, this.docNameForFile(file), doc, {
-            params: { token: this.settings.authToken }
+            params: { 
+                token: this.settings.authToken,
+                vaultId: this.vaultId,
+                userId: this.settings.userId
+            }
         });
         const text = doc.getText('content');
         provider.once('sync', () => {
@@ -273,7 +301,11 @@ export default class ShadowLinkPlugin extends Plugin {
             const doc = new this.Y!.Doc();
             const url = this.resolveServerUrl(this.settings.serverUrl);
             const provider = new this.WebsocketProviderClass!(url, `${this.vaultId}/${oldPath}`, doc, {
-                params: { token: this.settings.authToken }
+                params: { 
+                    token: this.settings.authToken,
+                    vaultId: this.vaultId,
+                    userId: this.settings.userId
+                }
             });
             const text = doc.getText('content');
             provider.once('sync', () => {
@@ -281,7 +313,7 @@ export default class ShadowLinkPlugin extends Plugin {
                 provider.destroy();
                 doc.destroy();
             });
-            await this.handleFileOpen(file);
+            await this.handleFileOpenDebounced(file);
         }
         if (this.metadataDoc) {
             const arr = this.metadataDoc.getArray<string>('paths');
@@ -292,7 +324,42 @@ export default class ShadowLinkPlugin extends Plugin {
         }
     }
 
+    /**
+     * Debounced file opening to prevent race conditions when switching files rapidly
+     */
+    private handleFileOpenDebounced(file: TFile | null) {
+        if (this.debounceTimeout) {
+            clearTimeout(this.debounceTimeout);
+        }
+        
+        this.debounceTimeout = setTimeout(() => {
+            void this.handleFileOpen(file);
+        }, 100); // 100ms debounce
+    }
+
     private async handleFileOpen(file: TFile | null) {
+        // Create a unique request ID to track this specific file open request
+        const requestId = file ? file.path : 'null';
+        this.currentFileOpenRequest = requestId;
+
+        // Queue the file open operation to prevent concurrent execution
+        this.fileOpenQueue = this.fileOpenQueue.then(async () => {
+            // Check if this request is still current (user hasn't switched to another file)
+            if (this.currentFileOpenRequest !== requestId || this.isCleaningUp) {
+                return;
+            }
+
+            try {
+                await this.handleFileOpenInternal(file);
+            } catch (error) {
+                console.error('ShadowLink: Error opening file', error);
+            }
+        });
+
+        return this.fileOpenQueue;
+    }
+
+    private async handleFileOpenInternal(file: TFile | null) {
         await this.loadCollabModules();
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!file || !view) {
@@ -312,7 +379,11 @@ export default class ShadowLinkPlugin extends Plugin {
         this.idb = new this.IndexeddbPersistenceClass!(docName, this.doc);
         await this.idb.whenSynced;
         this.provider = new this.WebsocketProviderClass!(url, docName, this.doc, {
-            params: { token: this.settings.authToken }
+            params: { 
+                token: this.settings.authToken,
+                vaultId: this.vaultId,
+                userId: this.settings.userId
+            }
         });
         this.provider.once('sync', async () => {
             await this.idb?.clearData();
@@ -439,7 +510,7 @@ class ShadowLinkSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Vault ID')
-            .setDesc('Identifier for this vault')
+            .setDesc('Identifier for this vault (share this with collaborators)')
             .addText(text => text
                 .setPlaceholder('auto')
                 .setValue(this.plugin.settings.vaultId)
@@ -448,5 +519,78 @@ class ShadowLinkSettingTab extends PluginSettingTab {
                     this.plugin.vaultId = value;
                     await this.plugin.saveSettings();
                 }));
+
+        new Setting(containerEl)
+            .setName('User ID')
+            .setDesc('Your unique identifier for collaboration')
+            .addText(text => text
+                .setPlaceholder('auto')
+                .setValue(this.plugin.settings.userId)
+                .setDisabled(true)); // Read-only display
+
+        // Vault collaboration section
+        containerEl.createEl('h3', { text: 'Vault Collaboration' });
+        
+        new Setting(containerEl)
+            .setName('Share Vault')
+            .setDesc('Share your vault ID with others to invite them to collaborate')
+            .addButton(button => button
+                .setButtonText('Copy Vault ID')
+                .onClick(() => {
+                    navigator.clipboard.writeText(this.plugin.settings.vaultId);
+                    button.setButtonText('Copied!');
+                    setTimeout(() => button.setButtonText('Copy Vault ID'), 2000);
+                }));
+
+        new Setting(containerEl)
+            .setName('Join Vault')
+            .setDesc('Enter a vault ID to join someone else\'s vault')
+            .addText(text => text
+                .setPlaceholder('Enter vault ID...')
+                .onChange(async (value) => {
+                    if (value && value !== this.plugin.settings.vaultId) {
+                        if (!this.plugin.settings.sharedVaults.includes(value)) {
+                            this.plugin.settings.sharedVaults.push(value);
+                            await this.plugin.saveSettings();
+                            this.display(); // Refresh the display
+                        }
+                    }
+                }));
+
+        if (this.plugin.settings.sharedVaults.length > 0) {
+            containerEl.createEl('h4', { text: 'Shared Vaults' });
+            
+            this.plugin.settings.sharedVaults.forEach((vaultId, index) => {
+                new Setting(containerEl)
+                    .setName(`Shared Vault ${index + 1}`)
+                    .setDesc(`Vault ID: ${vaultId}`)
+                    .addButton(button => button
+                        .setButtonText('Remove')
+                        .setWarning()
+                        .onClick(async () => {
+                            this.plugin.settings.sharedVaults.splice(index, 1);
+                            await this.plugin.saveSettings();
+                            this.display(); // Refresh the display
+                        }));
+            });
+        }
+
+        // Connection status
+        containerEl.createEl('h3', { text: 'Connection Status' });
+        const statusEl = containerEl.createEl('p');
+        const updateStatus = () => {
+            if (this.plugin.provider) {
+                const status = this.plugin.provider.wsconnected ? 'Connected' : 'Disconnected';
+                const userCount = this.plugin.provider.awareness.getStates().size;
+                statusEl.textContent = `${status} - ${userCount} user(s) online`;
+            } else {
+                statusEl.textContent = 'Not connected';
+            }
+        };
+        updateStatus();
+        // Update status every 2 seconds
+        const statusInterval = setInterval(updateStatus, 2000);
+        // Clean up interval when settings are closed
+        this.plugin.register(() => clearInterval(statusInterval));
     }
 }
