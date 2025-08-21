@@ -1172,7 +1172,22 @@ export default class ShadowLinkPlugin extends Plugin {
                 }
             } else {
                 const newValue = ytext.toString();
-                if (view.editor.getValue() === newValue) return;
+                const currentEditorValue = view.editor.getValue();
+                
+                // Don't overwrite content if values are the same
+                if (currentEditorValue === newValue) return;
+                
+                // Prevent overwriting valid content with empty content unless intentional
+                if (newValue.trim() === '' && currentEditorValue.trim() !== '') {
+                    console.warn('ShadowLink: Preventing empty content overwrite for', this.currentFile?.path);
+                    // Instead, update the Yjs document with current content
+                    ytext.delete(0, ytext.length);
+                    ytext.insert(0, currentEditorValue);
+                    if (this.currentFile) {
+                        this.documentVersions.set(this.currentFile.path, currentEditorValue);
+                    }
+                    return;
+                }
                 
                 // Check for conflicts before applying remote changes
                 if (this.currentFile && this.conflictResolver) {
@@ -1184,7 +1199,12 @@ export default class ShadowLinkPlugin extends Plugin {
                 }
                 
                 await this.defer();
-                if (this.currentText !== ytext) return;
+                // Enhanced race condition check - ensure we're still on the right file
+                if (this.currentText !== ytext || this.currentFile?.path !== file?.path) {
+                    console.warn('ShadowLink: Race condition detected, aborting content update');
+                    return;
+                }
+                
                 view.editor.setValue(newValue);
                 
                 // Store the new version
@@ -1217,9 +1237,16 @@ export default class ShadowLinkPlugin extends Plugin {
         const cm = (view.editor as any).cm as EditorView | undefined;
         if (cm) {
             const newValue = ytext.toString();
-            if (cm.state.doc.toString() !== newValue) {
+            const currentValue = cm.state.doc.toString();
+            
+            // Only update if content differs and prevent empty content overwrite
+            if (currentValue !== newValue && !(newValue.trim() === '' && currentValue.trim() !== '')) {
                 await this.defer();
-                if (this.currentText !== ytext) return;
+                // Enhanced race condition check
+                if (this.currentText !== ytext || this.currentFile?.path !== file?.path) {
+                    console.warn('ShadowLink: Race condition detected in final content update, aborting');
+                    return;
+                }
                 cm.dispatch({ changes: { from: 0, to: cm.state.doc.length, insert: newValue } });
             }
         }
