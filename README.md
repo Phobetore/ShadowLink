@@ -4,7 +4,7 @@
 
 ShadowLink brings live collaborative editing to [Obsidian](https://obsidian.md). Multiple users can work on the same notes simultaneously while changes sync automatically through a lightweight WebSocket server. The project is in early development but already provides the core building blocks for conflict‑free collaboration.
 
-# Still under Developpement 
+**Still under Developpement**
 
 ## Features
 
