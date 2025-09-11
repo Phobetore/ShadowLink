@@ -54,6 +54,7 @@ Environment variables:
 - `SSL_CERT` / `SSL_KEY` – enable TLS with your certificate and key
 
 The server now includes:
+- **Real-time monitoring** – beautiful terminal interface for tracking connections, vaults, and server stats
 - **Vault management** – tracks vault ownership and membership
 - **Rate limiting** – prevents abuse with max 10 operations per second per connection
 - **Session tracking** – monitors user activity and connection state
@@ -64,7 +65,9 @@ A trimmed-down standalone server is available in the `server/` folder:
 ```bash
 cd server
 npm install
-npm start
+npm run monitor  # Start with monitoring interface
+# or
+npm start        # Start without monitoring
 ```
 
 ### Using ShadowLink

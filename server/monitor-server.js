@@ -1,3 +1,16 @@
+#!/usr/bin/env node
+
+/**
+ * ShadowLink Server with integrated monitoring interface
+ * Usage: node monitor-server.js
+ * Environment variables:
+ * - PORT: Server port (default: 1234)
+ * - WS_AUTH_TOKEN: Authentication token
+ * - YPERSISTENCE: Data persistence directory
+ * - SSL_CERT, SSL_KEY: TLS certificate files
+ * - MONITOR: Enable/disable monitoring (default: true)
+ */
+
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -91,7 +104,7 @@ class VaultManager {
 const vaultManager = new VaultManager();
 const monitor = new ServerMonitor(vaultManager);
 
-// Enable monitoring if MONITOR environment variable is set
+// Enable monitoring by default, disable with MONITOR=false
 const enableMonitoring = process.env.MONITOR !== 'false';
 
 let server;
@@ -159,27 +172,61 @@ wss.on('connection', (conn, req) => {
     setupWSConnection(conn, req);
 });
 
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\n\nShutting down server...');
+    if (enableMonitoring) {
+        monitor.stop();
+    }
+    server.close(() => {
+        console.log('Server closed.');
+        process.exit(0);
+    });
+});
+
+process.on('SIGTERM', () => {
+    console.log('\n\nShutting down server...');
+    if (enableMonitoring) {
+        monitor.stop();
+    }
+    server.close(() => {
+        console.log('Server closed.');
+        process.exit(0);
+    });
+});
+
 server.listen(port, () => {
     const protocol = useTls ? 'wss' : 'ws';
     const persist = getPersistence()
         ? `with persistence at ${process.env.YPERSISTENCE}`
         : 'without persistence';
-    console.log(`ShadowLink relay server running on ${protocol}://localhost:${port} ${persist}`);
-    console.log('Server features: vault management, rate limiting, session tracking');
+    
+    console.log(`\n🚀 ShadowLink relay server starting...`);
+    console.log(`📡 Server: ${protocol}://localhost:${port}`);
+    console.log(`💾 Storage: ${persist}`);
+    console.log(`🔐 Auth: ${authToken ? 'enabled' : 'disabled'}`);
+    console.log(`📊 Monitoring: ${enableMonitoring ? 'enabled' : 'disabled'}`);
+    console.log(`✨ Features: vault management, rate limiting, session tracking`);
     
     // Start monitoring interface if enabled
     if (enableMonitoring) {
-        console.log('\nStarting server monitor...');
+        console.log('\n📈 Starting server monitor in 2 seconds...');
+        console.log('💡 Use MONITOR=false to disable monitoring interface');
+        
         setTimeout(() => {
             try {
                 monitor.start();
             } catch (error) {
-                console.warn('Failed to start terminal interface, falling back to console output:', error.message);
+                console.warn('\n⚠️  Failed to start terminal interface, falling back to console output:', error.message);
+                console.log('📝 Console monitoring will update every 5 seconds. Press Ctrl+C to exit.\n');
+                
                 // Fallback to simple console monitoring
                 setInterval(() => {
                     monitor.printConsoleStatus();
                 }, 5000);
             }
-        }, 1000);
+        }, 2000);
+    } else {
+        console.log('\n✅ Server ready! Press Ctrl+C to stop.');
     }
 });
