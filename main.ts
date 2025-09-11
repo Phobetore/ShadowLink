@@ -773,12 +773,13 @@ export default class ShadowLinkPlugin extends Plugin {
             colorLight: this.getUserColor(true),
             userId: this.settings.userId,
             vaultId: this.vaultId,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            currentFile: this.currentFile?.path || null
         };
         
         // Set awareness for document provider if available
         if (this.provider && this.provider.awareness) {
-            console.log('ShadowLink: Setting document awareness for', this.settings.username);
+            console.log('ShadowLink: Setting document awareness for', this.settings.username, 'on file:', this.currentFile?.path);
             this.provider.awareness.setLocalStateField('user', userState);
         }
         
@@ -895,10 +896,12 @@ export default class ShadowLinkPlugin extends Plugin {
     cleanupCurrent() {
         if (this.isCleaningUp) return; // Prevent recursive cleanup
         
-        if (this.provider && this.statusHandler) {
+        // Don't remove shared status handlers during file switching as they're also used by metadataProvider
+        // Only remove handlers if we're doing a complete cleanup (onunload)
+        if (this.provider && this.statusHandler && this.isCleaningUp) {
             this.provider.off('status', this.statusHandler);
         }
-        if (this.provider && this.connectionCloseHandler) {
+        if (this.provider && this.connectionCloseHandler && this.isCleaningUp) {
             this.provider.off('connection-close', this.connectionCloseHandler);
         }
         this.provider?.destroy();
@@ -1586,6 +1589,12 @@ export default class ShadowLinkPlugin extends Plugin {
             return;
         }
 
+        // Store current awareness state before cleanup to preserve it
+        let preservedAwarenessState: any = null;
+        if (this.provider && this.provider.awareness) {
+            preservedAwarenessState = this.provider.awareness.getLocalState();
+        }
+
         this.cleanupCurrent();
 
         const url = this.resolveServerUrl(this.settings.serverUrl);
@@ -1651,27 +1660,32 @@ export default class ShadowLinkPlugin extends Plugin {
         const userColor = this.getUserColor();
         const userColorLight = this.getUserColor(true);
         
-        // Set awareness state immediately when connection is established
-        this.provider.awareness.setLocalStateField('user', {
+        // Create the awareness state with preserved data if available
+        const awarenessState = {
             name: this.settings.username,
             color: userColor,
             colorLight: userColorLight,
             userId: this.settings.userId,
             vaultId: this.vaultId,
-            timestamp: Date.now()
-        });
+            timestamp: Date.now(),
+            ...(preservedAwarenessState?.user || {}) // Merge any preserved state
+        };
+        
+        // Set awareness state immediately when connection is established
+        this.provider.awareness.setLocalStateField('user', awarenessState);
         
         // Also set it again when connected to ensure it's always available
         this.provider.on('status', (event: { status: string }) => {
             if (event.status === 'connected') {
-                console.log('ShadowLink: Setting awareness on connection for', this.settings.username);
+                console.log('ShadowLink: Setting awareness on connection for', this.settings.username, 'file:', file.path);
                 this.provider!.awareness.setLocalStateField('user', {
                     name: this.settings.username,
                     color: userColor,
                     colorLight: userColorLight,
                     userId: this.settings.userId,
                     vaultId: this.vaultId,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    currentFile: file.path // Add current file info for better tracking
                 });
             }
         });
@@ -1679,20 +1693,21 @@ export default class ShadowLinkPlugin extends Plugin {
         // Set up awareness state monitoring for better presence tracking
         this.provider.awareness.on('change', ({ added, updated, removed }: { added: number[], updated: number[], removed: number[] }) => {
             const states = this.provider!.awareness.getStates();
-            console.log('ShadowLink: Awareness changed -', 
+            console.log('ShadowLink: Awareness changed for', file.path, '-', 
                 'Total users:', states.size, 
                 'Added:', added.length, 
                 'Updated:', updated.length, 
                 'Removed:', removed.length
             );
             
-            // Update status bar with current user count
-            if (this.statusBarItemEl && this.isOnline) {
+            // Update status bar with current user count only if we're the active connection
+            if (this.statusBarItemEl && this.isOnline && this.currentFile?.path === file.path) {
                 const userCount = states.size;
                 this.statusBarItemEl.setText(`ShadowLink: connected (${userCount} user${userCount !== 1 ? 's' : ''})`);
             }
         });
         
+        // Add status handlers for this provider - but don't remove them in cleanup to preserve metadata connection
         if (this.statusHandler) {
             this.provider.on('status', this.statusHandler);
         }
