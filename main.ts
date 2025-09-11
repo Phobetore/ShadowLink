@@ -624,6 +624,10 @@ export default class ShadowLinkPlugin extends Plugin {
                         this.retryTimeout = null;
                     }
                     this.statusBarItemEl.setText('ShadowLink: connected');
+                    // Trigger immediate sync check when connection is established
+                    if (!wasOnline) {
+                        this.scheduleImmediateSync();
+                    }
                     break;
                 case 'disconnected':
                     if (this.connectionStatus !== 'disconnected') {
@@ -648,9 +652,16 @@ export default class ShadowLinkPlugin extends Plugin {
                     this.statusBarItemEl.setText('ShadowLink: ' + event.status);
             }
             
-            // Update offline manager about connection status
+            // Update offline manager about connection status with immediate sync
             if (this.offlineManager && wasOnline !== this.isOnline) {
                 this.offlineManager.setOnlineStatus(this.isOnline);
+                
+                // If coming back online, trigger immediate metadata sync
+                if (this.isOnline && !wasOnline) {
+                    setTimeout(() => {
+                        this.performPeriodicSyncCheck();
+                    }, 1000); // Small delay to let connection stabilize
+                }
             }
             
             // Update status bar with queue info when offline
@@ -735,6 +746,38 @@ export default class ShadowLinkPlugin extends Plugin {
     /**
      * Schedule a reconnection attempt with exponential backoff
      */
+    /**
+     * Schedule immediate sync when connection is re-established
+     */
+    private scheduleImmediateSync() {
+        console.log('ShadowLink: Scheduling immediate sync after reconnection');
+        
+        // Trigger sync with a small delay to let connection stabilize
+        setTimeout(() => {
+            if (this.isOnline && this.metadataDoc) {
+                this.performPeriodicSyncCheck();
+            }
+        }, 2000);
+        
+        // Also trigger awareness update for live collaboration
+        if (this.provider && this.provider.awareness) {
+            this.provider.awareness.setLocalStateField('user', {
+                name: this.settings.username,
+                color: this.getUserColor(),
+                colorLight: this.getUserColor(true)
+            });
+        }
+    }
+
+    /**
+     * Get user color for awareness/presence
+     */
+    private getUserColor(light = false): string {
+        const userId = this.settings.userId;
+        const hue = userId ? parseInt(userId.substring(0, 8), 16) % 360 : Math.random() * 360;
+        return light ? `hsla(${hue}, 80%, 50%, 0.2)` : `hsl(${hue}, 80%, 50%)`;
+    }
+
     private scheduleReconnect(): void {
         if (this.isCleaningUp || this.connectionRetries >= this.maxRetries) {
             if (this.connectionRetries >= this.maxRetries) {
@@ -979,6 +1022,9 @@ export default class ShadowLinkPlugin extends Plugin {
             }
         }
         
+        // Set up continuous monitoring for metadata changes
+        this.setupMetadataChangeMonitoring();
+        
         console.log('ShadowLink: Vault sync completed');
     }
 
@@ -1020,6 +1066,222 @@ export default class ShadowLinkPlugin extends Plugin {
         // Show notification about merge
         if (localOnlyFiles.size > 0 || remoteOnlyFiles.size > 0) {
             new Notice(`ShadowLink: Merged vault contents - Added ${localOnlyFiles.size} local files to server, ${remoteOnlyFiles.size} remote files to local`, 8000);
+        }
+    }
+
+    /**
+     * Set up continuous monitoring for metadata changes to ensure real-time sync
+     */
+    private setupMetadataChangeMonitoring() {
+        if (!this.metadataDoc) return;
+
+        const pathsArray = this.metadataDoc.getArray<string>('paths');
+        
+        // Monitor path changes for file operations
+        pathsArray.observe((event) => {
+            this.handleRemotePathChanges(event);
+        });
+
+        // Also monitor folder-specific metadata if we extend to track folders separately
+        const foldersArray = this.metadataDoc.getArray<string>('folders');
+        if (foldersArray) {
+            foldersArray.observe((event) => {
+                this.handleRemoteFolderChanges(event);
+            });
+        }
+
+        // Set up periodic sync check to catch any missed changes
+        this.setupPeriodicSyncCheck();
+    }
+
+    /**
+     * Handle remote path changes (file create/delete operations)
+     */
+    private async handleRemotePathChanges(event: Y.YArrayEvent<string>) {
+        console.log('ShadowLink: Remote path changes detected', event);
+        
+        for (const delta of event.changes.delta) {
+            if (delta.insert) {
+                // New file(s) added remotely
+                const newPaths = Array.isArray(delta.insert) ? delta.insert : [delta.insert];
+                for (const path of newPaths) {
+                    const existingFile = this.app.vault.getAbstractFileByPath(path);
+                    if (!existingFile) {
+                        try {
+                            // Check if this isn't a recent local operation to avoid loops
+                            const recentCreate = this.lastSyncTimestamps.get(`create:${path}`);
+                            if (!recentCreate || Date.now() - recentCreate > 5000) { // 5 second threshold
+                                await this.app.vault.create(path, '');
+                                new Notice(`Created shared file: ${path}`, 3000);
+                            }
+                        } catch (error) {
+                            console.error('Failed to create file from remote change:', path, error);
+                        }
+                    }
+                }
+            }
+            
+            if (delta.delete && event.path.length > 0) {
+                // File(s) deleted remotely - need to reconcile
+                await this.reconcileRemoteFileDeletions();
+            }
+        }
+    }
+
+    /**
+     * Handle remote folder changes
+     */
+    private async handleRemoteFolderChanges(event: Y.YArrayEvent<string>) {
+        console.log('ShadowLink: Remote folder changes detected', event);
+        
+        for (const delta of event.changes.delta) {
+            if (delta.insert) {
+                // New folder(s) added remotely
+                const newFolders = Array.isArray(delta.insert) ? delta.insert : [delta.insert];
+                for (const folderPath of newFolders) {
+                    if (!this.app.vault.getAbstractFileByPath(folderPath)) {
+                        try {
+                            // Check if this isn't a recent local operation
+                            const recentCreate = this.lastSyncTimestamps.get(`createFolder:${folderPath}`);
+                            if (!recentCreate || Date.now() - recentCreate > 5000) {
+                                await this.app.vault.createFolder(folderPath);
+                                new Notice(`Created shared folder: ${folderPath}`, 3000);
+                            }
+                        } catch (error) {
+                            console.error('Failed to create folder from remote change:', folderPath, error);
+                        }
+                    }
+                }
+            }
+            
+            if (delta.delete) {
+                // Folder(s) deleted remotely
+                await this.reconcileRemoteFolderDeletions();
+            }
+        }
+    }
+
+    /**
+     * Reconcile remote file deletions by comparing current metadata with local state
+     */
+    private async reconcileRemoteFileDeletions() {
+        if (!this.metadataDoc) return;
+        
+        const pathsArray = this.metadataDoc.getArray<string>('paths');
+        const remotePaths = new Set(pathsArray.toArray());
+        const localFiles = this.app.vault.getFiles();
+        
+        for (const localFile of localFiles) {
+            if (!remotePaths.has(localFile.path)) {
+                // File exists locally but not in remote metadata
+                const recentDelete = this.lastSyncTimestamps.get(`delete:${localFile.path}`);
+                if (!recentDelete || Date.now() - recentDelete > 5000) {
+                    try {
+                        await this.app.vault.delete(localFile);
+                        new Notice(`Removed shared file: ${localFile.path}`, 3000);
+                    } catch (error) {
+                        console.error('Failed to delete file from remote change:', localFile.path, error);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Reconcile remote folder deletions
+     */
+    private async reconcileRemoteFolderDeletions() {
+        if (!this.metadataDoc) return;
+        
+        const foldersArray = this.metadataDoc.getArray<string>('folders');
+        const remoteFolders = new Set(foldersArray.toArray());
+        const localFolders = new Set<string>();
+        
+        // Get current local folders
+        this.app.vault.getAllLoadedFiles().forEach(file => {
+            if (!(file instanceof TFile)) {
+                localFolders.add(file.path);
+            }
+        });
+        
+        // Find folders that exist locally but not in remote metadata
+        for (const localFolder of localFolders) {
+            if (!remoteFolders.has(localFolder)) {
+                const recentDelete = this.lastSyncTimestamps.get(`deleteFolder:${localFolder}`);
+                if (!recentDelete || Date.now() - recentDelete > 5000) {
+                    const folder = this.app.vault.getAbstractFileByPath(localFolder);
+                    if (folder) {
+                        try {
+                            await this.app.vault.delete(folder);
+                            new Notice(`Removed shared folder: ${localFolder}`, 3000);
+                        } catch (error) {
+                            console.error('Failed to delete folder from remote change:', localFolder, error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Set up periodic sync check to catch any missed changes
+     */
+    private setupPeriodicSyncCheck() {
+        // Check for missed changes every 30 seconds
+        const interval = setInterval(() => {
+            if (this.isOnline && this.metadataDoc) {
+                this.performPeriodicSyncCheck();
+            }
+        }, 30000);
+        
+        this.register(() => clearInterval(interval));
+    }
+
+    /**
+     * Perform a periodic sync check to catch any missed changes
+     */
+    private async performPeriodicSyncCheck() {
+        if (!this.metadataDoc) return;
+        
+        const pathsArray = this.metadataDoc.getArray<string>('paths');
+        const remotePaths = new Set(pathsArray.toArray());
+        const localFiles = this.app.vault.getFiles();
+        const localPaths = new Set(localFiles.map(f => f.path));
+        
+        // Find any discrepancies and reconcile them
+        let hasChanges = false;
+        
+        // Check for local files not in remote
+        for (const localPath of localPaths) {
+            if (!remotePaths.has(localPath)) {
+                const recentOp = this.lastSyncTimestamps.get(`create:${localPath}`) ||
+                               this.lastSyncTimestamps.get(`rename:${localPath}`);
+                if (!recentOp || Date.now() - recentOp > 10000) { // 10 second threshold
+                    console.log('ShadowLink: Adding missing local file to remote:', localPath);
+                    pathsArray.push([localPath]);
+                    hasChanges = true;
+                }
+            }
+        }
+        
+        // Check for remote files not in local
+        for (const remotePath of remotePaths) {
+            if (!localPaths.has(remotePath)) {
+                const recentDelete = this.lastSyncTimestamps.get(`delete:${remotePath}`);
+                if (!recentDelete || Date.now() - recentDelete > 10000) {
+                    console.log('ShadowLink: Creating missing remote file locally:', remotePath);
+                    try {
+                        await this.app.vault.create(remotePath, '');
+                        hasChanges = true;
+                    } catch (error) {
+                        console.error('Failed to create missing file:', remotePath, error);
+                    }
+                }
+            }
+        }
+        
+        if (hasChanges) {
+            console.log('ShadowLink: Periodic sync check found and resolved discrepancies');
         }
     }
 
@@ -1066,10 +1328,14 @@ export default class ShadowLinkPlugin extends Plugin {
             return;
         }
         
+        // Immediately broadcast deletion to metadata
         if (this.metadataDoc) {
             const arr = this.metadataDoc.getArray<string>('paths');
             const idx = arr.toArray().indexOf(file.path);
-            if (idx >= 0) arr.delete(idx, 1);
+            if (idx >= 0) {
+                arr.delete(idx, 1);
+                console.log('ShadowLink: Broadcasted file deletion:', file.path);
+            }
         }
         
         // Optionally inform the server about the deletion
@@ -1111,10 +1377,12 @@ export default class ShadowLinkPlugin extends Plugin {
             return;
         }
         
+        // Immediately broadcast creation to metadata
         if (this.metadataDoc) {
             const arr = this.metadataDoc.getArray<string>('paths');
             if (!arr.toArray().includes(file.path)) {
                 arr.push([file.path]);
+                console.log('ShadowLink: Broadcasted file creation:', file.path);
             }
         }
     }
@@ -1159,12 +1427,19 @@ export default class ShadowLinkPlugin extends Plugin {
             });
             await this.handleFileOpenDebounced(file);
         }
+        // Immediately broadcast rename to metadata
         if (this.metadataDoc) {
             const arr = this.metadataDoc.getArray<string>('paths');
             const list = arr.toArray();
             const oldIdx = list.indexOf(oldPath);
-            if (oldIdx >= 0) arr.delete(oldIdx, 1);
-            if (!list.includes(file.path)) arr.push([file.path]);
+            if (oldIdx >= 0) {
+                arr.delete(oldIdx, 1);
+                console.log('ShadowLink: Broadcasted file deletion (rename):', oldPath);
+            }
+            if (!list.includes(file.path)) {
+                arr.push([file.path]);
+                console.log('ShadowLink: Broadcasted file creation (rename):', file.path);
+            }
         }
     }
 
@@ -1184,11 +1459,12 @@ export default class ShadowLinkPlugin extends Plugin {
             return;
         }
         
-        // Sync folder structure to metadata
+        // Immediately broadcast folder creation to metadata
         if (this.metadataDoc) {
             const foldersArray = this.metadataDoc.getArray<string>('folders');
             if (!foldersArray.toArray().includes(file.path)) {
                 foldersArray.push([file.path]);
+                console.log('ShadowLink: Broadcasted folder creation:', file.path);
             }
         }
     }
@@ -1209,11 +1485,14 @@ export default class ShadowLinkPlugin extends Plugin {
             return;
         }
         
-        // Remove from metadata
+        // Immediately broadcast folder deletion to metadata
         if (this.metadataDoc) {
             const foldersArray = this.metadataDoc.getArray<string>('folders');
             const idx = foldersArray.toArray().indexOf(file.path);
-            if (idx >= 0) foldersArray.delete(idx, 1);
+            if (idx >= 0) {
+                foldersArray.delete(idx, 1);
+                console.log('ShadowLink: Broadcasted folder deletion:', file.path);
+            }
         }
     }
 
@@ -1314,13 +1593,35 @@ export default class ShadowLinkPlugin extends Plugin {
         
         this.currentFile = file;
 
+        // Enhanced awareness setup for better live collaboration
         const clientId = this.provider.awareness.clientID;
-        const hue = clientId % 360;
-        const color = this.colorFromId(clientId);
+        const userColor = this.getUserColor();
+        const userColorLight = this.getUserColor(true);
+        
         this.provider.awareness.setLocalStateField('user', {
             name: this.settings.username,
-            color,
-            colorLight: `hsla(${hue}, 80%, 50%, 0.2)`
+            color: userColor,
+            colorLight: userColorLight,
+            userId: this.settings.userId,
+            vaultId: this.vaultId,
+            timestamp: Date.now()
+        });
+        
+        // Set up awareness state monitoring for better presence tracking
+        this.provider.awareness.on('change', ({ added, updated, removed }: { added: number[], updated: number[], removed: number[] }) => {
+            const states = this.provider!.awareness.getStates();
+            console.log('ShadowLink: Awareness changed -', 
+                'Total users:', states.size, 
+                'Added:', added.length, 
+                'Updated:', updated.length, 
+                'Removed:', removed.length
+            );
+            
+            // Update status bar with current user count
+            if (this.statusBarItemEl && this.isOnline) {
+                const userCount = states.size;
+                this.statusBarItemEl.setText(`ShadowLink: connected (${userCount} user${userCount !== 1 ? 's' : ''})`);
+            }
         });
         
         if (this.statusHandler) {
