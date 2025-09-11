@@ -783,10 +783,29 @@ export default class ShadowLinkPlugin extends Plugin {
             this.provider.awareness.setLocalStateField('user', userState);
         }
         
-        // Set awareness for metadata provider if available
+        // ENHANCEMENT: Always maintain global presence via metadata provider
+        // This allows users to see each other across different documents
         if (this.metadataProvider && this.metadataProvider.awareness) {
-            console.log('ShadowLink: Setting metadata awareness for', this.settings.username);
+            console.log('ShadowLink: Setting global vault awareness for', this.settings.username, 'current file:', this.currentFile?.path);
             this.metadataProvider.awareness.setLocalStateField('user', userState);
+            
+            // Update status bar with total vault users, not just document users
+            this.updateStatusBarWithVaultUsers();
+        }
+    }
+    
+    /**
+     * Update status bar with total vault user count for better visibility
+     */
+    private updateStatusBarWithVaultUsers() {
+        if (this.statusBarItemEl && this.metadataProvider && this.metadataProvider.awareness) {
+            const vaultUsers = this.metadataProvider.awareness.getStates();
+            const vaultUserCount = vaultUsers.size;
+            
+            // Show vault-wide user count instead of just document users
+            if (this.isOnline) {
+                this.statusBarItemEl.setText(`ShadowLink: ${vaultUserCount} user${vaultUserCount !== 1 ? 's' : ''} in vault`);
+            }
         }
     }
 
@@ -896,6 +915,14 @@ export default class ShadowLinkPlugin extends Plugin {
     cleanupCurrent() {
         if (this.isCleaningUp) return; // Prevent recursive cleanup
         
+        // CRITICAL FIX: Clear awareness state from current document provider before cleanup
+        // This prevents ghost cursors from appearing when switching documents
+        if (this.provider && this.provider.awareness) {
+            console.log('ShadowLink: Clearing awareness state for current document before cleanup');
+            // Remove local user from awareness to prevent ghost cursors
+            this.provider.awareness.setLocalState(null);
+        }
+        
         // Don't remove shared status handlers during file switching as they're also used by metadataProvider
         // Only remove handlers if we're doing a complete cleanup (onunload)
         if (this.provider && this.statusHandler && this.isCleaningUp) {
@@ -915,6 +942,12 @@ export default class ShadowLinkPlugin extends Plugin {
     }
 
     cleanupMetadata() {
+        // CRITICAL FIX: Clear global vault awareness before cleanup
+        if (this.metadataProvider && this.metadataProvider.awareness) {
+            console.log('ShadowLink: Clearing global vault awareness before metadata cleanup');
+            this.metadataProvider.awareness.setLocalState(null);
+        }
+        
         this.metadataProvider?.destroy();
         this.metadataDoc?.destroy();
         this.metadataProvider = null;
@@ -949,10 +982,37 @@ export default class ShadowLinkPlugin extends Plugin {
             this.metadataProvider.on('connection-close', this.connectionCloseHandler);
         }
         
+        // ENHANCEMENT: Set up global vault awareness tracking
+        // This enables cross-document user visibility
+        this.metadataProvider.awareness.on('change', ({ added, updated, removed }: { added: number[], updated: number[], removed: number[] }) => {
+            console.log('ShadowLink: Global vault awareness changed -', 
+                'Users in vault:', this.metadataProvider!.awareness.getStates().size,
+                'Added:', added.length, 
+                'Updated:', updated.length, 
+                'Removed:', removed.length
+            );
+            
+            // Update status bar with vault-wide user count
+            this.updateStatusBarWithVaultUsers();
+            
+            // Log current users in vault for debugging
+            const states = this.metadataProvider!.awareness.getStates();
+            const userList: string[] = [];
+            states.forEach((state, clientId) => {
+                if (state.user) {
+                    userList.push(`${state.user.name} (${state.user.currentFile || 'no file'})`);
+                }
+            });
+            console.log('ShadowLink: Users in vault:', userList.join(', '));
+        });
+        
         const onSync = async (synced: boolean) => {
             if (synced) {
                 await this.syncLocalWithMetadata();
                 this.metadataProvider?.off('sync', onSync);
+                
+                // Set up global presence immediately after sync
+                this.ensureAwarenessState();
             }
         };
         if (this.metadataProvider.synced) {
@@ -1668,11 +1728,16 @@ export default class ShadowLinkPlugin extends Plugin {
             userId: this.settings.userId,
             vaultId: this.vaultId,
             timestamp: Date.now(),
+            currentFile: file.path, // CRITICAL: Always update current file
             ...(preservedAwarenessState?.user || {}) // Merge any preserved state
         };
         
         // Set awareness state immediately when connection is established
         this.provider.awareness.setLocalStateField('user', awarenessState);
+        
+        // ENHANCEMENT: Update global vault presence when switching files
+        // This ensures other users can see where you are even if they're on different documents
+        this.ensureAwarenessState();
         
         // Also set it again when connected to ensure it's always available
         this.provider.on('status', (event: { status: string }) => {
@@ -1687,24 +1752,25 @@ export default class ShadowLinkPlugin extends Plugin {
                     timestamp: Date.now(),
                     currentFile: file.path // Add current file info for better tracking
                 });
+                
+                // Also update global presence
+                this.ensureAwarenessState();
             }
         });
         
         // Set up awareness state monitoring for better presence tracking
         this.provider.awareness.on('change', ({ added, updated, removed }: { added: number[], updated: number[], removed: number[] }) => {
             const states = this.provider!.awareness.getStates();
-            console.log('ShadowLink: Awareness changed for', file.path, '-', 
-                'Total users:', states.size, 
+            console.log('ShadowLink: Document awareness changed for', file.path, '-', 
+                'Document users:', states.size, 
                 'Added:', added.length, 
                 'Updated:', updated.length, 
                 'Removed:', removed.length
             );
             
-            // Update status bar with current user count only if we're the active connection
-            if (this.statusBarItemEl && this.isOnline && this.currentFile?.path === file.path) {
-                const userCount = states.size;
-                this.statusBarItemEl.setText(`ShadowLink: connected (${userCount} user${userCount !== 1 ? 's' : ''})`);
-            }
+            // ENHANCEMENT: Use vault-wide user count instead of just document users
+            // This provides better visibility of total collaboration activity
+            this.updateStatusBarWithVaultUsers();
         });
         
         // Add status handlers for this provider - but don't remove them in cleanup to preserve metadata connection
@@ -2029,13 +2095,51 @@ class ShadowLinkSettingTab extends PluginSettingTab {
         // Connection status
         containerEl.createEl('h3', { text: 'Connection Status' });
         const statusEl = containerEl.createEl('p');
+        
+        // ENHANCEMENT: Add vault users display for better cross-document visibility
+        const vaultUsersEl = containerEl.createEl('div');
+        vaultUsersEl.createEl('h4', { text: 'Users in Vault' });
+        const usersListEl = vaultUsersEl.createEl('div', { cls: 'shadowlink-users-list' });
+        
         const updateStatus = () => {
             if (this.plugin.provider) {
                 const status = this.plugin.provider.wsconnected ? 'Connected' : 'Disconnected';
                 const userCount = this.plugin.provider.awareness.getStates().size;
-                statusEl.textContent = `${status} - ${userCount} user(s) online`;
+                statusEl.textContent = `Document: ${status} - ${userCount} user(s) on current document`;
             } else {
-                statusEl.textContent = 'Not connected';
+                statusEl.textContent = 'Document: Not connected';
+            }
+            
+            // Update vault-wide user list
+            if (this.plugin.metadataProvider && this.plugin.metadataProvider.awareness) {
+                const vaultStates = this.plugin.metadataProvider.awareness.getStates();
+                const vaultUsers: string[] = [];
+                
+                vaultStates.forEach((state, clientId) => {
+                    if (state.user) {
+                        const currentFile = state.user.currentFile || 'no document';
+                        const isCurrentUser = state.user.userId === this.plugin.settings.userId;
+                        const userDisplay = `${state.user.name}${isCurrentUser ? ' (you)' : ''} - ${currentFile}`;
+                        vaultUsers.push(userDisplay);
+                    }
+                });
+                
+                usersListEl.innerHTML = '';
+                if (vaultUsers.length > 0) {
+                    const vaultStatusP = usersListEl.createEl('p');
+                    vaultStatusP.textContent = `Vault: ${vaultUsers.length} user(s) connected`;
+                    
+                    const usersList = usersListEl.createEl('ul', { cls: 'shadowlink-users-items' });
+                    vaultUsers.forEach(user => {
+                        const listItem = usersList.createEl('li');
+                        listItem.textContent = user;
+                    });
+                } else {
+                    usersListEl.createEl('p').textContent = 'Vault: No users connected';
+                }
+            } else {
+                usersListEl.innerHTML = '';
+                usersListEl.createEl('p').textContent = 'Vault: Not connected to vault metadata';
             }
         };
         updateStatus();

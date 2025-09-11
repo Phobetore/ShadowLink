@@ -161,3 +161,46 @@ If your plugin does not need CSS, delete this file.
 .shadowlink-notice.info::before {
   content: "ℹ️";
 }
+
+/* User list styling for better cross-document visibility */
+.shadowlink-users-list {
+  margin-top: 12px;
+  padding: 12px;
+  background-color: var(--background-secondary);
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+}
+
+.shadowlink-users-list h4 {
+  margin-top: 0;
+  margin-bottom: 8px;
+  color: var(--text-accent);
+  font-size: 1em;
+}
+
+.shadowlink-users-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.shadowlink-users-items li {
+  padding: 4px 0;
+  color: var(--text-normal);
+  font-size: 0.9em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shadowlink-users-items li::before {
+  content: "👤";
+  font-size: 0.8em;
+  opacity: 0.7;
+}
+
+.shadowlink-users-list p {
+  margin: 8px 0 4px 0;
+  font-weight: 500;
+  color: var(--text-accent);
+}
