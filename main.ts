@@ -577,6 +577,13 @@ export default class ShadowLinkPlugin extends Plugin {
     private lastSyncTimestamps: Map<string, number> = new Map();
     private documentVersions: Map<string, string> = new Map();
     private isOnline = false;
+    
+    // Connection retry logic
+    private connectionRetries = 0;
+    private maxRetries = 5;
+    private retryDelay = 1000; // Start with 1 second
+    private retryTimeout: NodeJS.Timeout | null = null;
+    private connectionStatus: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
 
     async onload() {
         await this.loadSettings();
@@ -603,17 +610,41 @@ export default class ShadowLinkPlugin extends Plugin {
         this.statusHandler = (event: { status: string }) => {
             if (!this.statusBarItemEl) return;
             const wasOnline = this.isOnline;
+            const previousStatus = this.connectionStatus;
+            
+            console.log('ShadowLink: Status change from', previousStatus, 'to', event.status);
             
             switch (event.status) {
                 case 'connected':
+                    this.connectionStatus = 'connected';
                     this.isOnline = true;
+                    this.connectionRetries = 0; // Reset retry count on successful connection
+                    if (this.retryTimeout) {
+                        clearTimeout(this.retryTimeout);
+                        this.retryTimeout = null;
+                    }
                     this.statusBarItemEl.setText('ShadowLink: connected');
                     break;
                 case 'disconnected':
-                    this.isOnline = false;
-                    this.statusBarItemEl.setText('ShadowLink: disconnected');
+                    if (this.connectionStatus !== 'disconnected') {
+                        this.connectionStatus = 'disconnected';
+                        this.isOnline = false;
+                        this.statusBarItemEl.setText('ShadowLink: disconnected');
+                        // Only start retry if we were previously connected or connecting
+                        if (previousStatus === 'connected' || previousStatus === 'connecting') {
+                            this.scheduleReconnect();
+                        }
+                    }
+                    break;
+                case 'connecting':
+                    if (this.connectionStatus !== 'connecting') {
+                        this.connectionStatus = 'connecting';
+                        this.isOnline = false;
+                        this.statusBarItemEl.setText('ShadowLink: connecting...');
+                    }
                     break;
                 default:
+                    // Handle other statuses without changing connection state
                     this.statusBarItemEl.setText('ShadowLink: ' + event.status);
             }
             
@@ -665,6 +696,9 @@ export default class ShadowLinkPlugin extends Plugin {
         if (this.debounceTimeout) {
             clearTimeout(this.debounceTimeout);
         }
+        if (this.retryTimeout) {
+            clearTimeout(this.retryTimeout);
+        }
         this.cleanupCurrent();
         this.cleanupMetadata();
         this.statusBarItemEl?.remove();
@@ -696,6 +730,60 @@ export default class ShadowLinkPlugin extends Plugin {
             return scheme + url.slice(2);
         }
         return scheme + url;
+    }
+
+    /**
+     * Schedule a reconnection attempt with exponential backoff
+     */
+    private scheduleReconnect(): void {
+        if (this.isCleaningUp || this.connectionRetries >= this.maxRetries) {
+            if (this.connectionRetries >= this.maxRetries) {
+                console.warn('ShadowLink: Max reconnection attempts reached');
+                if (this.statusBarItemEl) {
+                    this.statusBarItemEl.setText('ShadowLink: connection failed');
+                }
+            }
+            return;
+        }
+
+        if (this.retryTimeout) {
+            clearTimeout(this.retryTimeout);
+        }
+
+        const delay = this.retryDelay * Math.pow(2, this.connectionRetries);
+        this.connectionRetries++;
+        
+        console.log(`ShadowLink: Scheduling reconnect attempt ${this.connectionRetries}/${this.maxRetries} in ${delay}ms`);
+        
+        if (this.statusBarItemEl) {
+            this.statusBarItemEl.setText(`ShadowLink: reconnecting (${this.connectionRetries}/${this.maxRetries})`);
+        }
+
+        this.retryTimeout = setTimeout(() => {
+            if (!this.isCleaningUp) {
+                console.log('ShadowLink: Attempting reconnection...');
+                this.reconnect();
+            }
+        }, delay);
+    }
+
+    /**
+     * Attempt to reconnect by recreating metadata connection
+     */
+    private async reconnect(): Promise<void> {
+        try {
+            console.log('ShadowLink: Reconnecting...');
+            this.cleanupMetadata();
+            await this.connectMetadata();
+            
+            // If we have a current file, reconnect to it as well
+            if (this.currentFile) {
+                await this.handleFileOpenInternal(this.currentFile);
+            }
+        } catch (error) {
+            console.error('ShadowLink: Reconnection failed:', error);
+            this.scheduleReconnect();
+        }
     }
 
     private colorFromId(id: number): string {
@@ -741,7 +829,7 @@ export default class ShadowLinkPlugin extends Plugin {
         return `${this.vaultId}/vault-metadata`;
     }
 
-    private cleanupCurrent() {
+    cleanupCurrent() {
         if (this.isCleaningUp) return; // Prevent recursive cleanup
         
         if (this.provider && this.statusHandler) {
@@ -760,24 +848,41 @@ export default class ShadowLinkPlugin extends Plugin {
         this.currentFile = null;
     }
 
-    private cleanupMetadata() {
+    cleanupMetadata() {
         this.metadataProvider?.destroy();
         this.metadataDoc?.destroy();
         this.metadataProvider = null;
         this.metadataDoc = null;
     }
 
-    private async connectMetadata(): Promise<void> {
+    async connectMetadata(): Promise<void> {
         await this.loadCollabModules();
         const url = this.resolveServerUrl(this.settings.serverUrl);
         this.metadataDoc = new this.Y!.Doc();
+        
+        // Fix empty token parameter issue
+        const params: Record<string, string> = { 
+            vaultId: this.vaultId,
+            userId: this.settings.userId
+        };
+        
+        // Only add token if it's not empty
+        if (this.settings.authToken && this.settings.authToken.trim() !== '') {
+            params.token = this.settings.authToken;
+        }
+        
         this.metadataProvider = new this.WebsocketProviderClass!(url, this.metadataDocName(), this.metadataDoc, {
-            params: { 
-                token: this.settings.authToken,
-                vaultId: this.vaultId,
-                userId: this.settings.userId
-            }
+            params
         });
+        
+        // Add connection status tracking for metadata provider
+        if (this.statusHandler) {
+            this.metadataProvider.on('status', this.statusHandler);
+        }
+        if (this.connectionCloseHandler) {
+            this.metadataProvider.on('connection-close', this.connectionCloseHandler);
+        }
+        
         const onSync = async (synced: boolean) => {
             if (synced) {
                 await this.syncLocalWithMetadata();
@@ -798,52 +903,70 @@ export default class ShadowLinkPlugin extends Plugin {
         const localFiles = this.app.vault.getFiles();
         const localSet = new Set(localFiles.map(f => f.path));
         
+        console.log('ShadowLink: Syncing vault - Local files:', localSet.size, 'Remote files:', remote.size);
+        
         // Handle conflicts during sync
         const conflicts: ConflictInfo[] = [];
         
-        for (const p of remote) {
-            if (!localSet.has(p)) {
-                // Check if this was recently deleted locally
-                const lastDeleteTime = this.lastSyncTimestamps.get(`delete:${p}`);
-                if (lastDeleteTime && Date.now() - lastDeleteTime < 60000) { // 1 minute threshold
-                    // Potential conflict: file was deleted locally but exists remotely
-                    conflicts.push({
-                        type: 'structure',
-                        filePath: p,
-                        localVersion: '',
-                        remoteVersion: 'exists',
-                        localTimestamp: lastDeleteTime,
-                        remoteTimestamp: Date.now(),
-                        isResolvable: true,
-                        suggestedResolution: 'keepRemote'
-                    });
-                } else {
-                    await this.app.vault.create(p, '');
-                }
-            }
-        }
+        // Check if we're connecting to a vault that has content and we also have local content
+        const hasRemoteContent = remote.size > 0;
+        const hasLocalContent = localSet.size > 0;
         
-        for (const p of localSet) {
-            if (!remote.has(p)) {
-                // Check if this was recently created locally
-                const file = this.app.vault.getAbstractFileByPath(p);
-                if (file instanceof TFile) {
-                    const stat = await this.app.vault.adapter.stat(p);
-                    if (stat && Date.now() - stat.ctime < 60000) { // 1 minute threshold
-                        // Recently created locally, add to remote
-                        arr.push([p]);
-                    } else {
-                        // File exists locally but not remotely - potential conflict
+        if (hasRemoteContent && hasLocalContent) {
+            console.log('ShadowLink: Both local and remote content found, merging...');
+            await this.mergeVaultContents(localSet, remote, conflicts);
+        } else if (hasLocalContent && !hasRemoteContent) {
+            // Local content exists but remote is empty - push local to remote
+            console.log('ShadowLink: Pushing local content to remote vault...');
+            for (const path of localSet) {
+                arr.push([path]);
+            }
+        } else {
+            // Standard sync logic for when there's no conflict
+            for (const p of remote) {
+                if (!localSet.has(p)) {
+                    // Check if this was recently deleted locally
+                    const lastDeleteTime = this.lastSyncTimestamps.get(`delete:${p}`);
+                    if (lastDeleteTime && Date.now() - lastDeleteTime < 60000) { // 1 minute threshold
+                        // Potential conflict: file was deleted locally but exists remotely
                         conflicts.push({
                             type: 'structure',
                             filePath: p,
-                            localVersion: 'exists',
-                            remoteVersion: '',
-                            localTimestamp: stat?.mtime || Date.now(),
-                            remoteTimestamp: 0,
+                            localVersion: '',
+                            remoteVersion: 'exists',
+                            localTimestamp: lastDeleteTime,
+                            remoteTimestamp: Date.now(),
                             isResolvable: true,
-                            suggestedResolution: 'keepLocal'
+                            suggestedResolution: 'keepRemote'
                         });
+                    } else {
+                        await this.app.vault.create(p, '');
+                    }
+                }
+            }
+            
+            for (const p of localSet) {
+                if (!remote.has(p)) {
+                    // Check if this was recently created locally
+                    const file = this.app.vault.getAbstractFileByPath(p);
+                    if (file instanceof TFile) {
+                        const stat = await this.app.vault.adapter.stat(p);
+                        if (stat && Date.now() - stat.ctime < 60000) { // 1 minute threshold
+                            // Recently created locally, add to remote
+                            arr.push([p]);
+                        } else {
+                            // File exists locally but not remotely - potential conflict
+                            conflicts.push({
+                                type: 'structure',
+                                filePath: p,
+                                localVersion: 'exists',
+                                remoteVersion: '',
+                                localTimestamp: stat?.mtime || Date.now(),
+                                remoteTimestamp: 0,
+                                isResolvable: true,
+                                suggestedResolution: 'keepLocal'
+                            });
+                        }
                     }
                 }
             }
@@ -854,6 +977,49 @@ export default class ShadowLinkPlugin extends Plugin {
             if (this.conflictResolver) {
                 await this.conflictResolver.resolveConflict(conflict);
             }
+        }
+        
+        console.log('ShadowLink: Vault sync completed');
+    }
+
+    /**
+     * Merge local and remote vault contents when both have files
+     */
+    private async mergeVaultContents(localSet: Set<string>, remote: Set<string>, conflicts: ConflictInfo[]): Promise<void> {
+        if (!this.metadataDoc) return;
+        const arr = this.metadataDoc.getArray<string>('paths');
+        
+        // Files that exist in both local and remote
+        const commonFiles = new Set([...localSet].filter(f => remote.has(f)));
+        
+        // Files only in local
+        const localOnlyFiles = new Set([...localSet].filter(f => !remote.has(f)));
+        
+        // Files only in remote
+        const remoteOnlyFiles = new Set([...remote].filter(f => !localSet.has(f)));
+        
+        console.log('ShadowLink: Merge analysis - Common:', commonFiles.size, 'Local only:', localOnlyFiles.size, 'Remote only:', remoteOnlyFiles.size);
+        
+        // For common files, we'll let the document-level sync handle conflicts
+        // For local-only files, add them to remote
+        for (const path of localOnlyFiles) {
+            console.log('ShadowLink: Adding local file to remote:', path);
+            arr.push([path]);
+        }
+        
+        // For remote-only files, create them locally
+        for (const path of remoteOnlyFiles) {
+            try {
+                console.log('ShadowLink: Creating remote file locally:', path);
+                await this.app.vault.create(path, '');
+            } catch (error) {
+                console.warn('ShadowLink: Failed to create file locally:', path, error);
+            }
+        }
+        
+        // Show notification about merge
+        if (localOnlyFiles.size > 0 || remoteOnlyFiles.size > 0) {
+            new Notice(`ShadowLink: Merged vault contents - Added ${localOnlyFiles.size} local files to server, ${remoteOnlyFiles.size} remote files to local`, 8000);
         }
     }
 
@@ -909,13 +1075,17 @@ export default class ShadowLinkPlugin extends Plugin {
         // Optionally inform the server about the deletion
         const doc = new this.Y!.Doc();
         const url = this.resolveServerUrl(this.settings.serverUrl);
-        const provider = new this.WebsocketProviderClass!(url, this.docNameForFile(file), doc, {
-            params: { 
-                token: this.settings.authToken,
-                vaultId: this.vaultId,
-                userId: this.settings.userId
-            }
-        });
+        
+        const params: Record<string, string> = { 
+            vaultId: this.vaultId,
+            userId: this.settings.userId
+        };
+        
+        if (this.settings.authToken && this.settings.authToken.trim() !== '') {
+            params.token = this.settings.authToken;
+        }
+        
+        const provider = new this.WebsocketProviderClass!(url, this.docNameForFile(file), doc, { params });
         const text = doc.getText('content');
         provider.once('sync', () => {
             text.delete(0, text.length);
@@ -970,13 +1140,17 @@ export default class ShadowLinkPlugin extends Plugin {
             this.cleanupCurrent();
             const doc = new this.Y!.Doc();
             const url = this.resolveServerUrl(this.settings.serverUrl);
-            const provider = new this.WebsocketProviderClass!(url, `${this.vaultId}/${oldPath}`, doc, {
-                params: { 
-                    token: this.settings.authToken,
-                    vaultId: this.vaultId,
-                    userId: this.settings.userId
-                }
-            });
+            
+            const params: Record<string, string> = { 
+                vaultId: this.vaultId,
+                userId: this.settings.userId
+            };
+            
+            if (this.settings.authToken && this.settings.authToken.trim() !== '') {
+                params.token = this.settings.authToken;
+            }
+            
+            const provider = new this.WebsocketProviderClass!(url, `${this.vaultId}/${oldPath}`, doc, { params });
             const text = doc.getText('content');
             provider.once('sync', () => {
                 text.delete(0, text.length);
@@ -1078,7 +1252,7 @@ export default class ShadowLinkPlugin extends Plugin {
         return this.fileOpenQueue;
     }
 
-    private async handleFileOpenInternal(file: TFile | null) {
+    async handleFileOpenInternal(file: TFile | null) {
         await this.loadCollabModules();
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!file || !view) {
@@ -1099,11 +1273,19 @@ export default class ShadowLinkPlugin extends Plugin {
         await this.idb.whenSynced;
         
         this.provider = new this.WebsocketProviderClass!(url, docName, this.doc, {
-            params: { 
-                token: this.settings.authToken,
-                vaultId: this.vaultId,
-                userId: this.settings.userId
-            }
+            params: (() => {
+                const params: Record<string, string> = { 
+                    vaultId: this.vaultId,
+                    userId: this.settings.userId
+                };
+                
+                // Only add token if it's not empty
+                if (this.settings.authToken && this.settings.authToken.trim() !== '') {
+                    params.token = this.settings.authToken;
+                }
+                
+                return params;
+            })()
         });
         
         // Enhanced sync handling with conflict detection
@@ -1399,16 +1581,26 @@ class ShadowLinkSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Join Vault')
-            .setDesc('Enter a vault ID to join someone else\'s vault')
+            .setDesc('Enter a vault ID to join someone else\'s vault. This will merge your current vault content with the target vault.')
             .addText(text => text
                 .setPlaceholder('Enter vault ID...')
                 .onChange(async (value) => {
-                    if (value && value !== this.plugin.settings.vaultId) {
-                        if (!this.plugin.settings.sharedVaults.includes(value)) {
-                            this.plugin.settings.sharedVaults.push(value);
-                            await this.plugin.saveSettings();
-                            this.display(); // Refresh the display
-                        }
+                    // Store the text value for the button
+                    (text.inputEl as any)._pendingVaultId = value;
+                }))
+            .addButton(button => button
+                .setButtonText('Join Vault')
+                .onClick(async () => {
+                    const textInput = containerEl.querySelector('input[placeholder="Enter vault ID..."]') as HTMLInputElement;
+                    const targetVaultId = textInput?.value?.trim();
+                    
+                    if (targetVaultId && targetVaultId !== this.plugin.settings.vaultId) {
+                        await this.joinVault(targetVaultId);
+                        if (textInput) textInput.value = ''; // Clear the input
+                    } else if (targetVaultId === this.plugin.settings.vaultId) {
+                        new Notice('Cannot join your own vault');
+                    } else {
+                        new Notice('Please enter a valid vault ID');
                     }
                 }));
 
@@ -1447,5 +1639,82 @@ class ShadowLinkSettingTab extends PluginSettingTab {
         const statusInterval = setInterval(updateStatus, 2000);
         // Clean up interval when settings are closed
         this.plugin.register(() => clearInterval(statusInterval));
+    }
+
+    /**
+     * Join an existing vault by changing the vault ID and reconnecting
+     */
+    private async joinVault(targetVaultId: string): Promise<void> {
+        try {
+            // Confirm the action
+            const confirmed = await new Promise<boolean>((resolve) => {
+                const modal = this.app.workspace.containerEl.createDiv({ cls: 'modal-container' });
+                modal.innerHTML = `
+                    <div class="modal">
+                        <div class="modal-content">
+                            <h2>Join Vault</h2>
+                            <p>This will merge your current vault content with vault <code>${targetVaultId}</code>.</p>
+                            <p>Your current vault content will be preserved and synchronized with the target vault.</p>
+                            <p><strong>Continue?</strong></p>
+                            <div style="display: flex; gap: 10px; margin-top: 20px;">
+                                <button class="mod-cta" data-action="confirm">Join Vault</button>
+                                <button data-action="cancel">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                modal.addEventListener('click', (e) => {
+                    const action = (e.target as HTMLElement).getAttribute('data-action');
+                    if (action === 'confirm') {
+                        resolve(true);
+                    } else if (action === 'cancel' || e.target === modal) {
+                        resolve(false);
+                    }
+                    modal.remove();
+                });
+            });
+
+            if (!confirmed) {
+                return;
+            }
+
+            // Store the old vault ID for cleanup
+            const oldVaultId = this.plugin.settings.vaultId;
+            
+            // Update the vault ID
+            this.plugin.settings.vaultId = targetVaultId;
+            this.plugin.vaultId = targetVaultId;
+            await this.plugin.saveSettings();
+
+            // Add the old vault to shared vaults list for reference
+            if (!this.plugin.settings.sharedVaults.includes(oldVaultId)) {
+                this.plugin.settings.sharedVaults.push(oldVaultId);
+                await this.plugin.saveSettings();
+            }
+
+            // Disconnect current connections
+            this.plugin.cleanupCurrent();
+            this.plugin.cleanupMetadata();
+
+            // Create new offline manager for the new vault
+            this.plugin.offlineManager = new OfflineOperationManager(this.app, targetVaultId);
+
+            // Reconnect with new vault ID
+            await this.plugin.connectMetadata();
+
+            // If there's an active file, reconnect to it
+            const activeFile = this.app.workspace.getActiveFile();
+            if (activeFile) {
+                await this.plugin.handleFileOpenInternal(activeFile);
+            }
+
+            new Notice(`Successfully joined vault ${targetVaultId}. Your content will be merged.`, 5000);
+            this.display(); // Refresh the settings display
+
+        } catch (error) {
+            console.error('Failed to join vault:', error);
+            new Notice(`Failed to join vault: ${error.message}`, 5000);
+        }
     }
 }
