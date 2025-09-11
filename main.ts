@@ -759,13 +759,33 @@ export default class ShadowLinkPlugin extends Plugin {
             }
         }, 2000);
         
-        // Also trigger awareness update for live collaboration
+        // Ensure awareness is set up immediately for all providers
+        this.ensureAwarenessState();
+    }
+    
+    /**
+     * Ensure awareness state is properly set for all active providers
+     */
+    private ensureAwarenessState() {
+        const userState = {
+            name: this.settings.username,
+            color: this.getUserColor(),
+            colorLight: this.getUserColor(true),
+            userId: this.settings.userId,
+            vaultId: this.vaultId,
+            timestamp: Date.now()
+        };
+        
+        // Set awareness for document provider if available
         if (this.provider && this.provider.awareness) {
-            this.provider.awareness.setLocalStateField('user', {
-                name: this.settings.username,
-                color: this.getUserColor(),
-                colorLight: this.getUserColor(true)
-            });
+            console.log('ShadowLink: Setting document awareness for', this.settings.username);
+            this.provider.awareness.setLocalStateField('user', userState);
+        }
+        
+        // Set awareness for metadata provider if available
+        if (this.metadataProvider && this.metadataProvider.awareness) {
+            console.log('ShadowLink: Setting metadata awareness for', this.settings.username);
+            this.metadataProvider.awareness.setLocalStateField('user', userState);
         }
     }
 
@@ -955,6 +975,12 @@ export default class ShadowLinkPlugin extends Plugin {
         const hasRemoteContent = remote.size > 0;
         const hasLocalContent = localSet.size > 0;
         
+        // Force immediate visibility of changes by triggering a sync notification
+        if (hasRemoteContent || hasLocalContent) {
+            console.log('ShadowLink: Content detected, ensuring immediate sync visibility');
+            new Notice(`ShadowLink: Synchronizing vault (${Math.max(localSet.size, remote.size)} files)`, 3000);
+        }
+        
         if (hasRemoteContent && hasLocalContent) {
             console.log('ShadowLink: Both local and remote content found, merging...');
             await this.mergeVaultContents(localSet, remote, conflicts);
@@ -964,6 +990,18 @@ export default class ShadowLinkPlugin extends Plugin {
             for (const path of localSet) {
                 arr.push([path]);
             }
+            new Notice(`ShadowLink: Shared ${localSet.size} local files to vault`, 4000);
+        } else if (hasRemoteContent && !hasLocalContent) {
+            // Remote content exists but local is empty - pull remote to local
+            console.log('ShadowLink: Pulling remote content to local vault...');
+            for (const path of remote) {
+                try {
+                    await this.app.vault.create(path, '');
+                } catch (error) {
+                    console.warn('ShadowLink: Failed to create file:', path, error);
+                }
+            }
+            new Notice(`ShadowLink: Downloaded ${remote.size} files from shared vault`, 4000);
         } else {
             // Standard sync logic for when there's no conflict
             for (const p of remote) {
@@ -1024,6 +1062,11 @@ export default class ShadowLinkPlugin extends Plugin {
         
         // Set up continuous monitoring for metadata changes
         this.setupMetadataChangeMonitoring();
+        
+        // Trigger immediate awareness setup for live collaboration
+        setTimeout(() => {
+            this.ensureAwarenessState();
+        }, 1000);
         
         console.log('ShadowLink: Vault sync completed');
     }
@@ -1573,6 +1616,7 @@ export default class ShadowLinkPlugin extends Plugin {
             if (!ytext) return;
             
             const remoteContent = ytext.toString();
+            console.log('ShadowLink: Initial sync completed for', file.path, 'content length:', remoteContent.length);
             
             // Check for conflicts
             if (this.conflictResolver) {
@@ -1588,16 +1632,26 @@ export default class ShadowLinkPlugin extends Plugin {
                 }
             }
             
-            await this.idb?.clearData();
+            // Only clear IndexedDB data after successful sync, not the document data itself
+            // This prevents content loss when navigating between files
+            if (this.idb) {
+                try {
+                    // Clear only the update data, not the document itself
+                    await this.idb.clearData();
+                } catch (error) {
+                    console.warn('ShadowLink: Failed to clear IndexedDB update data:', error);
+                }
+            }
         });
         
         this.currentFile = file;
 
-        // Enhanced awareness setup for better live collaboration
+        // Enhanced awareness setup for better live collaboration - set up immediately
         const clientId = this.provider.awareness.clientID;
         const userColor = this.getUserColor();
         const userColorLight = this.getUserColor(true);
         
+        // Set awareness state immediately when connection is established
         this.provider.awareness.setLocalStateField('user', {
             name: this.settings.username,
             color: userColor,
@@ -1605,6 +1659,21 @@ export default class ShadowLinkPlugin extends Plugin {
             userId: this.settings.userId,
             vaultId: this.vaultId,
             timestamp: Date.now()
+        });
+        
+        // Also set it again when connected to ensure it's always available
+        this.provider.on('status', (event: { status: string }) => {
+            if (event.status === 'connected') {
+                console.log('ShadowLink: Setting awareness on connection for', this.settings.username);
+                this.provider!.awareness.setLocalStateField('user', {
+                    name: this.settings.username,
+                    color: userColor,
+                    colorLight: userColorLight,
+                    userId: this.settings.userId,
+                    vaultId: this.vaultId,
+                    timestamp: Date.now()
+                });
+            }
         });
         
         // Set up awareness state monitoring for better presence tracking
@@ -1646,8 +1715,11 @@ export default class ShadowLinkPlugin extends Plugin {
         });
 
         const initializeText = async () => {
+            console.log('ShadowLink: Initializing text for', file.path, 'Yjs length:', ytext.length);
+            
             if (ytext.length === 0) {
                 const currentContent = view.editor.getValue();
+                console.log('ShadowLink: Empty Yjs doc, inserting current content, length:', currentContent.length);
                 ytext.insert(0, currentContent);
                 // Store initial version
                 if (this.currentFile) {
@@ -1657,13 +1729,18 @@ export default class ShadowLinkPlugin extends Plugin {
                 const newValue = ytext.toString();
                 const currentEditorValue = view.editor.getValue();
                 
+                console.log('ShadowLink: Comparing content - Editor:', currentEditorValue.length, 'Yjs:', newValue.length);
+                
                 // Don't overwrite content if values are the same
-                if (currentEditorValue === newValue) return;
+                if (currentEditorValue === newValue) {
+                    console.log('ShadowLink: Content already synchronized');
+                    return;
+                }
                 
                 // Prevent overwriting valid content with empty content unless intentional
                 if (newValue.trim() === '' && currentEditorValue.trim() !== '') {
                     console.warn('ShadowLink: Preventing empty content overwrite for', this.currentFile?.path);
-                    // Instead, update the Yjs document with current content
+                    // Instead, update the Yjs document with current content to preserve local changes
                     ytext.delete(0, ytext.length);
                     ytext.insert(0, currentEditorValue);
                     if (this.currentFile) {
@@ -1672,12 +1749,19 @@ export default class ShadowLinkPlugin extends Plugin {
                     return;
                 }
                 
-                // Check for conflicts before applying remote changes
-                if (this.currentFile && this.conflictResolver) {
-                    const conflict = await this.detectContentConflicts(this.currentFile, newValue);
-                    if (conflict) {
-                        await this.conflictResolver.resolveConflict(conflict);
-                        return;
+                // Also prevent overwriting new content with old empty content
+                if (currentEditorValue.trim() === '' && newValue.trim() !== '') {
+                    console.log('ShadowLink: Applying remote content to empty editor');
+                } else if (currentEditorValue.trim() !== '' && newValue.trim() !== '') {
+                    console.log('ShadowLink: Both editor and Yjs have content, checking for conflicts');
+                    // Check for conflicts before applying remote changes
+                    if (this.currentFile && this.conflictResolver) {
+                        const conflict = await this.detectContentConflicts(this.currentFile, newValue);
+                        if (conflict) {
+                            console.log('ShadowLink: Conflict detected, resolving...');
+                            await this.conflictResolver.resolveConflict(conflict);
+                            return;
+                        }
                     }
                 }
                 
@@ -1688,6 +1772,7 @@ export default class ShadowLinkPlugin extends Plugin {
                     return;
                 }
                 
+                console.log('ShadowLink: Applying remote content to editor for', file.path);
                 view.editor.setValue(newValue);
                 
                 // Store the new version
@@ -1721,6 +1806,9 @@ export default class ShadowLinkPlugin extends Plugin {
             this.cmKeymap!.of(this.yUndoManagerKeymap!)
         );
         this.app.workspace.updateOptions();
+
+        // Ensure awareness state is set after collaboration extensions are loaded
+        this.ensureAwarenessState();
 
         // Final content synchronization using CodeMirror
         // This ensures the editor state is fully synchronized after the collaboration setup
