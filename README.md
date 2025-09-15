@@ -11,7 +11,6 @@ ShadowLink transforms Obsidian into a collaborative knowledge management platfor
 Existing collaborative note-taking solutions often come with significant limitations:
 
 - **High costs**: Services like Relay charge substantial fees for team collaboration
-- **Vendor lock-in**: Data hosted on third-party servers with limited export options  
 - **Privacy concerns**: Sensitive information stored on external platforms
 - **Limited customization**: Restricted ability to modify or extend functionality
 
