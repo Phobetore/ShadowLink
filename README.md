@@ -6,6 +6,73 @@ Real-time collaborative editing plugin for Obsidian using conflict-free document
 
 ShadowLink transforms Obsidian into a collaborative knowledge management platform by enabling multiple users to simultaneously edit notes with real-time synchronization. This open-source solution provides an alternative to expensive proprietary collaboration services while maintaining complete control over your data.
 
+## ⚠️ Current Project Status
+
+**ShadowLink is currently in active development with significant improvements made but several issues still being addressed:**
+
+### ✅ Recently Fixed Issues
+- **Cross-document user visibility**: Users can now see each other across different documents
+- **Ghost cursor elimination**: Proper cleanup when switching documents
+- **Initial sync problems**: No longer requires restarting Obsidian clients
+- **Content persistence**: Written content no longer disappears when navigating between notes
+- **Basic real-time collaboration**: Core synchronization functionality is working
+
+### 🚧 Known Issues Still Being Fixed
+- **Synchronization bugs**: Multiple synchronization edge cases and race conditions remain
+- **Live edit stability**: Intermittent issues with live editing consistency between clients
+- **Connection reliability**: Occasional connection drops and recovery issues
+- **Performance optimization**: System performance with multiple concurrent users needs improvement
+
+### 🧪 Testing Requirements
+- **Load testing**: Comprehensive testing with many simultaneous users is still needed
+- **Stress testing**: Performance validation under heavy usage scenarios
+- **Edge case testing**: Various network conditions and failure scenarios
+- **Multi-client testing**: Extensive testing with numerous connected clients
+
+**Note**: While the core functionality works, the plugin is not yet production-ready for critical workflows. Users should expect occasional synchronization issues and should backup their work regularly.
+
+## Development Roadmap
+
+### Immediate Priorities
+
+1. **Synchronization Bug Fixes**
+   - Resolve remaining CRDT conflict resolution edge cases
+   - Fix intermittent sync failures during rapid edits
+   - Improve handling of concurrent file operations
+   - Address race conditions in document switching
+
+2. **Live Edit Improvements**
+   - Stabilize real-time cursor positioning
+   - Fix text insertion/deletion conflicts
+   - Improve undo/redo synchronization
+   - Enhance conflict resolution for simultaneous edits
+
+3. **Load Testing & Performance**
+   - Test with 10+ simultaneous users
+   - Validate performance with large documents (>10MB)
+   - Stress test file operations with multiple clients
+   - Benchmark memory usage and connection stability
+   - Test network failure recovery scenarios
+
+### Upcoming Features
+
+- **Enhanced security and authentication**
+- **File permission management**
+- **Better offline synchronization**
+- **Mobile client support**
+- **Integration with Obsidian Publish**
+
+### Testing Requirements
+
+Before production use, the following testing scenarios must be completed:
+
+- [ ] **Multi-user stress testing** (20+ concurrent users)
+- [ ] **Large vault synchronization** (1000+ files)
+- [ ] **Network instability testing** (connection drops, slow networks)
+- [ ] **Cross-platform compatibility** (Windows, macOS, Linux)
+- [ ] **Extended session testing** (24+ hour continuous use)
+- [ ] **Data integrity validation** (no data loss under any conditions)
+
 ## Motivation
 
 Existing collaborative note-taking solutions often come with significant limitations:
@@ -44,28 +111,55 @@ The architecture follows a distributed approach with conflict-free synchronizati
 
 ## Key Features
 
-**Real-time Synchronization**
-- Instant propagation of changes across connected clients
-- Automatic conflict resolution using Yjs CRDTs
-- No data loss during concurrent editing
+### Currently Working ✅
 
-**Offline Capability**
-- Local changes stored in IndexedDB when disconnected
+**Basic Real-time Synchronization**
+- Document changes propagate across connected clients
+- Automatic conflict resolution using Yjs CRDTs (basic scenarios)
+- Cross-document user visibility and presence tracking
+
+**Offline Capability** 
+- Local changes stored when disconnected
 - Automatic synchronization when connection is restored
-- Comprehensive conflict resolution for offline modifications
+- Basic conflict resolution for offline modifications
 
 **Vault Collaboration**
 - Share entire vaults with team members
-- Granular access control and session management
+- Basic session management
 - Support for multiple concurrent vaults
 
-**Robust Architecture**
+### Partially Working ⚠️
+
+**Advanced Synchronization**
+- Complex conflict resolution has edge cases
+- Large file synchronization may be incomplete
+- Rapid concurrent edits can cause inconsistencies
+
+**Live Editing**
+- Real-time cursors work but may occasionally desync
+- Text insertion conflicts under heavy load
+- Undo/redo synchronization is inconsistent
+
+**Connection Management**
+- Automatic reconnection works in most cases
+- Some network conditions cause persistent disconnections
+- Server connection pooling needs optimization
+
+### Robust Architecture
 - Rate limiting to prevent abuse
 - Security validation and authentication
 - Protection against rapid file switching
 - Comprehensive error handling and recovery
 
 ## Installation and Setup
+
+### ⚠️ Development Version Warning
+
+**This is a development version with known bugs. Please:**
+- **Backup your vault** before testing
+- Use on **non-critical vaults** only
+- Expect **synchronization issues** and **data conflicts**
+- Report bugs through [GitHub Issues](https://github.com/Phobetore/ShadowLink/issues)
 
 ### Prerequisites
 
@@ -211,13 +305,39 @@ To verify your setup is working:
 
 ## Usage Guidelines
 
-**File Management**: All standard Obsidian file operations (create, delete, rename, move) are automatically synchronized across collaborators.
+### Current Limitations ⚠️
 
-**Conflict Resolution**: The system handles conflicts automatically using CRDTs. Manual intervention is only required for structural conflicts (e.g., file deleted on one side, modified on another).
+**Recommended Usage:**
+- **Small teams** (2-3 users maximum for stable experience)
+- **Small to medium vaults** (<500 files recommended)
+- **Non-critical workflows** (always backup important work)
+- **Testing and development** environments
 
-**Performance**: The system includes rate limiting and debouncing to maintain stability during intensive editing sessions.
+**File Management**: Most standard Obsidian file operations are synchronized, but edge cases may cause inconsistencies.
 
-**Security**: Use TLS encryption and authentication tokens for production deployments. Consider network-level security for sensitive environments.
+**Conflict Resolution**: The system handles basic conflicts automatically, but complex scenarios may require manual intervention.
+
+**Performance**: Rate limiting and debouncing help maintain stability, but performance degrades with multiple heavy users.
+
+**Security**: Use TLS encryption and authentication tokens for any networked deployment. The current security model is basic.
+
+### Best Practices for Current Version
+
+1. **Start small**: Begin with 2 users before scaling up
+2. **Backup regularly**: Sync bugs can occasionally cause data issues  
+3. **Monitor connections**: Watch for disconnect warnings in the status bar
+4. **Avoid rapid edits**: Wait for changes to sync before making more edits
+5. **Test thoroughly**: Validate sync is working before important sessions
+6. **Keep sessions short**: Restart Obsidian if issues occur
+
+### Production Readiness
+
+**ShadowLink is NOT recommended for production use** until the following issues are resolved:
+- Synchronization stability under load
+- Data integrity guarantees  
+- Comprehensive testing with many users
+- Performance optimization
+- Enhanced error recovery
 
 ### Reporting Issues
 
@@ -230,6 +350,28 @@ When reporting bugs or issues:
 
 Use the [GitHub Issues](https://github.com/Phobetore/ShadowLink/issues) page for all bug reports and feature requests.
 
+### Known Issues & Workarounds
+
+**Synchronization Problems:**
+- If sync breaks, try disconnecting and reconnecting all clients
+- For persistent issues, restart Obsidian on all clients
+- Large files (>1MB) may sync slowly or incompletely
+
+**Live Edit Issues:**
+- Cursors may occasionally become misaligned
+- Rapid typing can cause text conflicts
+- Undo/redo operations may not sync properly
+
+**Connection Issues:**
+- Plugin may not reconnect automatically after network changes
+- Server connection timeout may occur with poor network conditions
+- Multiple vault sharing may cause connection instability
+
+**Performance Issues:**
+- Memory usage increases with session length
+- Large vaults (500+ files) may experience slow initial sync
+- Multiple concurrent users may cause server overload
+
 ### Development Environment
 
 For local development:
@@ -240,6 +382,55 @@ For local development:
 4. Submit a pull request with detailed description
 
 The project uses TypeScript and follows standard Node.js development practices. Ensure all tests pass before submitting contributions.
+
+## Testing & Quality Assurance
+
+### Current Testing Status
+
+**Completed Tests:**
+- ✅ Basic two-client synchronization
+- ✅ User awareness and presence tracking  
+- ✅ Document switching without ghost cursors
+- ✅ Basic conflict resolution
+- ✅ Offline operation and reconnection
+
+**Tests in Progress:**
+- 🔄 Multi-user scenarios (3-5 users)
+- 🔄 Large document handling
+- 🔄 Extended session stability
+- 🔄 Network failure recovery
+
+**Tests Required:**
+- ❌ **High-load testing** (10+ simultaneous users)
+- ❌ **Stress testing** with rapid edits
+- ❌ **Large vault synchronization** (1000+ files)
+- ❌ **Cross-platform compatibility** testing
+- ❌ **Data integrity** under extreme conditions
+- ❌ **Memory leak** and performance regression testing
+- ❌ **Security** and access control validation
+
+### Running Tests
+
+Basic collaboration test:
+```bash
+node test-collaboration.js
+```
+
+Security validation:
+```bash
+node security-test.js
+```
+
+**Note:** Comprehensive test suite is under development. Current tests cover basic functionality only.
+
+### Testing Contributions
+
+The project welcomes testing contributions, especially:
+- **Load testing scripts** for many users
+- **Performance benchmarks** 
+- **Edge case testing scenarios**
+- **Cross-platform validation**
+- **Data integrity verification**
 
 ## License
 
