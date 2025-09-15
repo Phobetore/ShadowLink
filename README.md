@@ -219,30 +219,6 @@ To verify your setup is working:
 
 **Security**: Use TLS encryption and authentication tokens for production deployments. Consider network-level security for sensitive environments.
 
-## Development and Contributing
-
-We encourage community involvement in improving ShadowLink. The project is designed to be extensible and welcomes contributions in several areas:
-
-**Core Development**:
-- Performance optimizations
-- Feature enhancements
-- Bug fixes and stability improvements
-
-**Documentation**:
-- Installation guides for specific platforms
-- Integration tutorials
-- Best practices documentation
-
-**Testing**:
-- Cross-platform compatibility testing
-- Performance benchmarking
-- Security auditing
-
-**Feature Requests**:
-- End-to-end encryption implementation
-- Advanced permission systems
-- Mobile platform support
-
 ### Reporting Issues
 
 When reporting bugs or issues:
@@ -268,14 +244,4 @@ The project uses TypeScript and follows standard Node.js development practices. 
 ## License
 
 ShadowLink is distributed under the GNU General Public License v3.0 or later. This ensures the project remains open source and that improvements benefit the entire community.
-
-## Support
-
-For technical support and community discussion:
-
-- **Issues**: [GitHub Issues](https://github.com/Phobetore/ShadowLink/issues)
-- **Documentation**: Check the repository's documentation files
-- **Community**: Engage with other users and developers through GitHub Discussions
-
-Professional support and custom deployment assistance may be available upon request.
 
