@@ -109,48 +109,6 @@ The architecture follows a distributed approach with conflict-free synchronizati
 
 **Plugin Architecture**: By building as an Obsidian plugin, we leverage Obsidian's mature file management, editor integration, and plugin ecosystem while adding collaboration capabilities.
 
-## Key Features
-
-### Currently Working ✅
-
-**Basic Real-time Synchronization**
-- Document changes propagate across connected clients
-- Automatic conflict resolution using Yjs CRDTs (basic scenarios)
-- Cross-document user visibility and presence tracking
-
-**Offline Capability** 
-- Local changes stored when disconnected
-- Automatic synchronization when connection is restored
-- Basic conflict resolution for offline modifications
-
-**Vault Collaboration**
-- Share entire vaults with team members
-- Basic session management
-- Support for multiple concurrent vaults
-
-### Partially Working ⚠️
-
-**Advanced Synchronization**
-- Complex conflict resolution has edge cases
-- Large file synchronization may be incomplete
-- Rapid concurrent edits can cause inconsistencies
-
-**Live Editing**
-- Real-time cursors work but may occasionally desync
-- Text insertion conflicts under heavy load
-- Undo/redo synchronization is inconsistent
-
-**Connection Management**
-- Automatic reconnection works in most cases
-- Some network conditions cause persistent disconnections
-- Server connection pooling needs optimization
-
-### Robust Architecture
-- Rate limiting to prevent abuse
-- Security validation and authentication
-- Protection against rapid file switching
-- Comprehensive error handling and recovery
-
 ## Installation and Setup
 
 ### ⚠️ Development Version Warning
