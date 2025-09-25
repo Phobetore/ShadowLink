@@ -282,7 +282,7 @@ To verify your setup is working:
 ### Best Practices for Current Version
 
 1. **Start small**: Begin with 2 users before scaling up
-2. **Backup regularly**: Sync bugs can occasionally cause data issues  
+2. **Backup regularly**: Sync bugs can occasionally cause data loss issues  
 3. **Monitor connections**: Watch for disconnect warnings in the status bar
 4. **Avoid rapid edits**: Wait for changes to sync before making more edits
 5. **Test thoroughly**: Validate sync is working before important sessions
@@ -291,7 +291,7 @@ To verify your setup is working:
 ### Production Readiness
 
 **ShadowLink is NOT recommended for production use** until the following issues are resolved:
-- Synchronization stability under load
+- Synchronization stability
 - Data integrity guarantees  
 - Comprehensive testing with many users
 - Performance optimization
@@ -340,55 +340,6 @@ For local development:
 4. Submit a pull request with detailed description
 
 The project uses TypeScript and follows standard Node.js development practices. Ensure all tests pass before submitting contributions.
-
-## Testing & Quality Assurance
-
-### Current Testing Status
-
-**Completed Tests:**
-- ✅ Basic two-client synchronization
-- ✅ User awareness and presence tracking  
-- ✅ Document switching without ghost cursors
-- ✅ Basic conflict resolution
-- ✅ Offline operation and reconnection
-
-**Tests in Progress:**
-- 🔄 Multi-user scenarios (3-5 users)
-- 🔄 Large document handling
-- 🔄 Extended session stability
-- 🔄 Network failure recovery
-
-**Tests Required:**
-- ❌ **High-load testing** (10+ simultaneous users)
-- ❌ **Stress testing** with rapid edits
-- ❌ **Large vault synchronization** (1000+ files)
-- ❌ **Cross-platform compatibility** testing
-- ❌ **Data integrity** under extreme conditions
-- ❌ **Memory leak** and performance regression testing
-- ❌ **Security** and access control validation
-
-### Running Tests
-
-Basic collaboration test:
-```bash
-node test-collaboration.js
-```
-
-Security validation:
-```bash
-node security-test.js
-```
-
-**Note:** Comprehensive test suite is under development. Current tests cover basic functionality only.
-
-### Testing Contributions
-
-The project welcomes testing contributions, especially:
-- **Load testing scripts** for many users
-- **Performance benchmarks** 
-- **Edge case testing scenarios**
-- **Cross-platform validation**
-- **Data integrity verification**
 
 ## License
 
