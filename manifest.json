@@ -1,0 +1,10 @@
+{
+        "id": "shadowlink",
+        "name": "ShadowLink",
+        "version": "0.1.0",
+        "minAppVersion": "0.15.0",
+        "description": "Real-time collaborative editing using Yjs and a WebSocket server.",
+        "author": "ShadowLink Team",
+        "authorUrl": "https://github.com/Phobetore/ShadowLink",
+        "isDesktopOnly": false
+}
