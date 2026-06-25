@@ -1,347 +1,85 @@
 # ShadowLink
 
-Real-time collaborative editing plugin for Obsidian using conflict-free document synchronization.
+Real-time collaborative editing for [Obsidian](https://obsidian.md). **Status: P0 —
+real-time text co-editing of notes inside a single shared folder.** Structural sync
+(create/rename/move/delete), invites, images, and the member panel are on the roadmap
+(see `docs/review/2026-06-25-redesign-recommendation.md`).
 
-## Project Overview
+## How it works (P0)
 
-ShadowLink transforms Obsidian into a collaborative knowledge management platform by enabling multiple users to simultaneously edit notes with real-time synchronization. This open-source solution provides an alternative to expensive proprietary collaboration services while maintaining complete control over your data.
+- **Text**: [Yjs CRDT](https://yjs.dev) over the standard y-protocols sync; live cursors via Yjs awareness.
+- **Scope**: only notes inside the configured shared folder sync; the rest of the vault stays local.
+- **Auth**: the server validates `SERVER_KEY` at the WebSocket upgrade before any data flows.
 
-## ⚠️ Current Project Status
+## Quick start
 
-**ShadowLink is currently in active development with significant improvements made but several issues still being addressed:**
+### 1. Run the server
 
-### ✅ Recently Fixed Issues
-- **Cross-document user visibility**: Users can now see each other across different documents
-- **Ghost cursor elimination**: Proper cleanup when switching documents
-- **Initial sync problems**: No longer requires restarting Obsidian clients
-- **Content persistence**: Written content no longer disappears when navigating between notes
-- **Basic real-time collaboration**: Core synchronization functionality is working
-
-### 🚧 Known Issues Still Being Fixed
-- **Synchronization bugs**: Multiple synchronization edge cases and race conditions remain
-- **Live edit stability**: Intermittent issues with live editing consistency between clients
-- **Connection reliability**: Occasional connection drops and recovery issues
-- **Performance optimization**: System performance with multiple concurrent users needs improvement
-
-### 🧪 Testing Requirements
-- **Load testing**: Comprehensive testing with many simultaneous users is still needed
-- **Stress testing**: Performance validation under heavy usage scenarios
-- **Edge case testing**: Various network conditions and failure scenarios
-- **Multi-client testing**: Extensive testing with numerous connected clients
-
-**Note**: While the core functionality works, the plugin is not yet production-ready for critical workflows. Users should expect occasional synchronization issues and should backup their work regularly.
-
-## Development Roadmap
-
-### Immediate Priorities
-
-1. **Synchronization Bug Fixes**
-   - Resolve remaining CRDT conflict resolution edge cases
-   - Fix intermittent sync failures during rapid edits
-   - Improve handling of concurrent file operations
-   - Address race conditions in document switching
-
-2. **Live Edit Improvements**
-   - Stabilize real-time cursor positioning
-   - Fix text insertion/deletion conflicts
-   - Improve undo/redo synchronization
-   - Enhance conflict resolution for simultaneous edits
-
-3. **Load Testing & Performance**
-   - Test with 10+ simultaneous users
-   - Validate performance with large documents (>10MB)
-   - Stress test file operations with multiple clients
-   - Benchmark memory usage and connection stability
-   - Test network failure recovery scenarios
-
-### Upcoming Features
-
-- **Enhanced security and authentication**
-- **File permission management**
-- **Better offline synchronization**
-- **Mobile client support**
-- **Integration with Obsidian Publish**
-
-### Testing Requirements
-
-Before production use, the following testing scenarios must be completed:
-
-- [ ] **Multi-user stress testing** (20+ concurrent users)
-- [ ] **Large vault synchronization** (1000+ files)
-- [ ] **Network instability testing** (connection drops, slow networks)
-- [ ] **Cross-platform compatibility** (Windows, macOS, Linux)
-- [ ] **Extended session testing** (24+ hour continuous use)
-- [ ] **Data integrity validation** (no data loss under any conditions)
-
-## Motivation
-
-Existing collaborative note-taking solutions often come with significant limitations:
-
-- **High costs**: Services like Relay charge substantial fees for team collaboration
-- **Privacy concerns**: Sensitive information stored on external platforms
-- **Limited customization**: Restricted ability to modify or extend functionality
-
-ShadowLink addresses these issues by providing a fully open-source, self-hostable solution that integrates directly with Obsidian's powerful knowledge management features.
-
-## Technical Architecture
-
-### Design Philosophy
-
-The architecture follows a distributed approach with conflict-free synchronization at its core:
-
-**Client-Side Components:**
-- Obsidian plugin that integrates with CodeMirror editor
-- Yjs-based Conflict-free Replicated Data Types (CRDTs) for document state
-- IndexedDB persistence for offline operation
-- WebSocket client for real-time communication
-
-**Server-Side Components:**
-- Lightweight WebSocket relay server for message broadcasting
-- Vault management system with session tracking
-- Rate limiting and security validation
-- Optional persistence layer for document storage
-
-### Why This Approach
-
-**Yjs and CRDTs**: Traditional operational transformation approaches require complex server-side logic to resolve conflicts. Yjs CRDTs enable automatic conflict resolution without requiring a central authority, making the system more robust and scalable.
-
-**WebSocket Relay**: Rather than implementing complex server-side document management, the server acts as a simple message relay. This keeps the server lightweight while pushing intelligence to the clients, improving scalability and reducing server complexity.
-
-**Plugin Architecture**: By building as an Obsidian plugin, we leverage Obsidian's mature file management, editor integration, and plugin ecosystem while adding collaboration capabilities.
-
-## Installation and Setup
-
-### ⚠️ Development Version Warning
-
-**This is a development version with known bugs. Please:**
-- **Backup your vault** before testing
-- Use on **non-critical vaults** only
-- Expect **synchronization issues** and **data conflicts**
-- Report bugs through [GitHub Issues](https://github.com/Phobetore/ShadowLink/issues)
-
-### Prerequisites
-
-- Obsidian desktop application
-- Node.js (version 16 or later) for building the plugin
-- Network access for collaboration features
-
-### Building the Plugin
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Phobetore/ShadowLink.git
-   cd ShadowLink
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Build the plugin:
-   ```bash
-   npm run build
-   ```
-
-### Installing in Obsidian
-
-1. Navigate to your Obsidian vault directory
-2. Create the plugin directory:
-   ```bash
-   mkdir -p .obsidian/plugins/shadowlink
-   ```
-
-3. Copy the built files:
-   ```bash
-   cp manifest.json main.js styles.css .obsidian/plugins/shadowlink/
-   ```
-
-4. Launch Obsidian and enable ShadowLink:
-   - Open Settings → Community Plugins
-   - Enable "ShadowLink" from the installed plugins list
-
-### Server Deployment
-
-#### Quick Start (Development)
-
-For local testing and development:
+Requires Node.js 18+.
 
 ```bash
+git clone https://github.com/Phobetore/ShadowLink
+cd ShadowLink
+npm install
 npm run server
 ```
 
-The server will start on `localhost:1234` by default.
+Copy the `SERVER_KEY` from `data/SHADOWLINK_ADMIN_CREDS.txt`.
 
-#### Production Deployment
+### 2. Install the plugin
 
-1. Use the standalone server for production:
-   ```bash
-   cd server
-   npm install
-   npm start
-   ```
+Copy `main.js`, `styles.css`, and `manifest.json` into each vault's
+`.obsidian/plugins/shadowlink/` folder and enable the plugin.
 
-2. Configure environment variables:
-   ```bash
-   export PORT=8080                    # Server port
-   export WS_AUTH_TOKEN=your_token     # Authentication token
-   export YPERSISTENCE=/data/yjs       # Document storage directory
-   export SSL_CERT=/path/to/cert.pem   # TLS certificate
-   export SSL_KEY=/path/to/key.pem     # TLS private key
-   ```
+### 3. Configure (every member, identically)
 
-3. For monitoring and diagnostics:
-   ```bash
-   npm run monitor
-   ```
+Settings → ShadowLink: same **Server URL**, **Server key**, **Workspace ID**, and
+**Shared folder** name. Toggle the plugin off/on to apply.
 
-#### Docker Deployment
+### 4. Collaborate
 
-Create a `docker-compose.yml`:
+Create a note at the same path inside the shared folder in each vault, open it in both,
+and edit — changes and cursors sync live.
 
-```yaml
-version: '3.8'
-services:
-  shadowlink:
-    build: ./server
-    ports:
-      - "8080:8080"
-    environment:
-      - PORT=8080
-      - WS_AUTH_TOKEN=your_secure_token
-      - YPERSISTENCE=/data
-    volumes:
-      - ./data:/data
-```
+### P0 limitations
 
-Deploy with:
+- A note must exist at the same path in every member's vault (no structural sync yet).
+- Only notes inside the shared folder sync.
+- Settings are read at plugin load — toggle the plugin after changing them.
+- The shared document is the source of truth once connected; opening a note with content
+  that differs from the shared version will show the shared version.
+
+## Server configuration
+
+Set via environment variables or a `.env` file:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `4000` | WebSocket server port |
+| `MAX_FILE_SIZE_MB` | `700` | Max binary file size |
+| `MAX_TOTAL_STORAGE_GB` | `0` | Total storage cap (0 = unlimited) |
+| `ROOM_DEFAULT_TTL` | `permanent` | Default room lifetime: `session` \| `24h` \| `7d` \| `30d` \| `permanent` |
+| `PERSISTENCE_DIR` | `./data` | Where to store vault data |
+| `RATE_LIMIT_OPS_PER_SEC` | `10` | Max WebSocket messages per second per connection |
+| `MAX_CONNECTIONS_PER_IP` | `50` | Max simultaneous connections per IP |
+
+## Encryption
+
+By default the server uses unencrypted `ws://`. For encrypted `wss://`, put a reverse proxy in front:
+
+- **Nginx**: add a WebSocket proxy to your site config
+- **Caddy**: `reverse_proxy localhost:4000`
+- **Traefik**: use the `websecure` entrypoint
+
+## Development
+
 ```bash
-docker-compose up -d
+npm run dev    # watch mode — rebuilds main.js on change
+npm test       # run server unit tests
+npm run server # start the server
 ```
-
-### Client Configuration
-
-1. Open Obsidian Settings → ShadowLink
-
-2. Configure connection settings:
-   - **Server URL**: `ws://your-server:port` (or `wss://` for TLS)
-   - **Username**: Display name for collaborators
-   - **Auth Token**: Match the server's WS_AUTH_TOKEN (if configured)
-
-3. Vault identification will be generated automatically
-
-### Sharing and Collaboration
-
-#### Sharing Your Vault
-
-1. Open ShadowLink settings in Obsidian
-2. Copy your Vault ID from the configuration panel
-3. Share this ID with collaborators via secure communication
-
-#### Joining a Shared Vault
-
-1. Obtain a Vault ID from the vault owner
-2. Open ShadowLink settings
-3. Enter the Vault ID in the "Join Vault" field
-4. Click "Join" to connect to the shared vault
-
-#### Managing Collaborators
-
-Vault owners can:
-- View connected users in real-time
-- Monitor connection status and activity
-- Remove access to shared vaults when needed
-
-### Connection Verification
-
-To verify your setup is working:
-
-1. Open a note in Obsidian
-2. Check the status bar for connection indicator
-3. Make edits and verify they appear in real-time for other connected users
-4. Test offline functionality by disconnecting and reconnecting
-
-## Usage Guidelines
-
-### Current Limitations ⚠️
-
-**Recommended Usage:**
-- **Small teams** (2-3 users maximum for stable experience)
-- **Small to medium vaults** (<500 files recommended)
-- **Non-critical workflows** (always backup important work)
-- **Testing and development** environments
-
-**File Management**: Most standard Obsidian file operations are synchronized, but edge cases may cause inconsistencies.
-
-**Conflict Resolution**: The system handles basic conflicts automatically, but complex scenarios may require manual intervention.
-
-**Performance**: Rate limiting and debouncing help maintain stability, but performance degrades with multiple heavy users.
-
-**Security**: Use TLS encryption and authentication tokens for any networked deployment. The current security model is basic.
-
-### Best Practices for Current Version
-
-1. **Start small**: Begin with 2 users before scaling up
-2. **Backup regularly**: Sync bugs can occasionally cause data loss issues  
-3. **Monitor connections**: Watch for disconnect warnings in the status bar
-4. **Avoid rapid edits**: Wait for changes to sync before making more edits
-5. **Test thoroughly**: Validate sync is working before important sessions
-6. **Keep sessions short**: Restart Obsidian if issues occur
-
-### Production Readiness
-
-**ShadowLink is NOT recommended for production use** until the following issues are resolved:
-- Synchronization stability
-- Data integrity guarantees  
-- Comprehensive testing with many users
-- Performance optimization
-- Enhanced error recovery
-
-### Reporting Issues
-
-When reporting bugs or issues:
-
-1. Check existing issues first to avoid duplicates
-2. Provide detailed reproduction steps
-3. Include system information (OS, Obsidian version, plugin version)
-4. Attach relevant log files when possible
-
-Use the [GitHub Issues](https://github.com/Phobetore/ShadowLink/issues) page for all bug reports and feature requests.
-
-### Known Issues & Workarounds
-
-**Synchronization Problems:**
-- If sync breaks, try disconnecting and reconnecting all clients
-- For persistent issues, restart Obsidian on all clients
-- Large files (>1MB) may sync slowly or incompletely
-
-**Live Edit Issues:**
-- Cursors may occasionally become misaligned
-- Rapid typing can cause text conflicts
-- Undo/redo operations may not sync properly
-
-**Connection Issues:**
-- Plugin may not reconnect automatically after network changes
-- Server connection timeout may occur with poor network conditions
-- Multiple vault sharing may cause connection instability
-
-**Performance Issues:**
-- Memory usage increases with session length
-- Large vaults (500+ files) may experience slow initial sync
-- Multiple concurrent users may cause server overload
-
-### Development Environment
-
-For local development:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make changes and test thoroughly
-4. Submit a pull request with detailed description
-
-The project uses TypeScript and follows standard Node.js development practices. Ensure all tests pass before submitting contributions.
 
 ## License
 
-ShadowLink is distributed under the GNU General Public License v3.0 or later. This ensures the project remains open source and that improvements benefit the entire community.
+GPL-3.0-or-later
 
