@@ -2,6 +2,7 @@
   "name": "shadowlink",
   "version": "0.1.0",
   "description": "Real-time collaborative editing plugin for Obsidian",
+  "type": "module",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
