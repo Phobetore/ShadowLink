@@ -8,6 +8,15 @@ export interface ShadowLinkSettings {
   showJoinLeaveNotifications: boolean;
   autoRejoinRecentRooms: boolean;
   activeRoom: ActiveRoom | null;
+  share: ShareConfig;
+}
+
+/** P0 single shared-folder configuration. Generalized to a list in P1. */
+export interface ShareConfig {
+  serverUrl: string;     // ws://host:port  (no trailing slash)
+  serverKey: string;     // sk_... from SHADOWLINK_ADMIN_CREDS.txt
+  workspaceId: string;   // [A-Za-z0-9_-]{1,64}; identical for all members
+  sharedFolder: string;  // vault-relative folder, e.g. "Shared" (no leading/trailing slash)
 }
 
 export interface ServerEntry {
@@ -57,4 +66,5 @@ export const DEFAULT_SETTINGS: ShadowLinkSettings = {
   showJoinLeaveNotifications: true,
   autoRejoinRecentRooms: false,
   activeRoom: null,
+  share: { serverUrl: '', serverKey: '', workspaceId: '', sharedFolder: '' },
 };
