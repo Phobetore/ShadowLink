@@ -4,21 +4,10 @@
 // headlessly testable core that every stateful P1 module is built on, and it must
 // also run on Obsidian mobile, where node builtins do not exist.
 
-// Node's type stripping resolves ESM specifiers literally, so the runtime import
-// below must carry the '.ts' extension — which TypeScript 4.7 rejects outright
-// (`allowImportingTsExtensions` only arrived in TS 5.0). The checker is therefore
-// silenced on that one line and the values are re-bound with the real module's
-// types immediately after, so nothing here degrades to `any`. Type-only imports
-// need no extension: they are erased before Node ever sees them.
-import type { NodeFields } from './types';
-// @ts-ignore -- see note above
-import * as constantsModule from './constants.ts';
-
-const {
-  MAX_REL_PATH_LEN,
-  RECOVERED_DIR,
-  STAGING_DIR,
-}: typeof import('./constants') = constantsModule;
+// Node's type stripping resolves ESM specifiers literally, so relative imports of
+// local modules carry the '.ts' extension (`allowImportingTsExtensions` in tsconfig).
+import type { NodeFields } from './types.ts';
+import { MAX_REL_PATH_LEN, RECOVERED_DIR, STAGING_DIR } from './constants.ts';
 
 /** Windows device names that cannot exist as files even on POSIX vaults synced to Windows. */
 const RESERVED_BASENAMES = new Set([
