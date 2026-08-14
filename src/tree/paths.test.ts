@@ -191,3 +191,56 @@ test('dead nodes are excluded from the assignment', () => {
   assert.equal(out.has('AAAAAAAAAAAAAAAAAAAAAA'), false);
   assert.equal(out.get('BBBBBBBBBBBBBBBBBBBBBB'), 'todo.md');
 });
+
+// ── Hardening regressions (found in review of this slice) ────────────────────
+
+// Spec §7: any segment starting with '.' is out of scope. Without this, a peer could
+// materialize files under a dot-directory that Obsidian's explorer never shows.
+test('validateRel rejects leading-dot segments', () => {
+  assert.equal(validateRel('.obsidian', 'notes.md', 'f'), false);
+  assert.equal(validateRel('.git', 'x.md', 'f'), false);
+  assert.equal(validateRel('a/.trash', 'x.md', 'f'), false);
+  assert.equal(validateRel('', '.hidden.md', 'f'), false);
+  assert.equal(validateRel('', '.md', 'f'), false);
+  assert.equal(validateRel('', '.DS_Store', 'f'), false);
+  assert.equal(validateRel('', '.obsidian', 'd'), false);
+  // a dot INSIDE a segment is ordinary and must still pass
+  assert.equal(validateRel('2024.Q1', 'ok.md', 'f'), true);
+});
+
+test('validateRel rejects DEL and other control characters', () => {
+  assert.equal(validateRel('', 'a\x7fb.md', 'f'), false);
+  assert.equal(validateRel('a\x7fb', 'x.md', 'f'), false);
+});
+
+// withSuffix must split off the directory first: suffixing the whole relative path
+// would mangle a dotted DIRECTORY name and place the file in a different folder.
+test('collision suffixing never mangles the directory component', () => {
+  const out = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', { k: 'f', d: '2024.Q1', n: 'README', g: 1, c: 0 }],
+    ['BBBBBBBBBBBBBBBBBBBBBB', { k: 'f', d: '2024.Q1', n: 'README', g: 1, c: 0 }],
+  ]);
+  assert.equal(out.get('AAAAAAAAAAAAAAAAAAAAAA'), '2024.Q1/README');
+  assert.equal(out.get('BBBBBBBBBBBBBBBBBBBBBB'), '2024.Q1/README (2)');
+  // the dotted folder must be untouched on both
+  for (const p of out.values()) assert.ok(p.startsWith('2024.Q1/'), `mangled dir: ${p}`);
+});
+
+test('collision suffixing keeps the extension last for normal notes', () => {
+  const out = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', node({ d: 'x.y', n: 'todo.md' })],
+    ['BBBBBBBBBBBBBBBBBBBBBB', node({ d: 'x.y', n: 'todo.md' })],
+  ]);
+  assert.equal(out.get('BBBBBBBBBBBBBBBBBBBBBB'), 'x.y/todo (2).md');
+});
+
+test('assertInsideShare rejects empty path segments', () => {
+  assert.equal(assertInsideShare('Shared', 'Shared//a.md'), false);
+  assert.equal(assertInsideShare('Shared', 'Shared/'), false);
+  assert.equal(assertInsideShare('Shared', 'Shared/a.md'), true);
+});
+
+test('isLive treats an empty cascade root as covering everything', () => {
+  assert.equal(isLive(node({ d: 'Anywhere', g: 1, x: 1, xp: '' })), false);
+  assert.equal(isLive(node({ d: 'Anywhere', g: 1, x: 1, xp: 'Archive' })), true);
+});

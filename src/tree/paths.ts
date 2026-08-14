@@ -26,7 +26,7 @@ const RESERVED_BASENAMES = new Set([
  * Trailing spaces are rejected separately in validSegment().
  */
 // eslint-disable-next-line no-control-regex
-const ILLEGAL_NAME_CHARS = /[/\\<>:"|?*\x00-\x1f]/;
+const ILLEGAL_NAME_CHARS = /[/\\<>:"|?*\x00-\x1f\x7f]/;
 
 /** The share-relative path of a node. `path` is never stored — this is the only derivation. */
 export function relPath(f: Pick<NodeFields, 'd' | 'n'>): string {
@@ -63,6 +63,12 @@ export async function hashOf(text: string): Promise<string> {
 
 function validSegment(seg: string): boolean {
   if (seg === '' || seg === '.' || seg === '..') return false;
+  // Spec §7: reject the whole leading-dot class, not a denylist — .obsidian, .trash,
+  // .git, .DS_Store and any future dot-state. Inbound, this stops a peer materializing
+  // files under a dot-directory, which Obsidian's explorer does not show and the user
+  // therefore cannot see or manage. Outbound, it stops dotfiles inside the share being
+  // adopted and published.
+  if (seg.startsWith('.')) return false;
   if (ILLEGAL_NAME_CHARS.test(seg)) return false;
   if (seg !== seg.trimEnd()) return false;  // trailing space
   if (seg.endsWith('.')) return false;      // trailing dot
@@ -98,7 +104,9 @@ export function assertInsideShare(shareRoot: string, path: string, allowReserved
   if (typeof path !== 'string' || path.length === 0) return false;
   if (path.includes('\\')) return false;
   for (const seg of path.split('/')) {
-    if (seg === '.' || seg === '..') return false;
+    // An empty segment means a doubled or trailing slash ('Shared//a.md', 'Shared/').
+    // Not an escape, but such a string would reach the vault API verbatim.
+    if (seg === '' || seg === '.' || seg === '..') return false;
   }
   const root = shareRoot.replace(/\/+$/, '');
   if (allowReserved) {
@@ -122,15 +130,32 @@ export function isUnderDir(dir: string, root: string): boolean {
  */
 export function isLive(f: NodeFields): boolean {
   if (f.x === undefined || f.x < f.g) return true;
-  if (f.xp !== undefined && !isUnderDir(f.d, f.xp)) return true;
+  // `xp === ''` would mean the cascade root is the share root itself, under which
+  // everything lives — nothing can escape it. Guarding here keeps a malformed node
+  // from reading as live instead of dead.
+  if (f.xp !== undefined && f.xp !== '' && !isUnderDir(f.d, f.xp)) return true;
   return false;
 }
 
-/** `todo.md` + 2 -> `todo (2).md`; `Notes` + 2 -> `Notes (2)`. */
-function withSuffix(name: string, ordinal: number): string {
+/**
+ * `todo.md` + 2 -> `todo (2).md`; `Notes` + 2 -> `Notes (2)`.
+ *
+ * Splits off the directory component FIRST. Suffixing the whole relative path would
+ * find the last dot anywhere in it, so a file with no extension inside a dotted folder
+ * (`2024.Q1/README`) would become `2024 (2).Q1/README` — mangling the DIRECTORY and
+ * placing the file in a different, newly created folder. Valid `.md` files always keep
+ * the last dot in the basename, so that path is unreachable through validateRel today;
+ * doing the split makes it impossible by construction rather than by caller contract.
+ */
+function withSuffix(rel: string, ordinal: number): string {
+  const slash = rel.lastIndexOf('/');
+  const dir = slash === -1 ? '' : rel.slice(0, slash + 1);
+  const name = slash === -1 ? rel : rel.slice(slash + 1);
   const dot = name.lastIndexOf('.');
-  if (dot <= 0) return `${name} (${ordinal})`;
-  return `${name.slice(0, dot)} (${ordinal})${name.slice(dot)}`;
+  const suffixed = dot <= 0
+    ? `${name} (${ordinal})`
+    : `${name.slice(0, dot)} (${ordinal})${name.slice(dot)}`;
+  return dir + suffixed;
 }
 
 /**
