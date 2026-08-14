@@ -120,3 +120,81 @@ export function assertInsideShare(shareRoot: string, path: string, allowReserved
   if (root === '') return false;
   return path === root || path.startsWith(root + '/');
 }
+
+/** True when `dir` is `root` itself or lies beneath it. Pure string containment. */
+export function isUnderDir(dir: string, root: string): boolean {
+  return dir === root || dir.startsWith(root + '/');
+}
+
+/**
+ * Liveness is a pure function of converged fields — no clocks, no ordering.
+ * A node is dead when its tombstone generation has caught up with its generation,
+ * UNLESS it was killed by a folder cascade (`xp`) and has since escaped that folder.
+ */
+export function isLive(f: NodeFields): boolean {
+  if (f.x === undefined || f.x < f.g) return true;
+  if (f.xp !== undefined && !isUnderDir(f.d, f.xp)) return true;
+  return false;
+}
+
+/** `todo.md` + 2 -> `todo (2).md`; `Notes` + 2 -> `Notes (2)`. */
+function withSuffix(name: string, ordinal: number): string {
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return `${name} (${ordinal})`;
+  return `${name.slice(0, dot)} (${ordinal})${name.slice(dot)}`;
+}
+
+/**
+ * Assign a concrete vault path (share-relative) to every LIVE node, resolving
+ * collisions at derive time. Never writes to the tree: write-back would ping-pong
+ * against concurrent renames.
+ *
+ * Rules (all deterministic, all independent of iteration order and wall clocks):
+ *  - Dead nodes get no path.
+ *  - Directories are never suffixed: two live dir nodes at one path ARE one directory.
+ *  - Among colliding files, the lowest nodeId keeps the plain name; the rest are
+ *    suffixed " (2)", " (3)", ... in nodeId order.
+ *  - A directory outranks a file at the same path.
+ */
+export function suffixedVaultPath(
+  entries: Array<[string, NodeFields]>,
+): Map<string, string> {
+  const live = entries
+    .filter(([, f]) => isLive(f))
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+
+  const out = new Map<string, string>();
+  // fold(relPath) -> how many FILES have already taken that path
+  const taken = new Map<string, number>();
+
+  // Directories first: they own their path outright and never collide with each other.
+  for (const [id, f] of live) {
+    if (f.k !== 'd') continue;
+    const rel = relPath(f);
+    out.set(id, rel);
+    taken.set(fold(rel), 1);
+  }
+
+  for (const [id, f] of live) {
+    if (f.k !== 'f') continue;
+    const rel = relPath(f);
+    const key = fold(rel);
+    const used = taken.get(key) ?? 0;
+    if (used === 0) {
+      out.set(id, rel);
+      taken.set(key, 1);
+      continue;
+    }
+    let ordinal = used + 1;
+    let candidate = withSuffix(rel, ordinal);
+    while (taken.has(fold(candidate))) {
+      ordinal += 1;
+      candidate = withSuffix(rel, ordinal);
+    }
+    out.set(id, candidate);
+    taken.set(key, ordinal);
+    taken.set(fold(candidate), 1);
+  }
+
+  return out;
+}

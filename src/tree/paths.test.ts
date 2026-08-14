@@ -97,3 +97,97 @@ test('hashOf normalizes line endings', async () => {
   assert.equal(await hashOf('a\r\nb\r\n'), await hashOf('a\nb\n'));
   assert.notEqual(await hashOf('a\nb\n'), await hashOf('a\nb'));
 });
+
+import { isLive, isUnderDir, suffixedVaultPath } from './paths.ts';
+
+const node = (o: Partial<NodeFields>): NodeFields =>
+  ({ k: 'f', d: '', n: 'a.md', g: 1, c: 0, ...o });
+
+// Spec test A8
+test('isLive truth table', () => {
+  assert.equal(isLive(node({})), true);                          // never deleted
+  assert.equal(isLive(node({ g: 2, x: 1 })), true);              // x < g: resurrected
+  assert.equal(isLive(node({ g: 1, x: 1 })), false);             // x === g: dead
+  assert.equal(isLive(node({ g: 1, x: 2 })), false);             // x > g: dead
+  assert.equal(isLive(node({ g: 2, x: 1, xa: 5 })), true);       // resurrect wins
+});
+
+// Spec test A9 — the "child moved out of a deleted folder survives" property.
+test('isLive cascade escape by move', () => {
+  const stillInside = node({ d: 'Archive/sub', n: 'k.md', g: 1, x: 1, xp: 'Archive' });
+  assert.equal(isLive(stillInside), false);
+  const movedOut = node({ d: 'Active', n: 'k.md', g: 1, x: 1, xp: 'Archive' });
+  assert.equal(isLive(movedOut), true);
+});
+
+// Spec test A10 — the same property when the folder is renamed rather than the child moved.
+test('isLive cascade escape by folder rename', () => {
+  const descendants = ['G', 'G/sub', 'G/sub/deep'].map((d) =>
+    node({ d, n: 'k.md', g: 1, x: 1, xp: 'F' }));
+  for (const n of descendants) assert.equal(isLive(n), true);
+});
+
+test('isUnderDir matches only true descendants', () => {
+  assert.equal(isUnderDir('Archive', 'Archive'), true);
+  assert.equal(isUnderDir('Archive/sub', 'Archive'), true);
+  assert.equal(isUnderDir('ArchiveOld', 'Archive'), false);
+  assert.equal(isUnderDir('Active', 'Archive'), false);
+});
+
+// Spec test A11
+test('suffixedVaultPath is deterministic regardless of insertion order', () => {
+  const entries: Array<[string, NodeFields]> = [
+    ['ZZZZZZZZZZZZZZZZZZZZZZ', node({ n: 'todo.md' })],
+    ['AAAAAAAAAAAAAAAAAAAAAA', node({ n: 'todo.md' })],
+    ['MMMMMMMMMMMMMMMMMMMMMM', node({ n: 'todo.md' })],
+  ];
+  const forward = suffixedVaultPath(entries);
+  const backward = suffixedVaultPath([...entries].reverse());
+  assert.deepEqual(forward, backward);
+  // lowest nodeId keeps the plain name
+  assert.equal(forward.get('AAAAAAAAAAAAAAAAAAAAAA'), 'todo.md');
+  const others = ['MMMMMMMMMMMMMMMMMMMMMM', 'ZZZZZZZZZZZZZZZZZZZZZZ'].map((id) => forward.get(id));
+  assert.deepEqual(others.sort(), ['todo (2).md', 'todo (3).md']);
+});
+
+// Spec test A12
+test('suffixedVaultPath ignores ctime', () => {
+  const base: Array<[string, NodeFields]> = [
+    ['AAAAAAAAAAAAAAAAAAAAAA', node({ n: 'todo.md', c: 1 })],
+    ['BBBBBBBBBBBBBBBBBBBBBB', node({ n: 'todo.md', c: 2 })],
+  ];
+  const skewed: Array<[string, NodeFields]> = [
+    ['AAAAAAAAAAAAAAAAAAAAAA', node({ n: 'todo.md', c: 999_999 })],
+    ['BBBBBBBBBBBBBBBBBBBBBB', node({ n: 'todo.md', c: -5 })],
+  ];
+  assert.deepEqual(suffixedVaultPath(base), suffixedVaultPath(skewed));
+});
+
+// Spec test A13 — duplicate folders deduplicate instead of forking.
+test('directories are never suffixed', () => {
+  const out = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', node({ k: 'd', n: 'Projects' })],
+    ['BBBBBBBBBBBBBBBBBBBBBB', node({ k: 'd', n: 'Projects' })],
+  ]);
+  assert.equal(out.get('AAAAAAAAAAAAAAAAAAAAAA'), 'Projects');
+  assert.equal(out.get('BBBBBBBBBBBBBBBBBBBBBB'), 'Projects');
+});
+
+// Spec test A14
+test('a folder beats a file at the same path', () => {
+  const out = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', node({ k: 'f', n: 'Notes.md' })],
+    ['BBBBBBBBBBBBBBBBBBBBBB', node({ k: 'd', n: 'Notes.md' })],
+  ]);
+  assert.equal(out.get('BBBBBBBBBBBBBBBBBBBBBB'), 'Notes.md');
+  assert.equal(out.get('AAAAAAAAAAAAAAAAAAAAAA'), 'Notes (2).md');
+});
+
+test('dead nodes are excluded from the assignment', () => {
+  const out = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', node({ n: 'todo.md', g: 1, x: 1 })],
+    ['BBBBBBBBBBBBBBBBBBBBBB', node({ n: 'todo.md' })],
+  ]);
+  assert.equal(out.has('AAAAAAAAAAAAAAAAAAAAAA'), false);
+  assert.equal(out.get('BBBBBBBBBBBBBBBBBBBBBB'), 'todo.md');
+});
