@@ -9,6 +9,16 @@ export interface ShadowLinkSettings {
   autoRejoinRecentRooms: boolean;
   activeRoom: ActiveRoom | null;
   share: ShareConfig;
+  /**
+   * Spec §2.5: 16 random hex characters, minted once and then never again.
+   *
+   * It lives in `data.json` rather than in the device-state file it names,
+   * because that file is only trusted when it already agrees with this value —
+   * storing the identity inside the thing it authenticates would make every copy
+   * of the file self-authenticating, which is exactly what the check exists to
+   * prevent. Empty means "not minted yet".
+   */
+  deviceId: string;
 }
 
 /** P0 single shared-folder configuration. Generalized to a list in P1. */
@@ -67,4 +77,5 @@ export const DEFAULT_SETTINGS: ShadowLinkSettings = {
   autoRejoinRecentRooms: false,
   activeRoom: null,
   share: { serverUrl: '', serverKey: '', workspaceId: '', sharedFolder: '' },
+  deviceId: '',
 };

@@ -30,11 +30,12 @@ export class SettingsTab extends PluginSettingTab {
         }),
       );
 
-    containerEl.createEl('h3', { text: 'Shared workspace (P0)' });
+    containerEl.createEl('h3', { text: 'Shared workspace' });
     containerEl.createEl('p', {
       text:
-        'All members must use the same Server URL, Server key and Workspace ID, and a shared folder ' +
-        'of the same name. Toggle the plugin off and on after changing these to apply them.',
+        'All members must use the same Server URL, Server key and Workspace ID. The shared folder ' +
+        'is local to this vault and may be named differently on each device. Toggle the plugin ' +
+        'off and on after changing any of these to apply them.',
       cls: 'setting-item-description',
     });
 
@@ -77,6 +78,31 @@ export class SettingsTab extends PluginSettingTab {
           this.plugin.settings.share.sharedFolder = v.replace(/^\/+|\/+$/g, '');
           await this.plugin.saveSettings();
         }),
+      );
+
+    containerEl.createEl('h3', { text: 'This device' });
+
+    // Spec §2.5: the device-state file is named after this id and is trusted only
+    // when it names this id back. Showing it is what makes
+    // `state-<workspace>-<device>.json` in the plugin folder identifiable when
+    // somebody is looking at a vault that several machines have written to.
+    new Setting(containerEl)
+      .setName('Device ID')
+      .setDesc(
+        'Generated once for this vault on this machine. ShadowLink ignores any device-state '
+        + 'file that names a different one.',
+      )
+      .addText((t) => {
+        t.setValue(this.plugin.settings.deviceId || '(not yet generated)');
+        t.setDisabled(true);
+      });
+
+    new Setting(containerEl)
+      .setName('Sync status')
+      .setDesc(
+        this.plugin.configured
+          ? 'Configured. The status bar shows whether syncing is running or paused.'
+          : 'Not configured yet — fill in every field above, then reload the plugin.',
       );
   }
 }

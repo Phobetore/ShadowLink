@@ -222,17 +222,36 @@ export class ObsidianVaultPort implements VaultPort {
   /**
    * The `TAbstractFile` at `path`, resolved case-insensitively.
    *
-   * The fast path is Obsidian's own lookup; the fallback is a folded scan of the
-   * loaded-file index, because on a folding filesystem the reconciler's tree-cased
-   * path and the disk's literal casing routinely differ (I11).
+   * The fast path is Obsidian's own lookup, which is a case-SENSITIVE map read
+   * and therefore misses a case-variant neighbour — the exact miss invariant I11
+   * names, after which `vault.create` truncates the file it never saw. The
+   * fallback walks the folder tree segment by segment, comparing each segment
+   * FOLDED against the real names.
+   *
+   * Segment-wise is not incidental (SD-5): `fold` is `toLowerCase` on an NFC
+   * string, case mapping is neither length-preserving nor guaranteed to
+   * distribute over concatenation, so folding a whole path and slicing it is
+   * unsound. It is also what keeps the fallback proportional to the siblings
+   * along one path rather than to the size of the vault.
    */
   private resolve(path: string): TAbstractFile | null {
     const p = normPath(path);
+    if (p === '') return null;
     const direct = this.vault.getAbstractFileByPath(p);
     if (direct !== null) return direct;
-    const key = fold(p);
-    for (const file of this.vault.getAllLoadedFiles()) {
-      if (fold(normPath(file.path)) === key) return file;
+
+    const segments = p.split('/');
+    let folder: TFolder = this.vault.getRoot();
+    for (let i = 0; i < segments.length; i++) {
+      const want = fold(segments[i]);
+      let match: TAbstractFile | null = null;
+      for (const child of folder.children) {
+        if (fold(child.name) === want) { match = child; break; }
+      }
+      if (match === null) return null;
+      if (i === segments.length - 1) return match;
+      if (!(match instanceof TFolder)) return null;      // a file cannot hold children
+      folder = match;
     }
     return null;
   }
