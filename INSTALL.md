@@ -259,13 +259,29 @@ Environment variables, all optional:
 | Variable | Default | What it does |
 |---|---|---|
 | `PORT` | `4000` | Port to listen on |
-| `PERSISTENCE_DIR` | `./data` | Where the shared documents and the key file live |
+| `PERSISTENCE_DIR` | `./data` | Where the shared documents, attachments and the key file live |
+| `MAX_FILE_SIZE_MB` | `100` | Largest single attachment the server will store |
+| `MAX_TOTAL_STORAGE_GB` | `10` | Ceiling on the whole attachment store. `0` means no limit |
+| `INCOMPLETE_UPLOAD_TTL_HOURS` | `24` | How long a half-finished upload waits to be resumed before it is discarded |
+| `MAX_BLOB_CONCURRENCY` | `6` | Attachment transfers at once per shared folder, so uploads cannot crowd out typing |
+| `BLOB_CHUNK_BYTES` | `4194304` | Size of the pieces an upload is cut into (4 MB) |
+| `BLOB_ORPHAN_TTL_DAYS` | `90` | How long an attachment nothing references is kept. Only the cleanup tool reads this — the server never removes an attachment on its own |
+
+A value that is not a whole number is refused at startup rather than ignored: a
+typo in a limit would otherwise remove it instead of changing it.
 
 To use them:
 
 ```bash
 PORT=5000 PERSISTENCE_DIR=/var/lib/shadowlink npm run server
 ```
+
+**About the attachment limits.** `MAX_FILE_SIZE_MB` is 100 because the plugin
+holds a whole attachment in memory to verify it — on a phone as well as on a
+laptop — so a larger ceiling is a promise the other end cannot keep. When the
+store is full, or a file is over the limit, nothing breaks and nothing is
+deleted: that attachment stays unshared, the sender keeps retrying on its own
+schedule, and it goes through once you raise the limit or free some space.
 
 Back up `PERSISTENCE_DIR`. It holds the server's copy of the share and the key
 file. Everyone's vault also holds a full copy of every note, so losing it is
