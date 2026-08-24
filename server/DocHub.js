@@ -12,7 +12,7 @@ import { join, dirname } from 'node:path';
 import {
   mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, rmSync,
 } from 'node:fs';
-import { mkdir, writeFile, rename } from 'node:fs/promises';
+import { mkdir, writeFile, rename, rm } from 'node:fs/promises';
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -288,8 +288,45 @@ export class DocHub {
     const tmp = `${p}.tmp`;
     await mkdir(dirname(p), { recursive: true });
     await writeFile(tmp, Buffer.from(Y.encodeStateAsUpdate(doc)));
-    await rename(tmp, p);
+    await this._renameWithRetry(tmp, p);
     this._persistCounts.set(docName, this.writeCount(docName) + 1);
+  }
+
+  /**
+   * POSIX `rename` over an existing path is atomic and cannot fail because
+   * somebody is reading the destination. Windows is not POSIX: replacing a file
+   * that any other handle has open — a concurrent reader, an antivirus scanner,
+   * a backup agent — fails with EPERM, EACCES or EBUSY. The condition is
+   * transient, so the fix is to retry it briefly rather than to give up.
+   *
+   * This is not theoretical: it is what CI caught on windows-latest that a Linux
+   * run and this developer's own Windows machine both missed. Without the retry
+   * the snapshot silently keeps its PREVIOUS contents while a `.tmp` piles up
+   * beside it, so a server stopped soon after loses that state on restart.
+   *
+   * If every attempt fails, the temp file is removed — an incomplete snapshot is
+   * never the file to load, and leaving it would let one failing room fill the
+   * disk — and the error is rethrown for the caller to record.
+   */
+  async _renameWithRetry(tmp, p, attempts = 5, delayMs = 25) {
+    const TRANSIENT = new Set(['EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY']);
+    for (let i = 0; ; i++) {
+      try {
+        await this._rename(tmp, p);
+        return;
+      } catch (err) {
+        if (i >= attempts - 1 || !TRANSIENT.has(err?.code)) {
+          await rm(tmp, { force: true }).catch(() => { /* best effort */ });
+          throw err;
+        }
+        await new Promise((resolve) => { setTimeout(resolve, delayMs * (i + 1)); });
+      }
+    }
+  }
+
+  /** Indirection so a test can drive the retry path deterministically. */
+  _rename(from, to) {
+    return rename(from, to);
   }
 
   // Test/diagnostic helper.

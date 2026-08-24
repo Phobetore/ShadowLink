@@ -261,3 +261,97 @@ test('flushAllSync writes every resident doc atomically', async () => {
   hub.cancelPending();
   rmSync(dir, { recursive: true });
 });
+
+// ── Windows rename contention (found by CI on windows-latest) ────────────────
+//
+// POSIX rename over an existing path cannot fail because somebody is reading the
+// destination. Windows can: a concurrent reader, an antivirus scan or a backup
+// agent holding the snapshot open makes the replace fail with EPERM/EACCES/EBUSY.
+// Without a retry the snapshot silently keeps its previous contents and a `.tmp`
+// is left beside it — a server stopped soon after loses that state.
+
+test('a transient rename failure is retried and the snapshot still lands', async () => {
+  const dir = tempDir();
+  const hub = new DocHub(dir, { persistDebounceMs: 0 });
+
+  let attempts = 0;
+  const real = hub._rename.bind(hub);
+  hub._rename = async (from, to) => {
+    attempts += 1;
+    if (attempts <= 2) {
+      const err = new Error('EPERM: operation not permitted, rename');
+      err.code = 'EPERM';
+      throw err;
+    }
+    return real(from, to);
+  };
+
+  const a = new FakeConn();
+  hub.handleConnection(a, 'ws/retry');
+  const client = new Y.Doc();
+  client.getText('content').insert(0, 'survives contention');
+  a.emit('message', syncUpdateFrame(client));
+  await hub.flush('ws/retry');
+
+  const path = SNAP(dir, 'ws/retry');
+  assert.ok(attempts >= 3, `expected the rename to be retried, saw ${attempts} attempt(s)`);
+  assert.equal(decodeSnapshot(path).getText('content').toString(), 'survives contention');
+  assert.ok(!existsSync(`${path}.tmp`), 'a temp file was left behind');
+  assert.equal(hub.lastPersistError.get('ws/retry'), undefined, 'a retried write must not report an error');
+
+  hub.cancelPending();
+  rmSync(dir, { recursive: true });
+});
+
+test('a rename that never succeeds removes the temp file and reports the error', async () => {
+  const dir = tempDir();
+  const hub = new DocHub(dir, { persistDebounceMs: 0 });
+
+  hub._rename = async () => {
+    const err = new Error('EPERM: operation not permitted, rename');
+    err.code = 'EPERM';
+    throw err;
+  };
+
+  const a = new FakeConn();
+  hub.handleConnection(a, 'ws/doomed');
+  const client = new Y.Doc();
+  client.getText('content').insert(0, 'never lands');
+  a.emit('message', syncUpdateFrame(client));
+  await hub.flush('ws/doomed');
+
+  const path = SNAP(dir, 'ws/doomed');
+  // The temp file must not survive: an incomplete snapshot is never the file to
+  // load, and one failing room would otherwise fill the disk.
+  assert.ok(!existsSync(`${path}.tmp`), 'the temp file of a failed write was left behind');
+  assert.equal(hub.lastPersistError.get('ws/doomed')?.code, 'EPERM');
+
+  hub.cancelPending();
+  rmSync(dir, { recursive: true });
+});
+
+test('a non-transient rename failure is not retried', async () => {
+  const dir = tempDir();
+  const hub = new DocHub(dir, { persistDebounceMs: 0 });
+
+  let attempts = 0;
+  hub._rename = async () => {
+    attempts += 1;
+    const err = new Error('ENOSPC: no space left on device, rename');
+    err.code = 'ENOSPC';
+    throw err;
+  };
+
+  const a = new FakeConn();
+  hub.handleConnection(a, 'ws/nospace');
+  const client = new Y.Doc();
+  client.getText('content').insert(0, 'x');
+  a.emit('message', syncUpdateFrame(client));
+  await hub.flush('ws/nospace');
+
+  assert.equal(attempts, 1, 'a full disk is not a contention problem; retrying only wastes time');
+  assert.equal(hub.lastPersistError.get('ws/nospace')?.code, 'ENOSPC');
+
+  hub.cancelPending();
+  rmSync(dir, { recursive: true });
+});
