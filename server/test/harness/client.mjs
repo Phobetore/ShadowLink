@@ -151,6 +151,16 @@ export class Client {
     this._events = [];
     this._eventsEnabled = false;
 
+    /**
+     * Per-item failures reported by the most recent reconcile pass.
+     *
+     * A pass that threw `RetryLater` on a content doc did not converge, it
+     * DEFERRED — the file it was asked to materialize is still missing and the
+     * next pass is expected to fetch it. `settleAll` reads this so that it keeps
+     * pumping instead of counting a deferral as a quiet round.
+     */
+    this.lastFailures = [];
+
     this.vault = new WatchedVault({}, (ev) => this._onVaultEvent(ev));
     this.vault.seed(SHARE_ROOT, 'd');
 
@@ -406,7 +416,8 @@ export class Client {
       const beforeCalls = this.mutationCount();
       const beforeTree = this.treeFingerprint();
       this.dirty = false;
-      await this.reconciler.reconcile('remote');
+      const result = await this.reconciler.reconcile('remote');
+      this.lastFailures = result.failures ?? [];
       await this.drainEvents();
       const changed = this.mutationCount() !== beforeCalls
         || this.treeFingerprint() !== beforeTree;
@@ -486,22 +497,45 @@ export class Client {
 
 /**
  * Pump every client until the whole workspace is quiet: nothing left to
- * reconcile locally and nothing new arriving from the server.
+ * reconcile locally, nothing deferred to a later pass, and nothing new arriving
+ * from the server.
+ *
+ * The clients handed here are ones the caller expects to be SYNCING. A client
+ * that never got past `boot` mutates nothing and therefore looks perfectly quiet
+ * — which is how a tree provider that failed to sync used to surface three
+ * hundred lines later as "only 0 live nodes", a sentence about a symptom rather
+ * than about the cause. Say the cause instead.
  */
 export async function settleAll(clients, { rounds = 25, waitMs = 60 } = {}) {
+  for (const client of clients) {
+    if (client.bootstrap.phase !== 'ready') {
+      throw new Error(
+        `${client.name} is not syncing (phase ${client.bootstrap.phase}): `
+        + `${client.bootstrap.readOnlyReason ?? 'no reason recorded'}`,
+      );
+    }
+  }
+
   let quietRounds = 0;
   let maxWork = 0;
   for (let r = 0; r < rounds; r++) {
     await sleep(waitMs);
     let changed = false;
+    let deferred = false;
     for (const client of clients) {
       const before = `${client.mutationCount()}|${client.treeFingerprint()}`;
       const work = await client.settle();
       if (work > maxWork) maxWork = work;
       const after = `${client.mutationCount()}|${client.treeFingerprint()}`;
       if (before !== after || client.dirty) changed = true;
+      if (client.lastFailures.length > 0) deferred = true;
     }
-    quietRounds = changed ? 0 : quietRounds + 1;
+    // A pass that reported per-item failures changed nothing precisely BECAUSE
+    // it could not — a content doc that had not synced yet leaves the file it
+    // was going to write still missing. Reading that as quiet is what let this
+    // pump exit with a client half-materialized, and every assertion afterwards
+    // then described a state nobody was still waiting for.
+    quietRounds = (changed || deferred) ? 0 : quietRounds + 1;
     // Two consecutive silent rounds: one for the local fixpoint, one to prove
     // nothing was still in flight when the first one ended.
     if (quietRounds >= 2) return { rounds: r + 1, maxWork, converged: true };
