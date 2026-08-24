@@ -10,11 +10,18 @@
 // Every path here is SHARE-RELATIVE. Prefixing shareRoot is the reconciler's
 // job (spec §4.4 `vaultPathOf`), so this module never needs to know it.
 
-import type { NodeFields } from './types.ts';
-import { fold, isLive, relPath, splitRel, suffixedVaultPath, validateRel } from './paths.ts';
+import type { NodeFields, NodeKind } from './types.ts';
+import {
+  fold, isLive, isPublished, parseBlobRef, relPath, splitRel, suffixedVaultPath, validateRel,
+  type BlobRef,
+} from './paths.ts';
 
 export interface DerivedTree {
-  /** nodeId -> share-relative path, for LIVE, VALID, SEEDED file nodes only. */
+  /**
+   * nodeId -> share-relative path, for LIVE, VALID, PUBLISHED content nodes —
+   * notes and attachments alike. "Published" is `isPublished`, one predicate for
+   * both kinds.
+   */
   files: Map<string, string>;
   /** share-relative paths of every live valid directory node, plus every ancestor implied by a file. */
   folders: Set<string>;
@@ -24,7 +31,14 @@ export interface DerivedTree {
   deadFold: Set<string>;
   /** dead directory paths, for the empty-folder sweep. */
   deadFolders: Set<string>;
-  /** live valid file nodes whose content has never been published (s unset) — never materialized (I6). */
+  /**
+   * live valid content nodes that are not published — never materialized (I6).
+   *
+   * A note is here while `s` is unset. An attachment is here while `s` is unset OR
+   * its `b` does not parse: such a node is NOT invalid, because its path is
+   * perfectly good; it simply names no bytes anybody could fetch, so it is
+   * diagnosed here, never materialized and never deleted.
+   */
   pending: string[];
   /** node ids rejected by validateRel — skipped entirely, never deleted (I10). */
   invalid: string[];
@@ -49,8 +63,11 @@ export interface DerivedTree {
    * fold(relPath) -> the most recently deleted node at that path, for the bounded
    * resurrect of §5.6. Greatest `xa` wins; a tie breaks on the lowest nodeId, so
    * the answer never depends on iteration order.
+   *
+   * `k` travels with the entry so a resurrect can refuse to cross kinds: a `.png`
+   * recreated where a note died is a different file that merely shares a name.
    */
-  deadByFoldRel: Map<string, { nodeId: string; xa?: number; xh?: string }>;
+  deadByFoldRel: Map<string, { nodeId: string; k: NodeKind; xa?: number; xh?: string }>;
 
   /**
    * nodeId -> share-relative path WITH collision suffixes applied, for every LIVE
@@ -58,6 +75,15 @@ export interface DerivedTree {
    * it just observed on disk and writes nothing when the two already agree.
    */
   derivedPath: Map<string, string>;
+
+  /**
+   * nodeId -> the parsed `b` of every LIVE, VALID, PUBLISHED `'b'` node.
+   *
+   * Parsed once here so the reconciler never re-parses per pass, and so "which
+   * bytes belong at this path" has exactly one answer per derivation. A node
+   * missing from this map is one nothing may fetch bytes for.
+   */
+  blobs: Map<string, BlobRef>;
 }
 
 /**
@@ -89,10 +115,16 @@ function compareIds(a: string, b: string): number {
  * `folders`, which is a different question — what to create, not what to
  * reserve).
  *
- * Unseeded and dead nodes contribute nothing: I6 says an unpublished node
+ * Unpublished and dead nodes contribute nothing: I6 says an unpublished node
  * reserves neither its path nor the folders that path would have needed, and a
  * dead node's folder is one nobody will create. Either would otherwise push a
  * perfectly materializable file off the path it is entitled to.
+ *
+ * The published test here MUST be the same predicate the main loop uses. If the
+ * two disagree — say this one accepts an attachment whose `b` does not parse — the
+ * folder that node implies is reserved for a directory `folders` never contains,
+ * and the file that wanted the name is suffixed off it for ever. That is the CF-4
+ * bug class, and it was paid for once already in P1.
  *
  * Computed from the STORED path rather than the derived one, which is exact
  * rather than approximate: `suffixedVaultPath` splits the directory off before
@@ -106,7 +138,7 @@ function impliedDirPaths(valid: Array<[string, NodeFields]>): string[] {
 
   for (const [, f] of valid) {
     if (!isLive(f)) continue;
-    if (f.k === 'f' && !f.s) continue;
+    if (f.k !== 'd' && !isPublished(f)) continue;
     for (const anc of ancestorsOf(relPath(f))) {
       const key = fold(anc);
       if (seen.has(key)) continue;
@@ -139,7 +171,8 @@ export function deriveTree(entries: Array<[string, NodeFields]>): DerivedTree {
   const pending: string[] = [];
   const invalid: string[] = [];
   const liveByFoldRel = new Map<string, string>();
-  const deadByFoldRel = new Map<string, { nodeId: string; xa?: number; xh?: string }>();
+  const deadByFoldRel = new Map<string, { nodeId: string; k: NodeKind; xa?: number; xh?: string }>();
+  const blobs = new Map<string, BlobRef>();
 
   // Validity gate FIRST (I10). An invalid node is skipped entirely — never
   // materialized, never renamed to, never counted as occupying a path, and
@@ -191,7 +224,7 @@ export function deriveTree(entries: Array<[string, NodeFields]>): DerivedTree {
       // real timestamp: such a node can never pass the resurrect window anyway.
       const previous = deadByFoldRel.get(key);
       if (previous === undefined || wins(f.xa, id, previous.xa, previous.nodeId)) {
-        deadByFoldRel.set(key, { nodeId: id, xa: f.xa, xh: f.xh });
+        deadByFoldRel.set(key, { nodeId: id, k: f.k, xa: f.xa, xh: f.xh });
       }
       continue;
     }
@@ -212,7 +245,16 @@ export function deriveTree(entries: Array<[string, NodeFields]>): DerivedTree {
 
     // I6: an unpublished node is never materialized by anyone, so it reserves
     // nothing — not the path, and not the folders that path would have needed.
-    if (!f.s) { pending.push(id); continue; }
+    // `isPublished` is the same predicate `impliedDirPaths` uses above; the two
+    // gates are one rule, and splitting them is the CF-4 bug class.
+    if (!isPublished(f)) { pending.push(id); continue; }
+
+    if (f.k === 'b') {
+      // Non-null by construction — `isPublished` just proved this parses — but the
+      // narrowing is done honestly rather than asserted away.
+      const ref = parseBlobRef(f.b);
+      if (ref !== null) blobs.set(id, ref);
+    }
 
     files.set(id, path);
     wantAtFold.set(fold(path), id);
@@ -228,6 +270,6 @@ export function deriveTree(entries: Array<[string, NodeFields]>): DerivedTree {
 
   return {
     files, folders, wantAtFold, deadFold, deadFolders, pending, invalid,
-    liveByFoldRel, deadByFoldRel, derivedPath,
+    liveByFoldRel, deadByFoldRel, derivedPath, blobs,
   };
 }

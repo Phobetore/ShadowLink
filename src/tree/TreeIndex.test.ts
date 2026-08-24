@@ -134,7 +134,7 @@ test('deadByFoldRel keeps the most recently deleted node at a path, ties by lowe
   ]);
 
   assert.deepEqual(t.deadByFoldRel.get(fold('Notes/gone.md')), {
-    nodeId: newer, xa: 200, xh: 'new',
+    nodeId: newer, k: 'f', xa: 200, xh: 'new',
   }, 'greatest xa wins, whatever the case of the stored name');
   assert.equal(t.deadByFoldRel.get(fold('tied.md'))?.nodeId, tiedLow, 'ties break on nodeId');
   assert.equal(t.deadByFoldRel.size, 2);
@@ -475,4 +475,139 @@ test('a dead child implies no folder either', () => {
     [nid('child'), { k: 'f', d: 'Notes.md', n: 'child.md', g: 1, c: 0, s: 1, x: 1, xa: 5 }],
   ]);
   assert.equal(out.files.get(nid('file')), 'Notes.md');
+});
+
+// ── P2 §2.4: attachment nodes in the derivation ──────────────────────────────
+
+const SHA_1 = 'a'.repeat(64);
+const SHA_2 = 'b'.repeat(64);
+
+/** A published attachment node: `s` AND a parseable reference (§2.2 isPublished). */
+const attachment = (d: string, n: string, extra: Partial<NodeFields> = {}): NodeFields =>
+  ({ k: 'b', d, n, g: 1, c: 0, s: 1, b: `${SHA_1}:12:-`, ...extra });
+
+// Spec test A8 ⚠
+test('a published attachment is a first-class file in the derivation', () => {
+  const id = nid('a');
+  const t = deriveTree([[id, attachment('Notes/img', 'diagram.png')]]);
+
+  assert.equal(t.files.get(id), 'Notes/img/diagram.png');
+  assert.equal(t.wantAtFold.get(fold('Notes/img/diagram.png')), id);
+  assert.equal(t.derivedPath.get(id), 'Notes/img/diagram.png');
+  assert.equal(t.liveByFoldRel.get(fold('Notes/img/diagram.png')), id);
+  assert.deepEqual([...t.folders].sort(), ['Notes', 'Notes/img']);
+  assert.deepEqual(t.pending, []);
+  assert.deepEqual(t.invalid, []);
+  assert.deepEqual(t.blobs.get(id), { sha256: SHA_1, bytes: 12, parent: null });
+});
+
+// Spec test A8 ⚠, the other half: I6 says an unpublished node reserves NOTHING —
+// not its path and not the folders that path would have needed. Both `deriveTree`
+// gates have to agree about that, or an attachment nobody can materialize pushes a
+// note off the path it is entitled to (the CF-4 bug class).
+test('an unpublished attachment appears only in pending and reserves nothing', () => {
+  const noRef = nid('a');       // `s` set, no reference at all
+  const badRef = nid('b');      // `s` set, reference does not parse
+  const noSeed = nid('c');      // reference present, never published
+  const note = nid('d');
+
+  const t = deriveTree([
+    [noRef, attachment('Assets', 'one.png', { b: undefined })],
+    [badRef, attachment('Assets', 'two.png', { b: 'not-a-reference' })],
+    [noSeed, attachment('Assets', 'three.png', { s: undefined })],
+    [note, seeded('Notes', 'todo.md')],
+  ]);
+
+  assert.deepEqual(t.pending, [noRef, badRef, noSeed].sort());
+  assert.deepEqual([...t.files.keys()], [note]);
+  assert.equal(t.blobs.size, 0);
+  // A reference that does not parse is NOT invalid: the node's path is fine, so it
+  // is diagnosed through `pending`, never materialized and never deleted (I10).
+  assert.deepEqual(t.invalid, []);
+
+  for (const path of ['Assets/one.png', 'Assets/two.png', 'Assets/three.png']) {
+    assert.equal(t.wantAtFold.has(fold(path)), false, `${path} must reserve no path`);
+  }
+  assert.equal(t.folders.has('Assets'), false, 'and no ancestor folder either');
+  assert.deepEqual([...t.folders], ['Notes']);
+});
+
+// The two gates must use ONE predicate. If `impliedDirPaths` treated an
+// unpublishable attachment as published while the main loop did not, the folder it
+// implies would be reserved for a directory that `folders` never contains — and
+// the note that wanted that name would be suffixed off it for ever.
+test('an unpublished attachment does not push a note off its own path', () => {
+  const ghost = nid('a');
+  const note = nid('b');
+  const t = deriveTree([
+    // A stand-in directory would be reserved at `Notes.md` if the implied-dirs gate
+    // disagreed with the main loop, and that is exactly what the note is called.
+    [ghost, attachment('Notes.md', 'ghost.png', { s: undefined })],
+    [note, seeded('', 'Notes.md')],
+  ]);
+
+  assert.equal(t.files.get(note), 'Notes.md', 'the note keeps its plain name');
+  assert.equal(t.derivedPath.get(note), 'Notes.md');
+  assert.equal(t.folders.size, 0);
+  assert.deepEqual(t.pending, [ghost]);
+});
+
+// Spec test A9
+test('deadByFoldRel carries the kind, so a resurrect can refuse to cross kinds', () => {
+  const deadBlob = nid('a');
+  const deadNote = nid('b');
+  const deadDir = nid('c');
+  const t = deriveTree([
+    [deadBlob, attachment('', 'gone.png', { x: 1, xa: 9, xh: SHA_2 })],
+    [deadNote, seeded('', 'gone.md', { x: 1, xa: 9, xh: 'texthash' })],
+    [deadDir, dir('', 'Gone', { x: 1, xa: 9 })],
+  ]);
+
+  assert.deepEqual(t.deadByFoldRel.get(fold('gone.png')), {
+    nodeId: deadBlob, k: 'b', xa: 9, xh: SHA_2,
+  });
+  assert.equal(t.deadByFoldRel.get(fold('gone.md'))?.k, 'f');
+  assert.equal(t.deadByFoldRel.get(fold('Gone'))?.k, 'd');
+  assert.equal(t.blobs.size, 0, 'a dead attachment names no bytes to fetch');
+});
+
+// Spec test A9, the order-independence half — with blob nodes mixed in.
+test('deriveTree stays order-independent with attachments in the set', () => {
+  const entries: Entry[] = [
+    [nid('a'), attachment('Assets', 'diagram.png')],
+    [nid('b'), attachment('Assets', 'diagram.png', { b: `${SHA_2}:99:${SHA_1}` })],  // collides
+    [nid('c'), attachment('Assets', 'DIAGRAM.PNG')],                                 // folds onto it
+    [nid('d'), attachment('Assets', 'pending.png', { s: undefined })],
+    [nid('e'), attachment('Assets', 'broken.png', { b: 'nope' })],
+    [nid('f'), attachment('Assets', 'gone.png', { x: 1, xa: 4 })],
+    [nid('g'), attachment('', '.hidden.png')],                                       // invalid
+    [nid('h'), attachment('', 'payload.exe')],                                       // invalid
+    [nid('i'), seeded('Assets', 'notes.md')],
+    [nid('j'), dir('', 'Assets')],
+  ];
+
+  const reference = deriveTree(entries);
+  for (let seed = 1; seed <= 25; seed++) {
+    assert.deepEqual(deriveTree(shuffle(entries, seed)), reference, `shuffle seed ${seed}`);
+  }
+  assert.deepEqual(reference.invalid, [nid('g'), nid('h')]);
+  assert.deepEqual(reference.pending, [nid('d'), nid('e')]);
+  assert.equal(reference.blobs.size, 3);
+  assert.deepEqual(reference.blobs.get(nid('b')), { sha256: SHA_2, bytes: 99, parent: SHA_1 });
+});
+
+// The reconciler reads `blobs` instead of re-parsing `b` on every pass, so it must
+// hold exactly the nodes it is safe to fetch for: live, valid and published.
+test('blobs holds only live valid published attachments', () => {
+  const live = nid('a');
+  const t = deriveTree([
+    [live, attachment('', 'keep.png')],
+    [nid('b'), attachment('', 'dead.png', { x: 1, xa: 1 })],
+    [nid('c'), attachment('', 'unpublished.png', { s: undefined })],
+    [nid('d'), attachment('', 'payload.exe')],
+    [nid('e'), seeded('', 'note.md')],
+    [nid('f'), dir('', 'Folder')],
+  ]);
+
+  assert.deepEqual([...t.blobs.keys()], [live]);
 });

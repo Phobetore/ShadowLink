@@ -471,3 +471,62 @@ test('validateRel refuses a kind it does not recognize', () => {
     assert.equal(validateRel('', 'a.png', kind as unknown as NodeKind), false, String(kind));
   }
 });
+
+// ── P2 §2.4: attachments get derived paths, in ONE collision namespace ───────
+
+const blobRef = `${'c'.repeat(64)}:12:-`;
+const blob = (o: Partial<NodeFields>): NodeFields =>
+  ({ k: 'b', d: '', n: 'diagram.png', g: 1, c: 0, s: 1, b: blobRef, ...o });
+
+// Spec test A6 ⚠ — the second loop used to skip everything that was not an `'f'`,
+// which left an attachment node with NO derived path at all: silent and total,
+// and every later slice would have been reading an empty map.
+test('a live attachment node is assigned a derived path', () => {
+  const out = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', blob({ d: 'Notes/img' })],
+  ]);
+  assert.equal(out.get('AAAAAAAAAAAAAAAAAAAAAA'), 'Notes/img/diagram.png');
+});
+
+test('attachments and notes suffix in one namespace, and a folder still outranks both', () => {
+  const out = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', blob({})],
+    ['BBBBBBBBBBBBBBBBBBBBBB', blob({})],
+    ['CCCCCCCCCCCCCCCCCCCCCC', blob({ n: 'Diagram.PNG' })],   // folds onto the same path
+  ]);
+  assert.equal(out.get('AAAAAAAAAAAAAAAAAAAAAA'), 'diagram.png');
+  assert.deepEqual(
+    [out.get('BBBBBBBBBBBBBBBBBBBBBB'), out.get('CCCCCCCCCCCCCCCCCCCCCC')].sort(),
+    ['Diagram (3).PNG', 'diagram (2).png'],
+  );
+
+  // One namespace, not two: a note and an attachment at one folded path must not
+  // each keep the plain name. (validateRel makes this pair unreachable through the
+  // tree — a `.png` is never an `'f'` — but the RANKING rule is what is asserted
+  // here, and it is what stops two kinds claiming one path.)
+  const mixed = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', { k: 'f', d: '', n: 'x.md', g: 1, c: 0, s: 1 }],
+    ['BBBBBBBBBBBBBBBBBBBBBB', blob({ n: 'x.md' })],
+    ['CCCCCCCCCCCCCCCCCCCCCC', { k: 'd', d: '', n: 'Notes', g: 1, c: 0 }],
+  ]);
+  assert.equal(mixed.get('AAAAAAAAAAAAAAAAAAAAAA'), 'x.md');
+  assert.equal(mixed.get('BBBBBBBBBBBBBBBBBBBBBB'), 'x (2).md');
+  assert.equal(mixed.get('CCCCCCCCCCCCCCCCCCCCCC'), 'Notes');
+
+  // A directory outranks an attachment exactly as it outranks a note.
+  const folder = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', blob({ n: 'Assets' })],
+    ['BBBBBBBBBBBBBBBBBBBBBB', { k: 'd', d: '', n: 'Assets', g: 1, c: 0 }],
+  ]);
+  assert.equal(folder.get('BBBBBBBBBBBBBBBBBBBBBB'), 'Assets');
+  assert.equal(folder.get('AAAAAAAAAAAAAAAAAAAAAA'), 'Assets (2)');
+});
+
+test('a dead attachment node is excluded from the assignment like any other node', () => {
+  const out = suffixedVaultPath([
+    ['AAAAAAAAAAAAAAAAAAAAAA', blob({ x: 1 })],
+    ['BBBBBBBBBBBBBBBBBBBBBB', blob({})],
+  ]);
+  assert.equal(out.has('AAAAAAAAAAAAAAAAAAAAAA'), false);
+  assert.equal(out.get('BBBBBBBBBBBBBBBBBBBBBB'), 'diagram.png');
+});

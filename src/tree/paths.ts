@@ -323,8 +323,10 @@ function withSuffix(rel: string, ordinal: number): string {
  *  - Dead nodes get no path.
  *  - Directories are never suffixed: two live dir nodes at one path ARE one directory.
  *  - Among colliding files, the lowest nodeId keeps the plain name; the rest are
- *    suffixed " (2)", " (3)", ... in nodeId order.
- *  - A directory outranks a file at the same path.
+ *    suffixed " (2)", " (3)", ... in nodeId order. Notes and attachments share ONE
+ *    namespace here: they are both ordinary files on disk, so two of them at one
+ *    path collide exactly as two notes would.
+ *  - A directory outranks a file — of either kind — at the same path.
  */
 export function suffixedVaultPath(
   entries: Array<[string, NodeFields]>,
@@ -345,8 +347,12 @@ export function suffixedVaultPath(
     taken.set(fold(rel), 1);
   }
 
+  // Everything that is not a directory is a file on disk — a note or an attachment.
+  // Testing `k !== 'f'` here would leave every `'b'` node with NO derived path at
+  // all, which is silent and total: nothing would materialize it and nothing would
+  // report why.
   for (const [id, f] of live) {
-    if (f.k !== 'f') continue;
+    if (f.k === 'd') continue;
     const rel = relPath(f);
     const key = fold(rel);
     const used = taken.get(key) ?? 0;
