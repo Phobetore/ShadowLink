@@ -31,9 +31,15 @@ engine — the reconciler, the watcher, deletions, publication, bootstrap — ru
 headless under `node --test`. That is the point of the port layer; please keep it
 that way.
 
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the technical tour. Read the
-sections on the data model and the invariants before changing anything under
-`src/tree/` or `src/sync/`.
+Before changing anything under `src/tree/` or `src/sync/`, read the module you
+are touching from the top. Each one opens with a comment explaining what it is
+for and, more usefully, which failure the odd-looking parts are there to prevent
+— those comments are the design record, and they are kept accurate on purpose.
+[README.md](README.md#for-developers) has the short tour of how the pieces fit.
+
+If something looks over-careful, it is usually because the straightforward
+version was tried and lost somebody's file. Ask in an issue before simplifying
+it.
 
 ## What has to pass
 

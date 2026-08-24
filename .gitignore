@@ -33,3 +33,7 @@ test-*.js
 /data/
 server/data/*
 !server/data/.gitkeep
+
+# Internal design record: audit, specs, implementation plans.
+# Working material, kept locally and out of the published repository.
+docs/

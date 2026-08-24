@@ -210,15 +210,24 @@ npm run build               # type-check, then bundle main.js
 npm run server              # start the server
 ```
 
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the technical tour: the data
-model, the reconciliation pass, and the invariants that each exist because a
-specific failure was found without them.
-[CONTRIBUTING.md](CONTRIBUTING.md) covers how to get a change accepted.
+A short tour of how it fits together:
 
-The full design record lives in [`docs/`](docs/) — the audit that started the
-rewrite, the competitive analysis, the design specification, and every
-implementation plan, including the bugs found along the way and why the rejected
-alternatives were rejected.
+- **`src/tree/`** — the shared data model. The folder's structure is one Yjs
+  document per workspace: a flat map of nodes, each holding its parent directory
+  and its name. A path is *derived* from those two, never stored, which is why
+  two people moving folders into each other cannot create a loop.
+- **`src/sync/`** — the engine. `Reconciler` brings the disk to what the tree
+  describes, in one idempotent pass that recomputes rather than patches.
+  `VaultWatcher` goes the other way, with handlers written as "make the tree
+  match reality" so they are safe to replay. `Deletions` decides, per file,
+  between the vault trash and a rescue. Everything reaches the outside world
+  through a port with an in-memory fake.
+- **`server/`** — a document hub relaying the standard Yjs protocol, with the
+  shared key checked at the WebSocket upgrade before any data flows.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers how to get a change accepted, and the
+rules that are not negotiable — chiefly that nothing is ever hard-deleted, and
+that a failure is never allowed to look like a deletion.
 
 <br>
 
