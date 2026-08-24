@@ -1,0 +1,1002 @@
+// src/sync/VaultWatcher.test.ts
+//
+// Spec §10 Group B, tests 44-57 (this file) and 45-47/58-60 (added by the delete
+// slice below the same fixtures).
+//
+// Everything here drives the handlers with PLAIN PATHS, exactly as P1c will after
+// it adapts `vault.on('create', f => watcher.onCreate(f.path, kindOf(f)))`. No
+// Obsidian objects, no real timers: the coalesced batches are flushed by hand.
+//
+// The load-bearing test is 44. It replays every mutation a real reconciler pass
+// performed back through the handlers with the ticket book empty, and demands
+// ZERO tree writes. Tickets are an optimization (I9); idempotence (I8) is the
+// mechanism, and 44 is what proves the mechanism is actually there.
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+import { RESURRECT_WINDOW_MS, TICKET_TTL_MS } from '../tree/constants.ts';
+import { fold, hashOf, isLive, relPath } from '../tree/paths.ts';
+import { TreeDoc } from '../tree/TreeDoc.ts';
+import type { NodeFields } from '../tree/types.ts';
+import { Deletions } from './Deletions.ts';
+import { DeviceState, type StatePort } from './DeviceState.ts';
+import { FakeDocs, FakeVault } from './fakes.ts';
+import { Reconciler } from './Reconciler.ts';
+import { Tickets } from './Tickets.ts';
+import type { Kind } from './VaultPort.ts';
+import { VaultWatcher, type Phase, type WatcherDeps } from './VaultWatcher.ts';
+
+// ---------------------------------------------------------------- fixtures
+
+const SHARE = 'Shared';
+const NOW = 1_700_000_000_000;
+
+class MemoryStatePort implements StatePort {
+  private readonly store = new Map<string, string>();
+
+  async read(key: string): Promise<string | null> {
+    const v = this.store.get(key);
+    return v === undefined ? null : v;
+  }
+
+  async write(key: string, data: string): Promise<void> {
+    this.store.set(key, data);
+  }
+}
+
+interface Harness {
+  vault: FakeVault;
+  docs: FakeDocs;
+  tree: TreeDoc;
+  state: DeviceState;
+  tickets: Tickets;
+  watcher: VaultWatcher;
+  /** Transactions the tree observed, local and remote alike (I9). */
+  counts: { txns: number };
+  notices: string[];
+  readOnly: string[];
+  reconciles: string[];
+  published: string[];
+  shareRootWrites: string[];
+  bulkPrompts: number[];
+  unsharePrompts: Array<{ path: string; count: number }>;
+  now: () => number;
+  setClock: (ms: number) => void;
+  setPhase: (p: Phase) => void;
+  shareRoot: () => string;
+  resetCounts: () => void;
+}
+
+function makeHarness(over: Partial<WatcherDeps> = {}): Harness {
+  let clock = NOW;
+  let phase: Phase = 'ready';
+  let shareRoot = SHARE;
+
+  const now = (): number => clock;
+  const vault = new FakeVault();
+  const docs = new FakeDocs();
+  const tree = new TreeDoc();
+  const state = new DeviceState(new MemoryStatePort(), 'device-1', 'ws-1', now, 0);
+  const tickets = new Tickets(now);
+
+  const counts = { txns: 0 };
+  const notices: string[] = [];
+  const readOnly: string[] = [];
+  const reconciles: string[] = [];
+  const published: string[] = [];
+  const shareRootWrites: string[] = [];
+  const bulkPrompts: number[] = [];
+  const unsharePrompts: Array<{ path: string; count: number }> = [];
+
+  tree.observe(() => { counts.txns += 1; });
+
+  const watcher = new VaultWatcher({
+    tree,
+    entries: () => tree.entries(),
+    vault,
+    state,
+    tickets,
+    getShareRoot: () => shareRoot,
+    setShareRoot: (next) => { shareRoot = next; shareRootWrites.push(next); },
+    displayName: 'Ada',
+    phase: () => phase,
+    now,
+    notice: (m) => { notices.push(m); },
+    enterReadOnly: (r) => { readOnly.push(r); },
+    scheduleReconcile: (c) => { reconciles.push(c); },
+    enqueuePublish: (id) => { published.push(id); },
+    confirmLocalBulkDelete: async (count) => { bulkPrompts.push(count); return true; },
+    confirmUnshare: async (path, count) => { unsharePrompts.push({ path, count }); return 'unshare'; },
+    ...over,
+  });
+
+  return {
+    vault, docs, tree, state, tickets, watcher, counts,
+    notices, readOnly, reconciles, published, shareRootWrites, bulkPrompts, unsharePrompts,
+    now,
+    setClock: (ms) => { clock = ms; },
+    setPhase: (p) => { phase = p; },
+    shareRoot: () => shareRoot,
+    resetCounts: () => { counts.txns = 0; },
+  };
+}
+
+/** Mint a node directly in the tree, as a peer would have. */
+function mint(tree: TreeDoc, f: Omit<NodeFields, 'g' | 'c'> & { g?: number; c?: number }): string {
+  return tree.createNode(f, NOW);
+}
+
+function fieldsOf(tree: TreeDoc): Array<{ id: string; k: Kind; rel: string; g: number; live: boolean }> {
+  return tree.entries()
+    .map(([id, f]) => ({ id, k: f.k, rel: relPath(f), g: f.g, live: isLive(f) }))
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+}
+
+/** The whole tree as comparable plain data — what tests 49 and 50 compare. */
+function layout(tree: TreeDoc): Array<[string, NodeFields]> {
+  return tree.entries().sort((a, b) => (a[0] < b[0] ? -1 : 1));
+}
+
+// ---------------------------------------------------------------- I14 / share root
+
+// 51. The shared folder is never a node: renaming it moves the MOUNT, and writes
+// nothing at all into the tree.
+test('51: renaming the share root follows it and writes nothing', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: 'Notes', n: 'todo.md', s: 1 });
+  h.resetCounts();
+
+  await h.watcher.onRename('Projects/Shared', SHARE, 'd');
+
+  assert.equal(h.counts.txns, 0, 'zero tree writes');
+  assert.deepEqual(h.shareRootWrites, ['Projects/Shared']);
+  assert.equal(h.shareRoot(), 'Projects/Shared');
+  assert.equal(h.notices.length, 1, 'the user is told the mount moved');
+  assert.equal(h.tree.size(), 1);
+  assert.equal(relPath(h.tree.get(id)!), 'Notes/todo.md', 'the layout is unchanged');
+});
+
+// 52. A vanished share root is a wrong mount, never evidence that the user
+// deleted every note in it (I2).
+test('52: deleting the share root enters read-only and writes no tombstone', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.resetCounts();
+
+  await h.watcher.onDelete(SHARE, 'd');
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(h.readOnly.length, 1);
+  assert.equal(h.tree.get(id)!.x, undefined, 'zero tombstones');
+});
+
+// 53. An ANCESTOR of the share moved. The stored root is rewritten segment-wise;
+// nothing about the tree changed, because the tree is share-relative.
+test('53: renaming an ancestor of the share rewrites the stored root only', async () => {
+  let root = 'Work/Team';
+  const h = makeHarness({
+    getShareRoot: () => root,
+    setShareRoot: (next) => { root = next; },
+  });
+  const id = mint(h.tree, { k: 'f', d: 'Notes', n: 'todo.md', s: 1 });
+  h.resetCounts();
+
+  await h.watcher.onRename('Work2', 'Work', 'd');
+
+  assert.equal(root, 'Work2/Team', 'rewritten segment-wise, not by string arithmetic');
+  assert.equal(h.counts.txns, 0, 'zero tree writes');
+  assert.equal(relPath(h.tree.get(id)!), 'Notes/todo.md');
+});
+
+test('deleting an ancestor of the share enters read-only', async () => {
+  let root = 'Work/Team';
+  const h = makeHarness({ getShareRoot: () => root, setShareRoot: (n) => { root = n; } });
+  mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.resetCounts();
+
+  await h.watcher.onDelete('Work', 'd');
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.readOnly.length, 1);
+  assert.equal(h.counts.txns, 0);
+});
+
+// I14 is checked BEFORE the phase gate, so a share-root move during bootstrap is
+// followed rather than replayed later against a mount that no longer exists.
+test('the share-root guard runs before the phase gate', async () => {
+  const h = makeHarness();
+  h.setPhase('boot');
+
+  await h.watcher.onRename('Elsewhere/Shared', SHARE, 'd');
+
+  assert.deepEqual(h.shareRootWrites, ['Elsewhere/Shared']);
+  assert.equal(h.watcher.pendingEventCount, 0, 'not queued — handled');
+});
+
+// ---------------------------------------------------------------- I9 / phase gate
+
+test('events arriving before ready are queued and replayed, never dropped (I9)', async () => {
+  const h = makeHarness();
+  h.setPhase('boot');
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.tree.size(), 0, 'nothing written while booting');
+  assert.equal(h.watcher.pendingEventCount, 1);
+
+  h.setPhase('ready');
+  await h.watcher.flushPending();
+
+  assert.equal(h.tree.size(), 1);
+  assert.equal(h.watcher.pendingEventCount, 0);
+  assert.equal(relPath(h.tree.get(h.tree.entries()[0][0])!), 'todo.md');
+});
+
+test('a queued create that the tree already describes writes nothing on replay (I8)', async () => {
+  const h = makeHarness();
+  h.setPhase('boot');
+  mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+  h.resetCounts();
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+  h.setPhase('ready');
+  await h.watcher.flushPending();
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(h.tree.size(), 1);
+});
+
+// ---------------------------------------------------------------- onCreate
+
+test('a local create mints one node, claims ownership and enqueues a publish (I5)', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/Notes`, 'd');
+  h.vault.seed(`${SHARE}/Notes/todo.md`, 'f', 'body');
+
+  await h.watcher.onCreate(`${SHARE}/Notes/todo.md`, 'f');
+
+  assert.equal(h.tree.size(), 1);
+  const [id, f] = h.tree.entries()[0];
+  assert.deepEqual(
+    { k: f.k, d: f.d, n: f.n, g: f.g },
+    { k: 'f', d: 'Notes', n: 'todo.md', g: 1 },
+  );
+  assert.equal(f.s, undefined, 'the publisher sets `s`, not the watcher');
+  assert.equal(h.state.data.owned[id], true);
+  assert.deepEqual(h.published, [id]);
+  assert.equal(h.state.data.materialized[id], `${SHARE}/Notes/todo.md`);
+});
+
+test('a local folder create mints a dir node and enqueues no publish', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+
+  await h.watcher.onCreate(`${SHARE}/Notes`, 'd');
+
+  assert.equal(h.tree.size(), 1);
+  assert.equal(h.tree.entries()[0][1].k, 'd');
+  assert.deepEqual(h.published, []);
+  assert.deepEqual(h.state.data.owned, {});
+});
+
+// The shared folder itself is not a node (I14), and neither is anything outside it.
+test('creates outside the share, and of the share root itself, are ignored', async () => {
+  const h = makeHarness();
+  await h.watcher.onCreate('Elsewhere/todo.md', 'f');
+  await h.watcher.onCreate(SHARE, 'd');
+  await h.watcher.onCreate('ShadowLink Recovered/rescued.md', 'f');
+  assert.equal(h.tree.size(), 0);
+});
+
+test('an unsyncable local path is never adopted', async () => {
+  const h = makeHarness();
+  await h.watcher.onCreate(`${SHARE}/image.png`, 'f');       // not markdown (§7)
+  await h.watcher.onCreate(`${SHARE}/.hidden/note.md`, 'f'); // dot segment (§7)
+  assert.equal(h.tree.size(), 0);
+});
+
+test('a ticket swallows exactly the echo of our own create', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+  h.tickets.arm('create', `${SHARE}/todo.md`);
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+  assert.equal(h.tree.size(), 0, 'the echo is suppressed');
+
+  // Single-shot: a SECOND create at the same path is a real user action.
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+  assert.equal(h.tree.size(), 1, 'a ticket never mutes twice');
+});
+
+// I13. `declinedPaths` holds fold(VAULT path) — the same key Deletions writes
+// when it rescues a file or when the user keeps their copies.
+test('a create at a declined path is never re-shared (I13)', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/kept.md`, 'f', 'body');
+  h.state.data.declinedPaths.push(fold(`${SHARE}/kept.md`));
+
+  await h.watcher.onCreate(`${SHARE}/kept.md`, 'f');
+
+  assert.equal(h.tree.size(), 0);
+  assert.deepEqual(h.published, []);
+});
+
+// I8 through the FOLDER set: `Notes` is implied by `Notes/todo.md`, so the tree
+// already describes a folder there and a folder node would be pure duplication.
+// This is what makes `ensureDirs`' echo harmless once its ticket has expired.
+test('a create for a folder the tree already implies mints nothing', async () => {
+  const h = makeHarness();
+  mint(h.tree, { k: 'f', d: 'Notes/Deep', n: 'todo.md', s: 1 });
+  h.resetCounts();
+
+  await h.watcher.onCreate(`${SHARE}/Notes`, 'd');
+  await h.watcher.onCreate(`${SHARE}/Notes/Deep`, 'd');
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(h.tree.size(), 1);
+});
+
+test('a create at a live node\'s COLLISION-SUFFIXED path binds instead of forking', async () => {
+  const h = makeHarness();
+  const a = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  const b = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  const high = a < b ? b : a;
+  h.resetCounts();
+
+  await h.watcher.onCreate(`${SHARE}/todo (2).md`, 'f');
+
+  assert.equal(h.counts.txns, 0, 'the suffixed path is already the tree\'s doing');
+  assert.equal(h.tree.size(), 2);
+  assert.equal(h.state.data.materialized[high], `${SHARE}/todo (2).md`);
+});
+
+// ---------------------------------------------------------------- 48 / onRename
+
+// 48. The reason the index is recomputed for LOCAL transactions too: without it
+// the rename cannot see the node the create just minted, and forks it.
+test('48: create-then-rename with no reconcile in between does not fork the node', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/Untitled.md`, 'f', '');
+
+  await h.watcher.onCreate(`${SHARE}/Untitled.md`, 'f');
+  await h.watcher.onRename(`${SHARE}/Roadmap.md`, `${SHARE}/Untitled.md`, 'f');
+
+  assert.equal(h.tree.size(), 1, 'exactly ONE node');
+  const [id, f] = h.tree.entries()[0];
+  assert.equal(f.n, 'Roadmap.md');
+  assert.equal(f.d, '');
+  assert.equal(h.state.data.materialized[id], `${SHARE}/Roadmap.md`);
+});
+
+test('a move rewrites `d` and keeps the node — and its content doc room — intact', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.resetCounts();
+
+  await h.watcher.onRename(`${SHARE}/Archive/todo.md`, `${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.counts.txns, 1, 'one transaction');
+  assert.equal(h.tree.size(), 1);
+  assert.deepEqual(
+    { d: h.tree.get(id)!.d, n: h.tree.get(id)!.n },
+    { d: 'Archive', n: 'todo.md' },
+  );
+});
+
+test('a rename whose destination the tree already describes writes nothing (I8)', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: 'Archive', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.resetCounts();
+
+  await h.watcher.onRename(`${SHARE}/Archive/todo.md`, `${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(h.state.data.materialized[id], `${SHARE}/Archive/todo.md`, 'rebound only');
+});
+
+// Found by mutation probe: with the I8 early-return removed the suite stayed
+// green, because in the simple cases the recomputed patch is empty anyway. It is
+// NOT empty for a collision-suffixed node — there the handler would write the
+// derived suffix back into `n` and rename the node for the whole workspace, which
+// is precisely the write-back §1.4 forbids.
+test('the echo of a move never writes a collision suffix back into the node', async () => {
+  const h = makeHarness();
+  const a = mint(h.tree, { k: 'f', d: 'Archive', n: 'todo.md', s: 1 });
+  const b = mint(h.tree, { k: 'f', d: 'Archive', n: 'todo.md', s: 1 });
+  const high = a < b ? b : a;
+  // The reconciler has just moved the suffixed file from where it used to live.
+  h.state.data.materialized[high] = `${SHARE}/Notes/todo (2).md`;
+  h.resetCounts();
+
+  await h.watcher.onRename(
+    `${SHARE}/Archive/todo (2).md`,
+    `${SHARE}/Notes/todo (2).md`,
+    'f',
+  );
+
+  assert.equal(h.counts.txns, 0, 'the tree already said this (I8)');
+  assert.deepEqual(
+    { d: h.tree.get(high)!.d, n: h.tree.get(high)!.n },
+    { d: 'Archive', n: 'todo.md' },
+    'the suffix is a DERIVED path and is never written back',
+  );
+  assert.equal(h.state.data.materialized[high], `${SHARE}/Archive/todo (2).md`);
+});
+
+// Found by mutation probe: a binding can outlive the node it names — a declined
+// or failed deletion leaves the file on disk and the binding in place. Editing a
+// tombstone's `d`/`n` would drag a dead node around the tree behind the user's back.
+test('a rename never edits a node that is already dead (§5.7 mints a new one)', async () => {
+  const h = makeHarness();
+  const gone = mint(h.tree, { k: 'f', d: '', n: 'gone.md', s: 1 });
+  h.tree.patchNode(gone, { x: 1, xa: NOW - 60_000, xb: 'Ann' });
+  h.state.data.materialized[gone] = `${SHARE}/gone.md`;      // the user kept their copy
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/kept.md`, 'f', 'my notes');
+  h.resetCounts();
+
+  await h.watcher.onRename(`${SHARE}/kept.md`, `${SHARE}/gone.md`, 'f');
+
+  const dead = h.tree.get(gone)!;
+  assert.equal(dead.n, 'gone.md', 'the tombstone is not dragged to the new name');
+  assert.equal(isLive(dead), false);
+  assert.equal(h.tree.size(), 2);
+  const fresh = h.tree.entries().find(([id]) => id !== gone)!;
+  assert.equal(fresh[1].n, 'kept.md');
+  assert.equal(fresh[1].g, 1);
+});
+
+test('a rename claimed by a ticket is the echo of our own move', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.tickets.arm('rename', `${SHARE}/todo.md`, `${SHARE}/Archive/todo.md`);
+  h.resetCounts();
+
+  await h.watcher.onRename(`${SHARE}/Archive/todo.md`, `${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(h.tree.get(id)!.d, '', 'the tree already said what it meant');
+});
+
+test('a rename into the share from outside is a create', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+
+  await h.watcher.onRename(`${SHARE}/todo.md`, 'Inbox/todo.md', 'f');
+
+  assert.equal(h.tree.size(), 1);
+  assert.equal(h.tree.entries()[0][1].n, 'todo.md');
+});
+
+test('a rename entirely outside the share is ignored', async () => {
+  const h = makeHarness();
+  await h.watcher.onRename('B/todo.md', 'A/todo.md', 'f');
+  assert.equal(h.tree.size(), 0);
+  assert.equal(h.watcher.pendingDecision.size, 0);
+});
+
+// ---------------------------------------------------------------- 49 / 50
+
+/** A folder node plus `count` file nodes under it, all seeded. */
+function seedFolder(h: Harness, rel: string, count: number): { folder: string; children: string[] } {
+  const folder = mint(h.tree, { k: 'd', d: '', n: rel });
+  const children: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const id = mint(h.tree, { k: 'f', d: rel, n: `note-${String(i).padStart(3, '0')}.md`, s: 1 });
+    h.state.data.materialized[id] = `${SHARE}/${rel}/note-${String(i).padStart(3, '0')}.md`;
+    children.push(id);
+  }
+  h.state.data.materialized[folder] = `${SHARE}/${rel}`;
+  return { folder, children };
+}
+
+// 49. Obsidian MAY fan a folder rename out into one event per descendant. Each
+// of those hits the idempotence check and writes nothing.
+test('49: a folder rename plus 400 descendant events is one transaction and 400 no-ops', async () => {
+  const h = makeHarness();
+  const { folder, children } = seedFolder(h, 'Folder', 400);
+  h.resetCounts();
+  const sizeBefore = h.tree.size();
+
+  await h.watcher.onRename(`${SHARE}/Renamed`, `${SHARE}/Folder`, 'd');
+  assert.equal(h.counts.txns, 1, 'the folder and all 400 descendants in ONE transaction');
+
+  for (let i = 0; i < 400; i++) {
+    const name = `note-${String(i).padStart(3, '0')}.md`;
+    await h.watcher.onRename(`${SHARE}/Renamed/${name}`, `${SHARE}/Folder/${name}`, 'f');
+  }
+
+  assert.equal(h.counts.txns, 1, '400 descendant events wrote nothing');
+  assert.equal(h.tree.size(), sizeBefore, 'no node was minted or lost');
+  assert.equal(h.tree.get(folder)!.n, 'Renamed');
+  for (const id of children) assert.equal(h.tree.get(id)!.d, 'Renamed');
+  // Every descendant's FILE moved too, so its local binding has to move with it.
+  // Found by mutation probe: without this the next reconcile sees 400 bindings
+  // pointing at paths that no longer exist and re-derives them all from scratch.
+  assert.equal(h.state.data.materialized[folder], `${SHARE}/Renamed`);
+  assert.equal(h.state.data.materialized[children[0]], `${SHARE}/Renamed/note-000.md`);
+  assert.equal(h.state.data.materialized[children[399]], `${SHARE}/Renamed/note-399.md`);
+});
+
+// 50. The same rename with NO descendant events must reach the same tree. 49+50
+// together are what make the design independent of Obsidian's event fan-out.
+test('50: a folder rename without descendant events reaches an identical tree', async () => {
+  const withEvents = makeHarness();
+  const without = makeHarness();
+  const seeded = [withEvents, without].map((h) => seedFolder(h, 'Folder', 20));
+
+  await withEvents.watcher.onRename(`${SHARE}/Renamed`, `${SHARE}/Folder`, 'd');
+  for (let i = 0; i < 20; i++) {
+    const name = `note-${String(i).padStart(3, '0')}.md`;
+    await withEvents.watcher.onRename(`${SHARE}/Renamed/${name}`, `${SHARE}/Folder/${name}`, 'f');
+  }
+  await without.watcher.onRename(`${SHARE}/Renamed`, `${SHARE}/Folder`, 'd');
+
+  // Compared by CONTENT, sorted by path: nodeIds are random, so a comparison keyed
+  // on them would only ever be testing the random number generator.
+  const strip = (t: TreeDoc): Array<Omit<NodeFields, 'c'>> =>
+    t.entries()
+      .map(([, f]) => {
+        const { c, ...rest } = f;
+        return rest;
+      })
+      .sort((a, b) => (relPath(a) < relPath(b) ? -1 : 1));
+  assert.deepEqual(strip(withEvents.tree), strip(without.tree));
+
+  // And with NO descendant events there is nothing but the folder handler to move
+  // the descendants' local bindings, so it has to do it itself. (Found by mutation
+  // probe: asserting this in test 49 proves nothing — there the 400 child events
+  // rebind one by one and hide a missing subtree rebind.)
+  const [, plain] = seeded;
+  assert.equal(without.state.data.materialized[plain.folder], `${SHARE}/Renamed`);
+  for (let i = 0; i < 20; i++) {
+    assert.equal(
+      without.state.data.materialized[plain.children[i]],
+      `${SHARE}/Renamed/note-${String(i).padStart(3, '0')}.md`,
+    );
+  }
+});
+
+test('a folder rename only rewrites descendants of THAT folder', async () => {
+  const h = makeHarness();
+  const inside = mint(h.tree, { k: 'f', d: 'Folder/sub', n: 'a.md', s: 1 });
+  const sibling = mint(h.tree, { k: 'f', d: 'FolderOther', n: 'b.md', s: 1 });
+  const folder = mint(h.tree, { k: 'd', d: '', n: 'Folder' });
+  h.state.data.materialized[folder] = `${SHARE}/Folder`;
+
+  await h.watcher.onRename(`${SHARE}/Renamed`, `${SHARE}/Folder`, 'd');
+
+  assert.equal(h.tree.get(inside)!.d, 'Renamed/sub');
+  assert.equal(h.tree.get(sibling)!.d, 'FolderOther', 'a prefix is not a path');
+});
+
+// ---------------------------------------------------------------- 54 / unshare
+
+test('54: dragging a 300-note folder out of the share asks exactly once', async () => {
+  let seen: string[] = [];
+  const prompts: Array<{ path: string; count: number }> = [];
+  const h = makeHarness({
+    confirmUnshare: async (path, count) => {
+      prompts.push({ path, count });
+      seen = [...h.watcher.pendingDecision];
+      return 'undo';
+    },
+  });
+  const { folder, children } = seedFolder(h, 'Archive', 300);
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed('Archive', 'd');
+  h.resetCounts();
+
+  await h.watcher.onRename('Archive', `${SHARE}/Archive`, 'd');
+  for (let i = 0; i < 300; i++) {
+    const name = `note-${String(i).padStart(3, '0')}.md`;
+    await h.watcher.onRename(`Archive/${name}`, `${SHARE}/Archive/${name}`, 'f');
+  }
+  assert.equal(h.counts.txns, 0, 'nothing is written before the user answers');
+
+  await h.watcher.flushUnshare();
+
+  assert.equal(prompts.length, 1, 'ONE modal for 301 events');
+  assert.equal(prompts[0].count, 301);
+  assert.equal(prompts[0].path, `${SHARE}/Archive`);
+  assert.equal(seen.length, 301, 'every affected node was in pendingDecision');
+  for (const id of [folder, ...children]) assert.ok(seen.includes(id));
+  assert.equal(h.watcher.pendingDecision.size, 0, 'and released once answered');
+});
+
+test('54b: "stop sharing" tombstones the folder and cascades to its descendants', async () => {
+  const h = makeHarness();
+  const { folder, children } = seedFolder(h, 'Archive', 3);
+  h.resetCounts();
+
+  await h.watcher.onRename('Archive', `${SHARE}/Archive`, 'd');
+  await h.watcher.flushUnshare();
+
+  assert.equal(h.counts.txns, 1, 'one transaction');
+  assert.equal(isLive(h.tree.get(folder)!), false);
+  assert.equal(h.tree.get(folder)!.xp, undefined, 'never on the folder itself');
+  for (const id of children) {
+    assert.equal(isLive(h.tree.get(id)!), false);
+    assert.equal(h.tree.get(id)!.xp, 'Archive', 'the cascade marker (§2.2)');
+    assert.equal(h.state.data.materialized[id], undefined, 'unbound');
+  }
+});
+
+test('54c: "undo the move" renames the folder back through the ticket system', async () => {
+  const h = makeHarness({ confirmUnshare: async () => 'undo' });
+  const { folder } = seedFolder(h, 'Archive', 2);
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed('Archive', 'd');
+  h.vault.seed('Archive/note-000.md', 'f', 'a');
+  h.resetCounts();
+  h.vault.resetCalls();
+
+  await h.watcher.onRename('Archive', `${SHARE}/Archive`, 'd');
+  await h.watcher.flushUnshare();
+
+  assert.equal(h.counts.txns, 0, 'declining writes NOTHING');
+  assert.equal(isLive(h.tree.get(folder)!), true);
+  assert.deepEqual(
+    h.vault.callsTo('rename').map((c) => c.args),
+    [['Archive', `${SHARE}/Archive`]],
+  );
+  assert.equal(h.tickets.size(), 1, 'the reverse move is armed, so its echo is our own');
+  assert.equal(h.vault.callsTo('trashLocal').length, 0);
+
+  // And the echo itself changes nothing.
+  await h.watcher.onRename(`${SHARE}/Archive`, 'Archive', 'd');
+  assert.equal(h.counts.txns, 0);
+});
+
+// The rescue path (§5.3) moves a file OUT of the share on purpose. Its ticket is
+// cleared by the reconciler's `finally`, so the echo arrives unguarded — and it
+// must NOT be read as the user unsharing something.
+test('a move out of the share of an already-dead node asks nothing', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'gone.md', s: 1 });
+  h.tree.patchNode(id, { x: 1, xa: NOW - 1000, xb: 'Ann' });
+  h.resetCounts();
+
+  await h.watcher.onRename('ShadowLink Recovered/gone.md (deleted by Ann).md', `${SHARE}/gone.md`, 'f');
+  await h.watcher.flushUnshare();
+
+  assert.equal(h.unsharePrompts.length, 0);
+  assert.equal(h.counts.txns, 0);
+});
+
+test('a move into a reserved folder is our own staging, not an unshare', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.resetCounts();
+
+  await h.watcher.onRename('ShadowLink Staging/abc.md', `${SHARE}/todo.md`, 'f');
+  await h.watcher.flushUnshare();
+
+  assert.equal(h.unsharePrompts.length, 0);
+  assert.equal(h.counts.txns, 0);
+  assert.equal(isLive(h.tree.get(id)!), true);
+});
+
+test('an unshare with no confirmation callback defaults to leaving the tree alone', async () => {
+  const h = makeHarness({ confirmUnshare: undefined });
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed('Inbox', 'd');
+  h.vault.seed('Inbox/todo.md', 'f', 'body');
+  h.resetCounts();
+
+  await h.watcher.onRename('Inbox/todo.md', `${SHARE}/todo.md`, 'f');
+  await h.watcher.flushUnshare();
+
+  assert.equal(h.counts.txns, 0, 'silence is never consent to unshare');
+  assert.equal(isLive(h.tree.get(id)!), true);
+});
+
+// ---------------------------------------------------------------- 55-57 / resurrect
+
+async function seedTombstone(
+  h: Harness,
+  opts: { rel: string; xa: number; text: string },
+): Promise<string> {
+  const { dir, name } = splitOf(opts.rel);
+  const id = mint(h.tree, { k: 'f', d: dir, n: name, s: 1 });
+  h.tree.patchNode(id, { x: 1, xa: opts.xa, xb: 'Ann', xh: await hashOf(opts.text) });
+  return id;
+}
+
+function splitOf(rel: string): { dir: string; name: string } {
+  const i = rel.lastIndexOf('/');
+  return i === -1 ? { dir: '', name: rel } : { dir: rel.slice(0, i), name: rel.slice(i + 1) };
+}
+
+// 55. Delete then Ctrl-Z. The node — and therefore the content doc and its whole
+// history — comes back.
+test('55: recreating inside the window with matching content reuses the node', async () => {
+  const h = makeHarness();
+  const id = await seedTombstone(h, { rel: 'todo.md', xa: NOW - 60_000, text: 'body' });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.tree.size(), 1, 'the SAME node, not a second one');
+  const f = h.tree.get(id)!;
+  assert.equal(isLive(f), true);
+  assert.ok(f.g > (f.x ?? 0), `g (${f.g}) must beat x (${f.x})`);
+  assert.equal(f.g, 2);
+  assert.equal(f.x, 1, 'the tombstone generation stays; liveness is a comparison');
+  assert.deepEqual(
+    [f.xa, f.xb, f.xh, f.xp],
+    [undefined, undefined, undefined, undefined],
+  );
+  assert.equal(h.state.data.materialized[id], `${SHARE}/todo.md`);
+  assert.deepEqual(h.published, [], 'the content doc is still seeded — nothing to publish');
+});
+
+test('55b: an empty local file inside the window resurrects too (create fires before the bytes land)', async () => {
+  const h = makeHarness();
+  const id = await seedTombstone(h, { rel: 'todo.md', xa: NOW - 1_000, text: 'body' });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', '');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.tree.size(), 1);
+  assert.equal(h.tree.get(id)!.g, 2);
+});
+
+test('55c: a resurrect at a NEW path moves the node there', async () => {
+  const h = makeHarness();
+  const id = await seedTombstone(h, { rel: 'Archive/todo.md', xa: NOW - 60_000, text: 'body' });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/Archive`, 'd');
+  h.vault.seed(`${SHARE}/Archive/todo.md`, 'f', 'body');
+
+  await h.watcher.onCreate(`${SHARE}/Archive/todo.md`, 'f');
+  assert.equal(h.tree.get(id)!.d, 'Archive');
+});
+
+// 56. Bob drags his own `inbox.md` in three months later. He gets HIS file, as a
+// brand-new node, and Alice's tombstone is left exactly as it was.
+test('56: recreating outside the window mints a fresh node and leaves the tombstone alone', async () => {
+  const h = makeHarness();
+  const id = await seedTombstone(h, {
+    rel: 'todo.md',
+    xa: NOW - (RESURRECT_WINDOW_MS + 1),
+    text: 'the old note',
+  });
+  const before = h.tree.get(id)!;
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'a completely different note');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.tree.size(), 2, 'a FRESH node');
+  const fresh = h.tree.entries().find(([nodeId]) => nodeId !== id)!;
+  assert.notEqual(fresh[0], id);
+  assert.notEqual(`n_${fresh[0]}`, `n_${id}`, 'a different content doc room');
+  assert.equal(fresh[1].g, 1);
+  assert.equal(fresh[1].s, undefined);
+  assert.deepEqual(h.tree.get(id)!, before, 'the tombstone is untouched');
+  assert.deepEqual(h.published, [fresh[0]]);
+});
+
+// The window ALONE must be sufficient. Found by mutation probe: with only test 56
+// in place, deleting the window check still passed, because 56's content differs
+// too and the hash check caught it. Matching content months later is the case the
+// bound actually exists for — the same note restored from a backup, or a peer's
+// copy of a file that was legitimately deleted and rewritten since.
+test('56d: outside the window, MATCHING content still mints a fresh node', async () => {
+  const h = makeHarness();
+  const id = await seedTombstone(h, {
+    rel: 'todo.md',
+    xa: NOW - (RESURRECT_WINDOW_MS + 1),
+    text: 'body',
+  });
+  const before = h.tree.get(id)!;
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.tree.size(), 2, 'the window is checked before the content, and it is decisive');
+  assert.deepEqual(h.tree.get(id)!, before, 'the tombstone is untouched');
+});
+
+// The same, for an EMPTY local file: `local.length === 0` is a concession to
+// Obsidian's create-then-write ordering, not a way around the window.
+test('56e: outside the window, an empty local file still mints a fresh node', async () => {
+  const h = makeHarness();
+  const id = await seedTombstone(h, {
+    rel: 'todo.md',
+    xa: NOW - (RESURRECT_WINDOW_MS + 1),
+    text: 'body',
+  });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', '');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.tree.size(), 2);
+  assert.equal(h.tree.get(id)!.g, 1);
+});
+
+test('56b: inside the window but with different content, a fresh node is minted', async () => {
+  const h = makeHarness();
+  const id = await seedTombstone(h, { rel: 'todo.md', xa: NOW - 1_000, text: 'the old note' });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'somebody else entirely');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+
+  assert.equal(h.tree.size(), 2);
+  assert.equal(h.tree.get(id)!.g, 1, 'the tombstone did not move');
+});
+
+test('56c: a tombstone with no recorded hash never resurrects on non-empty content', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.tree.patchNode(id, { x: 1, xa: NOW - 1_000, xb: 'Ann' });   // no xh
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'unknown bytes');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+  assert.equal(h.tree.size(), 2);
+});
+
+// 57. The generation counter is why liveness is a comparison rather than a
+// boolean: a recreate concurrent with a delete always wins.
+test('57: a resurrect merged with a concurrent delete leaves the node live on both replicas', async () => {
+  const a = new TreeDoc();
+  const id = a.createNode({ k: 'f', d: '', n: 'todo.md', s: 1 }, NOW);
+  a.patchNode(id, { x: 1, xa: NOW - 1_000, xb: 'Ann', xh: await hashOf('body') });
+
+  const b = new TreeDoc();
+  b.applyUpdate(a.encodeState());
+
+  // Replica B resurrects through the watcher, using the real handler.
+  const hb = makeHarness({ tree: b, entries: () => b.entries() });
+  hb.vault.seed(SHARE, 'd');
+  hb.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+  await hb.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+  assert.equal(b.get(id)!.g, 2);
+
+  // Meanwhile replica A, which has not seen the resurrect, re-applies its delete.
+  a.patchNode(id, { x: 1, xa: NOW, xb: 'Ann' });
+
+  const updateA = a.encodeState();
+  const updateB = b.encodeState();
+  a.applyUpdate(updateB);
+  b.applyUpdate(updateA);
+
+  assert.equal(isLive(a.get(id)!), true, 'live on A');
+  assert.equal(isLive(b.get(id)!), true, 'live on B');
+  assert.deepEqual(a.get(id), b.get(id), 'and converged');
+});
+
+// ---------------------------------------------------------------- 44
+
+// 44. The whole design in one test: replay everything a real reconcile pass did
+// to the vault, with the ticket book EMPTY, and demand zero tree writes.
+test('44: replaying every reconciler mutation with no tickets writes nothing to the tree', async () => {
+  const h = makeHarness();
+  const docs = h.docs;
+
+  // A tree a peer built: a folder node, a file in an implied folder, a file whose
+  // disk casing differs from the tree's (forcing a staging round trip), and a
+  // tombstone whose local copy cannot be proven (forcing a rescue OUT of the share).
+  const folder = mint(h.tree, { k: 'd', d: '', n: 'Notes' });
+  const todo = mint(h.tree, { k: 'f', d: 'Notes', n: 'todo.md', s: 1 });
+  const leaf = mint(h.tree, { k: 'f', d: 'Deep/Nested', n: 'leaf.md', s: 1 });
+  const cased = mint(h.tree, { k: 'f', d: '', n: 'Readme.md', s: 1 });
+  const gone = mint(h.tree, { k: 'f', d: '', n: 'gone.md', s: 1 });
+  h.tree.patchNode(gone, { x: 1, xa: NOW - 60_000, xb: 'Ann' });
+
+  docs.setText(`n_${todo}`, 'todo body');
+  docs.setText(`n_${leaf}`, 'leaf body');
+  docs.setText(`n_${cased}`, 'readme body');
+
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/readme.md`, 'f', 'readme body');    // wrong case on disk
+  h.vault.seed(`${SHARE}/gone.md`, 'f', 'unproven bytes');
+  h.state.data.materialized[cased] = `${SHARE}/readme.md`;
+  h.state.data.materialized[gone] = `${SHARE}/gone.md`;
+
+  const deletions = new Deletions({
+    vault: h.vault,
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    now: h.now,
+    confirmBulk: async () => 'apply',
+  });
+  const reconciler = new Reconciler({
+    vault: h.vault,
+    docs,
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => h.tree.entries(),
+    applyDeletions: (ctx) => deletions.apply(ctx),
+    now: h.now,
+  });
+
+  const result = await reconciler.reconcile('sync');
+  assert.equal(result.ran, true);
+  assert.deepEqual(result.failures.map((f) => f.key), [], 'the pass itself was clean');
+
+  const mutations = h.vault.calls.filter(
+    (c) => c.op === 'create' || c.op === 'createFolder' || c.op === 'rename' || c.op === 'trashLocal',
+  );
+  assert.ok(mutations.length >= 6, `expected a busy pass, saw ${mutations.length}`);
+  assert.ok(
+    mutations.some((c) => c.op === 'rename' && String(c.args[1]).startsWith('ShadowLink Recovered/')),
+    'the pass rescued the unproven file out of the share',
+  );
+  assert.ok(
+    mutations.some((c) => c.op === 'rename' && String(c.args[1]).startsWith('ShadowLink Staging/')),
+    'the pass staged the case-only rename',
+  );
+
+  // The reconciler's `finally` already cleared the ticket book; expire the clock
+  // too, so nothing at all can be suppressed by a ticket.
+  h.tickets.clearArmed();
+  h.setClock(NOW + TICKET_TTL_MS * 10);
+  assert.equal(h.tickets.size(), 0);
+
+  const sizeBefore = h.tree.size();
+  const before = layout(h.tree);
+  h.resetCounts();
+
+  for (const call of mutations) {
+    if (call.op === 'createFolder') await h.watcher.onCreate(String(call.args[0]), 'd');
+    else if (call.op === 'create') await h.watcher.onCreate(String(call.args[0]), 'f');
+    else if (call.op === 'rename') {
+      const from = String(call.args[0]);
+      const to = String(call.args[1]);
+      await h.watcher.onRename(to, from, from.endsWith('.md') ? 'f' : 'd');
+    } else {
+      await h.watcher.onDelete(String(call.args[0]), 'd');
+    }
+  }
+  await h.watcher.flushDeleteBatch();
+  await h.watcher.flushUnshare();
+
+  assert.equal(h.counts.txns, 0, 'ZERO tree writes (I8)');
+  assert.equal(h.tree.size(), sizeBefore);
+  assert.deepEqual(layout(h.tree), before);
+  assert.equal(h.unsharePrompts.length, 0, 'a rescue is not an unshare');
+  assert.equal(h.bulkPrompts.length, 0);
+  assert.deepEqual(h.published, []);
+  assert.deepEqual(fieldsOf(h.tree).map((n) => n.id).sort(), [folder, todo, leaf, cased, gone].sort());
+});
+
+// ---------------------------------------------------------------- I1 guard
+
+test('the watcher never names an irreversible vault call (I1)', () => {
+  // Spelled indirectly for the same reason Deletions.test.ts does: invariant I1
+  // requires these two strings to appear NOWHERE under src/, and a test that
+  // wrote them out would itself break the grep.
+  const banned = [`vault.${'delete'}(`, `${'trash'}(file, true)`];
+  const source = readFileSync(new URL('./VaultWatcher.ts', import.meta.url), 'utf8');
+  for (const needle of banned) {
+    assert.ok(!source.includes(needle), `VaultWatcher.ts must not contain ${JSON.stringify(needle)}`);
+  }
+  assert.ok(!/from ['"]obsidian['"]/.test(source), 'no obsidian import');
+});
