@@ -4,7 +4,7 @@ import {
   relPath, splitRel, fold, validateRel, assertInsideShare, hashOf,
   parseBlobRef, formatBlobRef, hashOfBytes, nodeKindOf, isPublished, extOf, safeInFilename,
 } from './paths.ts';
-import type { NodeFields } from './types.ts';
+import type { NodeFields, NodeKind } from './types.ts';
 
 const file = (d: string, n: string): NodeFields => ({ k: 'f', d, n, g: 1, c: 0 });
 
@@ -401,4 +401,73 @@ test('safeInFilename strips what a path segment may not hold and always yields a
   assert.equal(safeInFilename('   '), 'a collaborator');
   assert.equal(safeInFilename(''), 'a collaborator');
   assert.ok(safeInFilename('N'.repeat(200)).length <= 40);
+});
+
+// ── P2 §2.3: validateRel's binary arm ────────────────────────────────────────
+
+// Spec test A3
+test("validateRel accepts the extensions real vaults actually hold for 'b'", () => {
+  for (const n of [
+    'diagram.png', 'Scan 2026-08-24.pdf', 'board.canvas', 'sketch.excalidraw',
+    'arch.drawio', 'clip.webm', 'data.base', 'photo.HEIC', 'take.MP4',
+    'Ünïcødé photo.jpeg', 'a.b.png',
+  ]) {
+    assert.equal(validateRel('Attachments', n, 'b'), true, n);
+    assert.equal(validateRel('', n, 'b'), true, n);
+  }
+});
+
+// Spec test A3, the refusals. REFUSED_EXTS is a denylist rather than an allowlist
+// because real vaults hold .canvas/.excalidraw/.drawio/.heic/.base; it exists
+// because a hostile peer could otherwise drop an executable into a folder the user
+// browses in Explorer or Finder, which Obsidian will not run but the OS will.
+test("validateRel refuses the names an attachment may not have", () => {
+  const refused = [
+    '.exe', '.dll', '.so', '.dylib', '.msi', '.bat', '.cmd', '.com',
+    '.scr', '.ps1', '.vbs', '.jar', '.app', '.lnk',
+  ];
+  for (const ext of refused) {
+    assert.equal(validateRel('', `payload${ext}`, 'b'), false, ext);
+    assert.equal(validateRel('', `payload${ext.toUpperCase()}`, 'b'), false, ext);
+  }
+
+  assert.equal(validateRel('', 'noext', 'b'), false, 'extensionless');
+  assert.equal(validateRel('', `x.${'y'.repeat(16)}`, 'b'), false, 'extension over 16 chars');
+  assert.equal(validateRel('', `x.${'y'.repeat(14)}`, 'b'), true, 'a 15-char extension is fine');
+  assert.equal(validateRel('', '.DS_Store', 'b'), false, 'leading-dot name');
+  assert.equal(validateRel('', '.hidden.png', 'b'), false, 'leading-dot name');
+  assert.equal(validateRel('.obsidian', 'x.png', 'b'), false, 'leading-dot segment');
+  assert.equal(validateRel('', 'a/b.png', 'b'), false, 'separator');
+  assert.equal(validateRel('', 'a\\b.png', 'b'), false, 'separator');
+  assert.equal(validateRel('', 'a\x01.png', 'b'), false, 'control character');
+  assert.equal(validateRel('', 'a<b>.png', 'b'), false, 'illegal glyph');
+  assert.equal(validateRel('', 'trailing.png ', 'b'), false, 'trailing space');
+  assert.equal(validateRel('', 'trailing.', 'b'), false, 'trailing dot');
+  assert.equal(validateRel('', 'CON.png', 'b'), false, 'Windows device stem');
+  assert.equal(validateRel('x'.repeat(500), 'y.png', 'b'), false, 'over MAX_REL_PATH_LEN');
+  assert.equal(validateRel('..', 'x.png', 'b'), false, 'traversal');
+});
+
+// Spec test A4 ⚠ — the exclusivity the whole 'f'/'b' split rests on, in BOTH
+// directions and case-folded. A path claimable by two kinds would let one node
+// materialize over another's file with neither derivation noticing.
+test('no path is claimable by both kinds, in any casing', () => {
+  for (const n of ['Notes.md', 'Notes.MD', 'Notes.Md']) {
+    assert.equal(validateRel('', n, 'f'), true, `${n} is a note`);
+    assert.equal(validateRel('', n, 'b'), false, `${n} must never be an attachment`);
+  }
+  for (const n of ['photo.HEIC', 'photo.heic', 'diagram.PNG']) {
+    assert.equal(validateRel('', n, 'b'), true, `${n} is an attachment`);
+    assert.equal(validateRel('', n, 'f'), false, `${n} must never be a note`);
+  }
+});
+
+// Spec §2.5. P1 returned TRUE for a kind it did not recognize, so a stray old
+// client would treat a 'b' node as valid, derive no path for it, and then sweep an
+// attachment-only folder as unclaimed and empty.
+test('validateRel refuses a kind it does not recognize', () => {
+  for (const kind of ['x', '', 'B', 'file', undefined, null, 1]) {
+    assert.equal(validateRel('', 'a.md', kind as unknown as NodeKind), false, String(kind));
+    assert.equal(validateRel('', 'a.png', kind as unknown as NodeKind), false, String(kind));
+  }
 });

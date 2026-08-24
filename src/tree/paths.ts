@@ -194,12 +194,43 @@ function validSegment(seg: string): boolean {
   return true;
 }
 
+/** Every kind this client understands. A node carrying any other is not actionable. */
+const KNOWN_KINDS = new Set<string>(['f', 'd', 'b']);
+
+/** Longest extension an attachment may carry, dot included. */
+const MAX_EXT_LEN = 16;
+
+/**
+ * Extensions an attachment may never have (spec §2.3). A DENYLIST, not an
+ * allowlist: real vaults hold `.canvas`, `.excalidraw`, `.drawio`, `.heic` and
+ * `.base`, and an allowlist would silently refuse to sync half a vault.
+ *
+ * It exists because a hostile or compromised peer can otherwise place an
+ * executable in a folder the user browses in Explorer or Finder. Obsidian will not
+ * run it; the OS file browser will.
+ */
+const REFUSED_EXTS = new Set([
+  '.exe', '.dll', '.so', '.dylib', '.msi', '.bat', '.cmd', '.com',
+  '.scr', '.ps1', '.vbs', '.jar', '.app', '.lnk',
+]);
+
 /**
  * Validates a node's `d`/`n` pair before it is trusted for any filesystem operation.
  * A node failing this is skipped entirely (never materialized, never renamed to).
+ *
+ * The extension test is case-folded on BOTH arms, so `Notes.MD` is a `'f'` and
+ * never a `'b'`, and `photo.HEIC` is a `'b'` and never an `'f'`. That exclusivity
+ * is what the whole kind split rests on: a path claimable by two kinds would let
+ * one node's materialization land on another node's file.
  */
 export function validateRel(d: string, n: string, kind: NodeKind): boolean {
   if (typeof d !== 'string' || typeof n !== 'string') return false;
+  // An unrecognized kind is refused rather than accepted (P1 returned true here).
+  // A node this client cannot classify must not be treated as valid: it would get
+  // no derived path, and its folder would then look unclaimed and empty to the
+  // sweep — which is precisely how an attachment-only folder gets deleted by a
+  // client that does not speak this schema.
+  if (!KNOWN_KINDS.has(kind)) return false;
   const rel = d === '' ? n : `${d}/${n}`;
   if (rel.length === 0 || rel.length > MAX_REL_PATH_LEN) return false;
   // The name is a single segment: it may not contain a separator at all.
@@ -209,7 +240,15 @@ export function validateRel(d: string, n: string, kind: NodeKind): boolean {
       if (!validSegment(seg)) return false;
     }
   }
-  if (kind === 'f' && !n.toLowerCase().endsWith('.md')) return false;
+  const ext = extOf(n).toLowerCase();
+  if (kind === 'f' && ext !== '.md') return false;
+  if (kind === 'b') {
+    // No extension means no way to tell Obsidian, or the user, what the file is —
+    // and `nodeKindOf` would still call it a `'b'`, so the refusal has to be here.
+    if (ext === '' || ext.length > MAX_EXT_LEN) return false;
+    if (ext === '.md') return false;
+    if (REFUSED_EXTS.has(ext)) return false;
+  }
   return true;
 }
 
