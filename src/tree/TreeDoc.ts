@@ -100,6 +100,23 @@ export class TreeDoc {
     return out as unknown as TreeMeta;
   }
 
+  /**
+   * Record the founder claim, but only if nobody holds one (spec §4.5 step 5).
+   * Returns whether this call wrote it.
+   *
+   * This is a LATENCY OPTIMIZATION and never a correctness mechanism. Two clients
+   * can both believe they founded the workspace — the claim only narrows the
+   * window in which that is possible — and losing it is harmless, because
+   * adoption is idempotent: the second client matches its local files to the
+   * first client's nodes by `fold(relPath)`, so a double publish MERGES instead
+   * of duplicating. Nothing anywhere may read this field to decide who wins.
+   */
+  claimFounder(deviceId: string, at: number): boolean {
+    if (this.metaMap.get('claim') !== undefined) return false;
+    this.transactLocal(() => { this.metaMap.set('claim', { by: deviceId, at }); });
+    return true;
+  }
+
   /** True when the doc was written by a newer schema than this client speaks. */
   isFutureSchema(): boolean {
     const v = this.metaMap.get('v');
