@@ -11,7 +11,7 @@
 // job (spec §4.4 `vaultPathOf`), so this module never needs to know it.
 
 import type { NodeFields } from './types.ts';
-import { fold, isLive, relPath, suffixedVaultPath, validateRel } from './paths.ts';
+import { fold, isLive, relPath, splitRel, suffixedVaultPath, validateRel } from './paths.ts';
 
 export interface DerivedTree {
   /** nodeId -> share-relative path, for LIVE, VALID, SEEDED file nodes only. */
@@ -79,6 +79,44 @@ function compareIds(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/**
+ * Every directory path the reconciler will actually put on disk for this tree,
+ * share-relative and fold-deduplicated (CF-4).
+ *
+ * Only ANCESTORS are collected. A dir node's own path is already reserved by
+ * `suffixedVaultPath`; its ancestors are not, and `ensureDirs` creates them all
+ * the same by walking from the share root down (CF-2 keeps them out of
+ * `folders`, which is a different question — what to create, not what to
+ * reserve).
+ *
+ * Unseeded and dead nodes contribute nothing: I6 says an unpublished node
+ * reserves neither its path nor the folders that path would have needed, and a
+ * dead node's folder is one nobody will create. Either would otherwise push a
+ * perfectly materializable file off the path it is entitled to.
+ *
+ * Computed from the STORED path rather than the derived one, which is exact
+ * rather than approximate: `suffixedVaultPath` splits the directory off before
+ * suffixing, so a collision suffix only ever changes a basename. That is also
+ * what keeps this non-circular — the folder set does not depend on the file
+ * paths it is about to constrain.
+ */
+function impliedDirPaths(valid: Array<[string, NodeFields]>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+
+  for (const [, f] of valid) {
+    if (!isLive(f)) continue;
+    if (f.k === 'f' && !f.s) continue;
+    for (const anc of ancestorsOf(relPath(f))) {
+      const key = fold(anc);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(anc);
+    }
+  }
+  return out;
+}
+
 /** Deletion recency, total and order-independent: later `xa` first, then lowest nodeId. */
 function wins(xa: number | undefined, id: string, bestXa: number | undefined, bestId: string): boolean {
   const a = xa ?? Number.NEGATIVE_INFINITY;
@@ -116,7 +154,30 @@ export function deriveTree(entries: Array<[string, NodeFields]>): DerivedTree {
   // Collision resolution runs over the whole LIVE VALID set, unseeded files
   // included. An unseeded node holds its slot, so the disk path of a file that
   // IS materialized does not shift the day its unpublished sibling seeds.
-  const derivedPath = suffixedVaultPath(valid);
+  //
+  // CF-4: the set is extended with a stand-in dir node for every folder the tree
+  // merely IMPLIES. `suffixedVaultPath` reserves paths for explicit dir nodes
+  // only, so without these a file node named `Notes.md` and a folder `Notes.md`
+  // implied by some other node's `d` both claimed the same path — `files` said
+  // the file owned it, `wantAtFold` said the folder did, and the reconciler's
+  // `adopt` refused the folder as "not a file" on every pass, for ever. The
+  // folder wins: it is a container other nodes live inside, so suffixing it would
+  // orphan them, while suffixing the file costs nothing. Feeding the reservation
+  // into the resolver rather than patching the reconciler is what makes `files`
+  // and `wantAtFold` incapable of disagreeing in the first place.
+  //
+  // The stand-ins are discarded immediately afterwards; their ids are impossible
+  // for a real node (a nodeId is exactly 22 characters of [A-Za-z0-9]), and they
+  // change nothing else, because `suffixedVaultPath` never suffixes a directory
+  // and orders files among themselves by id.
+  const standIns: Array<[string, NodeFields]> = [];
+  const implied = impliedDirPaths(valid);
+  for (let i = 0; i < implied.length; i++) {
+    const { d, n } = splitRel(implied[i]);
+    standIns.push([`_implied-dir-${i}`, { k: 'd', d, n, g: 1, c: 0 }]);
+  }
+  const derivedPath = suffixedVaultPath(standIns.length === 0 ? valid : [...valid, ...standIns]);
+  for (const [id] of standIns) derivedPath.delete(id);
 
   for (const [id, f] of valid) {
     if (!isLive(f)) {

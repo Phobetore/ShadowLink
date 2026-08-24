@@ -1116,3 +1116,45 @@ test('an unshared FOLDER and its cascade are frozen together, implying nothing o
   assert.equal(h.vault.callsTo('createFolder').length, 0, 'the frozen folder is not re-created');
   assert.deepEqual(r.diagnostics.invalid, [folder, child].sort());
 });
+
+// ---------------------------------------------------------------- CF-4: file vs implied folder
+
+// Carry-forward CF-4, closed. `Notes.md` is claimed by a file node AND implied as
+// an ancestor folder by another node's `d`. Before the fix `adopt` refused the
+// folder as "not a file" and the item landed in `failures` on EVERY pass, for
+// ever. The folder wins — it is a container other nodes live inside — and the
+// file materializes at a deterministic suffix instead.
+
+test('CF-4: a file colliding with an implied folder is suffixed, not failed for ever', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const clash = nid('A');
+  const child = nid('B');
+  h.nodes.set(clash, file('', 'Notes.md', { s: 1 }));
+  h.nodes.set(child, file('Notes.md', 'child.md', { s: 1 }));
+  h.docs.setText(`n_${clash}`, 'i am a file');
+  h.docs.setText(`n_${child}`, 'i live in the folder');
+
+  const first = await h.reconciler.reconcile('sync');
+
+  assert.equal(first.ran, true);
+  assert.deepEqual(first.failures, [], 'no permanent per-pass failure any more');
+  assert.deepEqual(inShare(h.vault), {
+    'Shared/Notes (2).md': 'i am a file',
+    'Shared/Notes.md/child.md': 'i live in the folder',
+  });
+  assert.equal(h.state.data.materialized[clash], 'Shared/Notes (2).md');
+  assert.equal(h.state.data.materialized[child], 'Shared/Notes.md/child.md');
+
+  // And it settles: no rename ping-pong between the plain and the suffixed name.
+  h.vault.resetCalls();
+  for (let pass = 0; pass < 5; pass++) {
+    const later = await h.reconciler.reconcile('retry');
+    assert.deepEqual(later.failures, [], `pass ${pass} failed`);
+  }
+  assert.equal(mutations(h.vault), 0, 'five further passes touch nothing');
+  assert.deepEqual(inShare(h.vault), {
+    'Shared/Notes (2).md': 'i am a file',
+    'Shared/Notes.md/child.md': 'i live in the folder',
+  });
+});

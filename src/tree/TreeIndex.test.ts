@@ -403,7 +403,76 @@ test('an implied ancestor folder claims wantAtFold over a colliding file', () =>
   assert.ok(out.folders.has('Notes.md'));
   // and the folder, not the file, owns that folded path
   assert.equal(out.wantAtFold.get(fold('Notes.md')), DIR_SENTINEL);
-  // documented consequence (carry-forward CF-4): files still records the file there,
-  // so the reconciler — not the index — must resolve the file-vs-implied-folder clash
+  // CF-4, resolved: the folder wins outright, so the colliding file is suffixed
+  // out of the way here rather than left for the reconciler to fail on forever.
+  // A folder is a container other nodes live inside; it cannot be suffixed without
+  // orphaning them, and a file can.
+  assert.equal(out.files.get(nid('file')), 'Notes (2).md');
+  assert.equal(out.derivedPath.get(nid('file')), 'Notes (2).md');
+  assert.equal(out.wantAtFold.get(fold('Notes (2).md')), nid('file'));
+  assert.equal(out.files.get(nid('child')), 'Notes.md/child.md');
+  // `files` and `wantAtFold` now agree about every path in `files`.
+  for (const [id, path] of out.files) assert.equal(out.wantAtFold.get(fold(path)), id);
+  // Whatever the resolver was told about implied folders stays inside it: only
+  // real nodes come back out, or the watcher's idempotence oracle (I8) would be
+  // asked about ids no tree contains.
+  assert.deepEqual([...out.derivedPath.keys()].sort(), [nid('child'), nid('file')].sort());
+});
+
+// The same clash reached through an EXPLICIT dir node's ancestor. `folders` never
+// records that ancestor (CF-2), but `ensureDirs` still creates it on disk, so the
+// file has to be moved aside here too or it collides with a folder nobody derived.
+test('an ancestor of an explicit dir node also outranks a colliding file', () => {
+  const out = deriveTree([
+    [nid('file'), { k: 'f', d: '', n: 'Notes.md', g: 1, c: 0, s: 1 }],
+    [nid('sub'), { k: 'd', d: 'Notes.md', n: 'Sub', g: 1, c: 0 }],
+  ]);
+  assert.equal(out.files.get(nid('file')), 'Notes (2).md');
+  assert.ok(out.folders.has('Notes.md/Sub'));
+});
+
+// The WHOLE ancestor chain is reserved, not just the deepest link. A mutation
+// that reserved only the immediate parent survived the rest of this section.
+test('a shallow implied ancestor outranks a colliding file as well as a deep one', () => {
+  const out = deriveTree([
+    [nid('file'), { k: 'f', d: '', n: 'Notes.md', g: 1, c: 0, s: 1 }],
+    [nid('deep'), { k: 'f', d: 'Notes.md/Sub', n: 'leaf.md', g: 1, c: 0, s: 1 }],
+  ]);
+  assert.equal(out.files.get(nid('file')), 'Notes (2).md');
+  assert.ok(out.folders.has('Notes.md'));
+  assert.ok(out.folders.has('Notes.md/Sub'));
+});
+
+// A folder reservation is a fold comparison, like every other occupancy check
+// (I11) — otherwise the file materializes onto a case-variant of the folder and
+// `vault.create` truncates it on macOS and Windows.
+test('a folder outranks a colliding file case-insensitively', () => {
+  const out = deriveTree([
+    [nid('file'), { k: 'f', d: '', n: 'NOTES.md', g: 1, c: 0, s: 1 }],
+    [nid('child'), { k: 'f', d: 'Notes.md', n: 'child.md', g: 1, c: 0, s: 1 }],
+  ]);
+  assert.equal(out.files.get(nid('file')), 'NOTES (2).md');
+});
+
+// I6 in the collision resolver: an unpublished node reserves nothing, so the
+// folder its path would have needed does not exist yet and must not displace a
+// file that is genuinely materializable today.
+test('an unseeded child implies no folder, so a colliding file keeps the plain path', () => {
+  const out = deriveTree([
+    [nid('file'), { k: 'f', d: '', n: 'Notes.md', g: 1, c: 0, s: 1 }],
+    [nid('child'), { k: 'f', d: 'Notes.md', n: 'child.md', g: 1, c: 0 }],
+  ]);
+  assert.equal(out.files.get(nid('file')), 'Notes.md');
+  assert.equal(out.wantAtFold.get(fold('Notes.md')), nid('file'));
+  assert.deepEqual(out.pending, [nid('child')]);
+});
+
+// A dead folder is not a folder: nothing will create it, so it must not push a
+// live file off the path it is entitled to.
+test('a dead child implies no folder either', () => {
+  const out = deriveTree([
+    [nid('file'), { k: 'f', d: '', n: 'Notes.md', g: 1, c: 0, s: 1 }],
+    [nid('child'), { k: 'f', d: 'Notes.md', n: 'child.md', g: 1, c: 0, s: 1, x: 1, xa: 5 }],
+  ]);
   assert.equal(out.files.get(nid('file')), 'Notes.md');
 });
