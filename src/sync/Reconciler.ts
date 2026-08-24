@@ -319,6 +319,7 @@ export class Reconciler {
       // actually on disk, and never stay wedged.
       try {
         this.deps.tickets.clearArmed();
+        this.absorbCollaboratorBindings(ctx);
         this.rebuildDeviceStateFromObserved(ctx);
         await this.persist();
       } finally {
@@ -857,6 +858,37 @@ export class Reconciler {
       sha256: await hashOf(normalized),
       len: normalized.length,
     };
+  }
+
+  /**
+   * Take in the bindings the pass's COLLABORATORS wrote while it was running.
+   *
+   * Step 6 hands untracked paths to `publishUntracked`, which is
+   * `VaultWatcher.onCreate`: it mints a node for the file and records the binding
+   * by writing `state.materialized[id]` directly. That write happens behind the
+   * pass's back — `ctx.have` never hears about it — so without this the rebuild
+   * below, which keys on `ctx.have` alone, wipes every binding the pass just
+   * created. The next pass then finds files under the share, a non-empty desired
+   * set and nothing bound, which is exactly the shape `mountMismatch` reads as a
+   * wrong mount: a first-joining client that published its own notes wedged
+   * itself in read-only for the rest of the session.
+   *
+   * This is NOT the desired state creeping back in. Every candidate is confirmed
+   * against `ctx.disk` first, so a binding whose file is not actually there is
+   * still dropped, and a fold already spoken for by another node is left alone.
+   * The rebuild stays a record of what was observed.
+   */
+  private absorbCollaboratorBindings(ctx: PassContext | null): void {
+    if (ctx === null) return;
+    for (const [id, path] of Object.entries(this.deps.state.data.materialized)) {
+      if (ctx.have.has(id)) continue;
+      const literal = ctx.disk.literal(path);
+      if (literal === undefined) continue;                  // I2/I15: not observed, not recorded
+      const claimed = ctx.boundAtFold.get(fold(literal));
+      if (claimed !== undefined && claimed !== id) continue; // another node already owns it
+      ctx.have.set(id, literal);
+      ctx.boundAtFold.set(fold(literal), id);
+    }
   }
 
   /**

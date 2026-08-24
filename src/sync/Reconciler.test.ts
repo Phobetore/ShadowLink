@@ -1158,3 +1158,59 @@ test('CF-4: a file colliding with an implied folder is suffixed, not failed for 
     'Shared/Notes.md/child.md': 'i live in the folder',
   });
 });
+
+// ---------------------------------------------------------------- the founder path
+
+/**
+ * `publishUntracked` stands in for `VaultWatcher.onCreate`: it mints a node for
+ * every path the pass offered it, records the binding in device state exactly
+ * where the watcher's `bind()` does, and leaves the bytes on disk alone.
+ *
+ * `s: 1` is set at the same moment because the publish queue seeds the content
+ * doc and patches `s` before the next pass runs; the point of the fixture is the
+ * BINDING, and a node without `s` would never reach `desired` and so could never
+ * exercise the mount guard that the missing binding trips.
+ */
+function publisher(h: Harness): (paths: string[]) => Promise<void> {
+  return async (paths) => {
+    h.published.push(paths);
+    for (const path of paths) {
+      const base = path.slice(path.lastIndexOf('/') + 1);
+      const id = nid(`P${base[0].toUpperCase()}`);
+      h.nodes.set(id, file('', base, { s: 1 }));
+      h.docs.setText(`n_${id}`, h.vault.snapshot()[path]);
+      h.state.data.materialized[id] = path;             // VaultWatcher.bind
+    }
+  };
+}
+
+test('a first join that publishes its own notes keeps the bindings the pass created', async () => {
+  let publish: (paths: string[]) => Promise<void> = async () => undefined;
+  const h = makeHarness({ publishUntracked: (paths) => publish(paths) });
+  publish = publisher(h);
+  const seeded: Record<string, string> = {};
+  for (const name of ['alpha', 'bravo', 'charlie', 'delta', 'echo']) {
+    seeded[`${SHARE}/${name}.md`] = `body of ${name}`;
+    h.vault.seed(`${SHARE}/${name}.md`, 'f', `body of ${name}`);
+  }
+
+  const first = await h.reconciler.reconcile('bootstrap');
+
+  assert.equal(first.ran, true);
+  assert.deepEqual(h.published, [Object.keys(seeded).sort()], 'all five were offered');
+  assert.deepEqual(
+    h.state.data.materialized,
+    Object.fromEntries(Object.keys(seeded).sort().map((p, i) => [
+      nid(`P${['A', 'B', 'C', 'D', 'E'][i]}`), p,
+    ])),
+    'the bindings step 6 created survive the pass that created them',
+  );
+
+  // The very next pass is the one that used to wedge the client for the session.
+  const second = await h.reconciler.reconcile('remote');
+
+  assert.equal(second.ran, true, 'the mount guard must not fire on a client that just published');
+  assert.equal(h.reconciler.readOnly, false);
+  assert.deepEqual(inShare(h.vault), seeded, 'and nothing was rewritten');
+  assert.equal(Object.keys(h.state.data.materialized).length, 5);
+});
