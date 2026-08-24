@@ -183,14 +183,23 @@ export class FakeVault implements VaultPort {
     this.maybeFail('listDir');
 
     // '' is the vault root: always present, never an entry of its own.
+    //
+    // Children MUST be enumerated from the RESOLVED literal, not from the requested
+    // path. Resolving existence case-insensitively but then prefix-matching on the
+    // caller's casing answers "the folder exists AND is empty" for a case variant —
+    // a state no real filesystem produces, and exactly the invariant I2 trap: the
+    // reconciler's empty-folder sweep walks TREE-cased paths while the disk holds
+    // literal case, so it would trash a folder that still holds files.
+    let base = p;
     if (p !== '') {
       const literal = this.resolve(p);
       if (literal === undefined) throw new Error(`FakeVault.listDir: not found: ${path}`);
       if (this.entries.get(literal)!.kind !== 'd') {
         throw new Error(`FakeVault.listDir: not a folder: ${path}`);
       }
+      base = literal;
     }
-    const prefix = p === '' ? '' : `${p}/`;
+    const prefix = base === '' ? '' : `${base}/`;
     return [...this.entries.keys()]
       .filter((k) => k.startsWith(prefix) && k.length > prefix.length)
       .filter((k) => !k.slice(prefix.length).includes('/'))   // direct children only
@@ -235,6 +244,14 @@ export class FakeVault implements VaultPort {
 
     const literal = this.resolve(src);
     if (literal === undefined) throw new Error(`FakeVault.rename: not found: ${from}`);
+    // A directory cannot be moved inside itself. Real vault.rename refuses; without
+    // this the fake happily produces `Notes/sub/a.md` with no `Notes` left, so a
+    // reconciler pass computing such a move would look green here and fail in
+    // production. The flat node registry can represent it (`d` and `n` are free
+    // strings), so it is reachable rather than theoretical.
+    if (this.entries.get(literal)!.kind === 'd' && fold(dst).startsWith(fold(literal) + '/')) {
+      throw new Error(`FakeVault.rename: cannot move a folder into itself: ${from} -> ${to}`);
+    }
     // On a folding filesystem this also refuses a CASE-ONLY rename, where the
     // destination resolves back to the source. That refusal is precisely why
     // spec §4.3 routes case-only renames out through ShadowLink Staging/ and back.

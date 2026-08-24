@@ -197,3 +197,47 @@ test('TreeDoc adopts an existing Y.Doc and tags its own writes with LOCAL_ORIGIN
 
   assert.deepEqual(origins, [LOCAL_ORIGIN]);
 });
+
+// ── Regressions found in review of this slice ────────────────────────────────
+
+// The public projection filters undefined, so asserting through get() cannot tell
+// "key deleted" from "key set to undefined". A stored undefined would replicate as
+// a real CRDT key and, once tombstone clearing matters (resurrect), a peer could
+// read a node as still-deleted. Assert on the raw Y.Map.
+test('patching a field to undefined deletes the CRDT key, not just the projection', () => {
+  const a = new TreeDoc();
+  const id = a.createNode({ k: 'f', d: 'Archive', n: 'k.md', x: 1, xp: 'Archive' }, 1000);
+  a.patchNode(id, { x: undefined, xp: undefined });
+
+  const rawLocal = a.doc.getMap('nodes').get(id) as Y.Map<unknown>;
+  assert.equal(rawLocal.has('x'), false, 'x must be deleted locally');
+  assert.equal(rawLocal.has('xp'), false, 'xp must be deleted locally');
+
+  // and it must replicate as a deletion, not as a key holding undefined
+  const b = new TreeDoc();
+  b.applyUpdate(a.encodeState());
+  const rawRemote = b.doc.getMap('nodes').get(id) as Y.Map<unknown>;
+  assert.equal(rawRemote.has('x'), false, 'x must be absent on the remote replica');
+  assert.equal(rawRemote.has('xp'), false, 'xp must be absent on the remote replica');
+  assert.equal(isLive(b.get(id)!), true);
+});
+
+// I9: handlers always run. One failing consumer must not silence structural sync.
+test('a throwing observe subscriber does not starve the others', () => {
+  const td = new TreeDoc();
+  const errors: unknown[] = [];
+  td.onSubscriberError = (e) => errors.push(e);
+
+  const seen: string[] = [];
+  td.observe(() => { seen.push('first'); throw new Error('boom'); });
+  td.observe(() => { seen.push('second'); });
+
+  td.createNode({ k: 'f', d: '', n: 'a.md' }, 1);
+  assert.deepEqual(seen, ['first', 'second']);
+  assert.equal(errors.length, 1);
+
+  // and a remote update must not have the exception escape into Yjs
+  const other = new TreeDoc();
+  other.createNode({ k: 'f', d: '', n: 'b.md' }, 2);
+  assert.doesNotThrow(() => td.applyUpdate(other.encodeState()));
+});

@@ -64,6 +64,13 @@ export class TreeDoc {
    */
   private lastNotified: Y.Transaction | null = null;
 
+  /**
+   * Optional sink for an exception thrown by an `observe` subscriber. Set by the
+   * plugin so a failing consumer is surfaced rather than swallowed; left unset in
+   * tests that deliberately throw.
+   */
+  onSubscriberError?: (err: unknown) => void;
+
   constructor(doc: Y.Doc = new Y.Doc()) {
     this.doc = doc;
     this.metaMap = doc.getMap<unknown>('meta');
@@ -180,7 +187,18 @@ export class TreeDoc {
     this.lastNotified = txn;
     const isLocal = txn.origin === LOCAL_ORIGIN;
     // Copy: a subscriber is allowed to unsubscribe from inside its callback.
-    for (const cb of [...this.subscribers]) cb(isLocal);
+    //
+    // Each callback is isolated. A throwing subscriber must not starve the ones
+    // registered after it, and must not propagate out of the Yjs transaction that
+    // is applying a remote update — invariant I9 says handlers always run, so one
+    // failing consumer cannot be allowed to silence structural sync for the rest.
+    for (const cb of [...this.subscribers]) {
+      try {
+        cb(isLocal);
+      } catch (err) {
+        this.onSubscriberError?.(err);
+      }
+    }
   }
 
   // ----------------------------------------------------------------- state

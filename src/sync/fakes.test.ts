@@ -376,3 +376,43 @@ test('FakeDocs.failNext fails exactly one openHeadless', async () => {
   assert.equal(opened.synced, true);
   assert.deepEqual(docs.calls.map((c) => c.op), ['openHeadless', 'openHeadless']);
 });
+
+// ── Regressions found in review of this slice ────────────────────────────────
+
+// listDir must enumerate from the RESOLVED literal path. Half-resolving (existence
+// case-insensitively, children by the caller's casing) answers "exists and empty"
+// for a case variant — the invariant I2 trap. The reconciler's empty-folder sweep
+// walks tree-cased paths while the disk holds literal case, so this would trash a
+// folder that still holds files.
+test('listDir enumerates children for a case-variant request', async () => {
+  const v = new FakeVault();
+  v.seed('Shared/Archive', 'd');
+  v.seed('Shared/Archive/keep.md', 'f', 'content');
+  v.seed('Shared/Archive/.git/config', 'f', '[core]');
+
+  const exact = await v.listDir('Shared/Archive');
+  const variant = await v.listDir('Shared/archive');
+  assert.deepEqual(variant, exact);
+  assert.ok(variant.length > 0, 'a case variant must not read as an empty folder');
+  assert.ok(variant.some((p) => p.endsWith('keep.md')));
+});
+
+test('listDir still throws for a genuinely missing folder', async () => {
+  const v = new FakeVault();
+  v.seed('Shared/Archive', 'd');
+  await assert.rejects(() => v.listDir('Shared/Nope'));
+});
+
+// Real vault.rename refuses to move a folder inside itself.
+test('rename refuses to move a folder into its own subtree', async () => {
+  const v = new FakeVault();
+  v.seed('Notes/a.md', 'f', 'x');
+  await assert.rejects(() => v.rename('Notes', 'Notes/sub'), /into itself/);
+  await assert.rejects(() => v.rename('Notes', 'notes/sub'), /into itself/);
+  // the vault is untouched by the refusal
+  assert.equal(await v.exists('Notes/a.md'), true);
+  // a move to a genuine sibling still works
+  await v.createFolder('Other');
+  await v.rename('Notes', 'Other/Notes');
+  assert.equal(await v.exists('Other/Notes/a.md'), true);
+});

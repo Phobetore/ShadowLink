@@ -262,3 +262,23 @@ test('an empty snapshot derives an empty desired state', () => {
 test('DIR_SENTINEL can never be mistaken for a nodeId', () => {
   assert.ok(!NODE_ID_RE.test(DIR_SENTINEL));
 });
+
+// ── Regression found in review of this slice ─────────────────────────────────
+
+// A folder must outrank a file at the same folded path in wantAtFold. With an
+// explicit dir node suffixedVaultPath already separates them, so the ranking is
+// only reachable through an IMPLIED ancestor folder — which is why a mutation of
+// that line survived the original suite.
+test('an implied ancestor folder claims wantAtFold over a colliding file', () => {
+  const out = deriveTree([
+    [nid('file'), { k: 'f', d: '', n: 'Notes.md', g: 1, c: 0, s: 1 }],
+    [nid('child'), { k: 'f', d: 'Notes.md', n: 'child.md', g: 1, c: 0, s: 1 }],
+  ]);
+  // the child implies the ancestor folder 'Notes.md'
+  assert.ok(out.folders.has('Notes.md'));
+  // and the folder, not the file, owns that folded path
+  assert.equal(out.wantAtFold.get(fold('Notes.md')), DIR_SENTINEL);
+  // documented consequence (carry-forward CF-4): files still records the file there,
+  // so the reconciler — not the index — must resolve the file-vs-implied-folder clash
+  assert.equal(out.files.get(nid('file')), 'Notes.md');
+});
