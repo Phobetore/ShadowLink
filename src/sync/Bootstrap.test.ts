@@ -627,6 +627,47 @@ test('an already-claimed workspace is not re-claimed, and the loser waits for no
   assert.deepEqual(result.buckets.upload, [], 'and was NOT published a second time');
 });
 
+test('the loser waits for the founder\'s LAST node, not its first', async () => {
+  // Regression for the structural end-to-end suite's case 75b, where two clients
+  // first-join one empty workspace at the same moment and the loser was minting
+  // a rival node for every file whose node had not landed yet ("A minted 24
+  // nodes for 20 files"). A founder publishes one node per file and each is its
+  // own transaction, so they arrive as a BURST spread over several ticks — and a
+  // wait that ends on the first of them classifies against a tree that is still
+  // being filled in. Adoption merges by fold(relPath), which can only match a
+  // node that has already arrived, so waking early is not a slower merge: it is
+  // a duplicate.
+  const names = ['alpha.md', 'beta.md', 'gamma.md', 'delta.md'];
+  const h = makeHarness();
+  for (const name of names) h.vault.seed(`${SHARE}/${name}`, 'f', `body of ${name}`);
+
+  const boot = new Bootstrap({
+    state: h.state, tree: h.tree, vault: h.vault, shareRoot: SHARE, deviceId: DEVICE,
+    loadSnapshot: async () => null,
+    connectTree: async () => true,
+    confirm: async (c) => { h.confirms.push(c); return { proceed: true, shareLocalFiles: true }; },
+    reconcile: async () => undefined,
+    replayPendingEvents: async () => undefined,
+    now: () => NOW,
+    sleep: async () => { h.tree.claimFounder('the-other-device', NOW - 1); },
+    founderWaitCapMs: 5_000,
+  });
+
+  // The founder's four nodes, one per tick rather than all in one frame.
+  names.forEach((name, i) => { setTimeout(() => { seededNode(h.tree, name); }, 10 + i * 25); });
+
+  const result = await boot.run();
+
+  assert.equal(
+    result.buckets.adopt.size, names.length,
+    'the loser classified before the founder had finished publishing',
+  );
+  assert.deepEqual(
+    result.buckets.upload, [],
+    'it offered to publish files the founder had already claimed — every one a duplicate node',
+  );
+});
+
 test('a founder wait that times out proceeds anyway', async () => {
   const h = makeHarness({ deps: { founderWaitCapMs: 20 } });
   const boot = new Bootstrap({

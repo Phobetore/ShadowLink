@@ -22,6 +22,16 @@ export const DEVICE_STATE_DEBOUNCE_MS = 1_000;
 export const FOUNDER_GRACE_MS = 2_000;
 export const FOUNDER_SETTLE_MS = 1_500;
 export const FOUNDER_WAIT_CAP_MS = 15_000;
+/**
+ * How long the tree must stop changing before a client that LOST the founder
+ * claim accepts that the founder has finished publishing (spec §4.5 step 5).
+ *
+ * A founder mints one node per file, each in its own Yjs transaction, so "the
+ * tree has a node in it" is a statement about the first frame of a burst, not
+ * about the burst being over. Classifying then is what mints a rival node at
+ * every path whose node was still in flight.
+ */
+export const FOUNDER_QUIET_MS = 500;
 
 /** Vault-root folders owned by ShadowLink. Never synced, never inside the share. */
 export const RECOVERED_DIR = 'ShadowLink Recovered';

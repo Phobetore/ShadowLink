@@ -29,6 +29,7 @@
 
 import {
   FOUNDER_GRACE_MS,
+  FOUNDER_QUIET_MS,
   FOUNDER_SETTLE_MS,
   FOUNDER_WAIT_CAP_MS,
   TREE_SYNC_TIMEOUT_MS,
@@ -430,22 +431,52 @@ export class Bootstrap {
     await this.waitForNodes(this.founderWaitCapMs);
   }
 
-  /** Resolve as soon as the tree holds a node, or when the cap expires. Never longer. */
+  /**
+   * Wait for the founder's first publish — and then for it to STOP.
+   *
+   * "The tree holds a node" is not the condition this needs. A founder mints one
+   * node per file and each is its own Yjs transaction, so a tree that has just
+   * gained its first node is a tree that is still being filled in. Classifying
+   * at that moment is not a merge: the paths whose nodes are still in flight
+   * look unclaimed, step 6 hands them to the publisher, and this client mints a
+   * rival node at every one of them. What makes adoption idempotent is matching
+   * on `fold(relPath)`, and that can only match nodes that have ARRIVED — which
+   * is exactly why the claim's loser has to wait for the whole burst rather than
+   * for the head of it.
+   *
+   * So: resolve once the tree holds nodes AND has been quiet for
+   * `FOUNDER_QUIET_MS`, and never later than `ms`. Both bounds are load-bearing.
+   * The quiet window is what makes this a wait for the founder rather than a
+   * wait on a timer; the cap is what stops a chatty workspace — or a founder
+   * that crashed halfway — from holding this client in `boot` for ever. Running
+   * off the cap is survivable exactly as it was before: the worst case is a
+   * duplicate node, which is a collision suffix, never lost content.
+   */
   private waitForNodes(ms: number): Promise<void> {
-    if (this.deps.tree.size() > 0) return Promise.resolve();
+    const quietMs = Math.min(FOUNDER_QUIET_MS, ms);
     return new Promise<void>((resolve) => {
       let done = false;
+      let quiet: ReturnType<typeof setTimeout> | null = null;
       const finish = (): void => {
         if (done) return;
         done = true;
-        clearTimeout(timer);
+        if (quiet !== null) clearTimeout(quiet);
+        clearTimeout(cap);
         unobserve();
         resolve();
       };
+      // Every arriving change restarts the window, so the wait ends on the
+      // founder falling silent rather than on a fixed delay after its first node.
+      const restartQuiet = (): void => {
+        if (done) return;
+        if (quiet !== null) clearTimeout(quiet);
+        quiet = setTimeout(finish, quietMs);
+      };
       const unobserve = this.deps.tree.observe(() => {
-        if (this.deps.tree.size() > 0) finish();
+        if (this.deps.tree.size() > 0) restartQuiet();
       });
-      const timer = setTimeout(finish, ms);
+      const cap = setTimeout(finish, ms);
+      if (this.deps.tree.size() > 0) restartQuiet();
     });
   }
 
