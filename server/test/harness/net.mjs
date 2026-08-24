@@ -24,6 +24,52 @@ const MESSAGE_SYNC = 0;
 export const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 
 /**
+ * The TCP socket under a `ws` client, at whichever stage of the handshake it is.
+ *
+ * `_socket` is only assigned once the upgrade has been accepted; before that the
+ * connection lives on the pending HTTP request.
+ */
+function socketOf(ws) {
+  return ws._socket ?? ws._req?.socket ?? null;
+}
+
+/**
+ * Close a socket ABORTIVELY — an RST, never a FIN.
+ *
+ * The side that closes gracefully keeps its ephemeral port in TIME_WAIT for two
+ * minutes. One full run of this suite opens ~6,300 sockets (three clients times
+ * one content-doc room each, across twenty seeds of test 72) and Windows hands
+ * out 16,384 ephemeral ports, so two runs inside one TIME_WAIT window are
+ * already enough to exhaust the range. What that looks like is not an error: the
+ * next `connect()` simply never completes, `waitSync` reports a timeout,
+ * `openHeadless` truthfully answers "not synced", and some test in the second
+ * half of the suite fails an assertion about convergence for a reason that has
+ * nothing to do with the code under test — a different test each run, which is
+ * exactly the flake this suite had.
+ *
+ * An RST releases the port immediately. Nothing is given up by it: every caller
+ * here is either simulating a partition (where losing whatever was in flight is
+ * the point) or tearing a client down at the end of a case, and `terminate()` —
+ * what this replaces — is an abrupt close already.
+ */
+function abort(ws) {
+  const socket = socketOf(ws);
+  if (socket !== null && typeof socket.resetAndDestroy === 'function') {
+    try {
+      socket.resetAndDestroy();
+      return;
+    } catch {
+      /* not connected yet: fall through to the library's own teardown */
+    }
+  }
+  try {
+    ws.terminate();
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
  * One document's link to the server.
  *
  * `synced` flips only when the server answers our SyncStep1 with a SyncStep2 —
@@ -83,9 +129,7 @@ export class DocLink {
     const ws = this.ws;
     this.ws = null;
     this.synced = false;
-    if (ws !== null) {
-      try { ws.terminate(); } catch { /* already gone */ }
-    }
+    if (ws !== null) abort(ws);
     this._notify();
   }
 
