@@ -26,6 +26,24 @@
 // the guard reporting itself. Test files are excluded from the scan for the same
 // reason and because they are not shipped.
 //
+// A LITERAL NEEDLE IS NOT ENOUGH, which is why the second half of this file
+// exists. `vault.delete(` misses `self.v.delete(f)` — the same call through an
+// alias — and it never looked at `DataAdapter` at all, though `ObsidianStatePort`
+// holds one and the adapter's own removal calls are every bit as unrecoverable as
+// the vault's. So removal is guarded twice over:
+//
+//  * NO destructive call may be written on a receiver that looks like a vault or
+//    an adapter, whatever it is named along the way;
+//  * EVERY destructive call in shipped source must name a receiver on the
+//    allowlist below, which holds nothing but in-memory bookkeeping — Maps, Sets
+//    and the `DiskIndex` mirror. Default-deny is the point: a new one has to be
+//    justified here, in a file whose whole subject is why these calls are
+//    dangerous, rather than merely not resembling anything anybody thought to ban.
+//
+// The two are backed by a third test that refuses a call this guard cannot
+// attribute to a receiver at all, so "write it across two lines" is not a way
+// through.
+//
 // One deliberate asymmetry: the CALL is banned everywhere, while the NAME is
 // allowed in exactly one file — `VaultPort.ts`, whose contract is where the rule
 // is written down. A guard that forbade the word outright would forbid
@@ -145,6 +163,133 @@ test('removal is spelled trashLocal, and the adapter provides it', () => {
     false,
     'the adapter-level system trash is banned too',
   );
+});
+
+test('the adapter-level system trash appears in NO shipped file (I1)', () => {
+  // Same ban as above, no longer limited to the one file that happens to hold a
+  // `Vault`: `ObsidianStatePort` holds a `DataAdapter`, and the plugin entry point
+  // can reach both.
+  const needle = `${'trashSystem'}(`;
+  for (const file of SOURCES) {
+    assert.equal(read(file).includes(needle), false, `${relative(file)} must not call ${needle}`);
+  }
+});
+
+// ---------------------------------------------------------------- I1, widened
+
+/**
+ * A destructive call written as `<receiver>.<op>(`, with the receiver captured as
+ * a plain dotted chain.
+ *
+ * Deliberately whitespace-free: a receiver is only meaningful if it can be
+ * attributed, and the test below refuses any occurrence this cannot attribute
+ * rather than letting an unusual layout through unexamined.
+ */
+const DESTRUCTIVE = new RegExp(
+  `([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)\\.(${'delete'}|${'remove'}|${'rmdir'})\\s*\\(`,
+  'g',
+);
+
+/** The same three calls with no receiver captured — used only to count them. */
+const DESTRUCTIVE_BARE = new RegExp(
+  `\\.(?:${'delete'}|${'remove'}|${'rmdir'})\\s*\\(`,
+  'g',
+);
+
+/**
+ * Receiver segments that mean "this is the user's vault, or the filesystem under
+ * it". None of the three calls above may ever be written on one, under any name:
+ * removal goes through `VaultPort.trashLocal` and nowhere else.
+ */
+const VAULT_SHAPED = new Set(['vault', 'vaults', 'adapter', 'dataadapter', 'v', 'app', 'filemanager']);
+
+/**
+ * Every receiver in shipped source that is allowed to be destroyed from, and what
+ * it actually is. Nothing here touches a disk:
+ *
+ *   ctx.disk            DiskIndex — the in-memory mirror of the pass's view
+ *   ctx.boundAtFold     Map, ctx.have Map, this.byFold Map, this.store Map,
+ *   this.errors Map, this.live Map, this.rooms Map, this.entries Map,
+ *   m / derivedPath     Y.Map and a derived Map
+ *   this.open, this.liveHandles, this.listeners, this.waiters,
+ *   this.subscribers, this.decisionPending, this.selected   Sets
+ */
+const IN_MEMORY: Record<string, string[]> = {
+  'src/sync/Deletions.ts': ['ctx.disk'],
+  'src/sync/DiskIndex.ts': ['this.byFold'],
+  'src/sync/ObsidianDocPort.ts': ['this.live', 'this.rooms'],
+  'src/sync/ProviderAck.ts': ['this.listeners'],
+  'src/sync/PublishQueue.ts': ['this.errors'],
+  'src/sync/Reconciler.ts': ['ctx.disk', 'ctx.boundAtFold', 'ctx.have'],
+  'src/sync/Tickets.ts': ['this.store'],
+  'src/sync/VaultWatcher.ts': ['this.decisionPending'],
+  'src/sync/WorkspaceSession.ts': ['this.waiters'],
+  'src/sync/fakes.ts': ['this.open', 'this.entries', 'this.byFold', 'this.liveHandles'],
+  'src/tree/TreeDoc.ts': ['m', 'this.subscribers'],
+  'src/tree/TreeIndex.ts': ['derivedPath'],
+  'src/ui/modals.ts': ['this.selected'],
+};
+
+test('no destructive call is written on a vault- or adapter-shaped receiver (I1)', () => {
+  for (const file of SOURCES) {
+    const source = read(file);
+    for (const match of source.matchAll(DESTRUCTIVE)) {
+      const receiver = match[1];
+      const shaped = receiver.split('.').filter((seg) => VAULT_SHAPED.has(seg.toLowerCase()));
+      assert.deepEqual(
+        shaped,
+        [],
+        `${relative(file)}: ${match[0]} removes through a vault or adapter. `
+        + 'Removal goes through VaultPort.trashLocal, which is the vault-local trash.',
+      );
+    }
+  }
+});
+
+test('every destructive call in shipped source is on an in-memory receiver (I1)', () => {
+  let checked = 0;
+  for (const file of SOURCES) {
+    const rel = relative(file);
+    const allowed = new Set(IN_MEMORY[rel] ?? []);
+    for (const match of read(file).matchAll(DESTRUCTIVE)) {
+      checked += 1;
+      assert.ok(
+        allowed.has(match[1]),
+        `${rel}: ${match[0]} is not on the in-memory allowlist. If "${match[1]}" really is `
+        + 'a Map, a Set or the DiskIndex, add it to IN_MEMORY with what it is; if it can '
+        + 'reach the user\'s files, it must go through VaultPort.trashLocal instead.',
+      );
+    }
+  }
+  // A scan that stopped matching would pass every assertion above.
+  assert.ok(checked >= 25, `expected the whole plugin's bookkeeping, matched ${checked} calls`);
+});
+
+test('a destructive call this guard cannot attribute is refused outright (I1)', () => {
+  for (const file of SOURCES) {
+    const source = read(file);
+    const attributed = [...source.matchAll(DESTRUCTIVE)].length;
+    const total = [...source.matchAll(DESTRUCTIVE_BARE)].length;
+    assert.equal(
+      total,
+      attributed,
+      `${relative(file)}: a destructive call is written in a shape this guard cannot `
+      + 'attribute to a receiver. Put the receiver and the call on one line.',
+    );
+  }
+});
+
+test('the allowlist itself names only files the scan actually reads', () => {
+  const scanned = new Set(SOURCES.map(relative));
+  for (const rel of Object.keys(IN_MEMORY)) {
+    assert.ok(scanned.has(rel), `IN_MEMORY names ${rel}, which the scan does not reach`);
+  }
+  for (const [rel, receivers] of Object.entries(IN_MEMORY)) {
+    for (const receiver of receivers) {
+      const shaped = receiver.split('.').filter((seg) => VAULT_SHAPED.has(seg.toLowerCase()));
+      assert.deepEqual(shaped, [], `${rel}: "${receiver}" may never be allowlisted`);
+    }
+  }
 });
 
 // ---------------------------------------------------------------- I16
