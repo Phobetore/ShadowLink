@@ -28,6 +28,36 @@ export interface DerivedTree {
   pending: string[];
   /** node ids rejected by validateRel — skipped entirely, never deleted (I10). */
   invalid: string[];
+
+  // ------------------------------------------------- watcher-facing (spec §4.1)
+  //
+  // The three lookups a LOCAL vault event needs. They are part of this derivation
+  // rather than a parallel index because two views of one tree drift apart in
+  // exactly the way spec risk R12 describes, and nothing ever notices.
+
+  /**
+   * fold(relPath) -> nodeId, for every LIVE VALID node, files AND dirs, keyed on
+   * the STORED path (`d` + '/' + `n`) rather than the collision-suffixed one.
+   *
+   * Unseeded files are in here. I6 governs materialization, not identity: the node
+   * exists, so a local create at its path must bind to it, never fork it.
+   * Collisions resolve to the lowest nodeId, deterministically.
+   */
+  liveByFoldRel: Map<string, string>;
+
+  /**
+   * fold(relPath) -> the most recently deleted node at that path, for the bounded
+   * resurrect of §5.6. Greatest `xa` wins; a tie breaks on the lowest nodeId, so
+   * the answer never depends on iteration order.
+   */
+  deadByFoldRel: Map<string, { nodeId: string; xa?: number; xh?: string }>;
+
+  /**
+   * nodeId -> share-relative path WITH collision suffixes applied, for every LIVE
+   * VALID node. This is the idempotence oracle (I8): a handler compares it to what
+   * it just observed on disk and writes nothing when the two already agree.
+   */
+  derivedPath: Map<string, string>;
 }
 
 /**
@@ -49,6 +79,14 @@ function compareIds(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/** Deletion recency, total and order-independent: later `xa` first, then lowest nodeId. */
+function wins(xa: number | undefined, id: string, bestXa: number | undefined, bestId: string): boolean {
+  const a = xa ?? Number.NEGATIVE_INFINITY;
+  const b = bestXa ?? Number.NEGATIVE_INFINITY;
+  if (a !== b) return a > b;
+  return compareIds(id, bestId) < 0;
+}
+
 /**
  * Pure. The same snapshot yields a deeply-equal result whatever order the
  * entries arrive in — `pending` and `invalid` are sorted for that reason, and
@@ -62,6 +100,8 @@ export function deriveTree(entries: Array<[string, NodeFields]>): DerivedTree {
   const deadFolders = new Set<string>();
   const pending: string[] = [];
   const invalid: string[] = [];
+  const liveByFoldRel = new Map<string, string>();
+  const deadByFoldRel = new Map<string, { nodeId: string; xa?: number; xh?: string }>();
 
   // Validity gate FIRST (I10). An invalid node is skipped entirely — never
   // materialized, never renamed to, never counted as occupying a path, and
@@ -82,10 +122,25 @@ export function deriveTree(entries: Array<[string, NodeFields]>): DerivedTree {
     if (!isLive(f)) {
       // Dead nodes get no derived path; their last known path is the plain one.
       const rel = relPath(f);
-      deadFold.add(fold(rel));
+      const key = fold(rel);
+      deadFold.add(key);
       if (f.k === 'd') deadFolders.add(rel);
+      // §5.6 needs ONE candidate per path, and which one must not depend on the
+      // order Yjs happens to hand the nodes back. A missing `xa` sorts below every
+      // real timestamp: such a node can never pass the resurrect window anyway.
+      const previous = deadByFoldRel.get(key);
+      if (previous === undefined || wins(f.xa, id, previous.xa, previous.nodeId)) {
+        deadByFoldRel.set(key, { nodeId: id, xa: f.xa, xh: f.xh });
+      }
       continue;
     }
+
+    // Keyed on the STORED path, before any collision suffix, and populated for
+    // dirs and unseeded files too — this map answers "does the tree already have
+    // a node here?", which is a question about identity, not about materialization.
+    const relKey = fold(relPath(f));
+    const claimed = liveByFoldRel.get(relKey);
+    if (claimed === undefined || compareIds(id, claimed) < 0) liveByFoldRel.set(relKey, id);
 
     const path = derivedPath.get(id);
     if (path === undefined) continue;   // unreachable: every live node is assigned one
@@ -110,5 +165,8 @@ export function deriveTree(entries: Array<[string, NodeFields]>): DerivedTree {
   pending.sort(compareIds);
   invalid.sort(compareIds);
 
-  return { files, folders, wantAtFold, deadFold, deadFolders, pending, invalid };
+  return {
+    files, folders, wantAtFold, deadFold, deadFolders, pending, invalid,
+    liveByFoldRel, deadByFoldRel, derivedPath,
+  };
 }

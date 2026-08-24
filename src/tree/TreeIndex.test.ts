@@ -48,12 +48,134 @@ test('deriveTree is order-independent across 50 shuffles', () => {
     [nid('j'), seeded('Deep/Nested/Path', 'leaf.md')],
     [nid('k'), seeded('Archive', 'escaped.md', { x: 1, xp: 'Elsewhere' })],
     [nid('l'), dir('Deep', 'Nested')],
+    // Two dead nodes at ONE path with different `xa`: deadByFoldRel must pick the
+    // most recent one whatever order the entries arrive in.
+    [nid('m'), seeded('Notes', 'gone.md', { x: 1, xa: 12, xh: 'hh' })],
+    // Dead at the same path AND the same `xa` as `m`: the tie is broken by nodeId.
+    [nid('n'), seeded('Notes', 'GONE.md', { x: 1, xa: 12, xh: 'other' })],
   ];
 
   const reference = deriveTree(entries);
   for (let seed = 1; seed <= 50; seed++) {
     assert.deepEqual(deriveTree(shuffle(entries, seed)), reference, `shuffle seed ${seed}`);
   }
+});
+
+// ------------------------------------------------- watcher-facing projections
+//
+// The vault watcher needs three lookups the reconciler never asked for (spec
+// §4.1 "Derived index"). They live on the same derivation on purpose: a parallel
+// index would be a second thing to keep in step with the first, and spec risk
+// R12 is precisely about two views of the tree drifting apart unnoticed.
+
+test('liveByFoldRel keys every live node on its STORED path, files and dirs alike', () => {
+  const seededFile = nid('a');
+  const unseededFile = nid('b');
+  const folder = nid('c');
+  const t = deriveTree([
+    [seededFile, seeded('Notes', 'todo.md')],
+    [unseededFile, file('Notes', 'draft.md')],
+    [folder, dir('', 'Notes')],
+  ]);
+
+  assert.equal(t.liveByFoldRel.get(fold('Notes/todo.md')), seededFile);
+  // I6 governs MATERIALIZATION, not identity: an unpublished node exists in the
+  // tree, so a local create at its path must bind to it rather than fork it.
+  assert.equal(t.liveByFoldRel.get(fold('Notes/draft.md')), unseededFile);
+  assert.equal(t.liveByFoldRel.get(fold('Notes')), folder);
+  assert.equal(t.liveByFoldRel.size, 3);
+});
+
+test('liveByFoldRel is keyed on the stored path, never on the collision suffix', () => {
+  const low = nid('a');
+  const high = nid('b');
+  const t = deriveTree([
+    [high, seeded('Notes', 'todo.md')],
+    [low, seeded('Notes', 'todo.md')],
+  ]);
+
+  // Both nodes STORE `Notes/todo.md`; only the derived path carries the suffix.
+  assert.equal(t.liveByFoldRel.get(fold('Notes/todo.md')), low, 'lowest nodeId wins');
+  assert.equal(t.liveByFoldRel.size, 1);
+  assert.ok(!t.liveByFoldRel.has(fold('Notes/todo (2).md')));
+  assert.equal(t.derivedPath.get(low), 'Notes/todo.md');
+  assert.equal(t.derivedPath.get(high), 'Notes/todo (2).md');
+});
+
+test('derivedPath covers every live node — dirs and unseeded files included — and no dead one', () => {
+  const seededFile = nid('a');
+  const unseededFile = nid('b');
+  const folder = nid('c');
+  const deadFile = nid('d');
+  const t = deriveTree([
+    [seededFile, seeded('Notes', 'todo.md')],
+    [unseededFile, file('Notes', 'draft.md')],
+    [folder, dir('', 'Notes')],
+    [deadFile, seeded('Notes', 'gone.md', { x: 1, xa: 5 })],
+  ]);
+
+  assert.equal(t.derivedPath.get(seededFile), 'Notes/todo.md');
+  assert.equal(t.derivedPath.get(unseededFile), 'Notes/draft.md');
+  assert.equal(t.derivedPath.get(folder), 'Notes');
+  assert.ok(!t.derivedPath.has(deadFile), 'a dead node has no derived path');
+  assert.equal(t.derivedPath.size, 3);
+});
+
+test('deadByFoldRel keeps the most recently deleted node at a path, ties by lowest nodeId', () => {
+  const older = nid('a');
+  const newer = nid('b');
+  const tiedHigh = nid('y');
+  const tiedLow = nid('x');
+  const t = deriveTree([
+    [older, seeded('Notes', 'gone.md', { x: 1, xa: 100, xh: 'old' })],
+    [newer, seeded('Notes', 'GONE.md', { x: 1, xa: 200, xh: 'new' })],
+    [tiedHigh, seeded('', 'tied.md', { x: 1, xa: 50, xh: 'hi' })],
+    [tiedLow, seeded('', 'tied.md', { x: 1, xa: 50, xh: 'lo' })],
+  ]);
+
+  assert.deepEqual(t.deadByFoldRel.get(fold('Notes/gone.md')), {
+    nodeId: newer, xa: 200, xh: 'new',
+  }, 'greatest xa wins, whatever the case of the stored name');
+  assert.equal(t.deadByFoldRel.get(fold('tied.md'))?.nodeId, tiedLow, 'ties break on nodeId');
+  assert.equal(t.deadByFoldRel.size, 2);
+});
+
+test('a live node and a dead node at one path appear in their own map only', () => {
+  const live = nid('a');
+  const gone = nid('b');
+  const t = deriveTree([
+    [live, seeded('', 'todo.md')],
+    [gone, seeded('', 'todo.md', { x: 1, xa: 5 })],
+  ]);
+
+  assert.equal(t.liveByFoldRel.get(fold('todo.md')), live);
+  assert.equal(t.deadByFoldRel.get(fold('todo.md'))?.nodeId, gone);
+  assert.ok(!t.derivedPath.has(gone));
+});
+
+// I10 again, for the new maps: an invalid node is skipped ENTIRELY. A watcher
+// that found one would bind a local file to a node that can never materialize.
+test('an invalid node appears in none of the watcher-facing maps', () => {
+  const badLive = nid('a');
+  const badDead = nid('b');
+  const t = deriveTree([
+    [badLive, seeded('', '../escape.md')],
+    [badDead, seeded('', '.hidden.md', { x: 1, xa: 5 })],
+  ]);
+
+  assert.deepEqual(t.invalid, [badLive, badDead]);
+  assert.equal(t.liveByFoldRel.size, 0);
+  assert.equal(t.deadByFoldRel.size, 0);
+  assert.equal(t.derivedPath.size, 0);
+});
+
+test('a node that escaped a cascade is live in liveByFoldRel and absent from deadByFoldRel', () => {
+  const escaped = nid('a');
+  const t = deriveTree([[escaped, seeded('Projects', 'note.md', { x: 1, xa: 9, xp: 'Archive' })]]);
+
+  assert.equal(t.liveByFoldRel.get(fold('Projects/note.md')), escaped);
+  assert.equal(t.derivedPath.get(escaped), 'Projects/note.md');
+  assert.equal(t.deadByFoldRel.size, 0);
 });
 
 test('deriveTree does not mutate its input and returns fresh collections', () => {
@@ -257,6 +379,9 @@ test('an empty snapshot derives an empty desired state', () => {
   assert.equal(t.deadFolders.size, 0);
   assert.deepEqual(t.pending, []);
   assert.deepEqual(t.invalid, []);
+  assert.equal(t.liveByFoldRel.size, 0);
+  assert.equal(t.deadByFoldRel.size, 0);
+  assert.equal(t.derivedPath.size, 0);
 });
 
 test('DIR_SENTINEL can never be mistaken for a nodeId', () => {
