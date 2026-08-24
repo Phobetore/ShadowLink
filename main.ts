@@ -1,61 +1,23 @@
 // main.ts
-import { Plugin, Notice, MarkdownView, TFile } from 'obsidian';
-import type { EditorView } from '@codemirror/view';
-import { WorkspaceSession } from './src/sync/WorkspaceSession';
+//
+// P1c NOTE: the P0 editing session was wired straight from here, with rooms
+// derived from the note's PATH. Spec §6.3 abandons that scheme outright and
+// there is no migration, so leaving the old wiring in place would have the
+// plugin talk to rooms nothing else in P1 uses. The session now needs the full
+// port stack (VaultPort, DocPort, StatePort, TreeDoc, DeviceState, Bootstrap),
+// which is P1c Task 4's job — `src/sync/ObsidianVaultPort.ts`,
+// `ObsidianDocPort.ts`, `ObsidianStatePort.ts` plus the wiring described in the
+// P1c plan. Until that lands the plugin loads its settings and nothing else.
+import { Plugin } from 'obsidian';
 import { SettingsTab } from './src/ui/SettingsTab';
 import { DEFAULT_SETTINGS, ShadowLinkSettings } from './src/types';
 
 export default class ShadowLinkPlugin extends Plugin {
   settings: ShadowLinkSettings = { ...DEFAULT_SETTINGS };
-  private session: WorkspaceSession | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
     this.addSettingTab(new SettingsTab(this.app, this));
-
-    this.session = new WorkspaceSession({
-      serverUrl: this.settings.share.serverUrl,
-      serverKey: this.settings.share.serverKey,
-      workspaceId: this.settings.share.workspaceId,
-      userName: this.settings.displayName,
-      userColor: this.settings.cursorColor,
-      getActiveEditorView: () => this._activeEditorView(),
-      getNoteContent: () =>
-        this.app.workspace.getActiveViewOfType(MarkdownView)?.editor.getValue() ?? '',
-      onError: (msg) => new Notice(msg, 6000),
-    });
-
-    // Register the binding compartment once; WorkspaceSession reconfigures it per note.
-    this.registerEditorExtension([this.session.editorExtension()]);
-
-    this.registerEvent(
-      this.app.workspace.on('file-open', (file) => {
-        if (!this.session) return;
-        if (file instanceof TFile && this._isShared(file.path)) {
-          void this.session.open(file.path);
-        } else {
-          void this.session.open(null);
-        }
-      }),
-    );
-  }
-
-  async onunload(): Promise<void> {
-    await this.session?.destroy();
-    this.session = null;
-  }
-
-  private _activeEditorView(): EditorView | null {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const cm = (view?.editor as unknown as { cm?: EditorView } | undefined)?.cm;
-    return cm ?? null;
-  }
-
-  private _isShared(path: string): boolean {
-    const s = this.settings.share;
-    if (!s.serverUrl || !s.serverKey || !s.workspaceId || !s.sharedFolder) return false;
-    const folder = s.sharedFolder.replace(/\/+$/, '');
-    return path === folder || path.startsWith(folder + '/');
   }
 
   async loadSettings(): Promise<void> {
