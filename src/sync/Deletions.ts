@@ -31,7 +31,7 @@
 // No `obsidian` import, no node builtins.
 
 import { RECOVERED_DIR, REMOTE_DELETE_BUDGET } from '../tree/constants.ts';
-import { assertInsideShare, fold, hashOf } from '../tree/paths.ts';
+import { assertInsideShare, extOf, fold, hashOf, safeInFilename } from '../tree/paths.ts';
 import type { NodeFields } from '../tree/types.ts';
 import type { DeviceState } from './DeviceState.ts';
 import type { DeletionContext } from './Reconciler.ts';
@@ -90,9 +90,6 @@ const TRASH_NOTICE_MS = 6_000;
 /** How many literal paths the aggregated dialog is given to show. */
 const SAMPLE_PATHS = 5;
 
-/** Upper bound on a remote display name once it is part of a filename. */
-const MAX_NAME_IN_FILENAME = 40;
-
 /**
  * The collaborators one `apply` runs against.
  *
@@ -122,13 +119,6 @@ function baseOf(path: string): string {
   return i === -1 ? path : path.slice(i + 1);
 }
 
-/** `.md` for `a/b.md`, `''` for an extensionless or dotfile name. */
-function extOf(path: string): string {
-  const base = baseOf(path);
-  const dot = base.lastIndexOf('.');
-  return dot <= 0 ? '' : base.slice(dot);
-}
-
 /** I18: compare and hash on normalized line endings; never write the result to disk. */
 function normLF(text: string): string {
   return text.replace(/\r\n/g, '\n');
@@ -141,21 +131,6 @@ function dateOf(ms: number): string {
 
 function displayName(f: NodeFields): string {
   return f.xb ?? 'a collaborator';
-}
-
-/**
- * `xb` is a remote-controlled string that is about to become part of a FILENAME.
- * A display name containing a separator would place the rescued file in a folder
- * that does not exist (at best) or somewhere nobody looks (at worst), so the same
- * character class `validateRel` rejects in a path segment is stripped here.
- * Nothing about this is cosmetic: it is the only sanitization between a peer's
- * profile name and a path this module writes.
- */
-function safeInFilename(name: string): string {
-  // eslint-disable-next-line no-control-regex
-  const cleaned = name.replace(/[/\\<>:"|?*\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
-  if (cleaned.length === 0) return 'a collaborator';
-  return cleaned.slice(0, MAX_NAME_IN_FILENAME).trim();
 }
 
 /**

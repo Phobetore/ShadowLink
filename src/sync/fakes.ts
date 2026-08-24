@@ -17,7 +17,7 @@
 //
 // No `obsidian` import, no node builtins.
 
-import { fold } from '../tree/paths.ts';
+import { extOf, fold } from '../tree/paths.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 
@@ -378,9 +378,10 @@ export class FakeVault implements VaultPort {
 
   private uniqueTrashPath(base: string): string {
     if (!this.trashed.has(base)) return base;
-    const dot = baseOf(base).lastIndexOf('.');
-    const stem = dot <= 0 ? base : base.slice(0, base.length - (baseOf(base).length - dot));
-    const ext = dot <= 0 ? '' : baseOf(base).slice(dot);
+    // The same extension rule the reconciler and the deletion path use. A fourth
+    // private copy is how a fake starts disagreeing with production.
+    const ext = extOf(base);
+    const stem = ext === '' ? base : base.slice(0, base.length - ext.length);
     for (let n = 2; ; n++) {
       const candidate = `${stem} (${n})${ext}`;
       if (!this.trashed.has(candidate)) return candidate;

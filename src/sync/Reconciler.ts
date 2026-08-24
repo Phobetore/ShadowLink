@@ -26,7 +26,9 @@
 import { RECOVERED_DIR, STAGING_DIR } from '../tree/constants.ts';
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
-import { assertInsideShare, fold, hashOf, isLive, relPath, validateRel } from '../tree/paths.ts';
+import {
+  assertInsideShare, extOf, fold, hashOf, isLive, relPath, validateRel,
+} from '../tree/paths.ts';
 import type { DeviceState } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
 import type { DocPort } from './DocPort.ts';
@@ -172,13 +174,6 @@ function dirOf(path: string): string {
 function baseOf(path: string): string {
   const i = path.lastIndexOf('/');
   return i === -1 ? path : path.slice(i + 1);
-}
-
-/** `.md` for `a/b.md`, `''` for an extensionless or dotfile name. */
-function extOf(path: string): string {
-  const base = baseOf(path);
-  const dot = base.lastIndexOf('.');
-  return dot <= 0 ? '' : base.slice(dot);
 }
 
 function depthOf(path: string): number {

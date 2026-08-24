@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { relPath, splitRel, fold, validateRel, assertInsideShare, hashOf } from './paths.ts';
+import {
+  relPath, splitRel, fold, validateRel, assertInsideShare, hashOf,
+  parseBlobRef, formatBlobRef, hashOfBytes, nodeKindOf, isPublished, extOf, safeInFilename,
+} from './paths.ts';
 import type { NodeFields } from './types.ts';
 
 const file = (d: string, n: string): NodeFields => ({ k: 'f', d, n, g: 1, c: 0 });
@@ -243,4 +246,159 @@ test('assertInsideShare rejects empty path segments', () => {
 test('isLive treats an empty cascade root as covering everything', () => {
   assert.equal(isLive(node({ d: 'Anywhere', g: 1, x: 1, xp: '' })), false);
   assert.equal(isLive(node({ d: 'Anywhere', g: 1, x: 1, xp: 'Archive' })), true);
+});
+
+// ── P2 §2.2: blob references, byte hashing, kinds and the published predicate ──
+
+const HASH_A = 'a'.repeat(64);
+const HASH_B = 'b'.repeat(64);
+const bytesOf = (s: string): Uint8Array => new TextEncoder().encode(s);
+
+// Spec test A1
+test('parseBlobRef and formatBlobRef round-trip', () => {
+  assert.equal(formatBlobRef(HASH_A, 2048, null), `${HASH_A}:2048:-`);
+  assert.equal(formatBlobRef(HASH_A, 0, HASH_B), `${HASH_A}:0:${HASH_B}`);
+
+  assert.deepEqual(parseBlobRef(`${HASH_A}:2048:-`), {
+    sha256: HASH_A, bytes: 2048, parent: null,
+  });
+  assert.deepEqual(parseBlobRef(`${HASH_A}:17:${HASH_B}`), {
+    sha256: HASH_A, bytes: 17, parent: HASH_B,
+  });
+  for (const ref of [formatBlobRef(HASH_A, 5, null), formatBlobRef(HASH_A, 5, HASH_B)]) {
+    const parsed = parseBlobRef(ref)!;
+    assert.equal(formatBlobRef(parsed.sha256, parsed.bytes, parsed.parent), ref);
+  }
+});
+
+// Spec test A1, the refusals. The reference is the only record of WHICH bytes
+// belong at a path, so a malformed one must never half-parse into a hash the
+// fetcher would then go looking for.
+test('parseBlobRef rejects every malformed reference', () => {
+  for (const bad of [
+    undefined,
+    '',
+    ' ',
+    HASH_A,                                   // no size, no parent
+    `${HASH_A}:2048`,                         // missing parent
+    `${'a'.repeat(63)}:1:-`,                  // hash too short
+    `${'a'.repeat(65)}:1:-`,                  // hash too long
+    `${'A'.repeat(64)}:1:-`,                  // uppercase hex
+    `${'g'.repeat(64)}:1:-`,                  // not hex at all
+    `${HASH_A}::-`,                           // missing size
+    `${HASH_A}:x:-`,                          // non-numeric size
+    `${HASH_A}:-1:-`,                         // negative size
+    `${HASH_A}:1.5:-`,                        // fractional size
+    `${HASH_A}:1234567890123:-`,              // size over 12 digits
+    `${HASH_A}:1:${'a'.repeat(63)}`,          // parent is not 64 hex
+    `${HASH_A}:1:${'A'.repeat(64)}`,          // uppercase parent
+    `${HASH_A}:1:`,                           // empty parent
+    `${HASH_A}:1:-:extra`,                    // an extra field
+    ` ${HASH_A}:1:-`,                         // leading space
+    `${HASH_A}:1:-\n`,                        // trailing newline
+  ]) {
+    assert.equal(parseBlobRef(bad as string | undefined), null, `accepted ${String(bad)}`);
+  }
+  // A formatter is not a validator: garbage in must still fail to parse, so a
+  // bad reference can never round-trip and look canonical.
+  assert.equal(parseBlobRef(formatBlobRef('nope', 1, null)), null);
+});
+
+// Spec test A2 ⚠ — `hashOf` normalizes CRLF because it hashes TEXT (I18).
+// Applying that rule to bytes changes the identity of a file: two different PNGs
+// could hash alike, and a file's own hash would not match what the store holds.
+test('hashOfBytes hashes RAW bytes and never normalizes line endings', async () => {
+  const crlf = await hashOfBytes(Uint8Array.from([0x0d, 0x0a]));
+  const lf = await hashOfBytes(Uint8Array.from([0x0a]));
+  assert.notEqual(crlf, lf, 'CRLF and LF are different bytes and must hash differently');
+
+  // The same statement against the text hasher, which deliberately folds them.
+  assert.equal(await hashOf('a\r\nb'), await hashOf('a\nb'));
+  assert.notEqual(await hashOfBytes(bytesOf('a\r\nb')), await hashOfBytes(bytesOf('a\nb')));
+  // ...and for content with no CRLF in it the two agree, so this is a difference
+  // of rule rather than of algorithm.
+  assert.equal(await hashOfBytes(bytesOf('a\nb')), await hashOf('a\nb'));
+
+  // Two PNG-shaped byte strings differing only in a CRLF-looking pair.
+  const png = (tail: number[]): Uint8Array =>
+    Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...tail]);
+  assert.notEqual(await hashOfBytes(png([0x0d, 0x0a])), await hashOfBytes(png([0x0a])));
+
+  // A real SHA-256, lowercase hex, of the empty input.
+  assert.equal(
+    await hashOfBytes(new Uint8Array(0)),
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+  );
+});
+
+// A Uint8Array carries its own offset and length. Hashing the whole underlying
+// buffer instead of the view is how a chunked read silently hashes padding.
+test('hashOfBytes honours a subarray view rather than its backing buffer', async () => {
+  const backing = Uint8Array.from([9, 9, 1, 2, 3, 9, 9]);
+  const view = backing.subarray(2, 5);
+  assert.equal(await hashOfBytes(view), await hashOfBytes(Uint8Array.from([1, 2, 3])));
+  assert.notEqual(await hashOfBytes(view), await hashOfBytes(backing));
+});
+
+// Spec test A5
+test('nodeKindOf is the one place a path becomes a tree kind', () => {
+  assert.equal(nodeKindOf('Notes', 'd'), 'd');
+  assert.equal(nodeKindOf('Notes/image.png', 'd'), 'd', 'a folder is a folder whatever it is called');
+
+  assert.equal(nodeKindOf('Notes/todo.md', 'f'), 'f');
+  assert.equal(nodeKindOf('Notes/Todo.MD', 'f'), 'f');
+  assert.equal(nodeKindOf('a.b.md', 'f'), 'f');
+
+  for (const rel of [
+    'Notes/diagram.png', 'Scan 2026-08-24.pdf', 'board.canvas', 'photo.HEIC',
+    'noext', 'archive.tar.gz', 'Notes/clip.webm',
+  ]) {
+    assert.equal(nodeKindOf(rel, 'f'), 'b', rel);
+  }
+});
+
+// Spec test A7
+test('isPublished needs `s` for a note and `s` plus a parseable reference for an attachment', () => {
+  const base = { d: '', n: 'x', g: 1, c: 0 };
+  assert.equal(isPublished({ ...base, k: 'f', n: 'a.md' } as NodeFields), false);
+  assert.equal(isPublished({ ...base, k: 'f', n: 'a.md', s: 1 } as NodeFields), true);
+  // A directory has no content to publish; the predicate is only ever asked about
+  // one alongside an explicit kind test, and it answers on `s` like a note.
+  assert.equal(isPublished({ ...base, k: 'd', n: 'Notes' } as NodeFields), false);
+
+  const ref = `${HASH_A}:10:-`;
+  assert.equal(isPublished({ ...base, k: 'b', n: 'a.png', s: 1, b: ref } as NodeFields), true);
+  assert.equal(isPublished({ ...base, k: 'b', n: 'a.png', b: ref } as NodeFields), false, 'no s');
+  assert.equal(isPublished({ ...base, k: 'b', n: 'a.png', s: 1 } as NodeFields), false, 'no b');
+  assert.equal(
+    isPublished({ ...base, k: 'b', n: 'a.png', s: 1, b: 'garbage' } as NodeFields),
+    false,
+    'a malformed reference is not a published attachment',
+  );
+});
+
+// The rule that decides a node's kind lived in three private copies; it is one
+// function now, and these are the cases each copy had to agree on.
+test('extOf returns the last extension, and nothing for a dotfile or a bare name', () => {
+  assert.equal(extOf('a/b.png'), '.png');
+  assert.equal(extOf('b.png'), '.png');
+  assert.equal(extOf('archive.tar.gz'), '.gz');
+  assert.equal(extOf('noext'), '');
+  assert.equal(extOf('a/noext'), '');
+  assert.equal(extOf('.hidden'), '', 'a leading dot is not an extension');
+  assert.equal(extOf('2024.Q1/README'), '', 'a dotted directory is not the file extension');
+  assert.equal(extOf('Notes/.DS_Store'), '');
+  assert.equal(extOf(''), '');
+});
+
+test('safeInFilename strips what a path segment may not hold and always yields a name', () => {
+  assert.equal(safeInFilename('Ada'), 'Ada');
+  assert.equal(safeInFilename('a/b\\c:d'), 'a b c d');
+  // A display name is remote-controlled and about to become part of a filename.
+  const ctl = String.fromCharCode(0) + String.fromCharCode(0x1f) + String.fromCharCode(0x7f);
+  assert.equal(safeInFilename(`Ada${ctl}`), 'Ada');
+  assert.equal(safeInFilename(`A${String.fromCharCode(0x1f)}B`), 'A B');
+  assert.equal(safeInFilename('   '), 'a collaborator');
+  assert.equal(safeInFilename(''), 'a collaborator');
+  assert.ok(safeInFilename('N'.repeat(200)).length <= 40);
 });

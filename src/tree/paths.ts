@@ -48,17 +48,134 @@ export function fold(p: string): string {
   return p.normalize('NFC').toLowerCase();
 }
 
-/**
- * Stable content hash. Line endings are normalized so a CRLF/LF round-trip does not
- * look like an edit. Uses Web Crypto (not node:crypto) so the plugin works on
- * Obsidian mobile, where node builtins do not exist.
- */
-export async function hashOf(text: string): Promise<string> {
-  const bytes = new TextEncoder().encode(text.replace(/\r\n/g, '\n'));
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
+/** Lowercase hex of a digest. */
+function toHex(digest: ArrayBuffer): string {
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
+}
+
+/**
+ * Stable content hash of TEXT. Line endings are normalized so a CRLF/LF round-trip
+ * does not look like an edit (I18). Uses Web Crypto (not node:crypto) so the plugin
+ * works on Obsidian mobile, where node builtins do not exist.
+ */
+export async function hashOf(text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(text.replace(/\r\n/g, '\n'));
+  return toHex(await crypto.subtle.digest('SHA-256', bytes));
+}
+
+/**
+ * Stable content hash of RAW BYTES (spec §2.2). Deliberately a second function
+ * rather than a branch in `hashOf`.
+ *
+ * It must NEVER apply `hashOf`'s CRLF normalization: that rule is about text, and
+ * a PNG or a PDF that happens to contain the pair `0D 0A` is not the same file as
+ * one containing `0A`. Normalizing here would change a file's identity, so the
+ * hash this device computes would not be the hash the store holds, and two
+ * genuinely different attachments could collide onto one object.
+ *
+ * The argument is a `Uint8Array` and its offset and length are honoured, so a
+ * subarray of a larger read hashes the view rather than the backing buffer.
+ */
+export async function hashOfBytes(data: Uint8Array): Promise<string> {
+  // The cast is a typing artefact, not a conversion: `digest` accepts any
+  // BufferSource at runtime, while this toolchain's DOM lib narrows an
+  // ArrayBufferView to a non-shared buffer. Nothing is copied — copying a
+  // 100 MB attachment to hash it is exactly what the memory cap exists to avoid.
+  return toHex(await crypto.subtle.digest('SHA-256', data as unknown as BufferSource));
+}
+
+/** A parsed `b` field: which bytes belong at a node's path, and what they replaced. */
+export interface BlobRef {
+  sha256: string;
+  bytes: number;
+  /** The hash this version replaced, or null for the first version (`-` on the wire). */
+  parent: string | null;
+}
+
+/**
+ * `<sha256hex>:<bytes>:<parent>`, anchored. The size cap is 12 digits because the
+ * field is a size in bytes, not an arbitrary number, and an unbounded `\d+` is a
+ * value nothing downstream could allocate for.
+ */
+const BLOB_REF_RE = /^([0-9a-f]{64}):(\d{1,12}):([0-9a-f]{64}|-)$/;
+
+/**
+ * Parse a `b` field. Null for anything that is not exactly the packed form —
+ * absent, malformed, uppercase, extra fields, a non-numeric size.
+ *
+ * This is the ONLY validator of the reference. `formatBlobRef` is a formatter and
+ * checks nothing, so a caller that builds a reference by hand and a peer running
+ * an older build both fail here rather than half-succeeding into a hash the
+ * fetcher would then chase.
+ */
+export function parseBlobRef(b: string | undefined): BlobRef | null {
+  if (typeof b !== 'string') return null;
+  const m = BLOB_REF_RE.exec(b);
+  if (m === null) return null;
+  return { sha256: m[1], bytes: Number(m[2]), parent: m[3] === '-' ? null : m[3] };
+}
+
+/** Build a `b` field. `parent` is null for a first publish, which serializes as `-`. */
+export function formatBlobRef(sha256: string, bytes: number, parent: string | null): string {
+  return `${sha256}:${bytes}:${parent ?? '-'}`;
+}
+
+/**
+ * The ONE place a path becomes a tree kind (spec §2.2). `diskKind` is what the
+ * filesystem reports — `'f' | 'd'`, all Obsidian knows — and the tree kind is
+ * derived from the name. Every call site routes through this rather than testing
+ * `.md` itself, which is how the `'f'`/`'b'` split stays a single rule.
+ */
+export function nodeKindOf(rel: string, diskKind: 'f' | 'd'): NodeKind {
+  if (diskKind === 'd') return 'd';
+  return extOf(rel).toLowerCase() === '.md' ? 'f' : 'b';
+}
+
+/**
+ * "Published" for both content kinds, defined exactly once (I6).
+ *
+ * A note is published when its creator has seeded the content doc. An attachment
+ * needs that AND a reference naming the bytes: `s` alone would materialize a node
+ * whose content nobody can name, and every gate that asks this question — both
+ * `TreeIndex` gates and Bootstrap — has to give the same answer or the two halves
+ * of one derivation disagree.
+ */
+export function isPublished(f: NodeFields): boolean {
+  return f.k === 'b' ? (f.s === 1 && parseBlobRef(f.b) !== null) : f.s === 1;
+}
+
+/**
+ * `.png` for `a/b.png`; `''` for an extensionless name and for a dotfile.
+ *
+ * Lifted here from `Reconciler`, `Deletions` and `WorkspaceSession`, which each
+ * held a private copy. It now decides a node's KIND (`nodeKindOf`) as well as
+ * naming rescued and staged files, and three copies of that rule is how one of
+ * them gets missed.
+ */
+export function extOf(path: string): string {
+  const base = splitRel(path).n;
+  const dot = base.lastIndexOf('.');
+  return dot <= 0 ? '' : base.slice(dot);
+}
+
+/** Longest run of a peer's display name that may appear inside a filename. */
+const MAX_NAME_IN_FILENAME = 40;
+
+/**
+ * A remote-controlled string that is about to become part of a FILENAME. A display
+ * name containing a separator would place the file in a folder that does not exist
+ * (at best) or somewhere nobody looks (at worst), so the same character class
+ * `validateRel` rejects in a path segment is stripped here. Nothing about this is
+ * cosmetic: it is the only sanitization between a peer's profile name and a path
+ * we write.
+ */
+export function safeInFilename(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const cleaned = name.replace(/[/\\<>:"|?*\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (cleaned.length === 0) return 'a collaborator';
+  return cleaned.slice(0, MAX_NAME_IN_FILENAME).trim();
 }
 
 function validSegment(seg: string): boolean {

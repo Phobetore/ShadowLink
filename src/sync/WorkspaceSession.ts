@@ -49,7 +49,7 @@ import type { Extension } from '@codemirror/state';
 import type { EditorView } from '@codemirror/view';
 
 import { NODE_WAIT_MS, NOTE_SYNC_TIMEOUT_MS, RECOVERED_DIR } from '../tree/constants.ts';
-import { assertInsideShare, fold, hashOf } from '../tree/paths.ts';
+import { assertInsideShare, extOf, fold, hashOf } from '../tree/paths.ts';
 import { deriveTree } from '../tree/TreeIndex.ts';
 import type { TreeDoc } from '../tree/TreeDoc.ts';
 import type { DeviceState } from './DeviceState.ts';
@@ -613,13 +613,6 @@ function normLF(text: string): string {
 function baseOf(path: string): string {
   const i = path.lastIndexOf('/');
   return i === -1 ? path : path.slice(i + 1);
-}
-
-/** `.md` for `a/b.md`, `''` for an extensionless or dotfile name. */
-function extOf(path: string): string {
-  const base = baseOf(path);
-  const dot = base.lastIndexOf('.');
-  return dot <= 0 ? '' : base.slice(dot);
 }
 
 /** Filesystem-safe wall-clock stamp for a stashed copy's name. */
