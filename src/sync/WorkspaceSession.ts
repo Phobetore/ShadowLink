@@ -53,6 +53,7 @@ import { assertInsideShare, fold, hashOf } from '../tree/paths.ts';
 import { deriveTree } from '../tree/TreeIndex.ts';
 import type { TreeDoc } from '../tree/TreeDoc.ts';
 import type { DeviceState } from './DeviceState.ts';
+import { ProviderAck } from './ProviderAck.ts';
 import type { VaultPort } from './VaultPort.ts';
 
 // ============================================================ ports
@@ -507,9 +508,8 @@ export class CodeMirrorBinding implements EditorBinding {
   }
 }
 
-/** How long `flush()` waits for the socket to drain before reporting failure. */
+/** How long `flush()` waits for the server's acknowledgement before giving up. */
 const FLUSH_TIMEOUT_MS = 5_000;
-const FLUSH_POLL_MS = 25;
 
 /**
  * y-websocket behind `ProviderPort`.
@@ -529,12 +529,17 @@ export class WebsocketProviderPort implements ProviderPort {
       params: { t: this.config.serverKey, w: this.config.workspaceId },
       disableBc: true,
     });
-    return new WebsocketSessionProvider(provider);
+    return new WebsocketSessionProvider(provider, doc);
   }
 }
 
 class WebsocketSessionProvider implements SessionProvider {
-  constructor(private readonly provider: WebsocketProvider) {}
+  /** The same round trip `ObsidianDocPort` uses, on the same terms (I17). */
+  private readonly ack: ProviderAck;
+
+  constructor(private readonly provider: WebsocketProvider, doc: Y.Doc) {
+    this.ack = new ProviderAck(provider, doc);
+  }
 
   get synced(): boolean {
     return this.provider.synced;
@@ -553,24 +558,20 @@ class WebsocketSessionProvider implements SessionProvider {
   }
 
   /**
-   * KNOWN LIMITATION, deliberately explicit. y-websocket exposes no
-   * application-level acknowledgement, so the strongest signal available without
-   * a protocol change is "the bytes left this process and the connection is still
-   * up": the socket's send buffer has drained while the provider is still
-   * connected and synced. It is a weaker guarantee than `DocPort.flush`'s server
-   * acknowledgement, so it is reported honestly (false on any doubt) and it never
-   * reports true for a socket that closed. Strengthening it belongs with the
-   * server work in spec §1.5.
+   * A genuine server acknowledgement — the same one `ObsidianDocPort.flush`
+   * awaits, through the same `ProviderAck`.
+   *
+   * This used to return `provider.synced` once `bufferedAmount` reached zero,
+   * which is "the bytes left this process" and, worse, a flag that LATCHES after
+   * the first sync. Its result sets `s` on the node, which is the exact watermark
+   * `DocPort.flush` exists to protect: a peer materializing a file from an `s = 1`
+   * node that the server never received writes an empty note and never re-fetches
+   * it. The publish queue's `pending` entry made that a recoverable window rather
+   * than permanent loss, but the window had no business existing on the path every
+   * user takes on every note they open.
    */
-  async flush(): Promise<boolean> {
-    const deadline = Date.now() + FLUSH_TIMEOUT_MS;
-    for (;;) {
-      const ws = this.provider.ws;
-      if (!this.provider.wsconnected || ws === null) return false;
-      if (ws.bufferedAmount === 0) return this.provider.synced;
-      if (Date.now() >= deadline) return false;
-      await new Promise<void>((resolve) => setTimeout(resolve, FLUSH_POLL_MS));
-    }
+  flush(): Promise<boolean> {
+    return this.ack.flush(FLUSH_TIMEOUT_MS);
   }
 
   disconnect(): void {
@@ -578,6 +579,7 @@ class WebsocketSessionProvider implements SessionProvider {
   }
 
   destroy(): void {
+    this.ack.destroy();
     this.provider.destroy();
   }
 }

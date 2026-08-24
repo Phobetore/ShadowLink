@@ -18,15 +18,12 @@
 //
 // WHAT IS IMPLEMENTED INSTEAD. The same mechanism the structural end-to-end
 // harness uses (`server/test/harness/net.mjs`): a real SyncStep1 → SyncStep2 round
-// trip. After the socket's send buffer has drained, a fresh SyncStep1 is written
-// onto the same connection that carried the update. Frames on one socket are
-// delivered and processed in order, so the server can only answer that SyncStep1
-// once it has already read and applied everything that preceded it — which makes
-// the SyncStep2 that comes back a genuine acknowledgement of this handle's
-// updates. Anything else (a closed socket, a reconnect mid-flush, no reply before
-// the deadline) returns FALSE. y-websocket's own `synced` flag is not sufficient
-// on its own: it latches true after the first sync and says nothing at all about
-// an update sent ten seconds later.
+// trip, which now lives in `ProviderAck.ts` because `WorkspaceSession`'s provider
+// needs exactly the same guarantee and had a materially weaker one. Anything
+// short of that acknowledgement (a closed socket, a reconnect mid-flush, no reply
+// before the deadline) returns FALSE. y-websocket's own `synced` flag is not
+// sufficient on its own: it latches true after the first sync and says nothing at
+// all about an update sent ten seconds later.
 //
 // `openHeadless` reports `synced` with the same honesty: a timeout is not a sync
 // (I3/I4), and a document whose sync could not be proven is handed back empty and
@@ -36,24 +33,13 @@
 
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
-import * as syncProtocol from 'y-protocols/sync';
-import * as encoding from 'lib0/encoding';
-import * as decoding from 'lib0/decoding';
 
 import { NOTE_SYNC_TIMEOUT_MS } from '../tree/constants.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
-
-/** y-websocket's outer message tag for a sync frame. */
-const MESSAGE_SYNC = 0;
+import { ProviderAck } from './ProviderAck.ts';
 
 /** How long a `flush` waits for the round trip before reporting failure. */
 const FLUSH_TIMEOUT_MS = 8_000;
-
-/** How often the send buffer is re-checked while it drains. */
-const DRAIN_POLL_MS = 25;
-
-/** `WebSocket.OPEN`, spelled out so this module needs no DOM constant at runtime. */
-const WS_OPEN = 1;
 
 interface PooledHandle extends DocHandle {
   readonly room: string;
@@ -67,30 +53,6 @@ export interface ObsidianDocPortConfig {
   workspaceId: string;
   syncTimeoutMs?: number;
   flushTimeoutMs?: number;
-}
-
-/**
- * Decode just far enough to tell whether a frame is a SyncStep2.
- *
- * Read-only: the frame is decoded into a throwaway decoder and nothing is applied
- * from it. y-websocket's own handler decodes the same bytes independently and is
- * the only thing that touches the document.
- */
-function isSyncStep2(data: unknown): boolean {
-  let bytes: Uint8Array;
-  if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
-  else if (ArrayBuffer.isView(data)) {
-    const view = data as ArrayBufferView;
-    bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-  } else return false;
-
-  try {
-    const dec = decoding.createDecoder(bytes);
-    if (decoding.readVarUint(dec) !== MESSAGE_SYNC) return false;
-    return decoding.readVarUint(dec) === syncProtocol.messageYjsSyncStep2;
-  } catch {
-    return false;
-  }
 }
 
 // ============================================================ one pooled room
@@ -111,35 +73,10 @@ class Room {
   /** Outstanding handles. The connection is torn down when this reaches zero. */
   refs = 0;
 
-  /**
-   * SyncStep2 frames observed on the CURRENT socket, and our own SyncStep1 frames
-   * still waiting for one.
-   *
-   * `unanswered` is what stops a reply to a PREVIOUS, timed-out flush from
-   * satisfying the next one: each flush's target is set past every reply still
-   * owed, so a stale acknowledgement advances the count without ever standing in
-   * for the round trip the caller actually asked about.
-   */
-  private step2 = 0;
-  private unanswered = 0;
+  /** The round trip, shared verbatim with the editing session's provider. */
+  private readonly ack: ProviderAck;
 
-  /** Bumped on every (re)attach. A flush that spans a reconnect fails, never lies. */
-  private epoch = 0;
-
-  private socket: WebSocket | null = null;
-  private readonly listeners = new Set<() => void>();
   private destroyed = false;
-
-  private readonly onMessage = (event: MessageEvent): void => {
-    if (!isSyncStep2(event.data)) return;
-    this.step2 += 1;
-    if (this.unanswered > 0) this.unanswered -= 1;
-    this.notify();
-  };
-
-  private readonly onSocketClose = (): void => {
-    this.notify();
-  };
 
   constructor(room: string, config: ObsidianDocPortConfig) {
     this.doc = new Y.Doc();
@@ -148,11 +85,7 @@ class Room {
       params: { t: config.serverKey, w: config.workspaceId },
       disableBc: true,
     });
-    // Re-attaching on every status transition is what keeps `epoch` honest: a
-    // reconnect replaces the socket, and every counter that described the old one
-    // is meaningless against the new.
-    this.provider.on('status', () => { this.attach(); });
-    this.attach();
+    this.ack = new ProviderAck(this.provider, this.doc);
   }
 
   get text(): string {
@@ -180,42 +113,12 @@ class Room {
   /** Spec §6.2's "await the update round-trip", and invariant I17's whole basis. */
   async flush(ms: number): Promise<boolean> {
     if (this.destroyed) return false;
-    this.attach();
-    const socket = this.socket;
-    if (socket === null || !this.provider.wsconnected) return false;
-
-    const deadline = Date.now() + ms;
-    const epoch = this.epoch;
-
-    // 1. The bytes must leave this process first. Until the buffer has drained
-    //    there is nothing for the server to have acknowledged, and a SyncStep1
-    //    queued behind them would only prove that the queue exists.
-    while (socket.bufferedAmount > 0) {
-      if (Date.now() >= deadline) return false;
-      await sleep(DRAIN_POLL_MS);
-      if (this.epoch !== epoch || !this.provider.wsconnected) return false;
-    }
-
-    // 2. Ask a question the server can only answer after it has processed
-    //    everything we sent before it.
-    const target = this.step2 + this.unanswered + 1;
-    this.unanswered += 1;
-    if (!this.sendStep1(socket)) return false;
-
-    await this.waitFor(
-      () => this.epoch !== epoch || this.step2 >= target || !this.provider.wsconnected,
-      Math.max(0, deadline - Date.now()),
-    );
-
-    // Every clause is a way of being unsure, and I17 says an unconfirmed flush is
-    // a retry rather than a completion.
-    return this.epoch === epoch && this.step2 >= target && this.provider.wsconnected;
+    return this.ack.flush(ms);
   }
 
   destroy(): void {
     this.destroyed = true;
-    this.detach();
-    this.listeners.clear();
+    this.ack.destroy();
     try {
       this.provider.destroy();
     } catch {
@@ -227,79 +130,6 @@ class Room {
       /* already gone */
     }
   }
-
-  // ---------------------------------------------------------- internals
-
-  /**
-   * Follow the provider onto its current socket.
-   *
-   * y-websocket assigns `ws.onmessage` rather than registering a listener, so an
-   * added listener sits alongside its handler instead of replacing it.
-   */
-  private attach(): void {
-    if (this.destroyed) return;
-    const next = this.provider.ws;
-    if (next === this.socket) return;
-    this.detach();
-    if (next === null) return;
-    this.socket = next;
-    this.epoch += 1;
-    this.step2 = 0;
-    this.unanswered = 0;
-    next.addEventListener('message', this.onMessage);
-    next.addEventListener('close', this.onSocketClose);
-    this.notify();
-  }
-
-  private detach(): void {
-    const socket = this.socket;
-    this.socket = null;
-    if (socket === null) return;
-    try {
-      socket.removeEventListener('message', this.onMessage);
-      socket.removeEventListener('close', this.onSocketClose);
-    } catch {
-      /* the socket is already gone; nothing left to unbind */
-    }
-  }
-
-  private sendStep1(socket: WebSocket): boolean {
-    if (socket.readyState !== WS_OPEN) return false;
-    const enc = encoding.createEncoder();
-    encoding.writeVarUint(enc, MESSAGE_SYNC);
-    syncProtocol.writeSyncStep1(enc, this.doc);
-    try {
-      socket.send(encoding.toUint8Array(enc));
-    } catch {
-      return false;
-    }
-    return true;
-  }
-
-  private notify(): void {
-    for (const listener of [...this.listeners]) listener();
-  }
-
-  private waitFor(predicate: () => boolean, ms: number): Promise<void> {
-    if (predicate()) return Promise.resolve();
-    return new Promise<void>((resolve) => {
-      let done = false;
-      const finish = (): void => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        this.listeners.delete(check);
-        resolve();
-      };
-      const check = (): void => { if (predicate()) finish(); };
-      this.listeners.add(check);
-      const timer = setTimeout(finish, ms);
-    });
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 }
 
 // ============================================================ ObsidianDocPort
