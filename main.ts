@@ -353,10 +353,13 @@ class SyncRuntime {
 
     const result = await this.kept.share(chosen);
     const failed = result.failed.length;
+    // `chosen.length`, never `result.cleared`: one decision can hold two records —
+    // a node id and a folded path — and telling the user "2" for one file they
+    // picked would be arithmetic about device state rather than about their vault.
     new Notice(
       `ShadowLink shared ${result.shared} file(s)`
       + (failed > 0 ? `, ${failed} could not be shared` : '')
-      + `. ${result.cleared} entr(ies) are no longer kept back.`,
+      + `. ${chosen.length} item(s) are no longer kept back.`,
     );
   }
 
