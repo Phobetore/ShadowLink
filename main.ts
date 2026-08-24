@@ -44,6 +44,7 @@ import { WebsocketProvider } from 'y-websocket';
 
 import { SettingsTab } from './src/ui/SettingsTab';
 import {
+  chooseKeptFiles,
   confirmBulkDelete,
   confirmFirstSync,
   confirmLocalBulkDelete,
@@ -56,6 +57,7 @@ import { TreeDoc } from './src/tree/TreeDoc';
 import { Bootstrap } from './src/sync/Bootstrap';
 import { DeviceState } from './src/sync/DeviceState';
 import { Deletions } from './src/sync/Deletions';
+import { KeptFiles } from './src/sync/KeptFiles';
 import { ObsidianDocPort } from './src/sync/ObsidianDocPort';
 import { ObsidianStatePort, treeSnapshotKey } from './src/sync/ObsidianStatePort';
 import { ObsidianVaultPort } from './src/sync/ObsidianVaultPort';
@@ -144,6 +146,7 @@ class SyncRuntime {
   readonly deletions: Deletions;
   readonly reconciler: Reconciler;
   readonly bootstrap: Bootstrap;
+  readonly kept: KeptFiles;
 
   /** Read fresh by the watcher and the session; §4.1 can move it mid-session. */
   private shareRoot: string;
@@ -312,6 +315,49 @@ class SyncRuntime {
       replayPendingEvents: () => this.watcher.flushPending(),
       notice: (msg) => { new Notice(msg); },
     });
+
+    // §5.4 / R6's escape hatch. The adoption hand-off is deliberately the SAME
+    // pair the reconciler's steps 6-7 use — `onCreate` mints and owns the node,
+    // the drain publishes it — because a file at a dead node's path is excluded
+    // from the reconciler's own step 6 by I13, so clearing the decline alone would
+    // publish nothing at all.
+    this.kept = new KeptFiles({
+      state: this.state,
+      entries: () => this.tree.entries(),
+      vault: this.vault,
+      shareRoot: () => this.shareRoot,
+      adopt: (path) => this.watcher.onCreate(path, 'f'),
+      drain: () => this.queue.drain(),
+      scheduleReconcile: (cause) => { this.scheduleReconcile(toCause(cause)); },
+      notice: (msg) => { new Notice(msg); },
+    });
+  }
+
+  // ---------------------------------------------------------- §5.4 / R6
+
+  /**
+   * The `resolve kept files` command's whole body.
+   *
+   * Listing is free and side-effect-free, so the "nothing is kept" case is
+   * answered without opening a window; everything else is the user's decision,
+   * and dismissing the dialog shares nothing.
+   */
+  async resolveKeptFiles(): Promise<void> {
+    const entries = this.kept.list();
+    if (entries.length === 0) {
+      new Notice('ShadowLink: nothing is being kept back — every local file is shared.');
+      return;
+    }
+    const chosen = await chooseKeptFiles(this.plugin.app, entries);
+    if (chosen.length === 0) return;
+
+    const result = await this.kept.share(chosen);
+    const failed = result.failed.length;
+    new Notice(
+      `ShadowLink shared ${result.shared} file(s)`
+      + (failed > 0 ? `, ${failed} could not be shared` : '')
+      + `. ${result.cleared} entr(ies) are no longer kept back.`,
+    );
   }
 
   // ---------------------------------------------------------- lifecycle
@@ -600,6 +646,16 @@ export default class ShadowLinkPlugin extends Plugin {
     this.addSettingTab(new SettingsTab(this.app, this));
     this.registerEditorExtension(this.editorBinding.editorExtension());
 
+    // Spec §5.4 and risk R6 both point at this command as the reason permanent
+    // local divergence is acceptable, and the first-sync dialog now names it. It
+    // is registered in `onload`, not with the runtime, so it exists — and can say
+    // so honestly — even when the share is not configured or sync failed to start.
+    this.addCommand({
+      id: 'resolve-kept-files',
+      name: 'Resolve kept files',
+      callback: () => { void this.resolveKeptFiles(); },
+    });
+
     this.statusEl = this.addStatusBarItem();
     this.setStatus('ShadowLink: starting…', 'ShadowLink is waiting for the workspace to load.');
 
@@ -664,6 +720,29 @@ export default class ShadowLinkPlugin extends Plugin {
 
     await runtime.start();
     this.refreshStatus();
+  }
+
+  // ---------------------------------------------------------- commands
+
+  /**
+   * §5.4 / R6. Delegated to the runtime, which owns the state the answer changes.
+   *
+   * Without a runtime there is nothing to list and nothing that could act on an
+   * answer, so the command says so rather than opening an empty window: the
+   * declines live in device state, which only a configured, started share reads.
+   */
+  private async resolveKeptFiles(): Promise<void> {
+    const runtime = this.runtime;
+    if (runtime === null) {
+      new Notice('ShadowLink is not running in this vault. Check its settings and reload it.');
+      return;
+    }
+    try {
+      await runtime.resolveKeptFiles();
+    } catch (err) {
+      console.error('[ShadowLink] resolving kept files failed', err);
+      new Notice('ShadowLink could not finish sharing those files. See the console.');
+    }
   }
 
   // ---------------------------------------------------------- status bar

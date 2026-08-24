@@ -1,5 +1,5 @@
 // src/ui/modals.ts
-// The four decisions P1 is not allowed to take on the user's behalf.
+// The five decisions P1 is not allowed to take on the user's behalf.
 //
 // Every module that asks one of these questions already treats a MISSING answer
 // as the safe one: `Bootstrap` stays read-only when the first sync is not
@@ -10,16 +10,22 @@
 // dismissed, which means Escape, the close button, and a modal torn down with the
 // workspace all mean the same thing as saying no.
 //
-// That is the whole reason `DecisionModal` exists rather than four ad-hoc
+// That is the whole reason `DecisionModal` exists rather than five ad-hoc
 // promises: the settlement is written once, in `onClose`, where every exit path
-// goes through it, instead of four times in four places where one of them would
+// goes through it, instead of five times in five places where one of them would
 // eventually be forgotten and leave a promise pending for ever — which, since
 // `Deletions` awaits it, would hang the reconcile pass rather than fail safe.
+//
+// The fifth dialog is the only one that is not a refusal to act: `KeptFilesModal`
+// is where a decision taken by one of the other four is taken BACK, and its safe
+// answer — share nothing — is the one that leaves everything exactly as the user
+// last left it.
 
 import { App, Modal, Setting } from 'obsidian';
 
 import type { BootstrapConfirmation, BootstrapDecision } from '../sync/Bootstrap.ts';
 import type { BulkChoice, BulkSummary } from '../sync/Deletions.ts';
+import type { KeptEntry } from '../sync/KeptFiles.ts';
 
 /** Longest list any of these dialogs renders inline before it summarizes. */
 const MAX_LISTED = 8;
@@ -116,9 +122,15 @@ class FirstSyncModal extends DecisionModal<BootstrapDecision> {
       contentEl.createEl('p', { text: 'Local files that would be shared:' });
       this.listPaths(info.upload);
 
+      // The promise in the second sentence is only true because the command
+      // exists, and it names the command so it can be acted on: an escape hatch
+      // nobody can find is the same as no escape hatch (spec §5.4, risk R6).
       new Setting(contentEl)
         .setName('Share my local files with this workspace')
-        .setDesc('Uncheck to keep them on this device only. You can share them later.')
+        .setDesc(
+          'Uncheck to keep them on this device only. The command '
+          + '"ShadowLink: Resolve kept files" lists them again and can share them later.',
+        )
         .addToggle((t) => t.setValue(true).onChange((v) => { this.shareLocalFiles = v; }));
     }
 
@@ -271,4 +283,64 @@ export function confirmUnshare(
   count: number,
 ): Promise<'unshare' | 'undo'> {
   return new UnshareModal(app, rootPath, count).ask();
+}
+
+// ============================================================ §5.4 / R6
+
+/**
+ * The escape hatch: everything this device is refusing to share, with a checkbox
+ * each.
+ *
+ * Nothing is pre-selected and dismissing shares nothing, because every entry here
+ * is a file the user already chose to keep — the burden is on the new decision,
+ * not on the old one. `KeptFiles.share` is what acts on the answer; this dialog
+ * only collects it.
+ */
+class KeptFilesModal extends DecisionModal<KeptEntry[]> {
+  private readonly selected = new Set<string>();
+
+  constructor(app: App, private readonly entries: readonly KeptEntry[]) {
+    super(app, []);
+  }
+
+  override onOpen(): void {
+    const { contentEl, titleEl, entries } = this;
+    titleEl.setText('ShadowLink — files you chose to keep');
+
+    contentEl.createEl('p', {
+      text: `${entries.length} item(s) on this device are deliberately not shared: `
+        + 'local files you kept back on first sync, and files a peer deleted whose '
+        + 'copies you kept. Tick the ones to share with the workspace now.',
+    });
+
+    for (const entry of entries) {
+      new Setting(contentEl)
+        .setName(entry.label)
+        .setDesc(entry.detail)
+        .addToggle((t) => t
+          .setValue(false)
+          .onChange((v) => {
+            if (v) this.selected.add(entry.key);
+            else this.selected.delete(entry.key);
+          }));
+    }
+
+    new Setting(contentEl)
+      .addButton((b) => b
+        .setButtonText('Keep them all')
+        .setCta()
+        .onClick(() => { this.choose([]); }))
+      .addButton((b) => b
+        .setButtonText('Share these')
+        .onClick(() => {
+          this.choose(this.entries.filter((e) => this.selected.has(e.key)));
+        }));
+  }
+}
+
+export function chooseKeptFiles(
+  app: App,
+  entries: readonly KeptEntry[],
+): Promise<KeptEntry[]> {
+  return new KeptFilesModal(app, entries).ask();
 }

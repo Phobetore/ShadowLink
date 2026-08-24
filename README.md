@@ -80,7 +80,9 @@ and **Shared folder**. Toggle the plugin off and on to apply.
 On its first join each member is shown exactly one dialog: what will be
 downloaded, what local files will be adopted into the shared folder, and what
 will be uploaded. Nothing on disk is touched until you accept it, and the
-"share my local files" checkbox can be unchecked to keep them local for good.
+"share my local files" checkbox can be unchecked to keep them on this device.
+That is not a one-way door: the command **ShadowLink: Resolve kept files** lists
+what you kept back and shares whichever of it you pick, whenever you like.
 
 ## Limitations
 
@@ -106,6 +108,26 @@ These are real and current. Read them before you rely on this.
   trust.
 - **`ShadowLink Recovered/` grows without bound.** Nothing prunes it. It is your
   copy of files a peer deleted, and clearing it out is your call.
+- **A file deleted while Obsidian was closed comes back.** On start, a note the
+  workspace still has and your vault does not is re-downloaded, never read as a
+  deletion — there is no evidence telling "the user deleted it externally" apart
+  from "we never finished fetching it", and resurrection is reversible where
+  deletion is not. Delete it again with Obsidian running and it goes for everyone.
+- **The structure document only ever grows.** Renaming a folder rewrites every
+  descendant's entry, and the CRDT keeps the superseded ones, so heavy
+  reorganization churn inflates the shared `_tree` document permanently. A team
+  reshuffling a few thousand notes monthly should expect a multi-megabyte tree
+  within a year — large, not broken. There is no compaction yet.
+- **Two notes with the same name: which one keeps the plain name is arbitrary.**
+  The tree honestly holds both, and your vault shows `Notes.md` and
+  `Notes (2).md`. Which is which is decided by internal id order, identically on
+  every device, and it will not match anyone's intuition. Renaming one of them
+  resolves it for everybody.
+- **Keeping your copies of a bulk delete leaves this device out of step on
+  purpose.** Those files stay yours and stop being shared, permanently and with
+  no re-prompt — including local files you kept back on first sync. The command
+  **ShadowLink: Resolve kept files** lists everything in that state and shares
+  the ones you pick; nothing else revisits the decision.
 - Settings are read at plugin load — toggle the plugin after changing them.
 
 ## Server configuration
