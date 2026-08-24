@@ -77,6 +77,9 @@ interface Call {
   args: readonly unknown[];
 }
 
+const encode = (text: string): Uint8Array => new TextEncoder().encode(text);
+const decode = (data: Uint8Array): string => new TextDecoder().decode(data);
+
 function baseOf(path: string): string {
   const i = path.lastIndexOf('/');
   return i === -1 ? path : path.slice(i + 1);
@@ -93,8 +96,19 @@ function parentOf(path: string): string {
  */
 class FakeObsidianVault {
   readonly calls: Call[] = [];
-  readonly contents = new Map<string, string>();
+  /**
+   * BYTES are the single truth, exactly as `FakeVault` keeps them. A parallel
+   * binary map beside a string one produces a fake where `create` then
+   * `readBinary` fails while production succeeds — the class of divergence that is
+   * invisible until it is catastrophic (spec §8.5).
+   */
+  readonly bytes = new Map<string, Uint8Array>();
   readonly root: TFolder;
+  /** Set to make the next `adapter.stat` THROW: "I could not look" (I2). */
+  statThrows: Error | null = null;
+  /** Monotonic, bumped on every write, so the size+mtime staleness test can bite. */
+  private clock = 1_700_000_000_000;
+  private readonly mtimes = new Map<string, number>();
 
   /** Every removal, with the bin it was routed to. Invariant I1 lives here. */
   readonly trashed: Array<{ path: string; system: boolean }> = [];
@@ -126,14 +140,43 @@ class FakeObsidianVault {
     if (kind === 'd') (node as TFolder).children = [];
     parent.children.push(node);
     this.byPath.set(path, node);
-    if (kind === 'f') this.contents.set(path, data);
+    if (kind === 'f') this.write(path, encode(data));
+    else this.mtimes.set(path, this.nextMtime());
     return node;
   }
 
-  /** Files only, path -> contents. What a test compares afterwards. */
+  /** Place raw bytes at `path`, creating the entry if it is not there yet. */
+  seedBinary(path: string, data: Uint8Array): void {
+    this.seed(path, 'f');
+    this.write(path, data);
+  }
+
+  /** The mtime the adapter reports. Bumped by every write, preserved by a rename. */
+  mtimeOf(path: string): number {
+    return this.mtimes.get(path) ?? 0;
+  }
+
+  private write(path: string, data: Uint8Array): void {
+    this.bytes.set(path, data.slice());
+    this.mtimes.set(path, this.nextMtime());
+  }
+
+  private nextMtime(): number {
+    this.clock += 1000;
+    return this.clock;
+  }
+
+  /** Files only, path -> text. What a test compares afterwards. */
   snapshot(): Record<string, string> {
     const out: Record<string, string> = {};
-    for (const path of [...this.contents.keys()].sort()) out[path] = this.contents.get(path)!;
+    for (const path of [...this.bytes.keys()].sort()) out[path] = decode(this.bytes.get(path)!);
+    return out;
+  }
+
+  /** Files only, path -> the bytes themselves. */
+  binarySnapshot(): Record<string, Uint8Array> {
+    const out: Record<string, Uint8Array> = {};
+    for (const path of [...this.bytes.keys()].sort()) out[path] = this.bytes.get(path)!.slice();
     return out;
   }
 
@@ -160,13 +203,34 @@ class FakeObsidianVault {
 
   async cachedRead(file: TFile): Promise<string> {
     this.calls.push({ op: 'cachedRead', args: [file.path] });
-    return this.contents.get(file.path) ?? '';
+    return decode(this.bytes.get(file.path) ?? new Uint8Array(0));
   }
 
   async read(file: TFile): Promise<string> {
     // Present so a test can prove the adapter chose `cachedRead` over this one.
     this.calls.push({ op: 'read', args: [file.path] });
-    return this.contents.get(file.path) ?? '';
+    return decode(this.bytes.get(file.path) ?? new Uint8Array(0));
+  }
+
+  /** The real one hands back an ArrayBuffer, so the adapter has to convert. */
+  async readBinary(file: TFile): Promise<ArrayBuffer> {
+    this.calls.push({ op: 'readBinary', args: [file.path] });
+    const found = this.bytes.get(file.path) ?? new Uint8Array(0);
+    const copy = new Uint8Array(found.length);
+    copy.set(found);
+    return copy.buffer;
+  }
+
+  /**
+   * The real one takes an ArrayBuffer and refuses an occupied path — but only
+   * case-SENSITIVELY, which is the whole reason the adapter checks first (I11).
+   */
+  async createBinary(path: string, data: ArrayBuffer): Promise<TFile> {
+    this.calls.push({ op: 'createBinary', args: [path, new Uint8Array(data).slice()] });
+    if (this.byPath.has(path)) throw new Error(`createBinary: already exists: ${path}`);
+    const file = this.seed(path, 'f') as TFile;
+    this.write(path, new Uint8Array(data));
+    return file;
   }
 
   async create(path: string, data: string): Promise<TFile> {
@@ -184,11 +248,16 @@ class FakeObsidianVault {
   async rename(file: TAbstractFile, to: string): Promise<void> {
     this.calls.push({ op: 'rename', args: [file.path, to] });
     const from = file.path;
-    const data = this.contents.get(from);
+    const data = this.bytes.get(from);
+    const mtime = this.mtimes.get(from);
     this.detach(from);
     this.byPath.delete(from);
-    this.contents.delete(from);
-    this.seed(to, file instanceof this.FolderClass ? 'd' : 'f', data ?? '');
+    this.bytes.delete(from);
+    this.mtimes.delete(from);
+    this.seed(to, file instanceof this.FolderClass ? 'd' : 'f');
+    if (data !== undefined) this.bytes.set(to, data);
+    // A rename MOVES the file; it does not rewrite it, so the mtime is preserved.
+    if (mtime !== undefined) this.mtimes.set(to, mtime);
   }
 
   async trash(file: TAbstractFile, system: boolean): Promise<void> {
@@ -196,7 +265,8 @@ class FakeObsidianVault {
     this.trashed.push({ path: file.path, system });
     this.detach(file.path);
     this.byPath.delete(file.path);
-    this.contents.delete(file.path);
+    this.bytes.delete(file.path);
+    this.mtimes.delete(file.path);
   }
 
   /** The FileManager rename must never be reached; calling it fails the test. */
@@ -217,11 +287,24 @@ class FakeObsidianVault {
         vault.calls.push({ op: 'adapter.exists', args: [path] });
         return vault.byPath.has(path);
       },
-      async stat(path: string): Promise<{ type: 'file' | 'folder' } | null> {
+      async stat(path: string): Promise<{
+        type: 'file' | 'folder'; size: number; mtime: number; ctime: number;
+      } | null> {
         vault.calls.push({ op: 'adapter.stat', args: [path] });
+        // "I could not look" is an ERROR, never an absence (I2). The real adapter
+        // does exactly this for a permission failure or an unreadable volume.
+        const boom = vault.statThrows;
+        if (boom !== null) { vault.statThrows = null; throw boom; }
         const node = vault.byPath.get(path);
         if (node === undefined) return null;
-        return { type: node instanceof vault.FolderClass ? 'folder' : 'file' };
+        const folder = node instanceof vault.FolderClass;
+        const mtime = vault.mtimeOf(path);
+        return {
+          type: folder ? 'folder' : 'file',
+          size: folder ? 0 : (vault.bytes.get(path)?.length ?? 0),
+          mtime,
+          ctime: mtime,
+        };
       },
       async list(path: string): Promise<{ files: string[]; folders: string[] }> {
         vault.calls.push({ op: 'adapter.list', args: [path] });
@@ -462,4 +545,149 @@ test('create and createFolder write exactly the normalized path they were given'
   assert.deepEqual(h.vault.callsTo('createFolder')[0].args, [`${SHARE}/sub`]);
   assert.deepEqual(h.vault.callsTo('create')[0].args, [`${SHARE}/sub/note.md`, 'first bytes']);
   assert.deepEqual(h.vault.snapshot(), { [`${SHARE}/sub/note.md`]: 'first bytes' });
+});
+
+// ---------------------------------------------------------------- binary access
+
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0x7f]);
+
+test('readBinary returns the file\'s exact bytes, through the folded lookup', async () => {
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/Diagram.png`, PNG);
+
+  assert.deepEqual(await h.port.readBinary(`${SHARE}/Diagram.png`), PNG);
+  // I11: Obsidian's own lookup is case-SENSITIVE, so the folded fallback is the
+  // adapter's own work here exactly as it is for `read`.
+  assert.deepEqual(await h.port.readBinary(`${SHARE}/diagram.PNG`), PNG);
+});
+
+test('readBinary and read see the same bytes — one store, not two', async () => {
+  // The hazard spec §8.5 names: a fake with a parallel binary map lets `create`
+  // then `readBinary` fail while production succeeds. Bytes are the only truth on
+  // both sides, so a file written as text reads back as its UTF-8 encoding.
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+  await h.port.create(`${SHARE}/note.md`, 'héllo — ok');
+
+  const raw = await h.port.readBinary(`${SHARE}/note.md`);
+  assert.deepEqual(raw, new TextEncoder().encode('héllo — ok'));
+  assert.equal(await h.port.read(`${SHARE}/note.md`), 'héllo — ok');
+
+  await h.port.createBinary(`${SHARE}/other.md`, new TextEncoder().encode('# from bytes'));
+  assert.equal(await h.port.read(`${SHARE}/other.md`), '# from bytes');
+});
+
+test('readBinary rejects for an absent path and for a directory, exactly like read', async () => {
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+
+  await assert.rejects(h.port.readBinary(`${SHARE}/missing.png`), /not found/);
+  await assert.rejects(h.port.readBinary(SHARE), /not a file/);
+});
+
+test('createBinary writes the bytes and refuses an occupied path (I1/I11)', async () => {
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+
+  await h.port.createBinary(`${SHARE}/Shot.png`, PNG);
+  assert.deepEqual(h.vault.binarySnapshot(), { [`${SHARE}/Shot.png`]: PNG });
+
+  await assert.rejects(h.port.createBinary(`${SHARE}/Shot.png`, new Uint8Array([1])), /already exists/);
+  // The case-variant neighbour is the dangerous one: Obsidian's own duplicate
+  // check is a case-sensitive map read, so on macOS and Windows this reaches the
+  // filesystem and truncates the file the check never saw.
+  await assert.rejects(h.port.createBinary(`${SHARE}/shot.PNG`, new Uint8Array([2])), /already exists/);
+
+  assert.deepEqual(
+    h.vault.binarySnapshot(), { [`${SHARE}/Shot.png`]: PNG },
+    'a refused createBinary leaves the occupant byte-for-byte untouched',
+  );
+  assert.equal(h.vault.callsTo('createBinary').length, 1, 'the refusals never reached the vault');
+});
+
+test('createBinary writes exactly the view it was given, not the whole buffer', async () => {
+  // `Uint8Array`, not `ArrayBuffer`, precisely so a subarray cannot silently
+  // become a whole-buffer copy. A 100 MB attachment is the case where that stops
+  // being a correctness detail and becomes an out-of-memory crash.
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const backing = new Uint8Array([9, 9, 9, 1, 2, 3, 9, 9]);
+
+  await h.port.createBinary(`${SHARE}/slice.bin`, backing.subarray(3, 6));
+
+  assert.deepEqual(
+    h.vault.binarySnapshot(),
+    { [`${SHARE}/slice.bin`]: new Uint8Array([1, 2, 3]) },
+  );
+  assert.deepEqual(await h.port.readBinary(`${SHARE}/slice.bin`), new Uint8Array([1, 2, 3]));
+});
+
+test('createBinary refuses an empty path rather than writing at the vault root', async () => {
+  const h = await makeHarness();
+  await assert.rejects(h.port.createBinary('', PNG), /empty path/);
+  await assert.rejects(h.port.createBinary('/', PNG), /empty path/);
+});
+
+// ---------------------------------------------------------------- stat
+
+test('stat reports kind, byte length and mtime, and sees dot paths', async () => {
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/img.png`, PNG);
+  h.vault.seed('.obsidian', 'd');
+  h.vault.seed('.obsidian/app.json', 'f', '{}');
+
+  const file = await h.port.stat(`${SHARE}/img.png`);
+  assert.deepEqual(
+    file,
+    { kind: 'f', bytes: PNG.length, mtime: h.vault.mtimeOf(`${SHARE}/img.png`) },
+  );
+
+  const folder = await h.port.stat(SHARE);
+  assert.equal(folder?.kind, 'd');
+
+  // Adapter level, so it sees what `list()` cannot.
+  assert.equal((await h.port.stat('.obsidian/app.json'))?.kind, 'f');
+});
+
+test('stat reports BYTES, not characters', async () => {
+  // A size compared against a byte length recorded elsewhere has to be a byte
+  // length, or every multi-byte note looks stale on every pass and is re-hashed.
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+  await h.port.create(`${SHARE}/n.md`, 'héllo');            // 5 characters, 6 bytes
+
+  assert.equal((await h.port.stat(`${SHARE}/n.md`))?.bytes, 6);
+});
+
+test('stat mtime bumps on a write and survives a rename', async () => {
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/a.png`, PNG);
+  const first = (await h.port.stat(`${SHARE}/a.png`))!.mtime;
+
+  h.vault.seedBinary(`${SHARE}/a.png`, new Uint8Array([1, 2, 3]));
+  const second = (await h.port.stat(`${SHARE}/a.png`))!.mtime;
+  assert.ok(second > first, 'a write moves the clock forward');
+
+  await h.port.rename(`${SHARE}/a.png`, `${SHARE}/b.png`);
+  const moved = (await h.port.stat(`${SHARE}/b.png`))!;
+  assert.equal(moved.mtime, second, 'a move is not a rewrite');
+  assert.equal(moved.bytes, 3);
+});
+
+test('stat resolves NULL for a definite not-found and REJECTS when it could not look (I2)', async () => {
+  const h = await makeHarness();
+  h.vault.seed(SHARE, 'd');
+
+  assert.equal(await h.port.stat(`${SHARE}/gone.png`), null, '"it is not there" is an answer');
+
+  // "I could not look" is NOT an answer. Collapsing the two is how a permission
+  // error, an unmounted volume or a locked file reads as "the user deleted it".
+  h.vault.statThrows = new Error('EACCES: permission denied');
+  await assert.rejects(h.port.stat(`${SHARE}/gone.png`), /EACCES/);
+
+  // …and the failure is one-shot, so the next look answers normally again.
+  assert.equal(await h.port.stat(`${SHARE}/gone.png`), null);
 });

@@ -45,8 +45,46 @@ export interface VaultPort {
   /** `vault.cachedRead`. Rejects for an absent path or a directory. */
   read(path: string): Promise<string>;
 
+  /**
+   * `vault.readBinary`. Rejects for an absent path or a directory, exactly like
+   * `read`.
+   *
+   * `Uint8Array`, not `ArrayBuffer`: it carries its own offset and length, so a
+   * subarray can never silently become a whole-buffer copy, and it is what both
+   * Web Crypto and the port fakes want. `ObsidianVaultPort` converts exactly once,
+   * at the boundary.
+   */
+  readBinary(path: string): Promise<Uint8Array>;
+
   /** `vault.create`. Rejects if the path is already occupied — never blind-overwrites. */
   create(path: string, data: string): Promise<void>;
+
+  /**
+   * `vault.createBinary`. Rejects if the path is occupied — never blind-overwrites,
+   * exactly like `create`, and through the same folded occupancy check (I11).
+   *
+   * There is deliberately NO in-place binary write (`modifyBinary`,
+   * `adapter.writeBinary`): an interrupted overwrite leaves a corrupt file at the
+   * canonical path with no way to detect it. Every byte replacement goes through
+   * the staging journal instead — the previous bytes are renamed into staging
+   * BEFORE the new ones exist, so a crash leaves a visible file and a journal line
+   * rather than a hole.
+   */
+  createBinary(path: string, data: Uint8Array): Promise<void>;
+
+  /**
+   * `adapter.stat`. RESOLVES NULL only for a definite not-found; REJECTS when the
+   * lookup itself failed.
+   *
+   * That distinction is invariant I2: "it is not there" is an answer, "I could not
+   * look" is not, and the two must not collapse into one value — the first is what
+   * the reconciler acts on, and the second must be a no-op.
+   *
+   * `mtime` is what makes the cheap staleness test possible: a pass over a share
+   * with 2,000 attachments decides "is my copy current?" with one `stat` each and
+   * a full hash only when size and mtime disagree with the recorded base.
+   */
+  stat(path: string): Promise<{ kind: Kind; bytes: number; mtime: number } | null>;
 
   /** `vault.createFolder`. Does NOT create intermediates; `ensureDirs` walks segments itself. */
   createFolder(path: string): Promise<void>;

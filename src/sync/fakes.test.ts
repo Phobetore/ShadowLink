@@ -8,6 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import type { BlobPort } from './BlobPort.ts';
 import { hashOfBytes } from '../tree/paths.ts';
 
 // ---------------------------------------------------------------- case folding
@@ -660,4 +661,39 @@ test('the same bytes stored twice are one object', async () => {
   assert.equal(await blobs.put(sha, PNG.slice()), true);
 
   assert.equal(blobs.objectCount(), 1, 'content addressing dedups by construction');
+});
+
+// A fake that has drifted from the port it stands in for is worse than no fake:
+// the engine is written against `BlobPort`, and every Group B test proves the
+// engine against THIS. If the two ever disagree about a method's name or its
+// arity, the suite goes on passing while the real port is never exercised.
+test('FakeBlobs and ObsidianBlobPort present the same surface', async () => {
+  const { ObsidianBlobPort } = await import('./ObsidianBlobPort.ts');
+  const fake = new FakeBlobs();
+  const real = new ObsidianBlobPort({
+    serverUrl: 'ws://127.0.0.1:9', serverKey: 'sk_x', workspaceId: 'w',
+  });
+
+  for (const method of ['has', 'put', 'get', 'limits'] as const) {
+    assert.equal(typeof fake[method], 'function', `FakeBlobs.${method}`);
+    assert.equal(typeof real[method], 'function', `ObsidianBlobPort.${method}`);
+    assert.equal(
+      fake[method].length, real[method].length,
+      `${method}() takes a different number of arguments on the fake than on the real port`,
+    );
+  }
+  assert.equal('lastError' in fake, true);
+  assert.equal('lastError' in real, true);
+});
+
+// `implements BlobPort` on both classes is a compile-time claim; this is the
+// runtime half, because the engine is handed one or the other through the same
+// binding and a shape that only type-checks is not enough.
+test('a BlobPort binding accepts either implementation', async () => {
+  const { ObsidianBlobPort } = await import('./ObsidianBlobPort.ts');
+  const ports: BlobPort[] = [
+    new FakeBlobs(),
+    new ObsidianBlobPort({ serverUrl: 'ws://127.0.0.1:9', serverKey: 'sk_x', workspaceId: 'w' }),
+  ];
+  assert.equal(ports.length, 2);
 });

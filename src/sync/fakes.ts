@@ -25,8 +25,11 @@
 // No `obsidian` import, no node builtins.
 
 import { extOf, fold, hashOfBytes } from '../tree/paths.ts';
+import type { BlobLimits, BlobPort, BlobPresence } from './BlobPort.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
+
+export type { BlobLimits } from './BlobPort.ts';
 
 // ============================================================ FakeVault
 
@@ -662,15 +665,10 @@ export interface BlobCall {
   readonly args: readonly unknown[];
 }
 
-export interface BlobLimits {
-  maxFileBytes: number;
-  freeBytes: number | null;
-}
-
 /** Default ceiling, matching nothing in particular: tests that care call `setLimits`. */
 const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 
-export class FakeBlobs {
+export class FakeBlobs implements BlobPort {
   /** Ordered log of every call, arguments included, throwing calls included. */
   readonly calls: BlobCall[] = [];
 
@@ -753,7 +751,7 @@ export class FakeBlobs {
   // ---------------------------------------------------------- BlobPort
 
   /** HEAD. Throws on transport failure — never answers false for "I could not ask". */
-  async has(sha256: string): Promise<{ present: boolean; bytes?: number }> {
+  async has(sha256: string): Promise<BlobPresence> {
     this.record('has', [sha256]);
     this.maybeFail('has');
 

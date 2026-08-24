@@ -220,6 +220,11 @@ class GatedVault implements VaultPort {
     await this.gate('create');
     return this.inner.create(path, data);
   }
+  readBinary(path: string): Promise<Uint8Array> { return this.inner.readBinary(path); }
+  createBinary(path: string, data: Uint8Array): Promise<void> {
+    return this.inner.createBinary(path, data);
+  }
+  stat(path: string): ReturnType<VaultPort['stat']> { return this.inner.stat(path); }
   createFolder(path: string): Promise<void> { return this.inner.createFolder(path); }
   rename(from: string, to: string): Promise<void> { return this.inner.rename(from, to); }
   trashLocal(path: string): Promise<void> { return this.inner.trashLocal(path); }

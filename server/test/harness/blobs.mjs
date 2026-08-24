@@ -19,6 +19,10 @@ import * as Y from 'yjs';
 import { test, assert } from './runner.mjs';
 import { startServer } from './server.mjs';
 import { DocLink, sleep } from './net.mjs';
+import { ObsidianBlobPort } from '../../../src/sync/ObsidianBlobPort.ts';
+import {
+  BlobTooLarge, BlobTransport, BlobUnavailable,
+} from '../../../src/sync/BlobPort.ts';
 
 const WS = 'blobs';
 
@@ -416,6 +420,136 @@ export function registerBlobCases(getServer, basePort) {
       }
     } finally {
       first.cleanup();
+    }
+  });
+
+  // ------------------------------------------------- the client port, for real
+
+  test('the client BlobPort round-trips against the real server process', async () => {
+    const server = getServer();
+    const ws = 'portrt';
+    const port = new ObsidianBlobPort({
+      // The plugin holds ONE server URL and it is a WebSocket one. If this port
+      // could not take it as given, every user would need a second setting.
+      serverUrl: `ws://127.0.0.1:${server.port}`,
+      serverKey: server.serverKey,
+      workspaceId: ws,
+    });
+
+    // The shipped defaults, arriving over the wire: proof that the config change
+    // reaches the CLIENT rather than only the server's own arithmetic.
+    const limits = await port.limits();
+    assert.equal(limits.maxFileBytes, 104_857_600, 'MAX_FILE_SIZE_MB = 100');
+    // `freeBytes` is the whole store's remaining room and every earlier case in
+    // this run has already put objects in it, so what is asserted is the ceiling
+    // and the arithmetic, not a pristine number.
+    assert.ok(
+      limits.freeBytes > 0 && limits.freeBytes <= 10_737_418_240,
+      `MAX_TOTAL_STORAGE_GB = 10, less what is stored (${limits.freeBytes})`,
+    );
+
+    const data = bytes(5 * 1024 * 1024, 61);
+    const hash = sha256(data);
+
+    assert.deepEqual(await port.has(hash), { present: false });
+    assert.equal(await port.put(hash, data), true);
+    assert.deepEqual(await port.has(hash), { present: true, bytes: data.length });
+
+    const back = await port.get(hash, data.length);
+    assert.notEqual(back, null, 'the fetch produced nothing');
+    assert.equal(sha256(Buffer.from(back)), hash, 'byte-identical after a real round trip');
+    assert.equal(port.lastError, null);
+  });
+
+  test('the client BlobPort resumes an interrupted upload against the real server', async () => {
+    const server = getServer();
+    const ws = 'portres';
+    const patches = [];
+    const port = new ObsidianBlobPort({
+      serverUrl: `ws://127.0.0.1:${server.port}`,
+      serverKey: server.serverKey,
+      workspaceId: ws,
+      chunkBytes: 512 * 1024,
+      fetchImpl: (input, init) => {
+        if ((init?.method ?? 'GET') === 'PATCH') patches.push(init.headers['content-range']);
+        return fetch(input, init);
+      },
+    });
+    const data = bytes(3 * 1024 * 1024, 63);
+    const hash = sha256(data);
+
+    // Abort part-way, exactly as a dropped link would.
+    const controller = new AbortController();
+    let stopped = 0;
+    const partial = new ObsidianBlobPort({
+      serverUrl: `ws://127.0.0.1:${server.port}`,
+      serverKey: server.serverKey,
+      workspaceId: ws,
+      chunkBytes: 512 * 1024,
+      fetchImpl: (input, init) => {
+        if (controller.signal.aborted) throw new Error('link down');
+        return fetch(input, init);
+      },
+    });
+    await partial.put(hash, data, (sent) => {
+      if (sent >= 1024 * 1024 && stopped === 0) { stopped = sent; controller.abort(); }
+    }).catch(() => { /* the interruption is the point */ });
+    assert.ok(stopped > 0, 'the upload really did get part way');
+
+    // The server kept the prefix that arrived, and says so.
+    const probe = await call(server, { method: 'HEAD', path: `/blob/${ws}/${hash}?partial=1` });
+    const offset = Number(probe.headers['x-shadowlink-received']);
+    assert.ok(offset > 0, 'the arrived prefix was retained');
+    assert.ok(offset < data.length, `the upload really was interrupted (${offset})`);
+
+    // A fresh port, no shared state: the partial is keyed by the content hash, so
+    // the upload IS its own session on both sides.
+    assert.equal(await port.put(hash, data), true);
+    assert.ok(patches.length > 0, 'the resume sent something');
+    assert.equal(
+      patches[0], `bytes ${offset}-${Math.min(offset + 512 * 1024, data.length) - 1}/${data.length}`,
+      'the resume began at the offset the server reported, not at zero',
+    );
+    assert.ok(
+      patches.length < Math.ceil(data.length / (512 * 1024)),
+      `the resume re-sent the whole object (${patches.length} chunks)`,
+    );
+
+    const back = await port.get(hash, data.length);
+    assert.equal(sha256(Buffer.from(back)), hash);
+  });
+
+  test('the client BlobPort tells the real server refusals apart', async () => {
+    const small = await startServer({ port: basePort + 3, env: { MAX_FILE_SIZE_MB: '1' } });
+    try {
+      const port = new ObsidianBlobPort({
+        serverUrl: `ws://127.0.0.1:${small.port}`,
+        serverKey: small.serverKey,
+        workspaceId: 'portref',
+      });
+
+      const big = bytes(2 * 1024 * 1024, 65);
+      assert.equal(await port.put(sha256(big), big), false, '413 is a refusal, not a throw');
+      assert.ok(port.lastError instanceof BlobTooLarge, `got ${String(port.lastError)}`);
+
+      // 404 is the only answer that is about the bytes — and `get` still returns
+      // null rather than throwing, so the caller can only ever no-op on it.
+      assert.equal(await port.get('f'.repeat(64), 128), null);
+      assert.ok(port.lastError instanceof BlobUnavailable, `got ${String(port.lastError)}`);
+
+      // A wrong key is "I could not ask", and `has` must never fold that into a
+      // definite `false` — a definite false at deletion time means rescue (I2).
+      const wrongKey = new ObsidianBlobPort({
+        serverUrl: `ws://127.0.0.1:${small.port}`,
+        serverKey: 'sk_wrong',
+        workspaceId: 'portref',
+      });
+      let threw = null;
+      try { await wrongKey.has('a'.repeat(64)); } catch (err) { threw = err; }
+      assert.ok(threw instanceof BlobTransport, `has must throw, got ${String(threw)}`);
+    } finally {
+      await small.stop();
+      small.cleanup();
     }
   });
 
