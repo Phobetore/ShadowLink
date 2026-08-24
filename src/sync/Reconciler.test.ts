@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 
 import type { NodeFields } from '../tree/types.ts';
 import { fold } from '../tree/paths.ts';
+import { Deletions, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { FakeDocs, FakeVault } from './fakes.ts';
 import { Reconciler, RetryLater, type ReconcilerDeps, type DeletionContext } from './Reconciler.ts';
@@ -777,4 +778,215 @@ test('the deletion collaborator receives the context its slice needs', async () 
   assert.equal(ctx.disk.hasFold('Shared/live.md'), true);
   assert.ok(Array.isArray(ctx.failures));
   assert.ok(ctx.removedThisPass instanceof Set);
+});
+
+// ---------------------------------------------------------------- step 4, wired for real
+//
+// Everything above drives step 4 as a stub. These three run the REAL `Deletions`
+// inside a full pass, because the collaborator and the pass have to agree about
+// four things that neither one can verify alone: which path a dead node actually
+// occupies, that the disk index stays in step, that a failing removal is
+// contained rather than fatal, and that nothing removed here is handed straight
+// back to the publisher in the same pass (I13).
+
+interface Wired {
+  h: Harness;
+  deletions: Deletions;
+  /** Summaries handed to the injected bulk dialog, in order. */
+  confirms: BulkSummary[];
+  /** The context step 4 was called with, once it has run. */
+  seen: () => DeletionContext;
+}
+
+function wireDeletions(answer: BulkChoice = 'apply', over: Partial<ReconcilerDeps> = {}): Wired {
+  const confirms: BulkSummary[] = [];
+  let deletions: Deletions | null = null;
+  let seen: DeletionContext | null = null;
+
+  const h = makeHarness({
+    applyDeletions: async (ctx) => {
+      seen = ctx;
+      await deletions!.apply(ctx);
+    },
+    ...over,
+  });
+
+  deletions = new Deletions({
+    vault: h.vault,
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    now: () => NOW,
+    notice: (msg) => { h.notices.push(msg); },
+    confirmBulk: async (summary) => {
+      confirms.push(summary);
+      return answer;
+    },
+  });
+
+  return {
+    h,
+    deletions,
+    confirms,
+    seen: () => {
+      assert.ok(seen, 'step 4 never ran');
+      return seen as unknown as DeletionContext;
+    },
+  };
+}
+
+test('a wired deletion removes the proven file and the pass still finishes its other steps', async () => {
+  const w = wireDeletions();
+  const { h } = w;
+  h.vault.seed(SHARE, 'd');
+  const keep = nid('A');
+  const folder = nid('B');
+  const goner = nid('C');
+  h.nodes.set(keep, file('', 'keep.md', { s: 1 }));
+  h.nodes.set(folder, dir('', 'Archive'));
+  h.nodes.set(goner, file('Archive', 'gone.md', { s: 1 }));
+  h.docs.setText(`n_${keep}`, 'still mine');
+  h.docs.setText(`n_${goner}`, 'shared bytes');
+
+  await h.reconciler.reconcile('sync');
+  assert.deepEqual(inShare(h.vault), {
+    'Shared/keep.md': 'still mine',
+    'Shared/Archive/gone.md': 'shared bytes',
+  });
+
+  // The folder and its only note are tombstoned together, as a cascade delete does.
+  h.nodes.set(folder, dead(dir('', 'Archive')));
+  h.nodes.set(goner, dead(file('Archive', 'gone.md', { s: 1 })));
+  h.published.length = 0;
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(r.failures, []);
+  assert.equal(w.confirms.length, 0, 'one file is nowhere near the budget');
+
+  // Step 4 removed the note...
+  assert.deepEqual(inShare(h.vault), { 'Shared/keep.md': 'still mine' });
+  assert.equal(h.vault.trashedFor('Shared/Archive/gone.md')[0].data, 'shared bytes', 'I1');
+  // ...and step 5, which runs after it, still swept the folder it emptied.
+  assert.equal(h.vault.wasTrashed('Shared/Archive'), true, 'the dead folder was swept too');
+  assert.deepEqual(r.diagnostics.deletedButPresent, [], 'nothing was left behind');
+  assert.deepEqual(h.published, [[]], 'and nothing was offered for publication (I13)');
+
+  assert.deepEqual(h.state.data.materialized, { [keep]: 'Shared/keep.md' }, 'unbound in device state');
+  assert.equal(h.state.data.deleteBudget.length, 1, 'one deletion charged to the rate window');
+  assert.equal(h.tickets.size(), 0, 'and the pass left no ticket armed');
+});
+
+test('a deletion that fails mid-pass is contained and the pass still reaches its finally (I15)', async () => {
+  const w = wireDeletions();
+  const { h } = w;
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  h.nodes.set(id, file('', 'gone.md', { s: 1 }));
+  h.docs.setText(`n_${id}`, 'shared bytes');
+  await h.reconciler.reconcile('sync');
+
+  h.nodes.set(id, dead(file('', 'gone.md', { s: 1 })));
+  h.published.length = 0;
+  h.vault.failNext('trashLocal', new Error('EPERM: the file is locked'));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.equal(r.ran, true, 'the pass completed');
+  assert.equal(h.reconciler.reconciling, false, 'the single-flight flag was cleared');
+  assert.equal(r.failures.length, 1);
+  assert.equal(r.failures[0].key, `delete:${id}`, 'contained to the one item');
+
+  assert.equal(h.vault.snapshot()['Shared/gone.md'], 'shared bytes', 'the file was not destroyed');
+  assert.equal(h.state.data.materialized[id], 'Shared/gone.md', 'still bound, so the next pass retries');
+  assert.equal(h.state.data.deleteBudget.length, 0, 'nothing was charged for a removal that failed');
+  assert.equal(w.seen().removedThisPass.size, 0);
+
+  // Steps 5-7 still ran: the survivor is reported, never handed to the publisher.
+  assert.deepEqual(r.diagnostics.deletedButPresent, ['Shared/gone.md']);
+  assert.deepEqual(h.published, [[]], 'I13');
+
+  h.vault.resetCalls();
+  const retry = await h.reconciler.reconcile('retry');
+  assert.deepEqual(retry.failures, []);
+  assert.equal(h.vault.callsTo('trashLocal').length, 1, 'and the retry finished the job');
+});
+
+test('a collision-suffixed dead node is removed where it actually sits, and step 6 skips it (I13, CF-1)', async () => {
+  const w = wireDeletions();
+  const { h } = w;
+  h.vault.seed(SHARE, 'd');
+  const low = nid('A');
+  const high = nid('B');
+  h.nodes.set(low, file('', 'note.md', { s: 1 }));
+  h.nodes.set(high, file('', 'note.md', { s: 1 }));
+  h.docs.setText(`n_${low}`, 'from A');
+  h.docs.setText(`n_${high}`, 'from B');
+
+  await h.reconciler.reconcile('sync');
+  assert.deepEqual(inShare(h.vault), {
+    'Shared/note.md': 'from A',
+    'Shared/note (2).md': 'from B',
+  });
+
+  // The dead node's DERIVED path is `Shared/note.md` — the live node's file. Only
+  // `state.materialized` knows it actually lives at the suffixed path, and keying
+  // on anything else here removes somebody else's note.
+  h.nodes.set(high, dead(file('', 'note.md', { s: 1 })));
+  h.published.length = 0;
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(inShare(h.vault), { 'Shared/note.md': 'from A' }, 'the live node is untouched');
+  const trashed = h.vault.callsTo('trashLocal');
+  assert.equal(trashed.length, 1);
+  assert.deepEqual(trashed[0].args, ['Shared/note (2).md'], 'removed at its real path');
+  assert.equal(h.vault.wasTrashed('Shared/note.md'), false, 'and never at the derived one');
+
+  assert.deepEqual(
+    [...w.seen().removedThisPass], [fold('Shared/note (2).md')],
+    'the removed fold reached step 6\'s exclusion list (I13)',
+  );
+  assert.deepEqual(h.published, [[]], 'so nothing was republished in the pass that deleted it');
+  assert.deepEqual(r.diagnostics.deletedButPresent, []);
+  assert.deepEqual(h.state.data.materialized, { [low]: 'Shared/note.md' });
+});
+
+test('a wired bulk batch is refused wholesale and never re-prompts', async () => {
+  const w = wireDeletions('keep');
+  const { h } = w;
+  h.vault.seed(SHARE, 'd');
+  const ids: string[] = [];
+  for (let i = 0; i < 12; i++) {
+    const id = nid(`D${pad3(i)}`);
+    ids.push(id);
+    h.nodes.set(id, file('', `f${pad3(i)}.md`, { s: 1 }));
+    h.docs.setText(`n_${id}`, `body ${i}`);
+  }
+  await h.reconciler.reconcile('sync');
+  assert.equal(Object.keys(inShare(h.vault)).length, 12);
+
+  for (let i = 0; i < ids.length; i++) h.nodes.set(ids[i], dead(file('', `f${pad3(i)}.md`, { s: 1 })));
+  h.vault.resetCalls();
+  h.published.length = 0;
+
+  const first = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(first.failures, []);
+  assert.equal(w.confirms.length, 1, 'one dialog for the whole batch');
+  assert.equal(w.confirms[0].count, 12);
+  assert.equal(mutations(h.vault), 0, 'and NOTHING was applied');
+  assert.equal(h.state.data.declinedPaths.length, 12);
+
+  // The declined files stay on disk, and stay out of the publisher's hands — a
+  // remote delete the user refused must not come back as twelve new nodes.
+  for (let pass = 0; pass < 3; pass++) {
+    const later = await h.reconciler.reconcile('retry');
+    assert.deepEqual(later.failures, []);
+    assert.deepEqual(h.published[h.published.length - 1], [], `pass ${pass} offered nothing`);
+  }
+  assert.equal(w.confirms.length, 1, 'never prompted again');
+  assert.equal(Object.keys(inShare(h.vault)).length, 12, 'every local copy is still there');
 });
