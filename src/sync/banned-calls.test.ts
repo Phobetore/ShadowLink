@@ -213,6 +213,7 @@ const VAULT_SHAPED = new Set(['vault', 'vaults', 'adapter', 'dataadapter', 'v', 
  *   m / derivedPath     Y.Map and a derived Map
  *   this.open, this.liveHandles, this.listeners, this.waiters,
  *   this.subscribers, this.decisionPending, this.selected   Sets
+ *   this.objects        FakeBlobs' in-memory content-addressed store
  */
 const IN_MEMORY: Record<string, string[]> = {
   'src/sync/Deletions.ts': ['ctx.disk'],
@@ -224,7 +225,7 @@ const IN_MEMORY: Record<string, string[]> = {
   'src/sync/Tickets.ts': ['this.store'],
   'src/sync/VaultWatcher.ts': ['this.decisionPending'],
   'src/sync/WorkspaceSession.ts': ['this.waiters'],
-  'src/sync/fakes.ts': ['this.open', 'this.entries', 'this.byFold', 'this.liveHandles'],
+  'src/sync/fakes.ts': ['this.open', 'this.entries', 'this.byFold', 'this.liveHandles', 'this.objects'],
   'src/tree/TreeDoc.ts': ['m', 'this.subscribers'],
   'src/tree/TreeIndex.ts': ['derivedPath'],
   'src/ui/modals.ts': ['this.selected'],

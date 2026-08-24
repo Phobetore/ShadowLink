@@ -14,18 +14,25 @@
 //  - `list()` cannot see dot paths; `exists` / `listDir` can.
 //  - Every port call is appended to an ordered `calls` log, because end-state
 //    assertions cannot see a transient empty stub that was written then fixed.
+//  - Content is BYTES, one store, with `read`/`create` encoding and decoding UTF-8
+//    at the edge. A parallel `bin?` field beside a string would produce a fake
+//    where `create` then `readBinary` fails while production succeeds, and would
+//    let a test write a PNG and read back a string — a world that cannot exist.
+//  - `stat` reports a MONOTONIC mtime that bumps on every write, so the
+//    "size and mtime still agree" cache branch is genuinely exercised rather than
+//    always missing.
 //
 // No `obsidian` import, no node builtins.
 
-import { extOf, fold } from '../tree/paths.ts';
+import { extOf, fold, hashOfBytes } from '../tree/paths.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 
 // ============================================================ FakeVault
 
 export type VaultOp =
-  | 'list' | 'exists' | 'listDir' | 'read'
-  | 'create' | 'createFolder' | 'rename' | 'trashLocal' | 'isOpenInLeaf';
+  | 'list' | 'exists' | 'listDir' | 'read' | 'readBinary' | 'stat'
+  | 'create' | 'createBinary' | 'createFolder' | 'rename' | 'trashLocal' | 'isOpenInLeaf';
 
 export interface VaultCall {
   readonly op: VaultOp;
@@ -39,7 +46,14 @@ export interface TrashedEntry {
   /** Its uniquified destination under the vault-local `.trash/`. */
   readonly trashPath: string;
   readonly kind: Kind;
+  /** The retained content as text. Lossy for an attachment — see `bytes`. */
   readonly data: string;
+  /**
+   * The retained content as bytes. This is the copy that proves I1 for a binary:
+   * a PNG round-tripped through `data` would not come back byte-identical, so
+   * "nothing was destroyed" could not be asserted positively without it.
+   */
+  readonly bytes: Uint8Array;
 }
 
 export interface FakeVaultOptions {
@@ -60,8 +74,31 @@ export interface FakeVaultOptions {
 
 interface Entry {
   kind: Kind;
-  data: string;
+  /** The single source of truth for content. Text is a view over these bytes. */
+  bytes: Uint8Array;
+  /** Bumped on every write, never on a rename — what a real filesystem does. */
+  mtime: number;
 }
+
+const UTF8_ENCODER = new TextEncoder();
+const UTF8_DECODER = new TextDecoder();
+
+function encode(text: string): Uint8Array {
+  return UTF8_ENCODER.encode(text);
+}
+
+function decode(bytes: Uint8Array): string {
+  return UTF8_DECODER.decode(bytes);
+}
+
+/** A defensive copy, so a caller holding a returned array cannot edit the vault. */
+function copyOf(bytes: Uint8Array): Uint8Array {
+  return bytes.slice();
+}
+
+/** The mtime the first write gets; each later write adds `MTIME_STEP_MS`. */
+const MTIME_EPOCH = 1_700_000_000_000;
+const MTIME_STEP_MS = 1_000;
 
 /** Directory component of a path, or '' for a top-level entry. */
 function parentOf(path: string): string {
@@ -99,6 +136,8 @@ export class FakeVault implements VaultPort {
 
   private readonly caseInsensitive: boolean;
   private readonly requireParentDir: boolean;
+  /** Monotonic, so "the file changed under us" is expressible without a real clock. */
+  private mtimeCursor = MTIME_EPOCH;
 
   constructor(options: FakeVaultOptions = {}) {
     this.caseInsensitive = options.caseInsensitive ?? true;
@@ -113,18 +152,30 @@ export class FakeVault implements VaultPort {
    * vault always has a TFolder for every ancestor of every file.
    */
   seed(path: string, kind: Kind, data = ''): void {
-    const p = normPath(path);
-    if (p === '') throw new Error('FakeVault.seed: empty path');
-    this.ensureAncestors(p);
-    this.put(p, { kind, data });
+    this.seedEntry(path, kind, encode(data));
   }
 
-  /** Literal path -> contents, FILES only, key-sorted. Directories are visible via `list()`. */
+  /** `seed` for content that is not text. Same store, same rules — bytes go in as bytes. */
+  seedBinary(path: string, bytes: Uint8Array): void {
+    this.seedEntry(path, 'f', copyOf(bytes));
+  }
+
+  /** Literal path -> contents as TEXT, FILES only, key-sorted. Folders are in `list()`. */
   snapshot(): Record<string, string> {
     const out: Record<string, string> = {};
     for (const path of [...this.entries.keys()].sort()) {
       const entry = this.entries.get(path)!;
-      if (entry.kind === 'f') out[path] = entry.data;
+      if (entry.kind === 'f') out[path] = decode(entry.bytes);
+    }
+    return out;
+  }
+
+  /** The same snapshot as bytes, for content a UTF-8 round trip would destroy. */
+  binarySnapshot(): Record<string, Uint8Array> {
+    const out: Record<string, Uint8Array> = {};
+    for (const path of [...this.entries.keys()].sort()) {
+      const entry = this.entries.get(path)!;
+      if (entry.kind === 'f') out[path] = copyOf(entry.bytes);
     }
     return out;
   }
@@ -211,11 +262,36 @@ export class FakeVault implements VaultPort {
     this.record('read', [path]);
     this.maybeFail('read');
 
+    return decode(this.fileBytes(p, 'read', path));
+  }
+
+  /**
+   * `vault.readBinary`. Rejects for an absent path or a directory, exactly like
+   * `read`, and returns a COPY: a caller that keeps the array must not be holding
+   * a handle that edits the vault.
+   */
+  async readBinary(path: string): Promise<Uint8Array> {
+    const p = normPath(path);
+    this.record('readBinary', [path]);
+    this.maybeFail('readBinary');
+    return copyOf(this.fileBytes(p, 'readBinary', path));
+  }
+
+  /**
+   * `adapter.stat`. Resolves NULL only for a definite not-found and REJECTS when
+   * the lookup itself failed (`failNext('stat', ...)`) — invariant I2: "it is not
+   * there" is an answer, "I could not look" is not, and the two must not collapse
+   * into one value.
+   */
+  async stat(path: string): Promise<{ kind: Kind; bytes: number; mtime: number } | null> {
+    const p = normPath(path);
+    this.record('stat', [path]);
+    this.maybeFail('stat');
+
     const literal = this.resolve(p);
-    if (literal === undefined) throw new Error(`FakeVault.read: not found: ${path}`);
+    if (literal === undefined) return null;
     const entry = this.entries.get(literal)!;
-    if (entry.kind !== 'f') throw new Error(`FakeVault.read: not a file: ${path}`);
-    return entry.data;
+    return { kind: entry.kind, bytes: entry.bytes.length, mtime: entry.mtime };
   }
 
   async create(path: string, data: string): Promise<void> {
@@ -224,7 +300,17 @@ export class FakeVault implements VaultPort {
     this.maybeFail('create');
     this.assertFree(p, 'create');
     this.assertParent(p, 'create');
-    this.put(p, { kind: 'f', data });
+    this.put(p, { kind: 'f', bytes: encode(data), mtime: this.nextMtime() });
+  }
+
+  /** `vault.createBinary`. Refuses an occupied path, exactly like `create` (I1/I11). */
+  async createBinary(path: string, data: Uint8Array): Promise<void> {
+    const p = normPath(path);
+    this.record('createBinary', [path, data]);
+    this.maybeFail('createBinary');
+    this.assertFree(p, 'createBinary');
+    this.assertParent(p, 'createBinary');
+    this.put(p, { kind: 'f', bytes: copyOf(data), mtime: this.nextMtime() });
   }
 
   async createFolder(path: string): Promise<void> {
@@ -233,7 +319,7 @@ export class FakeVault implements VaultPort {
     this.maybeFail('createFolder');
     this.assertFree(p, 'createFolder');
     this.assertParent(p, 'createFolder');
-    this.put(p, { kind: 'd', data: '' });
+    this.put(p, { kind: 'd', bytes: new Uint8Array(0), mtime: this.nextMtime() });
   }
 
   async rename(from: string, to: string): Promise<void> {
@@ -294,7 +380,11 @@ export class FakeVault implements VaultPort {
         ? root
         : `${root}/${victim.slice(literal.length + 1)}`;
       this.trashed.set(trashPath, {
-        originalPath: victim, trashPath, kind: entry.kind, data: entry.data,
+        originalPath: victim,
+        trashPath,
+        kind: entry.kind,
+        data: decode(entry.bytes),
+        bytes: copyOf(entry.bytes),
       });
       this.drop(victim);
     }
@@ -306,6 +396,29 @@ export class FakeVault implements VaultPort {
   }
 
   // ---------------------------------------------------------- internals
+
+  /** Shared by `seed` and `seedBinary`: setup, so it is absent from `calls`. */
+  private seedEntry(path: string, kind: Kind, bytes: Uint8Array): void {
+    const p = normPath(path);
+    if (p === '') throw new Error('FakeVault.seed: empty path');
+    // A real vault always has a TFolder for every ancestor of every file.
+    this.ensureAncestors(p);
+    this.put(p, { kind, bytes, mtime: this.nextMtime() });
+  }
+
+  /** The stored bytes of a FILE, or the same rejections `read` has always made. */
+  private fileBytes(p: string, op: string, requested: string): Uint8Array {
+    const literal = this.resolve(p);
+    if (literal === undefined) throw new Error(`FakeVault.${op}: not found: ${requested}`);
+    const entry = this.entries.get(literal)!;
+    if (entry.kind !== 'f') throw new Error(`FakeVault.${op}: not a file: ${requested}`);
+    return entry.bytes;
+  }
+
+  private nextMtime(): number {
+    this.mtimeCursor += MTIME_STEP_MS;
+    return this.mtimeCursor;
+  }
 
   private record(op: VaultOp, args: readonly unknown[]): void {
     this.calls.push({ op, args });
@@ -359,7 +472,9 @@ export class FakeVault implements VaultPort {
     const segs = path.split('/');
     for (let i = 1; i < segs.length; i++) {
       const dir = segs.slice(0, i).join('/');
-      if (this.resolve(dir) === undefined) this.put(dir, { kind: 'd', data: '' });
+      if (this.resolve(dir) === undefined) {
+        this.put(dir, { kind: 'd', bytes: new Uint8Array(0), mtime: this.nextMtime() });
+      }
     }
   }
 
@@ -520,5 +635,219 @@ export class FakeDocs implements DocPort {
     const queue = this.failures.get(op);
     if (!queue || queue.length === 0) return;
     throw queue.shift()!;
+  }
+}
+
+// ============================================================ FakeBlobs
+
+// The content-addressed store, in memory (spec §8.5). It gets the same rigour as
+// `FakeVault` because the same reasoning applies: the store is where "the bytes
+// exist" is decided, and a fake that answers that question more generously than
+// the real one would let every downstream test pass while a peer's attachment is
+// silently unrecoverable.
+//
+// Three refusals are modelled separately on purpose (spec §8.3):
+//  - `has` THROWS on transport failure. It never answers `false` for "I could not
+//    ask", because a definite `false` at delete time means RESCUE (I2).
+//  - `put` returns FALSE for a refusal the user must be told about, with the
+//    reason in `lastError`, and THROWS for transport, which the caller retries.
+//  - `get` returns NULL for every failure at all, verified by DIGEST before it
+//    returns anything, so an incomplete or corrupted fetch is a no-op rather than
+//    a partial write.
+
+export type BlobOp = 'has' | 'put' | 'get' | 'limits';
+
+export interface BlobCall {
+  readonly op: BlobOp;
+  readonly args: readonly unknown[];
+}
+
+export interface BlobLimits {
+  maxFileBytes: number;
+  freeBytes: number | null;
+}
+
+/** Default ceiling, matching nothing in particular: tests that care call `setLimits`. */
+const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
+
+export class FakeBlobs {
+  /** Ordered log of every call, arguments included, throwing calls included. */
+  readonly calls: BlobCall[] = [];
+
+  /** The reason for the most recent refusal, exactly like the real port. */
+  lastError: unknown = null;
+
+  /** sha256 -> stored bytes. `corrupt()` is the only way the two can disagree. */
+  private readonly objects = new Map<string, Uint8Array>();
+  private readonly failures = new Map<BlobOp, Error[]>();
+  private readonly putRefusals: unknown[] = [];
+  private limitsValue: BlobLimits = {
+    maxFileBytes: DEFAULT_MAX_FILE_BYTES,
+    freeBytes: null,
+  };
+
+  // ---------------------------------------------------------- test helpers
+
+  /** Place bytes in the store under their true hash. Setup, so it is not logged. */
+  async seed(data: Uint8Array): Promise<string> {
+    const sha256 = await hashOfBytes(data);
+    this.objects.set(sha256, copyOf(data));
+    return sha256;
+  }
+
+  /** Model a blob the server no longer holds — swept, lost, or never finished. */
+  setAbsent(sha256: string): void {
+    this.objects.delete(sha256);
+  }
+
+  /**
+   * Model bytes that no longer hash to the key they are stored under, keeping the
+   * LENGTH identical so only a digest check can catch it. Its whole job is to
+   * prove `get` returns null and writes nothing, rather than putting bad bytes on
+   * a user's disk.
+   */
+  corrupt(sha256: string): void {
+    const stored = this.objects.get(sha256);
+    if (stored === undefined) throw new Error(`FakeBlobs.corrupt: no such object: ${sha256}`);
+    const damaged = copyOf(stored);
+    if (damaged.length === 0) throw new Error('FakeBlobs.corrupt: cannot damage an empty object');
+    damaged[0] = damaged[0] ^ 0xff;
+    this.objects.set(sha256, damaged);
+  }
+
+  setLimits(limits: Partial<BlobLimits>): void {
+    this.limitsValue = { ...this.limitsValue, ...limits };
+  }
+
+  /** Make exactly the next call of `op` throw — transport, not refusal. */
+  failNext(op: BlobOp, error: Error): void {
+    const queue = this.failures.get(op);
+    if (queue) queue.push(error);
+    else this.failures.set(op, [error]);
+  }
+
+  /** Make exactly the next `put` REFUSE: resolves false, `lastError` carries why. */
+  refuseNextPut(error: unknown): void {
+    this.putRefusals.push(error);
+  }
+
+  /** What the store holds under `sha256`, for assertions. A copy. */
+  stored(sha256: string): Uint8Array | undefined {
+    const bytes = this.objects.get(sha256);
+    return bytes === undefined ? undefined : copyOf(bytes);
+  }
+
+  /** How many distinct objects the store holds — a dedup assertion in one number. */
+  objectCount(): number {
+    return this.objects.size;
+  }
+
+  callsTo(op: BlobOp): BlobCall[] {
+    return this.calls.filter((c) => c.op === op);
+  }
+
+  resetCalls(): void {
+    this.calls.length = 0;
+  }
+
+  // ---------------------------------------------------------- BlobPort
+
+  /** HEAD. Throws on transport failure — never answers false for "I could not ask". */
+  async has(sha256: string): Promise<{ present: boolean; bytes?: number }> {
+    this.record('has', [sha256]);
+    this.maybeFail('has');
+
+    const stored = this.objects.get(sha256);
+    return stored === undefined ? { present: false } : { present: true, bytes: stored.length };
+  }
+
+  /**
+   * Chunked, resumable PATCH, collapsed to one step. False for a refusal the user
+   * must be told about; throws for transport. Resolves true only for a stored
+   * object whose digest the store itself recomputed — a `put` whose bytes do not
+   * hash to the URL's `<sha>` stores NOTHING.
+   */
+  async put(
+    sha256: string,
+    data: Uint8Array,
+    onProgress?: (sent: number, total: number) => void,
+  ): Promise<boolean> {
+    this.record('put', [sha256, data.length]);
+    this.maybeFail('put');
+
+    if (this.putRefusals.length > 0) {
+      this.lastError = this.putRefusals.shift();
+      return false;
+    }
+    if (data.length > this.limitsValue.maxFileBytes) {
+      this.lastError = new Error(`too large: ${data.length} > ${this.limitsValue.maxFileBytes}`);
+      return false;
+    }
+    if (await hashOfBytes(data) !== sha256) {
+      this.lastError = new Error(`digest mismatch for ${sha256}`);
+      return false;
+    }
+
+    this.objects.set(sha256, copyOf(data));
+    onProgress?.(data.length, data.length);
+    this.lastError = null;
+    return true;
+  }
+
+  /**
+   * Resumable, Range-based GET, digest-verified BEFORE returning. Null on any
+   * failure at all: an incomplete or unverifiable fetch is a no-op, never a
+   * partial write.
+   */
+  async get(
+    sha256: string,
+    expectBytes: number,
+    signal?: AbortSignal,
+    onProgress?: (received: number, total: number) => void,
+  ): Promise<Uint8Array | null> {
+    this.record('get', [sha256, expectBytes]);
+    this.maybeFail('get');
+
+    if (signal?.aborted === true) {
+      this.lastError = new Error('aborted');
+      return null;
+    }
+    const stored = this.objects.get(sha256);
+    if (stored === undefined) {
+      this.lastError = new Error(`no such object: ${sha256}`);
+      return null;
+    }
+    if (stored.length !== expectBytes) {
+      this.lastError = new Error(`length mismatch: ${stored.length} != ${expectBytes}`);
+      return null;
+    }
+    if (await hashOfBytes(stored) !== sha256) {
+      this.lastError = new Error(`digest mismatch for ${sha256}`);
+      return null;
+    }
+
+    onProgress?.(stored.length, stored.length);
+    this.lastError = null;
+    return copyOf(stored);
+  }
+
+  async limits(): Promise<BlobLimits> {
+    this.record('limits', []);
+    this.maybeFail('limits');
+    return { ...this.limitsValue };
+  }
+
+  // ---------------------------------------------------------- internals
+
+  private record(op: BlobOp, args: readonly unknown[]): void {
+    this.calls.push({ op, args });
+  }
+
+  private maybeFail(op: BlobOp): void {
+    const queue = this.failures.get(op);
+    if (!queue || queue.length === 0) return;
+    const error = queue.shift()!;
+    this.lastError = error;
+    throw error;
   }
 }

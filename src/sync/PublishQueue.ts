@@ -91,6 +91,33 @@ export class PublishQueue {
     this.deps.state.schedulePersist();
   }
 
+  /**
+   * Repeatable admission (spec §3.2). Markdown publication is one-shot, so
+   * `enqueue` refuses a node that already has an entry; an attachment's bytes can
+   * change, so the same node has to be admissible again — but only for content it
+   * has not already been queued for.
+   *
+   * `intent` is the sha256 of the bytes this entry is meant to publish. A matching
+   * intent is a genuine no-op, whether the entry is pending or done, so a caller
+   * that requeues on every reconcile pass cannot defeat the backoff ladder or
+   * re-publish what is already published. Anything else — new bytes, or an entry
+   * from the markdown path carrying no intent at all — restarts the ladder,
+   * because it is new work.
+   *
+   * There is no ownership test here on purpose: the first publish of a node stays
+   * creator-only and a replace does not (I5a), so that decision belongs where the
+   * node's state can be read, not at the door.
+   */
+  requeue(nodeId: string, intent: string): void {
+    const data = this.deps.state.data;
+    const entry = data.publish[nodeId];
+    // Both states are covered deliberately: pending means the ladder is already
+    // running for these bytes, done means they are already published.
+    if (entry !== undefined && entry.intent === intent) return;
+    data.publish[nodeId] = { state: 'pending', attempts: 0, nextAt: 0, intent };
+    this.deps.state.schedulePersist();
+  }
+
   /** Entries still owed work, whether or not they are due yet. */
   pendingCount(): number {
     let n = 0;

@@ -1066,6 +1066,12 @@ export class Reconciler {
     data.owned = sortRecord(data.owned);
     data.publish = sortRecord(data.publish);
     data.staging = sortRecord(data.staging);
+    // The attachment maps are sorted for the same reason as the rest: two devices
+    // running the same events must serialize byte-identical state, and a map whose
+    // key order follows insertion makes that untestable.
+    data.fetchDeferred = sortRecord(data.fetchDeferred);
+    data.fetchApproved = sortRecord(data.fetchApproved);
+    data.oversized = sortRecord(data.oversized);
   }
 
   private async persist(): Promise<void> {

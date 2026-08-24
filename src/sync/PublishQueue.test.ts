@@ -519,3 +519,67 @@ test('a drain is idempotent: a published node is never opened or seeded twice', 
   assert.equal(h.docs.text(`n_${id}`), 'the body');
   assert.equal(h.queue.pendingCount(), 0);
 });
+
+// ---------------------------------------------------------------- P2 §3.2: requeue
+
+// Spec test A13. Markdown publication happens once, so `enqueue` refuses a node it
+// already has an entry for. Attachment publication REPEATS — the same node's bytes
+// can change — so admission needs a second door, and that door must not become a
+// way to reset the backoff ladder on every pass.
+test('requeue admits new content and is a genuine no-op for content already queued', () => {
+  const h = makeHarness();
+  const id = h.add('diagram.png', 'not really bytes');
+  const first = 'a'.repeat(64);
+  const second = 'b'.repeat(64);
+
+  h.queue.requeue(id, first);
+  assert.deepEqual(h.state.data.publish[id], {
+    state: 'pending', attempts: 0, nextAt: 0, intent: first,
+  });
+
+  // Charge the ladder, as a failed attempt would.
+  h.state.data.publish[id] = { state: 'pending', attempts: 3, nextAt: 99_000, intent: first };
+  h.queue.requeue(id, first);
+  assert.deepEqual(
+    h.state.data.publish[id],
+    { state: 'pending', attempts: 3, nextAt: 99_000, intent: first },
+    'requeueing the same intent must not reset the backoff — the reconciler does this every pass',
+  );
+
+  // New bytes are new work: the ladder restarts and the entry is due immediately.
+  h.queue.requeue(id, second);
+  assert.deepEqual(h.state.data.publish[id], {
+    state: 'pending', attempts: 0, nextAt: 0, intent: second,
+  });
+});
+
+test('requeue resets a done entry only when the content actually changed', () => {
+  const h = makeHarness();
+  const id = h.add('diagram.png', 'not really bytes');
+  const first = 'a'.repeat(64);
+  const second = 'b'.repeat(64);
+
+  h.state.data.publish[id] = { state: 'done', attempts: 0, nextAt: 0, intent: first };
+  h.queue.requeue(id, first);
+  assert.equal(h.state.data.publish[id].state, 'done', 'the same bytes are already published');
+  assert.equal(h.queue.pendingCount(), 0);
+
+  h.queue.requeue(id, second);
+  assert.deepEqual(h.state.data.publish[id], {
+    state: 'pending', attempts: 0, nextAt: 0, intent: second,
+  });
+  assert.equal(h.queue.pendingCount(), 1);
+});
+
+test('requeue reopens an entry left over from the markdown path, which carries no intent', () => {
+  const h = makeHarness();
+  const id = h.add('diagram.png', 'not really bytes');
+  const sha = 'a'.repeat(64);
+
+  h.state.data.publish[id] = { state: 'done', attempts: 2, nextAt: 7 };
+  h.queue.requeue(id, sha);
+
+  assert.deepEqual(h.state.data.publish[id], {
+    state: 'pending', attempts: 0, nextAt: 0, intent: sha,
+  });
+});

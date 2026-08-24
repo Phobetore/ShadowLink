@@ -7,7 +7,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeDocs, FakeVault } from './fakes.ts';
+import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import { hashOfBytes } from '../tree/paths.ts';
 
 // ---------------------------------------------------------------- case folding
 
@@ -415,4 +416,248 @@ test('rename refuses to move a folder into its own subtree', async () => {
   await v.createFolder('Other');
   await v.rename('Notes', 'Other/Notes');
   assert.equal(await v.exists('Other/Notes/a.md'), true);
+});
+
+// ---------------------------------------------------------------- bytes (P2 §8.5)
+
+// PNG magic plus a CRLF pair: a byte string no UTF-8 round trip survives, which is
+// exactly what makes it a proof that content is stored as BYTES.
+const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0xfe]);
+
+test('content is one byte-backed store, with text encoded and decoded at the edge', async () => {
+  const v = new FakeVault();
+  v.seed('Shared/note.md', 'f', 'the body');
+
+  // Text written through `create` reads back as bytes...
+  await v.create('Shared/other.md', 'other body');
+  assert.deepEqual(await v.readBinary('Shared/other.md'), new TextEncoder().encode('other body'));
+  // ...and bytes written through `createBinary` read back as text.
+  await v.createBinary('Shared/utf8.md', new TextEncoder().encode('from bytes'));
+  assert.equal(await v.read('Shared/utf8.md'), 'from bytes');
+
+  // A parallel string field would let this pass while production threw.
+  assert.deepEqual(await v.readBinary('Shared/note.md'), new TextEncoder().encode('the body'));
+});
+
+test('binary content survives byte-for-byte, and text views of it are lossy', async () => {
+  const v = new FakeVault();
+  v.seed('Shared', 'd');
+  await v.createBinary('Shared/diagram.png', PNG);
+
+  assert.deepEqual(await v.readBinary('Shared/diagram.png'), PNG);
+  assert.deepEqual(v.binarySnapshot()['Shared/diagram.png'], PNG);
+  // `snapshot()` keeps returning strings so every existing assertion still reads
+  // the same; for a PNG that view is lossy, which is the honest answer.
+  assert.notEqual(v.snapshot()['Shared/diagram.png'], undefined);
+  assert.notDeepEqual(
+    new TextEncoder().encode(v.snapshot()['Shared/diagram.png']),
+    PNG,
+    'decoding a PNG as UTF-8 is lossy — the bytes are the truth, not the string',
+  );
+
+  // seedBinary is the setup counterpart and stays out of the call log.
+  const w = new FakeVault();
+  w.seedBinary('Shared/photo.heic', PNG);
+  assert.deepEqual(w.calls, []);
+  assert.deepEqual(await w.readBinary('Shared/photo.heic'), PNG);
+});
+
+test('readBinary hands back a copy, so a caller cannot edit the vault through it', async () => {
+  const v = new FakeVault();
+  v.seedBinary('Shared/diagram.png', PNG);
+
+  const first = await v.readBinary('Shared/diagram.png');
+  first[0] = 0x00;
+  assert.deepEqual(await v.readBinary('Shared/diagram.png'), PNG, 'the vault is unchanged');
+});
+
+test('createBinary refuses an occupied path and a missing parent, like create', async () => {
+  const v = new FakeVault();
+  v.seed('Shared/diagram.png', 'f', 'incumbent');
+
+  await assert.rejects(() => v.createBinary('shared/DIAGRAM.PNG', PNG), /exists/i);
+  assert.equal(await v.read('Shared/diagram.png'), 'incumbent', 'the incumbent is untouched');
+  await assert.rejects(() => v.createBinary('Shared/Nested/x.png', PNG), /parent/i);
+});
+
+test('readBinary rejects for an absent path and for a directory', async () => {
+  const v = new FakeVault();
+  v.seed('Shared', 'd');
+
+  await assert.rejects(() => v.readBinary('Shared/nope.png'), /not found/i);
+  await assert.rejects(() => v.readBinary('Shared'), /not a file/i);
+});
+
+// Invariant I2: `stat` resolving null means "definitely not there". "I could not
+// look" has to be a rejection, or the two collapse into one value and an
+// unreadable file reads as a deleted one.
+test('stat reports kind, size and a monotonic mtime, and null only for a real absence', async () => {
+  const v = new FakeVault();
+  v.seed('Shared', 'd');
+  await v.createBinary('Shared/diagram.png', PNG);
+
+  const first = (await v.stat('Shared/diagram.png'))!;
+  assert.equal(first.kind, 'f');
+  assert.equal(first.bytes, PNG.length);
+  assert.equal((await v.stat('Shared'))!.kind, 'd');
+  assert.equal(await v.stat('Shared/missing.png'), null);
+
+  // Every write bumps the mtime, so "size and mtime still agree" is a branch a
+  // test can actually miss rather than one that is always true.
+  await v.create('Shared/note.md', 'x');
+  const note = (await v.stat('Shared/note.md'))!;
+  assert.ok(note.mtime > first.mtime, `${note.mtime} must be later than ${first.mtime}`);
+
+  // A rename moves the file; it does not rewrite it.
+  await v.rename('Shared/diagram.png', 'Shared/renamed.png');
+  assert.equal((await v.stat('Shared/renamed.png'))!.mtime, first.mtime);
+
+  const boom = new Error('EIO');
+  v.failNext('stat', boom);
+  await assert.rejects(() => v.stat('Shared/renamed.png'), (e) => e === boom);
+});
+
+// I1 proven positively for a binary: the bytes are retained, not a lossy string.
+test('trashLocal retains an attachment byte-for-byte', async () => {
+  const v = new FakeVault();
+  v.seedBinary('Shared/diagram.png', PNG);
+
+  await v.trashLocal('Shared/diagram.png');
+
+  assert.equal(await v.exists('Shared/diagram.png'), false);
+  const [entry] = v.trashedFor('Shared/diagram.png');
+  assert.deepEqual(entry.bytes, PNG);
+  assert.equal(entry.kind, 'f');
+});
+
+test('the new operations are logged and fault-injectable like every other one', async () => {
+  const v = new FakeVault();
+  v.seed('Shared', 'd');
+
+  await v.createBinary('Shared/a.png', PNG);
+  await v.readBinary('Shared/a.png');
+  await v.stat('Shared/a.png');
+
+  assert.deepEqual(v.calls.map((c) => c.op), ['createBinary', 'readBinary', 'stat']);
+  assert.equal(v.callsTo('createBinary')[0].args[0], 'Shared/a.png');
+
+  const boom = new Error('EBUSY');
+  v.failNext('createBinary', boom);
+  await assert.rejects(() => v.createBinary('Shared/b.png', PNG), (e) => e === boom);
+  assert.equal(await v.exists('Shared/b.png'), false, 'a failed write leaves nothing behind');
+  v.failNext('readBinary', new Error('EIO'));
+  await assert.rejects(() => v.readBinary('Shared/a.png'), /EIO/);
+});
+
+// ---------------------------------------------------------------- FakeBlobs
+
+test('put stores an object the store itself verified, and has reports it', async () => {
+  const blobs = new FakeBlobs();
+  const sha = await hashOfBytes(PNG);
+
+  assert.deepEqual(await blobs.has(sha), { present: false });
+  assert.equal(await blobs.put(sha, PNG), true);
+  assert.deepEqual(await blobs.has(sha), { present: true, bytes: PNG.length });
+  assert.deepEqual(blobs.stored(sha), PNG);
+  assert.deepEqual(blobs.calls.map((c) => c.op), ['has', 'put', 'has']);
+});
+
+// A store that took the caller's word for the hash would let a corrupted upload
+// become the canonical copy of the file, on every peer.
+test('put refuses bytes that do not hash to the name they are stored under', async () => {
+  const blobs = new FakeBlobs();
+  const wrong = 'a'.repeat(64);
+
+  assert.equal(await blobs.put(wrong, PNG), false);
+  assert.match(String((blobs.lastError as Error).message), /digest mismatch/);
+  assert.equal(blobs.objectCount(), 0, 'nothing at all is stored');
+  assert.deepEqual(await blobs.has(wrong), { present: false });
+});
+
+test('put refuses an object over the limit and reports why', async () => {
+  const blobs = new FakeBlobs();
+  blobs.setLimits({ maxFileBytes: 4, freeBytes: 10 });
+  const sha = await hashOfBytes(PNG);
+
+  assert.equal(await blobs.put(sha, PNG), false);
+  assert.match(String((blobs.lastError as Error).message), /too large/);
+  assert.equal(blobs.objectCount(), 0);
+  assert.deepEqual(await blobs.limits(), { maxFileBytes: 4, freeBytes: 10 });
+
+  // A queued refusal models the rest of the family (507, 422) without inventing
+  // status codes the fake does not have.
+  blobs.setLimits({ maxFileBytes: 1024 });
+  const quota = new Error('507 insufficient storage');
+  blobs.refuseNextPut(quota);
+  assert.equal(await blobs.put(sha, PNG), false);
+  assert.equal(blobs.lastError, quota);
+  assert.equal(await blobs.put(sha, PNG), true, 'the refusal was for exactly one call');
+});
+
+test('get returns the bytes, and null for every failure there is', async () => {
+  const blobs = new FakeBlobs();
+  const sha = await blobs.seed(PNG);
+
+  assert.deepEqual(await blobs.get(sha, PNG.length), PNG);
+  assert.equal(await blobs.get('b'.repeat(64), PNG.length), null, 'absent object');
+  assert.equal(await blobs.get(sha, PNG.length + 1), null, 'length disagrees with the reference');
+
+  const controller = new AbortController();
+  controller.abort();
+  assert.equal(await blobs.get(sha, PNG.length, controller.signal), null, 'aborted');
+});
+
+// ⚠ The whole point of verifying before returning: bad bytes must never reach the
+// caller, because the caller's next move is to write them at the user's path.
+test('corrupt bytes are caught by digest, not by length, and get returns null', async () => {
+  const blobs = new FakeBlobs();
+  const sha = await blobs.seed(PNG);
+  blobs.corrupt(sha);
+
+  assert.equal(blobs.stored(sha)!.length, PNG.length, 'the damage is invisible to a size check');
+  assert.equal(await blobs.get(sha, PNG.length), null);
+  assert.match(String((blobs.lastError as Error).message), /digest mismatch/);
+  // The store still claims to hold it — which is why `has` is not proof of bytes.
+  assert.deepEqual(await blobs.has(sha), { present: true, bytes: PNG.length });
+});
+
+test('setAbsent models a blob the server no longer holds', async () => {
+  const blobs = new FakeBlobs();
+  const sha = await blobs.seed(PNG);
+
+  blobs.setAbsent(sha);
+
+  assert.deepEqual(await blobs.has(sha), { present: false });
+  assert.equal(await blobs.get(sha, PNG.length), null);
+});
+
+// I2. `has` answering false for a network failure would turn "I could not ask"
+// into "the bytes are gone", which at delete time is the difference between a
+// rescue and a removal.
+test('a transport failure throws from has, put and get rather than answering', async () => {
+  const blobs = new FakeBlobs();
+  const sha = await blobs.seed(PNG);
+  const down = new Error('ECONNRESET');
+
+  blobs.failNext('has', down);
+  await assert.rejects(() => blobs.has(sha), (e) => e === down);
+
+  blobs.failNext('put', down);
+  await assert.rejects(() => blobs.put(sha, PNG), (e) => e === down);
+
+  blobs.failNext('get', down);
+  await assert.rejects(() => blobs.get(sha, PNG.length), (e) => e === down);
+
+  // ...and exactly one call each was affected.
+  assert.deepEqual(await blobs.has(sha), { present: true, bytes: PNG.length });
+});
+
+test('the same bytes stored twice are one object', async () => {
+  const blobs = new FakeBlobs();
+  const sha = await hashOfBytes(PNG);
+
+  assert.equal(await blobs.put(sha, PNG), true);
+  assert.equal(await blobs.put(sha, PNG.slice()), true);
+
+  assert.equal(blobs.objectCount(), 1, 'content addressing dedups by construction');
 });

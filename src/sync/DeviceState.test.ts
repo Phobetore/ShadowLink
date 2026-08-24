@@ -69,6 +69,9 @@ function assertEmpty(data: DeviceStateData): void {
   assert.deepEqual(data.declinedPaths, []);
   assert.deepEqual(data.deleteBudget, []);
   assert.deepEqual(data.staging, {});
+  assert.deepEqual(data.fetchDeferred, {});
+  assert.deepEqual(data.fetchApproved, {});
+  assert.deepEqual(data.oversized, {});
 }
 
 // ---------------------------------------------------------------- round trip
@@ -319,4 +322,78 @@ test('recordDeletion and the window accept an explicit timestamp', async () => {
   s.recordDeletion(6_000);
   assert.equal(s.deletionsInWindow(6_000), 2);
   assert.equal(s.deletionsInWindow(6_000 + REMOTE_DELETE_WINDOW_MS), 0);
+});
+
+// ---------------------------------------------------------------- P2 §8.4 fields
+
+// Spec test A12. A persisted map that `normalize` does not know about is silently
+// discarded on every reload — which for `contentHash.mtime` means re-hashing the
+// whole share on every restart, and for `oversized` means re-showing every Notice
+// the user already dismissed.
+test('the attachment maps round-trip through the port', async () => {
+  const sha = 'a'.repeat(64);
+  const port = new MemoryStatePort();
+  const a = new DeviceState(port, DEVICE, WORKSPACE);
+  await a.load();
+
+  a.data.contentHash['n1'] = { sha256: sha, len: 12, mtime: 1_700_000_000_000 };
+  a.data.publish['n1'] = { state: 'pending', attempts: 1, nextAt: 42, intent: sha };
+  a.data.fetchDeferred['n2'] = { sha256: sha, bytes: 4096 };
+  a.data.fetchApproved['n2'] = true;
+  a.data.oversized['shared/huge.mov'] = { bytes: 900, cap: 100, why: 'server' };
+  await a.flush();
+
+  const b = new DeviceState(port, DEVICE, WORKSPACE);
+  assert.deepEqual(await b.load(), { coldStart: false });
+  assert.deepEqual(b.data, a.data);
+  assert.deepEqual(b.data.contentHash['n1'], { sha256: sha, len: 12, mtime: 1_700_000_000_000 });
+  assert.equal(b.data.publish['n1'].intent, sha);
+  assert.deepEqual(b.data.fetchDeferred['n2'], { sha256: sha, bytes: 4096 });
+  assert.deepEqual(b.data.oversized['shared/huge.mov'], { bytes: 900, cap: 100, why: 'server' });
+});
+
+test('malformed attachment entries are dropped field by field', async () => {
+  const sha = 'a'.repeat(64);
+  const port = new MemoryStatePort();
+  port.store.set(deviceStateKey(WORKSPACE, DEVICE), JSON.stringify({
+    v: 1,
+    deviceId: DEVICE,
+    workspaceId: WORKSPACE,
+    contentHash: {
+      good: { sha256: sha, len: 1, mtime: 5 },
+      noMtime: { sha256: sha, len: 1 },
+      badMtime: { sha256: sha, len: 1, mtime: 'yesterday' },
+    },
+    publish: {
+      good: { state: 'pending', attempts: 0, nextAt: 0, intent: sha },
+      badIntent: { state: 'pending', attempts: 0, nextAt: 0, intent: 7 },
+    },
+    fetchDeferred: {
+      good: { sha256: sha, bytes: 10 },
+      shortSha: { sha256: 'abc', bytes: 10 },
+      upperSha: { sha256: 'A'.repeat(64), bytes: 10 },
+      badBytes: { sha256: sha, bytes: 'lots' },
+      notAnObject: 'nope',
+    },
+    fetchApproved: { good: true, notTrue: 'yes' },
+    oversized: {
+      good: { bytes: 9, cap: 1, why: 'device' },
+      bogusWhy: { bytes: 9, cap: 1, why: 'because' },
+      badNumbers: { bytes: '9', cap: 1, why: 'server' },
+    },
+  }));
+
+  const s = new DeviceState(port, DEVICE, WORKSPACE);
+  assert.deepEqual(await s.load(), { coldStart: false });
+
+  assert.deepEqual(Object.keys(s.data.fetchDeferred), ['good'], 'a bad sha or size is dropped');
+  assert.deepEqual(Object.keys(s.data.fetchApproved), ['good']);
+  assert.deepEqual(Object.keys(s.data.oversized), ['good']);
+  // A bad mtime costs the mtime, not the recorded hash: the entry still answers
+  // "what did this device last confirm", it just cannot use the cheap cache branch.
+  assert.deepEqual(s.data.contentHash.badMtime, { sha256: sha, len: 1 });
+  assert.deepEqual(s.data.contentHash.good, { sha256: sha, len: 1, mtime: 5 });
+  assert.equal('mtime' in s.data.contentHash.noMtime, false);
+  assert.equal(s.data.publish.good.intent, sha);
+  assert.equal('intent' in s.data.publish.badIntent, false, 'a bad intent costs the intent only');
 });

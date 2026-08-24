@@ -38,11 +38,25 @@ export interface PublishEntry {
   state: 'pending' | 'done';
   attempts: number;
   nextAt: number;
+  /**
+   * The content this entry was queued to publish — for an attachment, the sha256
+   * of the bytes on disk when it was queued. Markdown publication happens once, so
+   * a note's entry carries none; attachment publication repeats, so the intent is
+   * what lets a requeue tell "the same work, already queued" from "new bytes".
+   */
+  intent?: string;
 }
 
 export interface ContentHashEntry {
   sha256: string;
   len: number;
+  /**
+   * The file's modification time when the hash was recorded. The cheap staleness
+   * oracle: the recorded hash is trusted only when size AND mtime still agree.
+   * Optional, because a device that never observed one must re-hash rather than
+   * assume.
+   */
+  mtime?: number;
 }
 
 export interface StagingEntry {
@@ -70,6 +84,23 @@ export interface DeviceStateData {
   /** Applied remote deletions, for the rate window (§5.4). */
   deleteBudget: Array<{ at: number }>;
   staging: Record<string, StagingEntry>;
+
+  // ------------------------------------------------- attachments (spec §8.4)
+  //
+  // All three are LOCAL facts about this machine's fetching decisions, which is
+  // why they are here and not in the tree: another device's disk, budget and
+  // dismissed notices are none of this one's business.
+
+  /** nodeId -> the attachment this device chose not to fetch yet. Nothing is on disk for it. */
+  fetchDeferred: Record<string, { sha256: string; bytes: number }>;
+  /** nodeIds the user explicitly approved for fetching despite the policy. */
+  fetchApproved: Record<string, true>;
+  /**
+   * fold(vaultPath) -> why a local file could not be published. Persisted so a
+   * refusal is explained once rather than re-announced on every pass, and dropped
+   * again when the file shrinks below the cap.
+   */
+  oversized: Record<string, { bytes: number; cap: number; why: 'server' | 'device' }>;
 }
 
 /** The schema version this client writes and accepts. */
@@ -93,8 +124,14 @@ export function emptyDeviceState(deviceId: string, workspaceId: string): DeviceS
     declinedPaths: [],
     deleteBudget: [],
     staging: {},
+    fetchDeferred: {},
+    fetchApproved: {},
+    oversized: {},
   };
 }
+
+/** A content hash as it is written on the wire and on disk: 64 lowercase hex. */
+const SHA256_RE = /^[0-9a-f]{64}$/;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -133,12 +170,20 @@ function normalize(raw: Record<string, unknown>, deviceId: string, workspaceId: 
       if (!isRecord(x)) return undefined;
       if (x.state !== 'pending' && x.state !== 'done') return undefined;
       if (typeof x.attempts !== 'number' || typeof x.nextAt !== 'number') return undefined;
-      return { state: x.state, attempts: x.attempts, nextAt: x.nextAt };
+      const entry: PublishEntry = { state: x.state, attempts: x.attempts, nextAt: x.nextAt };
+      // A bad intent costs the intent, not the entry: the work is still owed, it
+      // simply has to be re-decided rather than matched.
+      if (typeof x.intent === 'string') entry.intent = x.intent;
+      return entry;
     }),
     contentHash: recordOf(raw.contentHash, (x) => {
       if (!isRecord(x)) return undefined;
       if (typeof x.sha256 !== 'string' || typeof x.len !== 'number') return undefined;
-      return { sha256: x.sha256, len: x.len };
+      const entry: ContentHashEntry = { sha256: x.sha256, len: x.len };
+      // Likewise: without a usable mtime the entry still says what this device last
+      // confirmed, it just cannot take the cheap "size and mtime agree" branch.
+      if (typeof x.mtime === 'number') entry.mtime = x.mtime;
+      return entry;
     }),
     declinedNodes: stringArray(raw.declinedNodes),
     declinedPaths: stringArray(raw.declinedPaths),
@@ -153,6 +198,21 @@ function normalize(raw: Record<string, unknown>, deviceId: string, workspaceId: 
         return undefined;
       }
       return { from: x.from, to: x.to, at: x.at };
+    }),
+    // A deferred fetch names bytes this device will later ask the store for, so a
+    // hash that is not a hash is worse than no entry at all.
+    fetchDeferred: recordOf(raw.fetchDeferred, (x) => {
+      if (!isRecord(x)) return undefined;
+      if (typeof x.sha256 !== 'string' || !SHA256_RE.test(x.sha256)) return undefined;
+      if (typeof x.bytes !== 'number') return undefined;
+      return { sha256: x.sha256, bytes: x.bytes };
+    }),
+    fetchApproved: recordOf(raw.fetchApproved, (x) => (x === true ? (true as const) : undefined)),
+    oversized: recordOf(raw.oversized, (x) => {
+      if (!isRecord(x)) return undefined;
+      if (typeof x.bytes !== 'number' || typeof x.cap !== 'number') return undefined;
+      if (x.why !== 'server' && x.why !== 'device') return undefined;
+      return { bytes: x.bytes, cap: x.cap, why: x.why };
     }),
   };
 }
