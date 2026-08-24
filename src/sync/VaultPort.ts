@@ -54,9 +54,14 @@ export interface VaultPort {
   rename(from: string, to: string): Promise<void>;
 
   /**
-   * `vault.trash(file, false)` — the vault-local `.trash`, recoverable from inside
-   * Obsidian on every platform including mobile. `vault.delete` and
-   * `vault.trash(file, true)` are banned outright by invariant I1.
+   * Implemented with Obsidian's trash call and the system flag set to FALSE: the
+   * vault-local `.trash`, recoverable from inside Obsidian on every platform
+   * including mobile.
+   *
+   * Hard deletion and the system-trash variant (that same call with the flag set
+   * to true) are banned outright by invariant I1 and are guarded by a test that
+   * greps `src/`. Both are spelled out only in that test, never in shipped source
+   * — including in a comment like this one, which would otherwise trip the guard.
    */
   trashLocal(path: string): Promise<void>;
 
