@@ -1,7 +1,6 @@
 // src/sync/VaultWatcher.test.ts
 //
-// Spec §10 Group B, tests 44-57 (this file) and 45-47/58-60 (added by the delete
-// slice below the same fixtures).
+// Spec §10 Group B, tests 44-60.
 //
 // Everything here drives the handlers with PLAIN PATHS, exactly as P1c will after
 // it adapts `vault.on('create', f => watcher.onCreate(f.path, kindOf(f)))`. No
@@ -77,7 +76,9 @@ function makeHarness(over: Partial<WatcherDeps> = {}): Harness {
   const now = (): number => clock;
   const vault = new FakeVault();
   const docs = new FakeDocs();
-  const tree = new TreeDoc();
+  // The tree may be injected (a second replica, or one that counts its writes);
+  // the observer has to be attached to whichever one the watcher is actually given.
+  const tree = over.tree ?? new TreeDoc();
   const state = new DeviceState(new MemoryStatePort(), 'device-1', 'ws-1', now, 0);
   const tickets = new Tickets(now);
 
@@ -871,7 +872,7 @@ test('57: a resurrect merged with a concurrent delete leaves the node live on bo
   b.applyUpdate(a.encodeState());
 
   // Replica B resurrects through the watcher, using the real handler.
-  const hb = makeHarness({ tree: b, entries: () => b.entries() });
+  const hb = makeHarness({ tree: b });
   hb.vault.seed(SHARE, 'd');
   hb.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
   await hb.watcher.onCreate(`${SHARE}/todo.md`, 'f');
@@ -985,6 +986,365 @@ test('44: replaying every reconciler mutation with no tickets writes nothing to 
   assert.equal(h.bulkPrompts.length, 0);
   assert.deepEqual(h.published, []);
   assert.deepEqual(fieldsOf(h.tree).map((n) => n.id).sort(), [folder, todo, leaf, cased, gone].sort());
+});
+
+// ---------------------------------------------------------------- 45-47, 58-60
+
+/** A TreeDoc that counts node patches, so "written once" is directly observable. */
+class CountingTree extends TreeDoc {
+  patches = 0;
+
+  override patchNode(nodeId: string, patch: Parameters<TreeDoc['patchNode']>[1]): void {
+    this.patches += 1;
+    super.patchNode(nodeId, patch);
+  }
+}
+
+/** A harness whose tree counts patches. */
+function makeCountingHarness(over: Partial<WatcherDeps> = {}): Harness & { counting: CountingTree } {
+  const counting = new CountingTree();
+  return { ...makeHarness({ tree: counting, ...over }), counting };
+}
+
+test('a local delete tombstones the node with x = g, and unbinds it', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.state.data.contentHash[id] = { sha256: 'abc123', len: 4 };
+  h.vault.seed(SHARE, 'd');
+  h.resetCounts();
+
+  h.watcher.onDelete(`${SHARE}/todo.md`, 'f');
+  await h.watcher.flushDeleteBatch();
+
+  const f = h.tree.get(id)!;
+  assert.equal(isLive(f), false);
+  assert.equal(f.x, f.g);
+  assert.equal(f.xa, NOW);
+  assert.equal(f.xb, 'Ada');
+  assert.equal(f.xh, 'abc123', 'the last CONFIRMED text, for the bounded resurrect');
+  assert.equal(f.xp, undefined, 'not a cascade victim');
+  assert.equal(h.state.data.materialized[id], undefined);
+  assert.equal(h.bulkPrompts.length, 0, 'one file is not a bulk delete');
+});
+
+// 45. The idempotence check that stops every peer writing its own explicit
+// tombstone for the same node — the hole that sank candidate 1.
+test('45: a delete event for an already-dead node writes nothing', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'gone.md', s: 1 });
+  h.tree.patchNode(id, { x: 1, xa: NOW - 60_000, xb: 'Ann' });
+  h.state.data.materialized[id] = `${SHARE}/gone.md`;
+  h.vault.seed(SHARE, 'd');
+  h.resetCounts();
+
+  h.watcher.onDelete(`${SHARE}/gone.md`, 'f');      // no ticket armed
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(h.tree.get(id)!.xa, NOW - 60_000, 'the existing tombstone is not rewritten');
+});
+
+test('45b: a delete of a path no node owns writes nothing', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.resetCounts();
+
+  h.watcher.onDelete(`${SHARE}/never-ours.md`, 'f');
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(h.tree.size(), 0);
+});
+
+// 46. I2. A staging move and a rename both surface as delete-then-create, and the
+// batch window is exactly long enough for the file to be back before we look.
+test('46: a path that is present again when the batch flushes is never tombstoned', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');    // back on disk before the flush
+  h.resetCounts();
+
+  h.watcher.onDelete(`${SHARE}/todo.md`, 'f');
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(isLive(h.tree.get(id)!), true);
+});
+
+test('46b: an `exists` that throws reads as present, never as a delete (I2)', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.vault.seed(SHARE, 'd');
+  h.vault.failNext('exists', new Error('EPERM'));
+  h.resetCounts();
+
+  h.watcher.onDelete(`${SHARE}/todo.md`, 'f');
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(isLive(h.tree.get(id)!), true);
+});
+
+// 47. `git checkout`, Syncthing and Dropbox all remove files behind Obsidian's
+// back, and each looks exactly like the user deleting them.
+test('47: 300 local deletes raise ONE modal, and declining writes nothing', async () => {
+  const prompts: number[] = [];
+  const h = makeHarness({
+    confirmLocalBulkDelete: async (count) => { prompts.push(count); return false; },
+  });
+  h.vault.seed(SHARE, 'd');
+  const ids: string[] = [];
+  for (let i = 0; i < 300; i++) {
+    const name = `note-${String(i).padStart(3, '0')}.md`;
+    const id = mint(h.tree, { k: 'f', d: '', n: name, s: 1 });
+    h.state.data.materialized[id] = `${SHARE}/${name}`;
+    ids.push(id);
+  }
+  h.resetCounts();
+
+  for (let i = 0; i < 300; i++) {
+    h.watcher.onDelete(`${SHARE}/note-${String(i).padStart(3, '0')}.md`, 'f');
+  }
+  await h.watcher.flushDeleteBatch();
+
+  assert.deepEqual(prompts, [300], 'exactly one modal, for the whole batch');
+  assert.equal(h.counts.txns, 0, 'declining writes NOTHING');
+  for (const id of ids) assert.equal(isLive(h.tree.get(id)!), true);
+  assert.deepEqual(h.reconciles, ['declined-local-delete'], 'the next pass restores them');
+  // The bindings survive too: the files are coming back.
+  assert.equal(h.state.data.materialized[ids[0]], `${SHARE}/note-000.md`);
+});
+
+// Silence is never consent to delete 300 files for the whole workspace.
+test('47b: a bulk delete with no confirmation callback is declined', async () => {
+  const h = makeHarness({ confirmLocalBulkDelete: undefined });
+  h.vault.seed(SHARE, 'd');
+  for (let i = 0; i < 30; i++) {
+    const name = `note-${String(i).padStart(3, '0')}.md`;
+    const id = mint(h.tree, { k: 'f', d: '', n: name, s: 1 });
+    h.state.data.materialized[id] = `${SHARE}/${name}`;
+  }
+  h.resetCounts();
+
+  for (let i = 0; i < 30; i++) {
+    h.watcher.onDelete(`${SHARE}/note-${String(i).padStart(3, '0')}.md`, 'f');
+  }
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 0);
+  assert.deepEqual(h.reconciles, ['declined-local-delete']);
+});
+
+test('47c: accepting the bulk gate applies every tombstone in one transaction', async () => {
+  const h = makeHarness();     // the default callback accepts
+  h.vault.seed(SHARE, 'd');
+  const ids: string[] = [];
+  for (let i = 0; i < 30; i++) {
+    const name = `note-${String(i).padStart(3, '0')}.md`;
+    const id = mint(h.tree, { k: 'f', d: '', n: name, s: 1 });
+    h.state.data.materialized[id] = `${SHARE}/${name}`;
+    ids.push(id);
+  }
+  h.resetCounts();
+
+  for (let i = 0; i < 30; i++) {
+    h.watcher.onDelete(`${SHARE}/note-${String(i).padStart(3, '0')}.md`, 'f');
+  }
+  await h.watcher.flushDeleteBatch();
+
+  assert.deepEqual(h.bulkPrompts, [30]);
+  assert.equal(h.counts.txns, 1);
+  for (const id of ids) assert.equal(isLive(h.tree.get(id)!), false);
+});
+
+// 58. Spec §2.2: `xp` is what lets a child that concurrently moved OUT of the
+// folder survive its deletion. Rename beats delete, deterministically.
+test('58: deleting a folder cascades to its live descendants and leaves escapees alone', async () => {
+  const h = makeHarness();
+  const folder = mint(h.tree, { k: 'd', d: '', n: 'Archive' });
+  const inside = mint(h.tree, { k: 'f', d: 'Archive', n: 'a.md', s: 1 });
+  const deeper = mint(h.tree, { k: 'f', d: 'Archive/sub', n: 'b.md', s: 1 });
+  const movedOut = mint(h.tree, { k: 'f', d: 'Active', n: 'kept.md', s: 1 });
+  const alreadyDead = mint(h.tree, { k: 'f', d: 'Archive', n: 'old.md', s: 1 });
+  h.tree.patchNode(alreadyDead, { x: 1, xa: NOW - 90_000, xb: 'Ann' });
+  h.state.data.materialized[folder] = `${SHARE}/Archive`;
+  h.state.data.materialized[inside] = `${SHARE}/Archive/a.md`;
+  h.state.data.contentHash[inside] = { sha256: 'hash-a', len: 1 };
+  h.vault.seed(SHARE, 'd');
+  h.resetCounts();
+
+  h.watcher.onDelete(`${SHARE}/Archive`, 'd');
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 1);
+  assert.equal(isLive(h.tree.get(folder)!), false);
+  assert.equal(h.tree.get(folder)!.xp, undefined, 'never on the folder itself');
+
+  for (const id of [inside, deeper]) {
+    const f = h.tree.get(id)!;
+    assert.equal(isLive(f), false, 'cascaded');
+    assert.equal(f.xp, 'Archive');
+    assert.equal(f.x, f.g);
+  }
+  assert.equal(h.tree.get(inside)!.xh, 'hash-a');
+
+  assert.equal(isLive(h.tree.get(movedOut)!), true, 'a node that moved out survives');
+  assert.equal(h.tree.get(movedOut)!.xp, undefined);
+  assert.equal(h.tree.get(alreadyDead)!.xa, NOW - 90_000, 'an already-dead node is not rewritten');
+  assert.equal(h.state.data.materialized[inside], undefined, 'unbound');
+});
+
+test('58b: a cascaded child that later moves out of the folder comes back to life', async () => {
+  const h = makeHarness();
+  const folder = mint(h.tree, { k: 'd', d: '', n: 'Archive' });
+  const child = mint(h.tree, { k: 'f', d: 'Archive', n: 'a.md', s: 1 });
+  h.state.data.materialized[folder] = `${SHARE}/Archive`;
+  h.vault.seed(SHARE, 'd');
+
+  h.watcher.onDelete(`${SHARE}/Archive`, 'd');
+  await h.watcher.flushDeleteBatch();
+  assert.equal(isLive(h.tree.get(child)!), false);
+
+  // A peer moves it out; `xp` no longer covers it (§2.2's escape rule).
+  h.tree.patchNode(child, { d: 'Active' });
+  assert.equal(isLive(h.tree.get(child)!), true);
+});
+
+// 59. 300 events, ONE transaction. Not 300 — every one of them would be a
+// separate update broadcast to every peer.
+test('59: 300 coalesced deletes produce exactly one transaction', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  for (let i = 0; i < 300; i++) {
+    const name = `note-${String(i).padStart(3, '0')}.md`;
+    const id = mint(h.tree, { k: 'f', d: '', n: name, s: 1 });
+    h.state.data.materialized[id] = `${SHARE}/${name}`;
+  }
+  h.resetCounts();
+
+  for (let i = 0; i < 300; i++) {
+    h.watcher.onDelete(`${SHARE}/note-${String(i).padStart(3, '0')}.md`, 'f');
+  }
+  assert.equal(h.counts.txns, 0, 'nothing is written until the batch flushes');
+
+  await h.watcher.flushDeleteBatch();
+  assert.equal(h.counts.txns, 1);
+});
+
+// Found by mutation probe: test 59 fires all 300 events in one synchronous loop,
+// so even a handler that flushed on EVERY event would still see one batch — the
+// flushes are microtasks and cannot run until the loop ends. Real events arrive
+// one macrotask apart, so the coalescing window has to be tested with the event
+// loop actually turning between them.
+test('59b: deletes arriving in separate ticks still coalesce into one transaction', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const names = ['a.md', 'b.md', 'c.md', 'd.md', 'e.md'];
+  for (const name of names) {
+    const id = mint(h.tree, { k: 'f', d: '', n: name, s: 1 });
+    h.state.data.materialized[id] = `${SHARE}/${name}`;
+  }
+  h.resetCounts();
+
+  for (const name of names) {
+    h.watcher.onDelete(`${SHARE}/${name}`, 'f');
+    await new Promise((resolve) => { setTimeout(resolve, 0); });   // let the loop turn
+  }
+  assert.equal(h.counts.txns, 0, 'still inside the coalescing window');
+
+  await h.watcher.flushDeleteBatch();
+  assert.equal(h.counts.txns, 1);
+  for (const [, f] of h.tree.entries()) assert.equal(isLive(f), false);
+});
+
+// 60. Deleting a folder in Obsidian emits an event for the folder AND for each of
+// its files. The folder must be written once and the children reached through the
+// cascade, or the subfolder among them loses the `xp` that lets it escape.
+test('60: a folder and its children in one batch write each node exactly once', async () => {
+  const h = makeCountingHarness();
+  const folder = mint(h.counting, { k: 'd', d: '', n: 'Archive' });
+  const sub = mint(h.counting, { k: 'd', d: 'Archive', n: 'sub' });
+  const a = mint(h.counting, { k: 'f', d: 'Archive', n: 'a.md', s: 1 });
+  const b = mint(h.counting, { k: 'f', d: 'Archive/sub', n: 'b.md', s: 1 });
+  for (const [id, path] of [
+    [folder, `${SHARE}/Archive`], [sub, `${SHARE}/Archive/sub`],
+    [a, `${SHARE}/Archive/a.md`], [b, `${SHARE}/Archive/sub/b.md`],
+  ] as const) h.state.data.materialized[id] = path;
+  h.vault.seed(SHARE, 'd');
+  h.resetCounts();
+  h.counting.patches = 0;
+
+  // The whole subtree arrives in one batch, in the order a filesystem walk emits it.
+  h.watcher.onDelete(`${SHARE}/Archive/sub/b.md`, 'f');
+  h.watcher.onDelete(`${SHARE}/Archive/a.md`, 'f');
+  h.watcher.onDelete(`${SHARE}/Archive/sub`, 'd');
+  h.watcher.onDelete(`${SHARE}/Archive`, 'd');
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 1);
+  assert.equal(h.counting.patches, 4, 'four nodes, four writes — no double tombstoning');
+  assert.equal(h.counting.get(folder)!.xp, undefined, 'the root carries no cascade marker');
+  for (const id of [sub, a, b]) {
+    assert.equal(isLive(h.counting.get(id)!), false);
+    assert.equal(h.counting.get(id)!.xp, 'Archive', 'reached through the cascade, so it can escape');
+  }
+});
+
+test('60b: deleting several unrelated files writes one tombstone each, with no cascade marker', async () => {
+  const h = makeCountingHarness();
+  h.vault.seed(SHARE, 'd');
+  const ids: string[] = [];
+  for (const name of ['a.md', 'b.md', 'c.md']) {
+    const id = mint(h.counting, { k: 'f', d: '', n: name, s: 1 });
+    h.state.data.materialized[id] = `${SHARE}/${name}`;
+    ids.push(id);
+    h.watcher.onDelete(`${SHARE}/${name}`, 'f');
+  }
+  h.counting.patches = 0;
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counting.patches, 3);
+  for (const id of ids) {
+    assert.equal(isLive(h.counting.get(id)!), false);
+    assert.equal(h.counting.get(id)!.xp, undefined);
+  }
+});
+
+test('a delete event claimed by a ticket is the echo of our own removal', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.vault.seed(SHARE, 'd');
+  h.tickets.arm('delete', `${SHARE}/todo.md`);
+  h.resetCounts();
+
+  h.watcher.onDelete(`${SHARE}/todo.md`, 'f');
+  await h.watcher.flushDeleteBatch();
+
+  assert.equal(h.counts.txns, 0);
+  assert.equal(isLive(h.tree.get(id)!), true);
+});
+
+test('a delete arriving before ready is queued and applied on replay (I9)', async () => {
+  const h = makeHarness();
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.vault.seed(SHARE, 'd');
+  h.setPhase('boot');
+  h.resetCounts();
+
+  h.watcher.onDelete(`${SHARE}/todo.md`, 'f');
+  assert.equal(h.watcher.pendingEventCount, 1);
+  assert.equal(h.counts.txns, 0);
+
+  h.setPhase('ready');
+  await h.watcher.flushPending();
+
+  assert.equal(isLive(h.tree.get(id)!), false);
 });
 
 // ---------------------------------------------------------------- I1 guard

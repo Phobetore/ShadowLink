@@ -33,6 +33,7 @@
 
 import {
   DELETE_COALESCE_MS,
+  LOCAL_BULK_DELETE_THRESHOLD,
   RECOVERED_DIR,
   RESURRECT_WINDOW_MS,
   STAGING_DIR,
@@ -561,11 +562,73 @@ export class VaultWatcher {
     this.deleteBatch.clear();
     if (paths.length === 0) return;
 
-    // Spec §4.1's re-verification, cascade expansion and local circuit breaker
-    // land with the delete slice. Until they do, a local delete is a NO-OP — the
-    // safe direction, and the same one declining the circuit breaker takes: the
-    // tree still says the files should exist, so the next reconcile restores them.
-    await Promise.resolve();
+    try {
+      // 1. RE-VERIFY (I2). A path that is back on disk was a staging move or a
+      //    rename, not a delete. An `exists` that throws is not evidence either:
+      //    it reads as present, because the cost of being wrong runs one way.
+      const gone: string[] = [];
+      for (const path of paths) {
+        let present = true;
+        try {
+          present = await this.deps.vault.exists(path);
+        } catch (err) {
+          this.lastFailure = err;
+        }
+        if (!present) gone.push(path);
+      }
+      if (gone.length === 0) return;
+
+      // 2. Map to LIVE nodes. A path whose node is already dead drops out — that
+      //    is `onDelete`'s idempotence check, and it is what stops every peer
+      //    writing its own explicit tombstone for the same descendant.
+      const idx = this.index();
+      const items: Batched[] = [];
+      const seen = new Set<string>();
+      for (const path of gone) {
+        const rel = this.toRel(path);
+        if (rel === null) continue;
+        const id = this.resolveLive(idx, rel);
+        if (id === undefined || seen.has(id)) continue;
+        const f = this.deps.tree.get(id);
+        if (f === null) continue;
+        seen.add(id);
+        // The node's STORED path, not the observed one: `xp` and the containment
+        // test in `expandCascade` are both expressed in stored coordinates.
+        items.push({ id, rel: relPath(f), kind: f.k, from: path, to: path });
+      }
+      if (items.length === 0) return;
+
+      // 3 + 4. Reduce to roots, then expand to everything they kill.
+      const roots = dropDescendants(items);
+      const { affected, cascade } = this.expandCascade(idx, roots);
+
+      // 5. The LOCAL circuit breaker. `git checkout`, Syncthing and Dropbox all
+      //    remove files behind Obsidian's back, and every one of those looks
+      //    exactly like the user deleting them. Declining writes NOTHING and
+      //    schedules a reconcile: the tree still says the files should exist, so
+      //    the next pass restores them. That is the correct answer for an external
+      //    tool having removed them, and it is why the default must be cancel — a
+      //    missing callback and a rejected dialog are both a decline.
+      if (affected.length > LOCAL_BULK_DELETE_THRESHOLD) {
+        let ok = false;
+        try {
+          const ask = this.deps.confirmLocalBulkDelete;
+          if (ask !== undefined) ok = await ask(affected.length);
+        } catch (err) {
+          this.lastFailure = err;
+          ok = false;
+        }
+        if (!ok) {
+          this.deps.scheduleReconcile?.('declined-local-delete');
+          return;
+        }
+      }
+
+      // 6. ONE transaction.
+      this.writeTombstones(roots, cascade);
+    } catch (err) {
+      this.lastFailure = err;
+    }
   }
 
   // ---------------------------------------------------------- tombstones
