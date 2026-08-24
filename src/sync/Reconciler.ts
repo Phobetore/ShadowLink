@@ -107,6 +107,17 @@ export interface ReconcilerDeps {
   shareRoot: string;
   /** Snapshot of the tree, injected so the reconciler never owns the Y.Doc. */
   entries: () => Array<[string, NodeFields]>;
+  /**
+   * Node ids the user has not yet answered the "stop sharing this?" dialog for
+   * (spec §5.5), read fresh on every pass. `VaultWatcher.pendingDecision` is the
+   * implementation; the default is an empty set.
+   *
+   * A node in here is treated EXACTLY like an invalid node: reported, and
+   * otherwise not created, moved, materialized or deleted. Without it, a pass
+   * firing while the modal is open re-materializes the very file the user just
+   * dragged out of the shared folder, putting it back where they took it from.
+   */
+  pendingDecision?: () => ReadonlySet<string>;
   /** Step 4. Default: a no-op. Filled in by P1b-2b. */
   applyDeletions?: (ctx: DeletionContext) => Promise<void>;
   /** Steps 6-7. Default: a no-op. Filled in by P1b-2c / P1c. */
@@ -128,6 +139,9 @@ export class RetryLater extends Error {
 }
 
 // ============================================================ internals
+
+/** Shared default for `pendingDecision`, so the common case allocates nothing. */
+const EMPTY_SET: ReadonlySet<string> = new Set<string>();
 
 /** The pass's own working set. `DeletionContext` is the subset step 4 is given. */
 interface PassContext extends DeletionContext {
@@ -331,7 +345,19 @@ export class Reconciler {
     diagnostics: ReconcileDiagnostics,
     cause: ReconcileCause,
   ): PassContext {
-    const entries = this.deps.entries();
+    // §5.5. A node awaiting the unshare answer is withheld from the derivation
+    // ENTIRELY, which is precisely what `deriveTree` does with an invalid one: it
+    // gets no derived path, implies no folder, occupies no slot, contributes no
+    // tombstone. Filtering here rather than testing the set at each of the four
+    // mutation sites is what makes "exactly like an invalid node" true by
+    // construction instead of by four separate remembered checks.
+    const frozen = this.deps.pendingDecision?.() ?? EMPTY_SET;
+    const entries: Array<[string, NodeFields]> = [];
+    const withheld: string[] = [];
+    for (const entry of this.deps.entries()) {
+      if (frozen.has(entry[0])) withheld.push(entry[0]);
+      else entries.push(entry);
+    }
     const derived = deriveTree(entries);
 
     const desired = new Map<string, { path: string; kind: Kind }>();
@@ -362,7 +388,10 @@ export class Reconciler {
     deadFolderPaths.sort(byDepthDesc);
 
     diagnostics.pending = [...derived.pending];
-    diagnostics.invalid = [...derived.invalid];
+    // Withheld ids join `invalid` rather than getting a channel of their own: the
+    // user-visible meaning is identical ("this node was skipped, nothing was
+    // touched"), and adding a field would be a public surface change.
+    diagnostics.invalid = [...derived.invalid, ...withheld].sort(cmp);
 
     const have = new Map<string, string>();
     const boundAtFold = new Map<string, string>();

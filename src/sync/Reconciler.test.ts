@@ -990,3 +990,129 @@ test('a wired bulk batch is refused wholesale and never re-prompts', async () =>
   assert.equal(w.confirms.length, 1, 'never prompted again');
   assert.equal(Object.keys(inShare(h.vault)).length, 12, 'every local copy is still there');
 });
+
+// ---------------------------------------------------------------- §5.5: awaiting an unshare answer
+
+// The watcher parks a node in `pendingDecision` from the moment the user drags it
+// out of the share until they answer "stop sharing?". Spec §5.5: while it sits
+// there the reconciler must treat it exactly like an INVALID node — do nothing,
+// report it, and above all do not put the file back where the user just took it
+// from. These four tests are the only thing standing between an open modal and a
+// pass that undoes the user's drag.
+
+test('a node awaiting an unshare decision is never materialized, and converges once answered', async () => {
+  const frozen = new Set<string>();
+  const h = makeHarness({ pendingDecision: () => frozen });
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  h.nodes.set(id, file('', 'note.md', { s: 1 }));   // live, valid, seeded: nothing else stops it
+  h.docs.setText(`n_${id}`, 'shared bytes');
+  frozen.add(id);
+
+  const first = await h.reconciler.reconcile('sync');
+
+  assert.equal(first.ran, true);
+  assert.deepEqual(first.failures, []);
+  assert.deepEqual(inShare(h.vault), {}, 'the file the user dragged out is not put back');
+  assert.equal(h.vault.callsTo('create').length, 0);
+  assert.deepEqual(first.diagnostics.invalid, [id], 'reported exactly like an invalid node');
+  assert.deepEqual(first.diagnostics.pending, [], 'and NOT as merely unpublished');
+  assert.equal(h.state.data.materialized[id], undefined, 'no binding was invented for it');
+
+  frozen.clear();                                   // the user chose "undo the move"
+  const second = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(second.failures, []);
+  assert.deepEqual(second.diagnostics.invalid, []);
+  assert.deepEqual(inShare(h.vault), { 'Shared/note.md': 'shared bytes' });
+  assert.equal(h.state.data.materialized[id], 'Shared/note.md');
+});
+
+test('a node awaiting an unshare decision is not moved to its desired path', async () => {
+  const frozen = new Set<string>();
+  const h = makeHarness({ pendingDecision: () => frozen });
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  h.nodes.set(id, file('', 'note.md', { s: 1 }));
+  h.docs.setText(`n_${id}`, 'shared bytes');
+  await h.reconciler.reconcile('sync');
+  assert.equal(h.state.data.materialized[id], 'Shared/note.md');
+
+  // A remote move arrives while the modal is still open.
+  h.nodes.set(id, file('Archive', 'renamed.md', { s: 1 }));
+  frozen.add(id);
+  h.vault.resetCalls();
+
+  const held = await h.reconciler.reconcile('remote');
+
+  assert.equal(held.ran, true);
+  assert.deepEqual(held.failures, []);
+  assert.equal(h.vault.callsTo('rename').length, 0, 'no relocation while the decision is open');
+  assert.equal(h.vault.callsTo('createFolder').length, 0, 'and it implies no folder either');
+  assert.deepEqual(inShare(h.vault), { 'Shared/note.md': 'shared bytes' });
+  assert.deepEqual(held.diagnostics.invalid, [id]);
+
+  frozen.clear();
+  await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(inShare(h.vault), { 'Shared/Archive/renamed.md': 'shared bytes' });
+  assert.equal(h.state.data.materialized[id], 'Shared/Archive/renamed.md');
+});
+
+test('a tombstone for a node awaiting an unshare decision is not applied', async () => {
+  const frozen = new Set<string>();
+  const w = wireDeletions('apply', { pendingDecision: () => frozen });
+  const { h } = w;
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  h.nodes.set(id, file('', 'gone.md', { s: 1 }));
+  h.docs.setText(`n_${id}`, 'shared bytes');
+  await h.reconciler.reconcile('sync');
+
+  // The tombstone lands (a peer deleted it) before the local user answers.
+  h.nodes.set(id, dead(file('', 'gone.md', { s: 1 })));
+  frozen.add(id);
+  h.published.length = 0;
+
+  const held = await h.reconciler.reconcile('remote');
+
+  assert.equal(held.ran, true);
+  assert.deepEqual(held.failures, []);
+  assert.equal(w.seen().deadNodes.has(id), false, 'step 4 was never even offered it');
+  assert.equal(h.vault.wasTrashed('Shared/gone.md'), false, 'nothing was removed');
+  assert.deepEqual(inShare(h.vault), { 'Shared/gone.md': 'shared bytes' });
+  assert.equal(h.state.data.deleteBudget.length, 0, 'and nothing was charged to the rate window');
+  assert.deepEqual(held.diagnostics.invalid, [id]);
+  assert.deepEqual(h.published, [[]], 'nor was the frozen file offered for publication');
+
+  frozen.clear();
+  const after = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(after.failures, []);
+  assert.equal(h.vault.wasTrashed('Shared/gone.md'), true, 'the tombstone applies once answered');
+});
+
+test('an unshared FOLDER and its cascade are frozen together, implying nothing on disk', async () => {
+  const frozen = new Set<string>();
+  const h = makeHarness({ pendingDecision: () => frozen });
+  h.vault.seed(SHARE, 'd');
+  const folder = nid('A');
+  const child = nid('B');
+  const other = nid('C');
+  h.nodes.set(folder, dir('', 'Archive'));
+  h.nodes.set(child, file('Archive', 'old.md', { s: 1 }));
+  h.nodes.set(other, file('', 'keep.md', { s: 1 }));
+  h.docs.setText(`n_${child}`, 'archived');
+  h.docs.setText(`n_${other}`, 'kept');
+
+  // The whole cascade the watcher computed sits in pendingDecision at once.
+  frozen.add(folder);
+  frozen.add(child);
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(inShare(h.vault), { 'Shared/keep.md': 'kept' }, 'only the untouched node lands');
+  assert.equal(h.vault.callsTo('createFolder').length, 0, 'the frozen folder is not re-created');
+  assert.deepEqual(r.diagnostics.invalid, [folder, child].sort());
+});
