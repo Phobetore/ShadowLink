@@ -9,17 +9,42 @@ import * as awarenessProtocol from 'y-protocols/awareness';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { join, dirname } from 'node:path';
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, rmSync,
+} from 'node:fs';
+import { mkdir, writeFile, rename } from 'node:fs/promises';
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
 
+/**
+ * Trailing window for the snapshot debounce (spec §1.5). The tree doc is hot and
+ * grows monotonically, so a full-state serialization on every update would block
+ * the relay for every other room.
+ */
+const PERSIST_DEBOUNCE_MS = 2000;
+
 export class DocHub {
-  constructor(dataDir) {
+  constructor(dataDir, options = {}) {
     this.baseDir = join(dataDir, 'yjs');
     mkdirSync(this.baseDir, { recursive: true });
     // docName → { doc: Y.Doc, awareness, conns: Map<conn, Set<number>> }
     this.docs = new Map();
+
+    this.persistDebounceMs = options.persistDebounceMs ?? PERSIST_DEBOUNCE_MS;
+    // docName → { timer, doc }. A timer that is already armed is NOT restarted by
+    // a later update: a classic reset-on-every-event debounce never fires at all
+    // under a continuous stream, which is exactly the traffic shape the tree doc
+    // has during a folder rename. Arming once and firing at the end of the window
+    // bounds the wait to persistDebounceMs no matter how busy the room is.
+    this._persistTimers = new Map();
+    // docName → Promise. Writes for one docName are serialized so two encoders
+    // can never race the same `<p>.tmp`.
+    this._persistChain = new Map();
+    // docName → number of snapshot writes actually issued. Diagnostic only.
+    this._persistCounts = new Map();
+    /** Last write error per docName, for diagnostics. Never thrown at a caller. */
+    this.lastPersistError = new Map();
   }
 
   _snapshotPath(docName) {
@@ -33,6 +58,14 @@ export class DocHub {
 
     const doc = new Y.Doc();
     const snap = this._snapshotPath(docName);
+    // A `.tmp` left behind is a write that never reached its rename — by
+    // construction an incomplete snapshot, and never the file to load. Remove it
+    // so a crashed write cannot accumulate, and load the last COMPLETE snapshot.
+    try {
+      rmSync(`${snap}.tmp`, { force: true });
+    } catch {
+      /* a tmp we cannot remove is still never read; carry on */
+    }
     if (existsSync(snap)) Y.applyUpdate(doc, readFileSync(snap));
 
     const awareness = new awarenessProtocol.Awareness(doc);
@@ -139,15 +172,124 @@ export class DocHub {
       /* already closed */
     }
     if (docName && state.conns.size === 0) {
-      this._persist(docName, state.doc);
+      // The last peer left: nothing will arrive to trigger the debounced write,
+      // so flush now rather than leaving the tail of the session unwritten.
+      void this.flush(docName);
       // P0: doc stays resident. Flush-then-destroy on last leave is P3/P4.
     }
   }
 
+  // ------------------------------------------------------------- persistence
+
+  /** Schedule a snapshot write for `docName` (spec §1.5: 2 s trailing debounce). */
   _persist(docName, doc) {
+    if (this._persistTimers.has(docName)) return;          // already armed
+    const timer = setTimeout(() => {
+      this._persistTimers.delete(docName);
+      void this._enqueueWrite(docName, doc);
+    }, this.persistDebounceMs);
+    // A pending snapshot timer must never be the only reason the process stays
+    // alive — the same reasoning as the awareness interval above. The WebSocket
+    // server keeps the loop open in production; `flush`/`flushAllSync` cover the
+    // shutdown path.
+    timer.unref?.();
+    this._persistTimers.set(docName, { timer, doc });
+  }
+
+  /**
+   * Cancel any pending debounce for `docName` and write now. Resolves once the
+   * write (and every write queued before it) has landed. Never rejects.
+   */
+  async flush(docName) {
+    const pending = this._persistTimers.get(docName);
+    if (pending !== undefined) {
+      clearTimeout(pending.timer);
+      this._persistTimers.delete(docName);
+    }
+    const state = this.docs.get(docName);
+    if (state === undefined) {
+      await (this._persistChain.get(docName) ?? Promise.resolve());
+      return;
+    }
+    await this._enqueueWrite(docName, state.doc);
+  }
+
+  /** Flush every resident doc. Awaits them all; never rejects. */
+  async flushAll() {
+    await Promise.all([...this.docs.keys()].map((docName) => this.flush(docName)));
+  }
+
+  /**
+   * Synchronous last-resort flush, for a process that is on its way out and
+   * cannot await anything. Still atomic: temp file, then rename.
+   */
+  flushAllSync() {
+    for (const [docName, state] of this.docs) {
+      const pending = this._persistTimers.get(docName);
+      if (pending !== undefined) {
+        clearTimeout(pending.timer);
+        this._persistTimers.delete(docName);
+      }
+      try {
+        const p = this._snapshotPath(docName);
+        const tmp = `${p}.tmp`;
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(tmp, Buffer.from(Y.encodeStateAsUpdate(state.doc)));
+        renameSync(tmp, p);
+        this._persistCounts.set(docName, this.writeCount(docName) + 1);
+      } catch (err) {
+        this.lastPersistError.set(docName, err);
+      }
+    }
+  }
+
+  /** Snapshot writes issued for `docName` so far. Test/diagnostic helper. */
+  writeCount(docName) {
+    return this._persistCounts.get(docName) ?? 0;
+  }
+
+  /** Drop every armed timer without writing. For tests and for teardown. */
+  cancelPending() {
+    for (const { timer } of this._persistTimers.values()) clearTimeout(timer);
+    this._persistTimers.clear();
+  }
+
+  /**
+   * Serialize writes per docName. A rejected predecessor must not poison the
+   * chain, or one ENOSPC would disable persistence for that room for the rest of
+   * the process's life.
+   */
+  _enqueueWrite(docName, doc) {
+    const previous = this._persistChain.get(docName) ?? Promise.resolve();
+    const next = previous.then(
+      () => this._writeSnapshot(docName, doc),
+      () => this._writeSnapshot(docName, doc),
+    ).catch((err) => {
+      this.lastPersistError.set(docName, err);
+    });
+    this._persistChain.set(docName, next);
+    return next;
+  }
+
+  /**
+   * Atomic snapshot write (spec §1.5). `writeFileSync(p, ...)` truncates `p`
+   * first, so a kill or a full disk mid-write leaves a SHORT file; the next
+   * `Y.applyUpdate` then throws and the tree doc reads as empty, which every
+   * client interprets as "this workspace was never initialized". Writing a temp
+   * file and renaming it over the snapshot means a reader only ever sees a
+   * complete file — the old one or the new one.
+   *
+   * The state is encoded HERE rather than at schedule time, so a debounced write
+   * always persists the newest state rather than the state at the first update
+   * of the window.
+   */
+  async _writeSnapshot(docName, doc) {
     const p = this._snapshotPath(docName);
-    mkdirSync(dirname(p), { recursive: true });
-    writeFileSync(p, Y.encodeStateAsUpdate(doc));
+    const tmp = `${p}.tmp`;
+    await mkdir(dirname(p), { recursive: true });
+    await writeFile(tmp, Buffer.from(Y.encodeStateAsUpdate(doc)));
+    await rename(tmp, p);
+    this._persistCounts.set(docName, this.writeCount(docName) + 1);
   }
 
   // Test/diagnostic helper.

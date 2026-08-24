@@ -47,6 +47,24 @@ httpServer.on('upgrade', (req, socket, head) => {
 process.on('uncaughtException', (err) => console.error('[uncaughtException]', err));
 process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
 
+// Snapshots are written on a trailing debounce (DocHub, spec §1.5), so an
+// orderly shutdown must write the tail of the window before the process goes.
+// Synchronous — and still temp-file-then-rename, so an interrupted shutdown
+// cannot leave a truncated snapshot behind either.
+let shuttingDown = false;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      docHub.flushAllSync();
+    } catch (err) {
+      console.error('[shutdown] snapshot flush failed', err);
+    }
+    process.exit(0);
+  });
+}
+
 httpServer.listen(config.port, () => {
   console.log(`ShadowLink server listening on ws://0.0.0.0:${config.port}`);
 });
