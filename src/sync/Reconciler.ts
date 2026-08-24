@@ -226,7 +226,33 @@ export class Reconciler {
 
   private running = false;
   private dirty = false;
-  private readOnlyReason: string | null = null;
+  /**
+   * Why the vault is not being mutated, and whether the next pass re-derives it.
+   *
+   * `recheck: true` marks a verdict this reconciler reached ITSELF from evidence
+   * it can read again — the share root was missing, the mount looked wrong. Those
+   * are re-diagnosed at the top of every pass rather than remembered, because a
+   * verdict that outlives its evidence is how a client that has since been fixed
+   * (the folder came back, the watcher bound a file) stays paused for the rest of
+   * the session with nothing able to clear it.
+   *
+   * `recheck: false` is a pause somebody else imposed — a newer schema, a
+   * cancelled first sync, a share root whose PARENT vanished. Those the pass
+   * cannot re-derive, so it does not try: it refuses without touching the vault.
+   */
+  private paused: { reason: string; recheck: boolean } | null = null;
+  /** The reason the user has already been shown, so a re-diagnosis is not a fresh popup. */
+  private announced: string | null = null;
+  /**
+   * Did the pass before this one contain any failure at all?
+   *
+   * I2, applied to the mount guard. A pass whose fetches threw `RetryLater`
+   * bound nothing — not because the share root points somewhere else, but
+   * because a content doc had not synced yet. Reading "nothing is bound" as a
+   * wrong mount on the pass after that turns an expected, transient condition
+   * into a session-long read-only.
+   */
+  private lastPassFailed = false;
 
   constructor(deps: ReconcilerDeps) {
     this.deps = deps;
@@ -242,13 +268,42 @@ export class Reconciler {
   }
 
   get readOnly(): boolean {
-    return this.readOnlyReason !== null;
+    return this.paused !== null;
   }
 
-  /** Stop mutating the vault until the plugin is reloaded. Never reversible in-pass. */
+  /** Why the vault is not being mutated, for the persistent status indicator. */
+  get readOnlyReason(): string | null {
+    return this.paused?.reason ?? null;
+  }
+
+  /**
+   * Stop mutating the vault. Imposed from outside, so no pass may re-diagnose it
+   * away; only `clearReadOnly` (a genuine reconnect, or a plugin reload) lifts it.
+   */
   enterReadOnly(reason: string): void {
-    if (this.readOnlyReason !== null) return;
-    this.readOnlyReason = reason;
+    if (this.paused !== null && !this.paused.recheck) return;   // the first imposed reason wins
+    this.setPaused(reason, false);
+  }
+
+  /**
+   * Resume after a genuine reconnect.
+   *
+   * Nothing is asserted about the vault here: the next pass re-runs the share
+   * root and mount checks from scratch and pauses again if either still holds,
+   * before it has mutated anything. Read-only is therefore recoverable without
+   * ever being recovered ON FAITH — which matters because the alternative,
+   * shipped until now, was a reconciler that refused every pass for the rest of
+   * the session while `Bootstrap` reported the client as `ready`.
+   */
+  clearReadOnly(): void {
+    this.paused = null;
+    this.announced = null;
+  }
+
+  private setPaused(reason: string, recheck: boolean): void {
+    this.paused = { reason, recheck };
+    if (this.announced === reason) return;                      // re-diagnosis, not news
+    this.announced = reason;
     this.notice(reason);
   }
 
@@ -273,13 +328,18 @@ export class Reconciler {
   // ---------------------------------------------------------- the pass
 
   private async runPass(cause: ReconcileCause): Promise<ReconcileResult> {
-    if (this.readOnlyReason !== null) return refused(this.readOnlyReason);
+    // A verdict this reconciler reached itself is dropped here and re-derived
+    // below. Both re-derivations run BEFORE anything is mutated, so the worst a
+    // stale pause costs is one `vault.exists` and one `vault.list`.
+    if (this.paused?.recheck === true) this.paused = null;
+    if (this.paused !== null) return refused(this.paused.reason);
 
     // I2: a share root that is not there is a wrong mount or a moved folder, and
     // never evidence that the user deleted everything in it.
     if (!(await this.exists(this.shareRoot))) {
-      this.enterReadOnly('The shared folder no longer exists. Sync is paused.');
-      return refused(this.readOnlyReason ?? 'shared folder missing');
+      const reason = 'The shared folder no longer exists. Sync is paused.';
+      this.setPaused(reason, true);
+      return refused(reason);
     }
 
     this.running = true;
@@ -298,9 +358,12 @@ export class Reconciler {
       // share root points somewhere else, not that the vault is empty.
       const mismatch = this.mountMismatch(disk, draft.desired.size, cause);
       if (mismatch !== null) {
-        this.enterReadOnly(mismatch);
+        this.setPaused(mismatch, true);
         return refused(mismatch);
       }
+      // Past both guards: the vault is about to be mutated, so whatever the user
+      // was last told is stale and a future pause is news again.
+      this.announced = null;
 
       await this.recoverStaging(draft);          // step 0
       this.observeBindings(draft);
@@ -323,6 +386,7 @@ export class Reconciler {
         this.rebuildDeviceStateFromObserved(ctx);
         await this.persist();
       } finally {
+        this.lastPassFailed = failures.length > 0;
         this.running = false;
       }
     }
@@ -441,9 +505,16 @@ export class Reconciler {
    * from the tree — so an ordinary sequence (a folder node arrives, then the file
    * that lives in it) would trip a guard measured on `size()` and wedge the client
    * in read-only on its very first real change.
+   *
+   * And every clause below is a statement about what was OBSERVED. A pass that
+   * failed observed nothing it can be held to (I2): `adopt` and `materialize`
+   * throw `RetryLater` when a content doc has not synced, which is expected and
+   * transient (I4), and they bind nothing when they do. "Nothing is bound"
+   * after such a pass is a report about the network, not about the mount.
    */
   private mountMismatch(disk: DiskIndex, desiredCount: number, cause: ReconcileCause): string | null {
     if (cause === 'bootstrap') return null;
+    if (this.lastPassFailed) return null;                  // I2: a failure is evidence of nothing
     if (desiredCount === 0) return null;
     if (disk.filesUnderShare().length === 0) return null;
     for (const path of Object.values(this.deps.state.data.materialized)) {

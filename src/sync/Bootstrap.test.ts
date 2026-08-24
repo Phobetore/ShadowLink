@@ -557,6 +557,40 @@ test('a reconnect while already ready is a no-op', async () => {
   assert.equal(h.reconciles.length, before, 'reconnects do not re-bootstrap a ready client');
 });
 
+test('a reconnect resumes a reconciler that paused itself after bootstrap', async () => {
+  let paused: string | null = null;
+  const h = makeHarness({
+    deps: {
+      syncPaused: () => paused,
+      resumeSync: () => { paused = null; },
+    },
+  });
+  await h.boot.run();
+  assert.equal(h.boot.phase, 'ready');
+
+  // Mid-session, the reconciler stops on evidence of its own.
+  paused = "Local layout does not match ShadowLink's records. Re-run first sync.";
+
+  const again = await h.boot.onReconnect();
+
+  assert.equal(again.outcome, 'ready');
+  assert.equal(paused, null, 'a genuine reconnect lifts a self-diagnosed pause');
+  assert.deepEqual(h.reconciles, ['bootstrap', 'bootstrap'], 'and re-runs steps 6-10');
+});
+
+test('a client whose reconciler is still paused reports read-only, never ready', async () => {
+  const reason = 'The shared folder no longer exists. Sync is paused.';
+  const h = makeHarness({ deps: { syncPaused: () => reason, resumeSync: () => undefined } });
+
+  const result = await h.boot.run();
+
+  assert.equal(result.outcome, 'readonly', 'one phase cannot mean two things');
+  assert.equal(result.reason, reason);
+  assert.equal(h.boot.phase, 'readonly');
+  assert.equal(h.boot.readOnlyReason, reason);
+  assert.deepEqual(h.reconciles, ['bootstrap'], 'the pass still ran and reported for itself');
+});
+
 // ================================================================ step 5
 
 test('the founder claim is taken when the workspace is empty', async () => {

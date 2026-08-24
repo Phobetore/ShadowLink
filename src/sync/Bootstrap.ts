@@ -113,6 +113,29 @@ export interface BootstrapDeps {
 
   reconcile: (cause: ReconcileCause) => Promise<unknown>;
 
+  /**
+   * Why the reconciler is refusing to mutate the vault, or null. Wire it to
+   * `Reconciler.readOnlyReason`.
+   *
+   * Two modules can each decide to stop, and until they were joined up they
+   * could disagree: the reconciler paused itself mid-session (a mount that
+   * looked wrong, a share root that had gone) while this class went on
+   * reporting `ready`, so the status indicator said everything was fine and
+   * every pass was refused. Reading the collaborator's own answer is what makes
+   * one phase mean one thing.
+   */
+  syncPaused?: () => string | null;
+
+  /**
+   * Lift a collaborator's self-imposed pause once the tree has genuinely synced
+   * again. `Reconciler.clearReadOnly` is the implementation.
+   *
+   * Safe because it asserts nothing: the reconciler re-runs its own share-root
+   * and mount checks on the very next pass, before mutating anything, and
+   * pauses again if either still holds.
+   */
+  resumeSync?: () => void;
+
   /** Spec §4.5 step 10 — `VaultWatcher.flushPending`. */
   replayPendingEvents: () => Promise<void>;
 
@@ -229,12 +252,17 @@ export class Bootstrap {
    * Re-attempts step 4 and, if the tree genuinely syncs this time, runs steps
    * 6-10. A ready client is left alone; a client held read-only by a schema it
    * cannot read is never retried, because reconnecting does not make it older.
+   *
+   * "Ready" means ready in BOTH modules. A client whose reconciler paused itself
+   * after bootstrap finished is not left alone — that pause is exactly the one a
+   * reconnect is able to lift, and skipping the re-run is what used to strand a
+   * client reporting `ready` while every reconcile pass was refused.
    */
   async onReconnect(): Promise<BootstrapResult> {
     if (this.fatal) {
       return this.result('readonly', this._readOnlyReason ?? undefined);
     }
-    if (this._phase === 'ready') return this.result('ready');
+    if (this._phase === 'ready' && this.pausedReason() === null) return this.result('ready');
     return this.syncAndClassify();
   }
 
@@ -255,6 +283,10 @@ export class Bootstrap {
       );
     }
     this._readOnlyReason = null;
+    // The tree is genuinely synced, so a collaborator that paused ITSELF gets to
+    // try again. It re-runs its own guards before it mutates anything, so this
+    // resumes the client without assuming anything about the vault.
+    this.deps.resumeSync?.();
 
     // 5. Founder claim. Latency only; skipped on a reconnect, which by
     //    definition is not a first join (§4.6 runs steps 6-10).
@@ -294,7 +326,22 @@ export class Bootstrap {
     //     out — which is most of it.
     await this.guarded(() => this.deps.replayPendingEvents());
 
+    // Step 9 may have paused the reconciler on evidence only it can see (the
+    // share root really is gone). Report ITS answer rather than a `ready` the
+    // pass just contradicted — one phase, one meaning.
+    const paused = this.pausedReason();
+    if (paused !== null) {
+      this._phase = 'readonly';
+      this._readOnlyReason = paused;
+      return this.result('readonly', paused);
+    }
+
     return this.result('ready');
+  }
+
+  /** The collaborator's own read-only reason, or null when it is not wired. */
+  private pausedReason(): string | null {
+    return this.deps.syncPaused?.() ?? null;
   }
 
   // ---------------------------------------------------------- step 7

@@ -1214,3 +1214,89 @@ test('a first join that publishes its own notes keeps the bindings the pass crea
   assert.deepEqual(inShare(h.vault), seeded, 'and nothing was rewritten');
   assert.equal(Object.keys(h.state.data.materialized).length, 5);
 });
+
+// ---------------------------------------------------------------- the mount guard as evidence
+
+test('a transient content-doc failure on first join is not evidence of a wrong mount', async () => {
+  const h = makeHarness();
+  const names = ['one.md', 'two.md', 'three.md'];
+  const ids = ['A', 'B', 'C'].map(nid);
+  const seeded: Record<string, string> = {};
+  for (let i = 0; i < ids.length; i++) {
+    h.nodes.set(ids[i], file('', names[i], { s: 1 }));
+    h.docs.setText(`n_${ids[i]}`, `body of ${names[i]}`);
+    h.docs.setSynced(`n_${ids[i]}`, false);        // the transient condition I4 requires us to tolerate
+    seeded[`${SHARE}/${names[i]}`] = `body of ${names[i]}`;
+    h.vault.seed(`${SHARE}/${names[i]}`, 'f', `body of ${names[i]}`);
+  }
+
+  const first = await h.reconciler.reconcile('bootstrap');
+
+  assert.equal(first.ran, true);
+  assert.deepEqual(first.failures.map((f) => f.key), ids.map((id) => `adopt:${id}`));
+  for (const f of first.failures) {
+    assert.ok(f.err instanceof RetryLater, `${f.key} was not a RetryLater`);
+  }
+  assert.deepEqual(h.state.data.materialized, {}, 'an unproven fetch binds nothing (I17)');
+
+  // The content provider recovers, exactly as it is expected to.
+  for (const id of ids) h.docs.setSynced(`n_${id}`, true);
+
+  const second = await h.reconciler.reconcile('remote');
+
+  assert.equal(second.ran, true, 'a failed fetch is not evidence of a wrong mount (I2)');
+  assert.equal(h.reconciler.readOnly, false);
+  assert.deepEqual(second.failures, []);
+  assert.deepEqual(
+    h.state.data.materialized,
+    Object.fromEntries(ids.map((id, i) => [id, `${SHARE}/${names[i]}`])),
+  );
+  assert.deepEqual(inShare(h.vault), seeded, 'the bytes already matched');
+  assert.deepEqual(stashed(h.vault), {}, 'so nothing was stashed either');
+});
+
+test('a mount mismatch is re-diagnosed, not remembered, and clears when the evidence does', async () => {
+  const h = makeHarness();
+  for (let i = 0; i < 300; i++) {
+    h.state.data.materialized[nid(`N${pad3(i)}`)] = `Work/Team/note-${i}.md`;
+  }
+  h.vault.seed('Shared/existing.md', 'f', 'still here');
+  const wanted = nid('A');
+  h.nodes.set(wanted, file('', 'wanted.md', { s: 1 }));
+  h.docs.setText(`n_${wanted}`, 'body');
+
+  const refused = await h.reconciler.reconcile('remote');
+
+  assert.equal(refused.ran, false);
+  assert.equal(h.reconciler.readOnly, true);
+  assert.equal(mutations(h.vault), 0);
+
+  // The watcher binds the file that was sitting there all along: the share root
+  // does point at this workspace's folder after all.
+  h.state.data.materialized[nid('Z')] = 'Shared/existing.md';
+
+  const healed = await h.reconciler.reconcile('remote');
+
+  assert.equal(healed.ran, true, 'the guard re-reads the evidence rather than replaying a verdict');
+  assert.equal(h.reconciler.readOnly, false);
+  assert.equal(h.vault.snapshot()['Shared/wanted.md'], 'body');
+  assert.equal(h.notices.length, 1, 'and the user was told once, not once per pass');
+});
+
+test('clearReadOnly resumes a self-diagnosed pause but an imposed one survives it', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.reconciler.enterReadOnly('This workspace was created by a newer version of ShadowLink.');
+
+  h.reconciler.clearReadOnly();
+  assert.equal(h.reconciler.readOnly, false, 'a reconnect may resume a paused reconciler');
+
+  // ...but the guards themselves are re-run, so a pause that is still warranted
+  // comes straight back rather than letting the pass mutate the vault.
+  h.reconciler.enterReadOnly('imposed');
+  const refused = await h.reconciler.reconcile('sync');
+
+  assert.equal(refused.ran, false);
+  assert.equal(refused.refusedReason, 'imposed');
+  assert.equal(h.reconciler.readOnly, true, 'an imposed pause is never re-diagnosed away');
+});
