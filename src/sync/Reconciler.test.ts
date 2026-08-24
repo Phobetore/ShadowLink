@@ -154,6 +154,14 @@ function inShare(vault: FakeVault): Record<string, string> {
   return out;
 }
 
+/** Directory paths under the share, literal casing, sorted. */
+function foldersIn(vault: FakeVault): string[] {
+  return vault.list()
+    .filter((e) => e.kind === 'd' && e.path.startsWith(`${SHARE}/`))
+    .map((e) => e.path)
+    .sort();
+}
+
 function mutations(vault: FakeVault): number {
   return vault.calls.filter(
     (c) => c.op === 'create' || c.op === 'createFolder' || c.op === 'rename' || c.op === 'trashLocal',
@@ -1299,4 +1307,167 @@ test('clearReadOnly resumes a self-diagnosed pause but an imposed one survives i
   assert.equal(refused.ran, false);
   assert.equal(refused.refusedReason, 'imposed');
   assert.equal(h.reconciler.readOnly, true, 'an imposed pause is never re-diagnosed away');
+});
+
+// ---------------------------------------------------------------- the directory a rename empties
+
+// A folder rename converges as one `d`/`n` rewrite per node (spec §4.1):
+// `applyMoves` relocates the FILES, and step 1 creates the folder they are moving
+// into. Nothing relocates the directory itself, so the old one is left standing —
+// and step 5's sweep only ever visited folders whose NODE was dead, which a
+// renamed folder's is not. Every peer that did not perform the rename accumulated
+// one empty directory per rename, permanently.
+
+test('a remote folder rename removes the directory it emptied', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const folder = nid('A');
+  const note = nid('B');
+  const deep = nid('C');
+  h.nodes.set(folder, dir('', 'X'));
+  h.nodes.set(note, file('X', 'a.md', { s: 1 }));
+  h.nodes.set(deep, file('X/inner', 'b.md', { s: 1 }));
+  h.docs.setText(`n_${note}`, 'a body');
+  h.docs.setText(`n_${deep}`, 'b body');
+
+  await h.reconciler.reconcile('bootstrap');
+  assert.deepEqual(foldersIn(h.vault), ['Shared/X', 'Shared/X/inner']);
+
+  // The rename arrives from a peer.
+  h.nodes.set(folder, dir('', 'Y'));
+  h.nodes.set(note, file('Y', 'a.md', { s: 1 }));
+  h.nodes.set(deep, file('Y/inner', 'b.md', { s: 1 }));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(inShare(h.vault), {
+    'Shared/Y/a.md': 'a body',
+    'Shared/Y/inner/b.md': 'b body',
+  });
+  assert.deepEqual(foldersIn(h.vault), ['Shared/Y', 'Shared/Y/inner'], 'no empty Shared/X survives');
+  assert.equal(h.vault.wasTrashed('Shared/X'), true, 'and it went to the vault-local .trash (I1)');
+  assert.equal(h.vault.wasTrashed('Shared/X/inner'), true, 'deepest first, so the cascade completes');
+
+  // And it is a fixpoint: nothing to sweep, nothing to recreate.
+  h.vault.resetCalls();
+  const again = await h.reconciler.reconcile('retry');
+  assert.equal(again.ran, true);
+  assert.equal(mutations(h.vault), 0);
+});
+
+test('a directory a rename emptied is kept when a dot path is still inside it', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const folder = nid('A');
+  const note = nid('B');
+  h.nodes.set(folder, dir('', 'X'));
+  h.nodes.set(note, file('X', 'a.md', { s: 1 }));
+  h.docs.setText(`n_${note}`, 'a body');
+
+  await h.reconciler.reconcile('bootstrap');
+  // Invisible to `vault.list()` and therefore to the DiskIndex; visible to
+  // `listDir`, which is exactly why emptiness is decided by the adapter (I2).
+  h.vault.seed('Shared/X/.git/config', 'f', 'gitdir');
+
+  h.nodes.set(folder, dir('', 'Y'));
+  h.nodes.set(note, file('Y', 'a.md', { s: 1 }));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.equal(r.ran, true);
+  assert.equal(h.vault.snapshot()['Shared/Y/a.md'], 'a body');
+  assert.equal(h.vault.wasTrashed('Shared/X'), false, 'a .git inside vetoes the removal');
+  assert.equal(h.vault.snapshot()['Shared/X/.git/config'], 'gitdir');
+});
+
+test('a directory a live node still claims is never swept, even after a move out of it', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const folder = nid('A');
+  const note = nid('B');
+  h.nodes.set(folder, dir('', 'Keep'));
+  h.nodes.set(note, file('Keep', 'a.md', { s: 1 }));
+  h.docs.setText(`n_${note}`, 'a body');
+
+  await h.reconciler.reconcile('bootstrap');
+
+  // Only the FILE moves out; the folder node is untouched and still wants to exist.
+  h.nodes.set(note, file('', 'a.md', { s: 1 }));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(inShare(h.vault), { 'Shared/a.md': 'a body' });
+  assert.deepEqual(foldersIn(h.vault), ['Shared/Keep'], 'an empty folder the tree wants stays');
+  assert.equal(h.vault.wasTrashed('Shared/Keep'), false);
+});
+
+test('a renamed folder that never held a file still leaves no directory behind', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const outer = nid('A');
+  const inner = nid('B');
+  h.nodes.set(outer, dir('', 'X'));
+  h.nodes.set(inner, dir('X', 'inner'));
+
+  await h.reconciler.reconcile('bootstrap');
+  assert.deepEqual(foldersIn(h.vault), ['Shared/X', 'Shared/X/inner']);
+
+  // No file ever lived in here, so nothing MOVES: the whole rename is two `d`/`n`
+  // rewrites and two `createFolder` calls, and the old pair is left standing.
+  h.nodes.set(outer, dir('', 'Y'));
+  h.nodes.set(inner, dir('Y', 'inner'));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(foldersIn(h.vault), ['Shared/Y', 'Shared/Y/inner']);
+  assert.equal(h.vault.wasTrashed('Shared/X'), true);
+  assert.equal(h.vault.wasTrashed('Shared/X/inner'), true);
+});
+
+test('an empty folder that predates the first pass is never swept', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed('Shared/Ideas', 'd');            // the user's own, from before ShadowLink ran here
+  const id = nid('A');
+  h.nodes.set(id, file('', 'note.md', { s: 1 }));
+  h.docs.setText(`n_${id}`, 'body');
+
+  await h.reconciler.reconcile('bootstrap');
+  const later = await h.reconciler.reconcile('remote');
+
+  assert.equal(later.ran, true);
+  assert.deepEqual(
+    foldersIn(h.vault), ['Shared/Ideas'],
+    'no node claims it because step 6 offers only files — a gap in what gets shared, '
+    + 'never a licence to remove the user’s directory',
+  );
+  assert.equal(h.vault.wasTrashed('Shared/Ideas'), false);
+  assert.equal(h.vault.snapshot()['Shared/note.md'], 'body');
+});
+
+test('a directory that predates the session is still swept once the pass itself empties it', async () => {
+  const h = makeHarness();
+  // Both the folder and the file were already there when this session started —
+  // the tree moved the note while Obsidian was closed.
+  h.vault.seed('Shared/X/a.md', 'f', 'a body');
+  const id = nid('A');
+  h.nodes.set(id, file('Y', 'a.md', { s: 1 }));
+  h.state.data.materialized[id] = 'Shared/X/a.md';
+  h.docs.setText(`n_${id}`, 'a body');
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(inShare(h.vault), { 'Shared/Y/a.md': 'a body' });
+  assert.deepEqual(
+    foldersIn(h.vault), ['Shared/Y'],
+    'the pass watched the last file leave, which outranks "it was here when we started"',
+  );
+  assert.equal(h.vault.wasTrashed('Shared/X'), true);
 });

@@ -64,16 +64,16 @@ function desiredFolders(client) {
 }
 
 /**
- * Assert the two clients converged: identical files with identical bytes, and
- * an identical DESIRED folder structure.
+ * Assert the two clients converged: identical files with identical bytes, an
+ * identical DESIRED folder structure, and an identical folder structure ON DISK.
  *
- * On-disk folder sets are compared with one documented allowance. Reconcile step
- * 5 sweeps a directory only when its NODE is dead; a directory emptied by a
- * remote RENAME has a live node that simply moved, so the old path survives as
- * an empty folder on every peer that did not perform the rename (this is spec
- * risk R4's family, and it is reported in the task notes). The allowance is
- * therefore exactly "an extra directory that holds nothing" — a stranded FILE is
- * always a failure.
+ * The last of those used to carry an allowance for "an extra directory that
+ * holds nothing", because reconcile step 5 swept a folder only when its NODE was
+ * dead: a directory emptied by a remote RENAME has a live node that simply moved,
+ * so the old path survived as an empty folder on every peer that did not perform
+ * the rename. Step 5 now also removes an empty directory the tree does not
+ * claim, so there is nothing left to tolerate — the two vaults must look the
+ * same, folders included, and this assertion is what keeps them that way.
  */
 function assertSameLayout(a, b, label) {
   const la = a.layout();
@@ -89,12 +89,10 @@ function assertSameLayout(a, b, label) {
     desiredFolders(a), desiredFolders(b),
     `${label}: the clients disagree about the desired folder structure`,
   );
-  for (const [client, mine, theirs] of [[a, la, lb], [b, lb, la]]) {
-    for (const dir of mine.folders.filter((f) => !theirs.folders.includes(f))) {
-      const inside = Object.keys(mine.files).filter((p) => p.startsWith(`${dir}/`));
-      assert.deepEqual(inside, [], `${label}: ${client.name} stranded files in ${dir}`);
-    }
-  }
+  assert.deepEqual(
+    la.folders, lb.folders,
+    `${label}: on-disk folder sets differ (${a.name} vs ${b.name})`,
+  );
 }
 
 /** Read a room straight off the server, with a connection no client owns. */
@@ -295,13 +293,16 @@ scenario('64 the assigned hard case — folder rename vs child rename, partition
     const files = Object.keys(client.layout().files).sort();
     assert.deepEqual(files, expected, `${client.name} did not converge to Y/renamed.md + 10 siblings`);
     assert.equal(client.layout().files['Shared/Y/renamed.md'], 'the note');
-    // Nothing may be left behind in the directory the rename emptied. B keeps an
-    // EMPTY `Shared/X` — reconcile step 5 only sweeps a folder whose NODE is
-    // dead, and this folder's node is alive under a new name — but no file may
-    // be stranded there.
+    // Nothing may be left behind in the directory the rename emptied — not a
+    // stranded file, and since step 5 also removes an empty directory the tree
+    // no longer claims, not the directory either.
     assert.deepEqual(
       files.filter((p) => p.startsWith('Shared/X/')), [],
       `${client.name} stranded files under the old folder name`,
+    );
+    assert.deepEqual(
+      client.layout().folders.filter((p) => p === 'Shared/X' || p.startsWith('Shared/X/')), [],
+      `${client.name} kept the directory the rename emptied`,
     );
   }
   assert.deepEqual(desiredFolders(a), ['Y'], 'A wants a folder other than Y');

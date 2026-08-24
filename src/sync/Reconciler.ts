@@ -151,6 +151,11 @@ interface PassContext extends DeletionContext {
   folderPaths: string[];
   /** Vault paths of dead directory nodes, deepest first. */
   deadFolderPaths: string[];
+  /**
+   * Directories under the share that this pass moved a file OUT of, ancestors
+   * included. Step 5's other sweep candidates.
+   */
+  vacatedDirs: Set<string>;
   /** fold(state.materialized[id]) for every currently-dead id. CF-1. */
   deadMaterializedFold: Set<string>;
   /** fold(literal path) -> nodeId, the inverse of `have`. */
@@ -253,6 +258,26 @@ export class Reconciler {
    * into a session-long read-only.
    */
   private lastPassFailed = false;
+  /**
+   * fold() of every directory that was already under the share when this session
+   * ran its first pass, and null until that pass has run.
+   *
+   * Step 5 removes an empty directory the tree does not claim, which is what
+   * converges a folder rename (§4.1 rewrites one `d` per descendant; nothing
+   * relocates the directory, so the old one is simply left standing on every
+   * peer). One kind of directory must be exempt from that: a folder the user
+   * made BEFORE ShadowLink first ran here. It has no `create` event to replay
+   * and step 6 offers only files to the publisher, so no node will ever claim it
+   * — and an unclaimed folder is a gap in what gets shared (spec §4.5 step 7
+   * says folders belong in the `upload` bucket), never a licence to remove the
+   * user's directory. Anything that appears later either came from a node, rode
+   * in with a rename, or was created by the user, whose `create` mints a node
+   * that claims it.
+   *
+   * A dead folder node and a directory this pass itself emptied are NOT exempt:
+   * both are positive evidence about that directory, not an absence of it.
+   */
+  private preexistingDirs: Set<string> | null = null;
 
   constructor(deps: ReconcilerDeps) {
     this.deps = deps;
@@ -351,6 +376,9 @@ export class Reconciler {
 
     try {
       const disk = DiskIndex.build(this.deps.vault, this.shareRoot);
+      if (this.preexistingDirs === null) {
+        this.preexistingDirs = new Set(disk.dirsUnderShare().map(fold));
+      }
       const draft = this.describeDesiredState(disk, failures, diagnostics, cause);
 
       // MOUNT SANITY (spec §4.1/§4.3): the tree wants files, the share holds
@@ -373,7 +401,7 @@ export class Reconciler {
       await this.applyMoves(ctx);                // step 2 (+ unstageAll)
       await this.materialize(ctx);               // step 3
       await this.runDeletions(ctx);              // step 4 — injected collaborator
-      await this.sweepDeadFolders(ctx);          // step 5
+      await this.sweepEmptyFolders(ctx);         // step 5
       await this.publish(ctx);                   // steps 6-7 — injected collaborator
 
       return { ran: true, failures, diagnostics };
@@ -483,6 +511,7 @@ export class Reconciler {
       desired,
       folderPaths,
       deadFolderPaths,
+      vacatedDirs: new Set<string>(),
       diagnostics,
       guarded: (key, fn) => this.guarded(failures, key, fn),
       bind: (id, path) => this.bindPath(ctx, id, path),
@@ -615,6 +644,32 @@ export class Reconciler {
     await this.deps.vault.rename(from, stagePath);
     ctx.disk.remove(from);          // staging is outside the share; it leaves the index entirely
     this.unbindPath(ctx, id);
+    this.vacate(ctx, from);
+  }
+
+  /**
+   * Note every directory between `from`'s parent and the share root as a step 5
+   * sweep candidate.
+   *
+   * `applyMoves` relocates files, never directories (a folder rename arrives as
+   * one `d` rewrite per descendant), and step 1 creates the folder they move
+   * into — so the directory they came from is simply left standing, with a node
+   * that is alive under its new name and therefore never a dead-folder
+   * candidate.
+   *
+   * Positive evidence, which is why it outranks `preexistingDirs`: this pass
+   * watched the last file leave. A folder that was already there when the
+   * session began is otherwise left alone, but one the pass itself emptied is a
+   * folder the tree has demonstrably moved on from.
+   */
+  private vacate(ctx: PassContext, from: string): void {
+    const rootFold = fold(this.shareRoot);
+    for (let dir = dirOf(from); dir !== ''; dir = dirOf(dir)) {
+      const key = fold(dir);
+      if (key === rootFold) return;                       // the share root is not a node (I14)
+      if (!key.startsWith(`${rootFold}/`)) return;        // staging / recovered: not ours to sweep
+      ctx.vacatedDirs.add(dir);
+    }
   }
 
   // ---------------------------------------------------------- step 1
@@ -708,6 +763,7 @@ export class Reconciler {
           await this.deps.vault.rename(from, to);                                 // I16
           ctx.disk.move(from, to);
           this.bindPath(ctx, id, to);
+          this.vacate(ctx, from);
         });
         // Dropped from the queue whether or not it succeeded: a failure is
         // recorded and retried on the NEXT pass, never spun on inside this one.
@@ -833,7 +889,28 @@ export class Reconciler {
   // ---------------------------------------------------------- step 5
 
   /**
-   * Remove dead folders, deepest first, and ONLY when they are genuinely empty.
+   * Remove directories the tree has finished with, deepest first, and ONLY when
+   * they are genuinely empty.
+   *
+   * Three things qualify, and the last two are both the folder RENAME a peer
+   * never used to clean up — its node is alive under a new name, so it was never
+   * a dead folder, yet the directory it used to be is an empty shell nothing
+   * will claim again:
+   *
+   *  - a DEAD folder node's path: the folder the user deleted;
+   *  - a directory this pass moved the last file out of (`vacatedDirs`);
+   *  - any directory under the share that no live node claims and the tree does
+   *    not imply, except one that predates this session (`preexistingDirs`).
+   *
+   * The third clause is deliberately about the DISK rather than about what the
+   * tree used to want. A leftover does not stay put: the user renaming the
+   * folder above it carries it along, path and all, and any bookkeeping keyed on
+   * where it used to be loses it at that moment. Re-deriving the candidates from
+   * what is actually there also means a removal that failed — an EPERM, a `.git`
+   * that vetoed it — is retried on the next pass for free (I15).
+   *
+   * Deepest first matters for all three, and for the same reason: sweeping
+   * `X/inner` is what makes `X` empty in time for its own turn.
    *
    * Emptiness is decided by `vault.listDir`, never by the DiskIndex: the index is
    * built from `vault.list()`, which cannot see `.git/`, `.obsidian/` or any
@@ -842,10 +919,21 @@ export class Reconciler {
    * folder, and `guarded` turns that into a no-op rather than permission to
    * remove (I2).
    */
-  private async sweepDeadFolders(ctx: PassContext): Promise<void> {
-    for (const path of ctx.deadFolderPaths) {
-      if (ctx.wantAtFold.has(fold(path))) continue;               // a live node claims it
-      await this.guarded(ctx.failures, `deadfolder:${path}`, async () => {
+  private async sweepEmptyFolders(ctx: PassContext): Promise<void> {
+    const exempt = this.preexistingDirs ?? new Set<string>();
+    const rootFold = fold(this.shareRoot);
+    const unclaimed = ctx.disk.dirsUnderShare()
+      .filter((path) => fold(path) !== rootFold && !exempt.has(fold(path)));
+
+    const candidates = [...new Set([...ctx.deadFolderPaths, ...ctx.vacatedDirs, ...unclaimed])]
+      // A live node claims it, or the tree implies it as some node's ancestor —
+      // including a file that failed to materialize this pass and will be
+      // retried into it on the next one.
+      .filter((path) => !ctx.wantAtFold.has(fold(path)) && fold(path) !== rootFold)
+      .sort(byDepthDesc);
+
+    for (const path of candidates) {
+      await this.guarded(ctx.failures, `emptyfolder:${path}`, async () => {
         if (!ctx.disk.hasFold(path)) return;                      // already gone: idempotent
         const literal = ctx.disk.literal(path)!;
         if (ctx.disk.kindOf(literal) !== 'd') return;             // a file lives there now

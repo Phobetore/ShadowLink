@@ -84,6 +84,19 @@ export class DiskIndex {
     return out.sort();
   }
 
+  /**
+   * Every directory (kind 'd') under the share, literal paths, sorted. The share
+   * root itself is included — it is an entry like any other, and callers that
+   * must not touch it (I14) say so themselves.
+   */
+  dirsUnderShare(): string[] {
+    const out: string[] = [];
+    for (const entry of this.byFold.values()) {
+      if (entry.kind === 'd') out.push(entry.path);
+    }
+    return out.sort();
+  }
+
   size(): number {
     return this.byFold.size;
   }
