@@ -27,3 +27,9 @@ test-*.js
 
 # Git worktrees
 .worktrees/
+
+# Server state. Holds the workspace documents AND the server key
+# (data/tokens.json, data/SHADOWLINK_ADMIN_CREDS.txt). Never commit it.
+/data/
+server/data/*
+!server/data/.gitkeep
