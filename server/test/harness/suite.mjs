@@ -4,6 +4,11 @@
 // Every case below boots nothing of its own: one server process serves the whole
 // run, and each case gets its own workspace id, which is what isolates its `_tree`
 // and `n_*` snapshots from every other case's.
+//
+// P2's blob transport (spec §11 Group C1-C7, C10) rides the same run, registered
+// from `blobs.mjs`: it needs the same real server process on the same real port,
+// and C10 needs both halves of it at once — a saturated blob store and a relay
+// that still answers.
 
 import { WebSocket } from 'ws';
 import * as Y from 'yjs';
@@ -11,12 +16,15 @@ import { test, run, setFilter, assert } from './runner.mjs';
 import { startServer } from './server.mjs';
 import { Client, settleAll, SHARE_ROOT } from './client.mjs';
 import { DocLink, sleep } from './net.mjs';
+import { registerBlobCases } from './blobs.mjs';
 import { fold, isLive, relPath } from '../../../src/tree/paths.ts';
 import { deriveTree } from '../../../src/tree/TreeIndex.ts';
 
 const PORT = Number(process.env.SL_E2E_PORT ?? 4171);
 /** Nothing listens here. Used by test 73's unsynced-provider cases. */
 const DEAD_PORT = Number(process.env.SL_E2E_DEAD_PORT ?? 4197);
+/** The blob cases that need their own server configuration take these. */
+const BLOB_PORT = Number(process.env.SL_E2E_BLOB_PORT ?? 4181);
 
 let server = null;
 let workspaceCounter = 0;
@@ -903,7 +911,11 @@ async function main() {
     if (arg.startsWith('--only=')) setFilter(arg.slice('--only='.length));
   }
 
-  console.log('ShadowLink — structural end-to-end (spec §10 Group C)\n');
+  // Registered here rather than at module scope so the cases close over the
+  // server this run actually started, and so `--only=` filters them like the rest.
+  registerBlobCases(() => server, BLOB_PORT);
+
+  console.log('ShadowLink — structural end-to-end (P1 spec §10 Group C, P2 spec §11 Group C)\n');
   let summary = { failed: 1, passed: 0, skipped: 0 };
   try {
     server = await startServer({ port: PORT });

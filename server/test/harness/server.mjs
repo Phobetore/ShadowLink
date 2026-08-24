@@ -28,12 +28,16 @@ function health(port) {
 /**
  * Start `server/index.js` on `port`, persisting into `dir` (a fresh temp
  * directory unless one is supplied, so a restart can reuse the same snapshots).
+ *
+ * `env` adds settings the case under test needs — a small `MAX_FILE_SIZE_MB`, a
+ * short `INCOMPLETE_UPLOAD_TTL_HOURS` — read by the real `loadConfig`, so what is
+ * exercised is the shipped configuration path and not a test-only injection.
  */
-export async function startServer({ port, dir = null }) {
+export async function startServer({ port, dir = null, env = {} }) {
   const dataDir = dir ?? mkdtempSync(join(tmpdir(), 'sl-e2es-'));
   const proc = spawn(process.execPath, [join(REPO_ROOT, 'server', 'index.js')], {
     cwd: REPO_ROOT,
-    env: { ...process.env, PORT: String(port), PERSISTENCE_DIR: dataDir },
+    env: { ...process.env, ...env, PORT: String(port), PERSISTENCE_DIR: dataDir },
     stdio: 'ignore',
   });
   proc.on('error', () => { /* surfaced by the health poll below */ });

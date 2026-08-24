@@ -6,6 +6,8 @@ import { loadConfig } from './config.js';
 import { Auth } from './auth.js';
 import { DocHub } from './DocHub.js';
 import { authorizeUpgrade } from './upgradeAuth.js';
+import { BlobStore } from './blobStore.js';
+import { createBlobRoutes } from './blobRoutes.js';
 
 const config = loadConfig();
 mkdirSync(config.persistenceDir, { recursive: true });
@@ -22,10 +24,25 @@ console.log('========================================\n');
 
 const docHub = new DocHub(config.persistenceDir);
 
+// The content-addressed attachment store (spec §6). It shares this process and
+// this port with the relay, and nothing else: `DocHub` gains no new callers.
+const blobStore = new BlobStore(config.persistenceDir, {
+  maxFileBytes: config.maxFileSizeMb * 1024 * 1024,
+  maxTotalBytes: config.maxTotalStorageGb * 1024 * 1024 * 1024,
+  incompleteUploadTtlHours: config.incompleteUploadTtlHours,
+});
+await blobStore.start();
+
+const blobRoutes = createBlobRoutes({
+  store: blobStore,
+  isValidKey: (key) => auth.validateServerKey(key),
+  maxConcurrency: config.maxBlobConcurrency,
+});
+
 const httpServer = createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' }).end('{"status":"ok"}');
-  } else {
+  } else if (!blobRoutes.handle(req, res)) {
     res.writeHead(404).end();
   }
 });
@@ -61,6 +78,9 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     } catch (err) {
       console.error('[shutdown] snapshot flush failed', err);
     }
+    // A partial upload needs nothing written on the way out: it is already on
+    // disk, keyed by its content hash, and resumes from a HEAD ?partial=1.
+    blobStore.stop();
     process.exit(0);
   });
 }
