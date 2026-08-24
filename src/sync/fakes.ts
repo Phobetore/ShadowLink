@@ -390,7 +390,7 @@ export class FakeVault implements VaultPort {
 
 // ============================================================ FakeDocs
 
-export type DocOp = 'openHeadless' | 'insertIfEmpty' | 'close';
+export type DocOp = 'openHeadless' | 'insertIfEmpty' | 'flush' | 'close';
 
 export interface DocCall {
   readonly op: DocOp;
@@ -407,6 +407,7 @@ export class FakeDocs implements DocPort {
 
   private readonly contents = new Map<string, string>();
   private readonly syncedRooms = new Map<string, boolean>();
+  private readonly flushConfirms = new Map<string, boolean>();
   private readonly opens = new Map<string, number>();
   private readonly totals = new Map<string, number>();
   private readonly closedHandles = new Set<number>();
@@ -423,6 +424,16 @@ export class FakeDocs implements DocPort {
   /** Simulate "the content doc never synced" (spec test 20). Rooms default to synced. */
   setSynced(room: string, synced: boolean): void {
     this.syncedRooms.set(room, synced);
+  }
+
+  /**
+   * Simulate "the update never came back from the server". Rooms default to
+   * confirming, so a caller that ignores the flag is exercised by every other
+   * test and only fails where the flag is deliberately turned off — which is the
+   * point: invariant I17 says an unconfirmed flush is a retry, not a completion.
+   */
+  setFlushConfirmed(room: string, confirmed: boolean): void {
+    this.flushConfirms.set(room, confirmed);
   }
 
   text(room: string): string {
@@ -478,6 +489,21 @@ export class FakeDocs implements DocPort {
     if (this.text(h.room) !== '') return false;   // invariant I5
     this.contents.set(h.room, text);
     return true;
+  }
+
+  async flush(handle: DocHandle): Promise<boolean> {
+    this.calls.push({ op: 'flush', args: [handle.room] });
+    this.maybeFail('flush');
+
+    const h = handle as FakeHandle;
+    if (typeof h.id !== 'number') throw new Error('FakeDocs.flush: foreign handle');
+    // Flushing a released handle is a caller bug, not a no-op: the real port has
+    // nothing left to await once the provider is gone, so it could only ever
+    // answer "confirmed" by lying.
+    if (this.closedHandles.has(h.id)) {
+      throw new Error(`FakeDocs.flush: handle is closed (${h.room})`);
+    }
+    return this.flushConfirms.get(h.room) ?? true;
   }
 
   close(handle: DocHandle): void {

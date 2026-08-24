@@ -36,6 +36,21 @@ export interface DocPort {
    */
   insertIfEmpty(handle: DocHandle, text: string): Promise<boolean>;
 
+  /**
+   * Await the round trip: resolves `true` only once the local updates on this
+   * handle have been acknowledged by the server, `false` when that confirmation
+   * did not arrive in time.
+   *
+   * Invariant I17 is why this returns a boolean rather than `void`. The publish
+   * queue advances two watermarks after seeding — the node's `s` flag and this
+   * device's `contentHash` — and both are claims that the workspace now holds the
+   * content. Advancing them on an update that is still sitting in an outbound
+   * buffer means the node reads as published on a machine that then loses the
+   * write, and no later pass will ever offer it again, because `s` says the job
+   * is done. An unconfirmed flush is a retry, never a completion.
+   */
+  flush(handle: DocHandle): Promise<boolean>;
+
   /** Release the handle. Safe to call more than once (callers close in a `finally`). */
   close(handle: DocHandle): void;
 }
