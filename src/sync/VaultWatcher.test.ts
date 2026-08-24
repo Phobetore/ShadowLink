@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { RESURRECT_WINDOW_MS, TICKET_TTL_MS } from '../tree/constants.ts';
 import { fold, hashOf, isLive, relPath } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
-import type { NodeFields } from '../tree/types.ts';
+import type { NodeFields, NodeKind } from '../tree/types.ts';
 import { Deletions } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { FakeDocs, FakeVault } from './fakes.ts';
@@ -129,7 +129,9 @@ function mint(tree: TreeDoc, f: Omit<NodeFields, 'g' | 'c'> & { g?: number; c?: 
   return tree.createNode(f, NOW);
 }
 
-function fieldsOf(tree: TreeDoc): Array<{ id: string; k: Kind; rel: string; g: number; live: boolean }> {
+function fieldsOf(
+  tree: TreeDoc,
+): Array<{ id: string; k: NodeKind; rel: string; g: number; live: boolean }> {
   return tree.entries()
     .map(([id, f]) => ({ id, k: f.k, rel: relPath(f), g: f.g, live: isLive(f) }))
     .sort((a, b) => (a.id < b.id ? -1 : 1));

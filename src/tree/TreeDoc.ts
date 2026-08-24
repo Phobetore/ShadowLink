@@ -23,15 +23,28 @@ import { newNodeId } from './ids.ts';
  */
 export const LOCAL_ORIGIN: symbol = Symbol('shadowlink.tree.local');
 
-/** The schema version this client understands. A higher `meta.v` => read-only. */
-const SCHEMA_VERSION = 1;
+/**
+ * The schema version this client understands. A higher `meta.v` => read-only.
+ *
+ * 2 since P2 (spec §2.5): the model gained the `'b'` kind and the `b` reference.
+ * A P1 client reads `validateRel` as TRUE for a kind it does not know, so it would
+ * treat a `'b'` node as valid, derive no path for it, and then sweep an
+ * attachment-only folder as unclaimed and empty. The bump is what stops it: such a
+ * client sees a future schema and goes read-only instead.
+ */
+const SCHEMA_VERSION = 2;
 
 /**
- * Every field the node model defines (spec §2.2). Reads and writes go through
+ * Every field the node model defines (spec §2.1). Reads and writes go through
  * this list so an unknown key written by a future schema is never echoed back
  * into a NodeFields object, and never silently dropped from the doc either.
+ *
+ * It is an ALLOWLIST, which makes it the most dangerous line in the module: a
+ * field omitted here is never written AND is stripped on read, so the loss is
+ * total and silent — every peer would hold a `'b'` node that names no bytes,
+ * and nothing that reads `NodeFields` would fail.
  */
-const NODE_FIELD_KEYS = ['k', 'd', 'n', 'g', 'c', 's', 'x', 'xa', 'xb', 'xh', 'xp'] as const;
+const NODE_FIELD_KEYS = ['k', 'd', 'n', 'g', 'c', 's', 'b', 'x', 'xa', 'xb', 'xh', 'xp'] as const;
 
 /**
  * A partial node write. A key present with the value `undefined` DELETES that
@@ -84,10 +97,29 @@ export class TreeDoc {
 
   // ------------------------------------------------------------------ meta
 
-  /** Set `{ v: 1 }` if — and only if — no version is recorded yet. */
+  /** Set `{ v: SCHEMA_VERSION }` if — and only if — no version is recorded yet. */
   initMeta(): void {
     if (this.metaMap.get('v') !== undefined) return;
     this.transactLocal(() => { this.metaMap.set('v', SCHEMA_VERSION); });
+  }
+
+  /**
+   * Raise the recorded schema version to `v` (spec §2.5). Called after a PROVEN
+   * tree sync, so a workspace founded by a P1 client is stamped once this client
+   * has seen the whole tree — never before (I3).
+   *
+   * Never lowers: a tree already stamped by a newer client must keep that stamp,
+   * or every peer that correctly went read-only would be flipped back into acting
+   * on a schema it does not speak. Never raises past what THIS client understands
+   * either, which would be the same failure aimed at itself. Writing the version
+   * already recorded is skipped outright: this runs on every reconnect, and a
+   * no-op write is still a tree update and a reconcile pass on every peer.
+   */
+  raiseMeta(v: number = SCHEMA_VERSION): void {
+    if (v > SCHEMA_VERSION) return;
+    const current = this.metaMap.get('v');
+    if (typeof current === 'number' && current >= v) return;
+    this.transactLocal(() => { this.metaMap.set('v', v); });
   }
 
   getMeta(): TreeMeta | null {

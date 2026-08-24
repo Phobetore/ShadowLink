@@ -41,7 +41,7 @@ import {
 import { DIR_SENTINEL, deriveTree, type DerivedTree } from '../tree/TreeIndex.ts';
 import { fold, hashOf, isUnderDir, relPath, splitRel, validateRel } from '../tree/paths.ts';
 import type { NodePatch, TreeDoc } from '../tree/TreeDoc.ts';
-import type { NodeFields } from '../tree/types.ts';
+import type { NodeFields, NodeKind } from '../tree/types.ts';
 import type { DeviceState } from './DeviceState.ts';
 import type { Tickets } from './Tickets.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
@@ -88,7 +88,8 @@ interface Batched {
   id: string;
   /** The node's STORED rel path — never the observed one, which may carry a suffix. */
   rel: string;
-  kind: Kind;
+  /** The node's TREE kind (it comes from `f.k`), which is not the disk kind. */
+  kind: NodeKind;
   /** Where the path was, and (for an unshare) where it went. */
   from: string;
   to: string;

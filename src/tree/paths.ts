@@ -6,7 +6,7 @@
 
 // Node's type stripping resolves ESM specifiers literally, so relative imports of
 // local modules carry the '.ts' extension (`allowImportingTsExtensions` in tsconfig).
-import type { NodeFields } from './types.ts';
+import type { NodeFields, NodeKind } from './types.ts';
 import { MAX_REL_PATH_LEN, RECOVERED_DIR, STAGING_DIR } from './constants.ts';
 
 /** Windows device names that cannot exist as files even on POSIX vaults synced to Windows. */
@@ -81,7 +81,7 @@ function validSegment(seg: string): boolean {
  * Validates a node's `d`/`n` pair before it is trusted for any filesystem operation.
  * A node failing this is skipped entirely (never materialized, never renamed to).
  */
-export function validateRel(d: string, n: string, kind: 'f' | 'd'): boolean {
+export function validateRel(d: string, n: string, kind: NodeKind): boolean {
   if (typeof d !== 'string' || typeof n !== 'string') return false;
   const rel = d === '' ? n : `${d}/${n}`;
   if (rel.length === 0 || rel.length > MAX_REL_PATH_LEN) return false;

@@ -201,7 +201,7 @@ test('the schema version is written once the client is allowed to touch the tree
 
   await h.boot.run();
 
-  assert.equal(h.tree.getMeta()?.v, 1);
+  assert.equal(h.tree.getMeta()?.v, 2);
 });
 
 test("a dead node's last path is never offered for upload (I13)", async () => {
@@ -313,7 +313,7 @@ test('a share root configured with a trailing slash still classifies', async () 
 test('a future schema stops before the provider is even connected', async () => {
   let connects = 0;
   const h = makeHarness({ deps: { connectTree: async () => { connects += 1; return true; } } });
-  h.tree.doc.getMap('meta').set('v', 2);
+  h.tree.doc.getMap('meta').set('v', 3);
 
   const result = await h.boot.run();
 
@@ -325,7 +325,7 @@ test('a future schema stops before the provider is even connected', async () => 
 
 test('a future schema is never retried on reconnect', async () => {
   const h = makeHarness();
-  h.tree.doc.getMap('meta').set('v', 2);
+  h.tree.doc.getMap('meta').set('v', 3);
   await h.boot.run();
 
   const again = await h.boot.onReconnect();

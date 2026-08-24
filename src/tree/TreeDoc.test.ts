@@ -29,6 +29,32 @@ test('createNode writes every field in ONE transaction', () => {
   assert.equal(fires, 1);
 });
 
+// `NODE_FIELD_KEYS` is an ALLOWLIST: a field missing from it is never written and
+// is stripped on read, so a `b` left out of the list would leave every peer with a
+// `'b'` node carrying no bytes reference — silently, with nothing else failing.
+// Asserted through a real replica, because a projection can be right locally while
+// the CRDT holds nothing.
+test('a binary node carries its blob reference through the field allowlist and across a sync', () => {
+  const ref = `${'a'.repeat(64)}:2048:-`;
+  const a = new TreeDoc();
+  const id = a.createNode({ k: 'b', d: 'Notes/img', n: 'diagram.png', s: 1, b: ref }, 5);
+
+  assert.deepEqual(a.get(id), {
+    k: 'b', d: 'Notes/img', n: 'diagram.png', s: 1, b: ref, g: 1, c: 5,
+  });
+  assert.equal((a.doc.getMap('nodes').get(id) as Y.Map<unknown>).get('b'), ref);
+
+  const b = new TreeDoc();
+  b.applyUpdate(a.encodeState());
+  assert.equal(b.get(id)?.b, ref, 'the reference must reach a peer, not just the local projection');
+
+  // A replace rewrites the same register, and the new value must replicate too.
+  const next = `${'b'.repeat(64)}:4096:${'a'.repeat(64)}`;
+  a.patchNode(id, { b: next, s: 1 });
+  b.applyUpdate(a.encodeState());
+  assert.equal(b.get(id)?.b, next);
+});
+
 test('patchNode changes only the patched keys and no-ops on an absent node', () => {
   const td = new TreeDoc();
   const id = td.createNode({ k: 'f', d: 'Projects', n: 'note.md', s: 1 }, 42);
@@ -134,24 +160,76 @@ test('per-key LWW: A renames while B moves the same node offline, and both chang
 
 // ---------------------------------------------------------------- meta
 
-test('initMeta sets v:1 once, never clobbers existing meta, and isFutureSchema flags v:2', () => {
+test('initMeta sets v:2 once, never clobbers existing meta, and isFutureSchema flags v:3', () => {
   const td = new TreeDoc();
   assert.equal(td.getMeta(), null);
   assert.equal(td.isFutureSchema(), false);
 
   td.initMeta();
-  assert.deepEqual(td.getMeta(), { v: 1 });
+  assert.deepEqual(td.getMeta(), { v: 2 });
   assert.equal(td.isFutureSchema(), false);
 
   td.doc.getMap('meta').set('claim', { by: 'device-1', at: 99 });
   td.initMeta();
-  assert.deepEqual(td.getMeta(), { v: 1, claim: { by: 'device-1', at: 99 } });
+  assert.deepEqual(td.getMeta(), { v: 2, claim: { by: 'device-1', at: 99 } });
 
   const future = new TreeDoc();
-  future.doc.getMap('meta').set('v', 2);
+  future.doc.getMap('meta').set('v', 3);
   future.initMeta();
-  assert.equal((future.getMeta() as TreeMeta).v, 2);
+  assert.equal((future.getMeta() as TreeMeta).v, 3);
   assert.equal(future.isFutureSchema(), true);
+});
+
+// Spec §2.5. A P1 client reads `validateRel` as TRUE for an unrecognized kind, so
+// it would treat a `'b'` node as valid, derive no path for it, and then sweep an
+// attachment-only folder as unclaimed and empty. The version bump is what makes
+// such a client report `isFutureSchema()` and go read-only instead.
+test('a v:1 tree is not a future schema for this client, and v:2 is what it writes', () => {
+  const old = new TreeDoc();
+  old.doc.getMap('meta').set('v', 1);
+  assert.equal(old.isFutureSchema(), false, 'a P1 tree is still readable');
+  assert.equal((old.getMeta() as TreeMeta).v, 1, 'initMeta does not clobber it');
+});
+
+test('raiseMeta raises the recorded version and never lowers it', () => {
+  const td = new TreeDoc();
+  td.doc.getMap('meta').set('v', 1);
+
+  td.raiseMeta(2);
+  assert.equal((td.getMeta() as TreeMeta).v, 2);
+
+  // A tree already stamped by a newer client must not be dragged backwards: that
+  // would flip every peer out of read-only and let them act on a schema they do
+  // not speak.
+  const ahead = new TreeDoc();
+  ahead.doc.getMap('meta').set('v', 7);
+  ahead.raiseMeta(2);
+  assert.equal((ahead.getMeta() as TreeMeta).v, 7);
+});
+
+test('raiseMeta on an unstamped tree records the version, and re-raising writes nothing', () => {
+  const td = new TreeDoc();
+  const seen: boolean[] = [];
+  td.observe((isLocal) => { seen.push(isLocal); });
+
+  td.raiseMeta(2);
+  assert.deepEqual(td.getMeta(), { v: 2 });
+  assert.deepEqual(seen, [true]);
+
+  // Idempotent: Bootstrap calls this after every proven sync, and a write per
+  // reconnect would be a tree update — and a peer-wide reconcile — for nothing.
+  td.raiseMeta(2);
+  assert.deepEqual(seen, [true], 'raising to the version already recorded is a no-op');
+});
+
+// A client may only stamp a version it can itself read; writing a higher one
+// would make it read-only against a document only it has ever written.
+test('raiseMeta refuses a version this client does not speak', () => {
+  const td = new TreeDoc();
+  td.initMeta();
+  td.raiseMeta(99);
+  assert.deepEqual(td.getMeta(), { v: 2 });
+  assert.equal(td.isFutureSchema(), false);
 });
 
 test('a meta change fires observe', () => {
@@ -178,7 +256,7 @@ test('encodeState / applyUpdate round-trip a populated tree into a fresh TreeDoc
   b.applyUpdate(a.encodeState());
 
   assert.equal(b.size(), 3);
-  assert.deepEqual(b.getMeta(), { v: 1 });
+  assert.deepEqual(b.getMeta(), { v: 2 });
   for (const id of ids) assert.deepEqual(b.get(id), a.get(id));
   assert.deepEqual(
     b.entries().sort((x, y) => (x[0] < y[0] ? -1 : 1)),

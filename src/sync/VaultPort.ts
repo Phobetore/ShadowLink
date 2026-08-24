@@ -12,7 +12,13 @@
 //  - `exists()` / `listDir()` are adapter-level and DO see dot paths. Spec test 39
 //    (a tombstoned folder whose only surviving child is `.git`) turns on that gap.
 
-/** File or directory. Structurally identical to `NodeKind` in the tree model. */
+/**
+ * File or directory. This is a DISK kind, and since P2 it is NO LONGER
+ * structurally identical to `NodeKind`, which gained `'b'`: a binary attachment
+ * is an ordinary file on disk. Conflating the two vocabularies is the single most
+ * likely source of bugs in P2, so the conversion happens in exactly one place —
+ * `nodeKindOf` in `src/tree/paths.ts`.
+ */
 export type Kind = 'f' | 'd';
 
 /** One entry of the vault's in-memory file index. */
