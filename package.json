@@ -2,6 +2,7 @@
   "name": "shadowlink",
   "version": "0.1.0",
   "description": "Real-time collaborative editing plugin for Obsidian",
+  "license": "GPL-3.0-or-later",
   "type": "module",
   "main": "main.js",
   "scripts": {

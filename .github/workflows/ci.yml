@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Type-checks every source AND test file, then bundles the plugin.
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
+      # Boots the real server and converges two real Yjs clients over a socket.
+      - name: End-to-end
+        run: npm run test:e2e
+
+      # Three clients, 200 random structural operations, shuffled delivery,
+      # two network partitions, 20 seeds. The slow one, and the one that matters.
+      - name: Structural convergence
+        run: npm run test:e2e:structural
+        timeout-minutes: 10

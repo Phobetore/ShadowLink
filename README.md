@@ -1,179 +1,255 @@
+<div align="center">
+
 # ShadowLink
 
-Collaborative editing for [Obsidian](https://obsidian.md), self-hosted.
+### Write in the same Obsidian folder, at the same time.
 
-**Status: P1 — real-time text co-editing *and* structural sync for one shared
-folder.** Creating, renaming, moving and deleting a note now propagates to every
-member: the folder's structure lives in a Yjs file tree, alongside one Yjs
-document per note.
+**Your vault stays yours. You share the one folder you meant to share.**
 
-## What P1 does
+[**Get started**](INSTALL.md) &nbsp;·&nbsp; [How it works](#how-it-works) &nbsp;·&nbsp; [What it does not do](#what-it-does-not-do-yet) &nbsp;·&nbsp; [Licence](LICENSE)
 
-- **Text.** [Yjs CRDT](https://yjs.dev) over the standard y-protocols sync, with
-  live cursors via Yjs awareness — unchanged from P0.
-- **Structure.** A shared `_tree` document holds the folder's files and folders.
-  Create a note, rename it, drag it into a subfolder, delete it, and every
-  member's vault follows. Empty folders sync too, so the shape of the folder is
-  shared and not just its contents.
-- **Rename and move are not re-creates.** A note's content document is keyed by
-  an immutable node id, never by its path. Renaming or moving a note **while it
-  is open** keeps the editing session, the leaf and the cursor exactly where they
-  were — the rename is invisible to the CodeMirror binding, and no history is
-  lost on either side.
-- **Scope.** One shared folder per vault. Nothing outside it is ever shared. Two
-  folders at the vault root belong to the plugin: `ShadowLink Recovered/`, where
-  your copies are rescued to, and `ShadowLink Staging/`, which a rename passes
-  through and which is empty the rest of the time.
-- **Auth.** The server validates `SERVER_KEY` at the WebSocket upgrade, before
-  any data flows.
+<a href="https://github.com/Phobetore/ShadowLink/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Phobetore/ShadowLink/ci.yml?branch=master&label=tests&style=flat-square&labelColor=1f1a29" alt="Tests"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/licence-GPL--3.0-2496ed?style=flat-square&labelColor=1f1a29" alt="Licence GPL-3.0"></a>
+<img src="https://img.shields.io/badge/self--hosted-no%20account-2496ed?style=flat-square&labelColor=1f1a29" alt="Self-hosted, no account">
 
-## Deletion safety
+</div>
 
-A delete is never destructive on the peers that receive it. Deletions are
-**tombstones** in the shared tree, and when your client applies one it decides
-per file:
+<br>
 
-- If the file's content is **provably** the shared document's content — the node
-  was published, this device recorded a confirmed hash for it, and the bytes on
-  disk still match that hash — the file goes to the **vault-local `.trash`**,
-  which you can restore from inside Obsidian on every platform, mobile included.
-- **Otherwise** — the note was never published, or you had unsynced edits, or you
-  have it open — your copy is **moved aside** into `ShadowLink Recovered/` under
-  a name recording who deleted it and when. Nothing is removed on a guess.
+ShadowLink is an Obsidian plugin and a small server you run yourself. Point a few
+people at it, agree on one folder, and that folder becomes shared: two of you can
+type in the same note and watch each other's cursors, and creating, renaming,
+moving or deleting a file shows up for everyone.
 
-Bulk deletions are gated. A batch that would push this device past its deletion
-rate window, and **any** batch arriving on a first sync (the "you were offline
-while the team reorganized" case), applies nothing until you answer one dialog.
-That dialog **defaults to keeping your files** — dismissing it, pressing Escape,
-or never seeing it all mean the same thing: keep.
+Everything outside that folder never leaves your machine. There is no account to
+make, nobody in the middle, and no copy of your notes on any server but the one
+you started yourself.
 
-The plugin never calls Obsidian's permanent-delete or system-trash APIs. A test
-in the suite reads the shipped source to keep it that way.
+I built it because the alternatives each wanted something I did not want to give:
+the whole vault, an account, a subscription, or trust in a service that could
+decide later what my notes are worth. This one asks for a folder.
 
-## Quick start
+<br>
 
-### 1. Run the server
+> **Status: early.** The sync engine is finished and heavily tested — 400+
+> automated tests, including three simulated clients performing 200 random
+> operations each across network partitions. What has *not* had heavy real-world
+> use is the plugin inside Obsidian itself. Treat this as a beta, keep backups,
+> and please [open an issue](https://github.com/Phobetore/ShadowLink/issues) when
+> something misbehaves.
 
-Requires Node.js 18+.
+<br>
+
+---
+
+<br>
+
+## What makes it different
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+### One folder, not your vault
+
+You nominate a folder. That is the share. Your journal, your finances and the
+half-written things you have no intention of showing anybody stay exactly where
+they are — unsynced, unread, untouched. Sharing a project should not mean handing
+over a decade of private notes.
+
+</td>
+<td width="33%" valign="top">
+
+### It refuses to lose your work
+
+A collaborator's delete does not delete your copy. Unless ShadowLink can *prove*
+the content is safe in the shared document, your file is moved aside into
+`ShadowLink Recovered/` instead. Bulk deletions stop and ask, and the default
+answer is always to keep your files.
+
+</td>
+<td width="33%" valign="top">
+
+### Nobody's server but yours
+
+One `node server/index.js`, on a machine you control. No account, no telemetry,
+no plan, no seat count. GPL and self-hosted from the first minute — the hosted
+version does not exist and is not the plan.
+
+</td>
+</tr>
+</table>
+
+<br>
+
+---
+
+<br>
+
+## How it works
+
+**Text.** Every note in the share is a [Yjs](https://yjs.dev) CRDT document. Two
+people typing in the same paragraph is a solved problem: edits merge, nobody
+overwrites anybody, and you watch the other cursor move.
+
+**Structure.** The folder's shape is itself a shared document. Create a note,
+rename a folder, drag something into a subfolder, and everyone converges on the
+same layout — empty folders included.
+
+The interesting part is what a note *is*. Each one carries an identifier minted
+once and never changed, and its content lives under that identifier rather than
+under its path. Two things follow, and they are why the plugin is built this way:
+
+- **Renaming or moving a note while somebody is editing it does nothing to their
+  session.** Same tab, same cursor, same undo history, no reconnection. A design
+  keyed on paths orphans the note's history at exactly that moment.
+- **Two people moving folders into each other cannot create a loop.** A path is
+  derived from a parent name and a file name, never from a pointer to another
+  node, so the cycle that breaks tree-shaped designs is not representable.
+
+**Deletion.** Nothing is ever hard-deleted. A delete writes a tombstone, and each
+peer decides what to do with its own copy. It goes to the vault-local `.trash` —
+the one you restore from inside Obsidian, on desktop and mobile — but *only* when
+the content is provably in the shared document. Otherwise your copy is moved to
+`ShadowLink Recovered/`, named with who deleted it and when.
+
+If more than ten deletions arrive within ten minutes, or any arrive on your first
+sync after time away, everything stops and one dialog appears. Its default action
+is to keep your files. So is pressing Escape.
+
+**Two folders belong to the plugin.** `ShadowLink Recovered/` holds rescued
+copies. `ShadowLink Staging/` is a waypoint a rename passes through and is empty
+the rest of the time. Both sit at the vault root, both are visible on purpose:
+hiding transient state in a dotfolder turns a crash into an invisible orphan.
+
+<br>
+
+---
+
+<br>
+
+## What you get
+
+Live cursors with names and colours. Notes that merge instead of fighting.
+Folders that stay in step. Deletions that ask before they act. A share that
+reconciles itself after you have been offline, without you doing anything.
+
+And some things that are less visible but are the reason the rest holds up: a
+file it cannot prove is safe is never destroyed; a note whose content has not
+finished uploading is never materialised as an empty file on anyone else's disk;
+a failed network request is never mistaken for a deletion.
+
+<br>
+
+---
+
+<br>
+
+## What it does not do yet
+
+This section is honest on purpose. These are real limitations of the current
+release, not hypothetical ones.
+
+- **Only `.md` files sync.** Images, PDFs and other attachments are ignored, so a
+  note containing `![[diagram.png]]` shows a broken link for everybody else. This
+  is the biggest gap and the next thing being built.
+- **Unopened notes go stale.** A note's content is fetched once, when it appears.
+  Until somebody opens it, later edits are not written to that peer's disk — so
+  Obsidian search, `git` and any external tool can read out-of-date bytes.
+- **One shared folder per vault.**
+- **One shared key per server.** Anyone holding it can join any workspace on that
+  server. No invitations, no per-member permissions, no read-only members yet.
+- **No end-to-end encryption yet.** Put a reverse proxy in front for `wss://`, and
+  treat the server as trusted. E2E is planned, and the storage layer was designed
+  to keep it possible.
+- **A file deleted outside Obsidian while Obsidian was closed comes back.**
+  Startup never infers a deletion from a file being missing; resurrection is
+  reversible, deletion is not.
+- **`ShadowLink Recovered/` is never pruned.** It is an ordinary folder in your
+  vault, and yours to manage.
+- **When two notes end up with the same name**, one keeps it and the other gains a
+  ` (2)` suffix. Which one wins is arbitrary — but identical for everybody.
+- **The shared document grows** as you reorganise. A team churning through a large
+  share for a year will notice. Compaction is planned.
+
+<br>
+
+---
+
+<br>
+
+<div align="center">
+
+## Get started
+
+A server, a plugin folder, and four settings everyone types the same.
+
+### [Read the installation guide](INSTALL.md)
+
+<sub>Windows, macOS and Linux &nbsp;·&nbsp; Node.js 18+ &nbsp;·&nbsp; no account, no cloud</sub>
+
+</div>
+
+<br>
+
+---
+
+<br>
+
+## For developers
+
+The sync engine is deliberately testable without Obsidian: everything touching
+the vault or the network goes through a port with an in-memory fake, so the whole
+reconciler runs headless.
 
 ```bash
-git clone https://github.com/Phobetore/ShadowLink
-cd ShadowLink
-npm install
-npm run server
-```
-
-Copy the `SERVER_KEY` from `data/SHADOWLINK_ADMIN_CREDS.txt`.
-
-### 2. Install the plugin
-
-Copy `main.js` and `manifest.json` into each vault's
-`.obsidian/plugins/shadowlink/` folder and enable the plugin.
-
-### 3. Configure (every member, identically)
-
-Settings → ShadowLink: the same **Server URL**, **Server key**, **Workspace ID**
-and **Shared folder**. Toggle the plugin off and on to apply.
-
-### 4. First sync
-
-On its first join each member is shown exactly one dialog: what will be
-downloaded, what local files will be adopted into the shared folder, and what
-will be uploaded. Nothing on disk is touched until you accept it, and the
-"share my local files" checkbox can be unchecked to keep them on this device.
-That is not a one-way door: the command **ShadowLink: Resolve kept files** lists
-what you kept back and shares whichever of it you pick, whenever you like.
-
-## Limitations
-
-These are real and current. Read them before you rely on this.
-
-- **Non-markdown files are not synced.** Images, PDFs and every other attachment
-  are ignored — they are not uploaded, not downloaded, and not deleted. An
-  embedded `![[diagram.png]]` will render as a broken link for everyone who does
-  not already have that file in their own vault.
-- **A note nobody has open is fetched once, not continuously.** Your client
-  writes a note's bytes to disk when it first materializes it and then leaves the
-  file alone. Later edits by peers live in the shared document and reach your
-  disk only when you open the note — at which point the shared version wins and
-  any differing local copy is preserved in `ShadowLink Recovered/`. Until then,
-  external tools, scripts and Obsidian's own search read stale bytes.
-- **One shared folder per vault.** There is no second folder and no per-folder
-  configuration.
-- **No invites and no per-member permissions.** Everyone shares a single
-  `SERVER_KEY`. Anyone holding it can read and write every workspace on that
-  server; there is no way to revoke one person without rotating the key for all.
-- **No end-to-end encryption.** The server sees the plaintext of every document.
-  Use `wss://` (below) so the network does not, and self-host on a machine you
-  trust.
-- **`ShadowLink Recovered/` grows without bound.** Nothing prunes it. It is your
-  copy of files a peer deleted, and clearing it out is your call.
-- **A file deleted while Obsidian was closed comes back.** On start, a note the
-  workspace still has and your vault does not is re-downloaded, never read as a
-  deletion — there is no evidence telling "the user deleted it externally" apart
-  from "we never finished fetching it", and resurrection is reversible where
-  deletion is not. Delete it again with Obsidian running and it goes for everyone.
-- **The structure document only ever grows.** Renaming a folder rewrites every
-  descendant's entry, and the CRDT keeps the superseded ones, so heavy
-  reorganization churn inflates the shared `_tree` document permanently. A team
-  reshuffling a few thousand notes monthly should expect a multi-megabyte tree
-  within a year — large, not broken. There is no compaction yet.
-- **Two notes with the same name: which one keeps the plain name is arbitrary.**
-  The tree honestly holds both, and your vault shows `Notes.md` and
-  `Notes (2).md`. Which is which is decided by internal id order, identically on
-  every device, and it will not match anyone's intuition. Renaming one of them
-  resolves it for everybody.
-- **Keeping your copies of a bulk delete leaves this device out of step on
-  purpose.** Those files stay yours and stop being shared, permanently and with
-  no re-prompt — including local files you kept back on first sync. The command
-  **ShadowLink: Resolve kept files** lists everything in that state and shares
-  the ones you pick; nothing else revisits the decision.
-- Settings are read at plugin load — toggle the plugin after changing them.
-
-## Server configuration
-
-Environment variables the server actually reads:
-
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `4000` | HTTP/WebSocket port |
-| `PERSISTENCE_DIR` | `./data` | Where credentials and document snapshots are stored |
-
-`ROOM_DEFAULT_TTL` is still validated at startup — an unrecognized value refuses
-to boot — but nothing consumes it: rooms are permanent. Earlier versions of this
-README also listed `MAX_FILE_SIZE_MB`, `MAX_TOTAL_STORAGE_GB`,
-`RATE_LIMIT_OPS_PER_SEC` and `MAX_CONNECTIONS_PER_IP`. The server no longer reads
-any of them, and setting them does nothing.
-
-Document snapshots are written to `PERSISTENCE_DIR/yjs/` on a trailing debounce,
-via a temp file and a rename, so a reader only ever sees a complete snapshot.
-
-## Encryption in transit
-
-By default the server speaks unencrypted `ws://`. For `wss://`, put a reverse
-proxy in front:
-
-- **Nginx**: add a WebSocket proxy to your site config
-- **Caddy**: `reverse_proxy localhost:4000`
-- **Traefik**: use the `websecure` entrypoint
-
-## Development
-
-```bash
-npm run dev                 # watch mode — rebuilds main.js on change
-npm run build               # typecheck, then a production main.js
-npm test                    # server unit tests, then client unit tests
-npm run test:e2e            # text co-editing against a real server process
-npm run test:e2e:structural # structural convergence: real clients, real sockets
+npm test                    # unit and integration tests
+npm run test:e2e            # real server, two real Yjs clients
+npm run test:e2e:structural # three clients, 200 random ops, partitions, 20 seeds
+npm run build               # type-check, then bundle main.js
 npm run server              # start the server
 ```
 
-`test:e2e:structural` runs the whole Group C suite — concurrent renames,
-partitions, offline deletes, and twenty seeds of 200 randomized operations across
-three clients. It takes about a minute. Useful knobs: `SL_E2E_SEEDS`,
-`SL_E2E_OPS`, `SL_E2E_PORT`, `SL_E2E_DEAD_PORT`, and `--only=<substring>` to run
-one case.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the technical tour: the data
+model, the reconciliation pass, and the invariants that each exist because a
+specific failure was found without them.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers how to get a change accepted.
 
-## License
+The full design record lives in [`docs/`](docs/) — the audit that started the
+rewrite, the competitive analysis, the design specification, and every
+implementation plan, including the bugs found along the way and why the rejected
+alternatives were rejected.
 
-GPL-3.0-or-later
+<br>
+
+---
+
+<br>
+
+## What is coming
+
+Attachments and images, the gap people will hit first. Continuous content sync,
+so unopened notes stop going stale. Invitation links with per-member permissions,
+replacing the single shared key. Then opt-in end-to-end encryption, which is
+rather the point of having built it self-hosted and open.
+
+Contributions are welcome — [CONTRIBUTING.md](CONTRIBUTING.md) explains how, and
+what this project declines. Security reports go through
+[SECURITY.md](SECURITY.md), privately. Questions about setting it up belong in
+[Discussions](https://github.com/Phobetore/ShadowLink/discussions).
+
+If ShadowLink turns out to be useful to you, starring it is the thing that puts
+it in front of the next person looking for the same thing.
+
+<br>
+
+## Licence
+
+[GPL-3.0-or-later](LICENSE). Run it, change it and share it freely. A modified
+version you distribute stays open source under the same licence.
+
+<br>
+
+<div align="center">
+<sub>Sharing a project should cost you one folder, not your whole vault.</sub>
+</div>
