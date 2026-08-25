@@ -31,12 +31,14 @@ decide later what my notes are worth. This one asks for a folder.
 
 <br>
 
-> **Status: early.** The sync engine is finished and heavily tested — 400+
+> **Status: early.** The sync engine is finished and heavily tested — over 850
 > automated tests, including three simulated clients performing 200 random
-> operations each across network partitions. What has *not* had heavy real-world
-> use is the plugin inside Obsidian itself. Treat this as a beta, keep backups,
-> and please [open an issue](https://github.com/Phobetore/ShadowLink/issues) when
-> something misbehaves.
+> operations each across network partitions; `npm test` and
+> `npm run test:e2e:structural` print the exact counts. What has *not* had heavy
+> real-world use is the plugin inside Obsidian itself. Treat this as a beta, keep
+> backups, and please
+> [open an issue](https://github.com/Phobetore/ShadowLink/issues) when something
+> misbehaves.
 
 <br>
 
@@ -107,15 +109,34 @@ under its path. Two things follow, and they are why the plugin is built this way
   derived from a parent name and a file name, never from a pointer to another
   node, so the cycle that breaks tree-shaped designs is not representable.
 
+**Attachments.** Anything that is not a `.md` note — an image, a PDF, a
+`.canvas` — does not go through Yjs at all. Its bytes are uploaded once to a
+content-addressed store on the server, and the tree records the hash, so deciding
+"is my copy current?" for two thousand attachments costs two thousand `stat`s and
+no network.
+
+The consequence worth knowing up front is that attachments do not *merge*. If two
+people replace the same attachment at once — or if ShadowLink cannot tell whose
+version came first — the one that lands second in the tree keeps the name, and the
+other person's copy is renamed beside it to
+`diagram (conflicted copy — Ann, a71c4013).png` and shared under that name.
+Everybody ends up with both files and nobody loses bytes, but nobody gets one
+merged file either. This catches people out with `.canvas`, which Obsidian stores
+as a single JSON file and ShadowLink therefore treats as an attachment: two people
+rearranging one canvas at the same time fork it.
+
 **Deletion.** Nothing is ever hard-deleted. A delete writes a tombstone, and each
 peer decides what to do with its own copy. It goes to the vault-local `.trash` —
 the one you restore from inside Obsidian, on desktop and mobile — but *only* when
 the content is provably in the shared document. Otherwise your copy is moved to
 `ShadowLink Recovered/`, named with who deleted it and when.
 
-If more than ten deletions arrive within ten minutes, or any arrive on your first
-sync after time away, everything stops and one dialog appears. Its default action
-is to keep your files. So is pressing Escape.
+If more than ten deletions arrive within ten minutes, if the attachments in one
+batch add up to more than 100 MB, or if any arrive on the first sync after
+Obsidian starts, everything stops and one dialog appears. The byte condition is
+there because one 200 MB video is at least as consequential as eleven notes, and a
+count alone waves it straight through. The dialog's default action is to keep your
+files. So is pressing Escape.
 
 **Two folders belong to the plugin.** `ShadowLink Recovered/` holds rescued
 copies. `ShadowLink Staging/` is a waypoint a rename passes through and is empty
@@ -153,11 +174,28 @@ release, not hypothetical ones.
 - **Large attachments are not downloaded on their own.** Notes, images, PDFs,
   canvases and other attachments all sync now. But an attachment over about 10 MB
   — 2 MB on a phone — is held back rather than pulled down in the background, and
-  so is anything past a per-session download budget. Nothing is missing and nothing
-  is broken: the file stays in the shared folder for everybody, the status bar says
-  how many are waiting and how big they are, and a **Download** button appears
-  where the embed would be. The *ShadowLink: Download attachments* command lists
-  them with their sizes.
+  so is anything past a per-session download budget of 512 MB, or 20 MB on a phone.
+  Nothing is missing and nothing is broken: the file stays in the shared folder for
+  everybody, the status bar counts how many are waiting and its tooltip gives the
+  sizes, and a **Download** button appears where the embed would be. The
+  *ShadowLink: Download attachments* command lists them with their sizes.
+- **Past a hard ceiling, an attachment is not shared at all.** 100 MB on a desktop,
+  and **32 MB on a phone** — a screen recording made on that phone is over it
+  immediately. This is not the deferral above and no button lifts it: the whole
+  file has to fit in memory to be hashed and verified, in both directions, so a
+  device will neither publish nor download anything past its own ceiling. Your
+  server has a ceiling of its own (`MAX_FILE_SIZE_MB`, 100 MB by default) and the
+  lower of the two decides. Nothing is destroyed when this happens — the file stays
+  exactly where you put it, it is simply not shared, and you get one notice saying
+  so. If that attachment was already shared, only the new bytes are refused and the
+  version everybody has stays shared. The 100 MB and 32 MB figures are compiled in;
+  there is no setting for them.
+- **Some files are never shared, and nothing says so.** A file with no extension,
+  one whose extension runs past 16 characters, and anything ending `.exe`, `.dll`,
+  `.so`, `.dylib`, `.msi`, `.bat`, `.cmd`, `.com`, `.scr`, `.ps1`, `.vbs`, `.jar`,
+  `.app` or `.lnk`. A shared folder is a folder somebody else can write into, and
+  while Obsidian will not run what lands there, Explorer and Finder will. Nothing
+  is deleted and nothing is moved — the file just stays local, silently.
 - **New attachments can land outside the shared folder.** ShadowLink shares one
   folder; Obsidian's *Default location for new attachments* is a vault-wide setting
   whose default is the vault root. If yours points outside the shared folder, an
@@ -186,6 +224,13 @@ release, not hypothetical ones.
   vault, and yours to manage.
 - **When two notes end up with the same name**, one keeps it and the other gains a
   ` (2)` suffix. Which one wins is arbitrary — but identical for everybody.
+- **Two people replacing one attachment produce two files, not one.** Notes merge;
+  attachments do not. The version that lands second in the tree keeps the name, and
+  the loser's copy is renamed to
+  `diagram (conflicted copy — Ann, a71c4013).png` and shared under that name, so
+  everybody ends up with both and can see whose is whose. Because `.canvas` is a
+  single file rather than a note, this is also what two people editing one canvas
+  at the same time get.
 - **The shared document grows** as you reorganise. A team churning through a large
   share for a year will notice. Compaction is planned.
 
@@ -239,8 +284,16 @@ A short tour of how it fits together:
   match reality" so they are safe to replay. `Deletions` decides, per file,
   between the vault trash and a rescue. Everything reaches the outside world
   through a port with an in-memory fake.
-- **`server/`** — a document hub relaying the standard Yjs protocol, with the
-  shared key checked at the WebSocket upgrade before any data flows.
+- **`server/`** — two halves sharing one process and one key. `DocHub.js` relays
+  the standard Yjs protocol over WebSocket, with the shared key checked at the
+  upgrade (`upgradeAuth.js`) before any data flows. Attachments take the other
+  half: `blobRoutes.js` serves `HEAD`/`GET`/`PATCH` on a content hash plus a
+  `limits` probe, behind a bearer check (`httpAuth.js`), and `blobStore.js` is the
+  content-addressed store underneath — write-once objects at a fanned-out path,
+  resumable partial uploads, a re-hash of what was assembled before anything is
+  published, and per-workspace quota accounting. `server/tools/sweep-blobs.mjs` is
+  the offline sweeper; the server itself has no delete route and never removes an
+  attachment on its own.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers how to get a change accepted, and the
 rules that are not negotiable — chiefly that nothing is ever hard-deleted, and
