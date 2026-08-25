@@ -370,7 +370,14 @@ test('a dead server throws from has and returns null from get — never false, n
     assert.ok(err instanceof BlobTransport, `got ${String(err)}`);
     return true;
   });
-  await assert.rejects(port.limits());
+  // MATCHED, like every sibling above. A bare `assert.rejects` here is satisfied by
+  // any rejection at all — a TypeError raised before a request was ever attempted
+  // included — so it would go on passing if `limits()` stopped reaching the network.
+  // The failure this setup injects is a dead socket, which `send()` wraps.
+  await assert.rejects(port.limits(), (err: unknown) => {
+    assert.ok(err instanceof BlobTransport, `got ${String(err)}`);
+    return true;
+  });
   assert.equal(await port.get(ABSENT, 10), null, 'get never throws');
   assert.notEqual(port.lastError, null);
 });
