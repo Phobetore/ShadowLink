@@ -17,6 +17,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -692,6 +693,118 @@ test('one connection cannot take more than its share of the workspace', async ()
     unblock();
     await new Promise((r) => { setTimeout(r, 50); });
     assert.equal(parkedRes.code, 201, 'and the first one still completes');
+  });
+});
+
+test('a GET aborted while the store is being consulted releases its slot', async () => {
+  // The cap counts CONCURRENT transfers (spec §6.4). A slot taken and never given
+  // back turns it into a count of HISTORY instead, and once a workspace has
+  // accumulated `maxConcurrency` of them every later GET and PATCH in that share
+  // answers 503 until the process is restarted. Nothing clears it — while HEAD,
+  // which never acquires, keeps cheerfully reporting the bytes are present.
+  await withRoutes({ routes: { maxConcurrency: 1 } }, async ({ port, store }) => {
+    const buf = bytes(600);
+    const hash = sha256(buf);
+    assert.equal((await put(port, WS, hash, buf)).status, 201);
+
+    // Park `stat`, which is the one window `getBlob` has: after the request has
+    // been dispatched and before `acquire()` hands out a slot. `res` emits its
+    // one and only 'close' in there, while the listeners that would release the
+    // slot do not exist yet — and an EventEmitter does not replay a fired event
+    // for a listener that arrives late. Gating rather than racing `fs.stat`
+    // makes the window infinite, so this is deterministic rather than timing.
+    const realStat = store.stat.bind(store);
+    let open;
+    const gate = new Promise((r) => { open = r; });
+    let parked;
+    const reached = new Promise((r) => { parked = r; });
+    store.stat = async (ws, sha) => { parked(); await gate; return realStat(ws, sha); };
+
+    const req = httpRequest({
+      host: '127.0.0.1',
+      port,
+      path: `/blob/${WS}/${hash}`,
+      method: 'GET',
+      agent: false,
+      headers: { authorization: `Bearer ${KEY}` },
+    });
+    req.on('error', () => { /* the abort below is the point of the test */ });
+    req.end();
+    await reached;                                     // the handler is inside the window
+    req.destroy();                                     // the lid closing, mid-download
+    await new Promise((r) => { setTimeout(r, 100); }); // …and the server noticing
+    open();
+    store.stat = realStat;
+    await new Promise((r) => { setTimeout(r, 100); });
+
+    const after = await call(port, { path: `/blob/${WS}/${hash}` });
+    assert.equal(after.status, 200, 'the aborted GET must not have kept its concurrency slot');
+  });
+});
+
+test('GETs pipelined onto a socket that dies take no slot with them', async () => {
+  // The same leak, one step further out. For a PIPELINED second response Node
+  // never marks `res` destroyed and never fires 'close' on it at all, so the
+  // response object alone cannot tell you the peer is gone — only the socket
+  // can. Two GETs written in one packet and then a reset therefore leak a slot
+  // apiece unless the guard consults `req.socket` as well.
+  await withRoutes({ routes: { maxConcurrency: 1 } }, async ({ port, store }) => {
+    const buf = bytes(600);
+    const hash = sha256(buf);
+    assert.equal((await put(port, WS, hash, buf)).status, 201);
+
+    const realStat = store.stat.bind(store);
+    let open;
+    const gate = new Promise((r) => { open = r; });
+    let reaches = 0;
+    let bothIn;
+    const both = new Promise((r) => { bothIn = r; });
+    store.stat = async (ws, sha) => {
+      reaches += 1;
+      if (reaches >= 2) bothIn();
+      await gate;
+      return realStat(ws, sha);
+    };
+
+    const raw = `GET /blob/${WS}/${hash} HTTP/1.1\r\nHost: x\r\n`
+      + `Authorization: Bearer ${KEY}\r\n\r\n`;
+    const socket = netConnect(port, '127.0.0.1', () => { socket.write(raw + raw); });
+    socket.on('error', () => { /* expected: we destroy it below */ });
+
+    await both;                                        // both are parked in the window
+    socket.destroy();
+    await new Promise((r) => { setTimeout(r, 100); });
+    open();
+    store.stat = realStat;
+    await new Promise((r) => { setTimeout(r, 100); });
+
+    const after = await call(port, { path: `/blob/${WS}/${hash}` });
+    assert.equal(after.status, 200, 'neither pipelined GET may keep a concurrency slot');
+  });
+});
+
+test('an aborted PATCH releases its slot, because its finally covers the whole body', async () => {
+  // The asymmetry between the two transfer paths, pinned. `patchBlob` awaits the
+  // body inside `try { … } finally { release(); }`, so every exit releases;
+  // `getBlob` hands the response to `stream.pipe` and outlives its own function
+  // call, so no `finally` can guard it and the check has to be explicit. This
+  // test passes before and after that fix — it is here so that deleting PATCH's
+  // `finally`, or "unifying" the two paths onto the weaker one, reddens.
+  await withRoutes({ routes: { maxConcurrency: 1 } }, async ({ port }) => {
+    const transfer = slowPatch(port, `/blob/${WS}/${sha256(bytes(4000, 1))}`, 4000);
+    await new Promise((r) => { setTimeout(r, 150); });
+    transfer.abort();
+    await transfer.done;
+    await new Promise((r) => { setTimeout(r, 100); });
+
+    const buf = bytes(500, 5);
+    const after = await call(port, {
+      method: 'PATCH',
+      path: `/blob/${WS}/${sha256(buf)}`,
+      headers: { 'content-range': 'bytes 0-499/500' },
+      body: buf,
+    });
+    assert.equal(after.status, 201, 'the aborted upload must not have kept its slot either');
   });
 });
 

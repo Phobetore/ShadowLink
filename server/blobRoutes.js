@@ -192,6 +192,23 @@ export function createBlobRoutes(deps) {
     const found = await store.stat(ws, sha);
     if (found === null) return send(res, 404, { 'cache-control': 'no-store' });
 
+    // THE PEER MAY HAVE GONE AWAY DURING THAT await, and it is the only place in
+    // `getBlob` where that can happen unobserved: everything from here down to
+    // `stream.pipe(res)` runs in one synchronous tick. `res` emits its one and
+    // only 'close' the moment the socket dies, which is BEFORE the release
+    // listeners below are attached, and an EventEmitter never replays a fired
+    // event for a listener that arrives late — so a slot taken now would never be
+    // given back. That is not a leak the process recovers from: after
+    // `maxConcurrency` of them every GET and PATCH in the workspace answers 503
+    // for ever, while HEAD keeps reporting the bytes are present. `patchBlob`
+    // needs no such check because its whole body sits in a `finally`; a piped
+    // response outlives this function call, so here it has to be explicit.
+    //
+    // Both halves are load-bearing. For a PIPELINED response Node leaves `res`
+    // UNdestroyed and fires no event on it at all, so only the socket knows.
+    // Nothing can be written to either state, which is why this answers nothing.
+    if (res.destroyed || req.socket?.destroyed) return undefined;
+
     const release = acquire(ws, req.socket);
     if (release === null) {
       return send(res, 503, {
