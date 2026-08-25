@@ -46,6 +46,7 @@ import {
 } from '../tree/constants.ts';
 import {
   assertInsideShare, extOf, fold, hashOf, hashOfBytes, parseBlobRef, safeInFilename,
+  type BlobRef,
 } from '../tree/paths.ts';
 import type { NodeFields } from '../tree/types.ts';
 import type { BlobPort } from './BlobPort.ts';
@@ -120,6 +121,9 @@ const TRASH_NOTICE_MS = 6_000;
 /** How many literal paths the aggregated dialog is given to show. */
 const SAMPLE_PATHS = 5;
 
+/** Shared empty answer for a partial context, so the common case allocates nothing. */
+const EMPTY_REFS: ReadonlyMap<string, BlobRef> = new Map<string, BlobRef>();
+
 /**
  * The collaborators one `apply` runs against.
  *
@@ -135,6 +139,8 @@ interface Env {
   vault: VaultPort;
   /** Null when no store was wired: "cannot ask", which is never proof (I2). */
   blobs: BlobPort | null;
+  /** The pass's parsed references for LIVE published `'b'` nodes (§5.2). */
+  blobRefs: ReadonlyMap<string, BlobRef>;
   state: DeviceState;
   tickets: Tickets;
   shareRoot: string;
@@ -166,18 +172,28 @@ function displayName(f: NodeFields): string {
 }
 
 /**
- * Spec §5.3's rescue name: `<basename> (deleted by <who> <date>).md`.
+ * Spec §5.3's rescue name: `<basename> (deleted by <who> <date>)<ext>`.
  *
- * The basename keeps its own `.md`, so a rescued `todo.md` becomes
- * `todo.md (deleted by Ann 2026-06-26).md`. That is the spec's literal
+ * The basename keeps its own extension, so a rescued `todo.md` becomes
+ * `todo.md (deleted by Ann 2026-06-26).md` and a rescued `shot.png` becomes
+ * `shot.png (deleted by Ann 2026-06-26).png`. That is the spec's literal
  * construction and it is the right one: the name Obsidian shows is then exactly
  * the name the file had, plus the reason it moved.
+ *
+ * The FALLBACK is kind-aware (§5.2). `validateRel` guarantees a `'b'` node has an
+ * extension, so it is unreachable today — but a hardcoded `.md` on a rescued PNG
+ * would be silently wrong the day that stops being true, and the file would come
+ * back as an unreadable note rather than an image.
+ *
+ * Exported for its Group A test: it is a pure naming function, and reaching it
+ * only through a context that could not legally exist would test less than it.
  */
-function rescueName(path: string, f: NodeFields, fallbackAt: number): string {
+export function rescueName(path: string, f: NodeFields, fallbackAt: number): string {
   const who = safeInFilename(displayName(f));
   const when = dateOf(f.xa ?? fallbackAt);
   const ext = extOf(path);
-  return `${baseOf(path)} (deleted by ${who} ${when})${ext === '' ? '.md' : ext}`;
+  const fallback = f.k === 'b' ? '.bin' : '.md';
+  return `${baseOf(path)} (deleted by ${who} ${when})${ext === '' ? fallback : ext}`;
 }
 
 function summaryOf(batch: Deletable[]): BulkSummary {
@@ -393,6 +409,11 @@ export class Deletions {
    * "defaults to rescue on ignorance", unchanged.
    */
   private async isProvenBlob(env: Env, item: Deletable): Promise<boolean> {
+    // A deletable is a DEAD node, and the pass's reference map holds LIVE ones,
+    // so a node in both is the two halves of one derivation disagreeing about
+    // whether this file should exist. An ambiguity is never a deletion (I2).
+    if (env.blobRefs.has(item.id)) return false;
+
     const ref = parseBlobRef(item.f.b);
     if (item.f.s !== 1 || ref === null) return false;    // never published => never proven
     const blobs = env.blobs;
@@ -536,7 +557,8 @@ export class Deletions {
     const shareRoot = ctx.shareRoot ?? this.deps.shareRoot;
     return {
       vault: ctx.vault ?? this.deps.vault,
-      blobs: this.deps.blobs ?? null,
+      blobs: ctx.blobs ?? this.deps.blobs ?? null,
+      blobRefs: ctx.blobRefs ?? EMPTY_REFS,
       state: ctx.state ?? this.deps.state,
       tickets: ctx.tickets ?? this.deps.tickets,
       shareRoot: shareRoot.replace(/\/+$/, ''),

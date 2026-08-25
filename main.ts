@@ -295,9 +295,16 @@ class SyncRuntime {
 
     this.deletions = new Deletions({
       vault: this.vault,
+      // §5.1: an attachment is proven by asking the store whether it still holds
+      // the exact bytes the tree names. With no store the answer is "I could not
+      // ask", which rescues — safe, but it fills Recovered/ with 200 MB files.
+      blobs: this.blobs,
       state: this.state,
       tickets: this.tickets,
       shareRoot: this.shareRoot,
+      // §7.4: the same platform cap the publisher and the reconciler use, here
+      // applied to the hash a deletion verdict would otherwise cost.
+      memoryCapBytes: () => blobMemoryCap(),
       notice: (msg, ms) => { new Notice(msg, ms); },
       confirmBulk: (summary) => confirmBulkDelete(app, summary),
       openNodeId: this.session.openNodeId,

@@ -73,6 +73,7 @@ class MemoryStatePort implements StatePort {
 
 interface Harness {
   vault: FakeVault;
+  blobs: FakeBlobs;
   docs: FakeDocs;
   tree: TreeDoc;
   state: DeviceState;
@@ -93,6 +94,7 @@ function makeHarness(): Harness {
   const log: string[] = [];
   const now = (): number => NOW;
   const vault = new FakeVault();
+  const blobs = new FakeBlobs();
   const docs = new FakeDocs();
   const tree = new TreeDoc();
   const port = new MemoryStatePort(log);
@@ -104,7 +106,7 @@ function makeHarness(): Harness {
   const queue = new PublishQueue({
     docs,
     vault,
-    blobs: new FakeBlobs(),
+    blobs,
     state,
     tree,
     openNodeId: () => null,
@@ -129,6 +131,7 @@ function makeHarness(): Harness {
 
   const deletions = new Deletions({
     vault,
+    blobs,
     state,
     tickets,
     shareRoot: SHARE,
@@ -151,7 +154,7 @@ function makeHarness(): Harness {
   });
 
   const h: Harness = {
-    vault, docs, tree, state, tickets, port, queue, watcher, deletions, kept,
+    vault, blobs, docs, tree, state, tickets, port, queue, watcher, deletions, kept,
     log, notices, reconciles,
     ctx: () => makeCtx(h),
   };
@@ -190,10 +193,12 @@ function makeCtx(h: Harness): DeletionContext {
     deadFold,
     wantAtFold,
     have,
+    blobRefs: derived.blobs,
     disk,
     failures,
     removedThisPass: new Set<string>(),
     vault: h.vault,
+    blobs: h.blobs,
     docs: h.docs,
     state: h.state,
     tickets: h.tickets,

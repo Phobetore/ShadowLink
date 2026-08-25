@@ -103,11 +103,30 @@ export interface DeletionContext {
   wantAtFold: Map<string, string>;
   /** nodeId -> the literal path it currently occupies on disk. */
   have: Map<string, string>;
+  /**
+   * nodeId -> the parsed `b` of every LIVE, VALID, PUBLISHED `'b'` node, from the
+   * same derivation as `desired`.
+   *
+   * Membership here IS the kind test for the whole pass. Deriving it once means
+   * `materialize` and `adopt` cannot disagree about what a node is — and the way
+   * they could disagree is not academic: `adopt` reading an attachment as a note
+   * decodes a PNG to lossy UTF-8, decides it differs from the shared copy, and
+   * exiles the user's real file (§3.4).
+   *
+   * Step 4 is handed it for the same reason (§5.2): a deletion must be decided
+   * against the pass's own derivation. It reads a DEAD node's own reference from
+   * `f.b`, because a dead node is absent from here by construction — so a node
+   * that appears in both is the two halves of one derivation contradicting each
+   * other, and an ambiguity is never a deletion (I2).
+   */
+  blobRefs: Map<string, BlobRef>;
   disk: DiskIndex;
   failures: ReconcileFailure[];
   /** fold(path) of everything this pass removed. Feeds step 6's exclusion list. */
   removedThisPass: Set<string>;
   vault: VaultPort;
+  /** The attachment store (§8.3). Step 4 asks it whether bytes are still retrievable. */
+  blobs: BlobPort;
   docs: DocPort;
   state: DeviceState;
   tickets: Tickets;
@@ -219,17 +238,6 @@ interface PassContext extends DeletionContext {
   deadMaterializedFold: Set<string>;
   /** fold(literal path) -> nodeId, the inverse of `have`. */
   boundAtFold: Map<string, string>;
-  /**
-   * nodeId -> the parsed `b` of every LIVE, VALID, PUBLISHED `'b'` node, from the
-   * same derivation as `desired`.
-   *
-   * Membership here IS the kind test for the whole pass. Deriving it once means
-   * `materialize` and `adopt` cannot disagree about what a node is — and the way
-   * they could disagree is not academic: `adopt` reading an attachment as a note
-   * decodes a PNG to lossy UTF-8, decides it differs from the shared copy, and
-   * exiles the user's real file (§3.4).
-   */
-  blobRefs: Map<string, BlobRef>;
   /**
    * fold(path) of every file the modify handler flagged since the last pass.
    *
@@ -591,6 +599,7 @@ export class Reconciler {
       failures,
       removedThisPass,
       vault: this.deps.vault,
+      blobs: this.deps.blobs,
       docs: this.deps.docs,
       state: this.deps.state,
       tickets: this.deps.tickets,

@@ -27,7 +27,7 @@ import {
   PROVE_HASH_MAX_BYTES, REMOTE_DELETE_BUDGET, REMOTE_DELETE_WINDOW_MS,
 } from '../tree/constants.ts';
 import { BlobTransport } from './BlobPort.ts';
-import { Deletions, type BulkChoice, type BulkSummary } from './Deletions.ts';
+import { Deletions, rescueName, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
 import { FakeBlobs, FakeDocs, FakeVault, type VaultOp } from './fakes.ts';
@@ -255,10 +255,14 @@ function makeCtx(h: Harness, cause: ReconcileCause, over: Partial<DeletionContex
     deadFold,
     wantAtFold,
     have,
+    // The pass's own derivation, exactly as the reconciler hands it over: LIVE
+    // published `'b'` nodes only.
+    blobRefs: derived.blobs,
     disk,
     failures,
     removedThisPass: new Set<string>(),
     vault: h.vaultPort,
+    blobs: h.blobs,
     docs: h.docs,
     state: h.state,
     tickets: h.tickets,
@@ -1029,6 +1033,72 @@ test('B15: a base that still matches size and mtime answers without re-reading t
   assert.equal(h.vault.callsTo('stat').length, 1, 'one stat per item');
   assert.equal(h.blobs.callsTo('has').length, 1, 'but the store is asked every time');
   assert.equal(h.vault.callsTo('trashLocal').length, 1);
+});
+
+test('A14: a rescued attachment keeps its own extension, and the fallback is never .md', () => {
+  const shot = dead(blob('', 'shot.png', { s: 1 }));
+  assert.equal(
+    rescueName('Shared/shot.png', shot, NOW),
+    'shot.png (deleted by Ann 2023-11-14).png',
+    'the name Obsidian shows is the name it had, plus why it moved',
+  );
+  assert.equal(
+    rescueName('Shared/deck.excalidraw', dead(blob('', 'deck.excalidraw', { s: 1 })), NOW),
+    'deck.excalidraw (deleted by Ann 2023-11-14).excalidraw',
+  );
+
+  // `validateRel` guarantees a `'b'` node HAS an extension, so this is
+  // unreachable today — which is exactly why it is asserted. A hardcoded `.md`
+  // on a rescued PNG would be silently wrong the day it stops being unreachable.
+  assert.equal(
+    rescueName('Shared/scan', dead(blob('', 'scan', { s: 1 })), NOW),
+    'scan (deleted by Ann 2023-11-14).bin',
+  );
+  assert.equal(
+    rescueName('Shared/note', dead(file('', 'note')), NOW),
+    'note (deleted by Ann 2023-11-14).md',
+    'and markdown is unchanged',
+  );
+});
+
+test('the pass\'s own blob store decides, not the one the module was built with', async () => {
+  // §5.2: step 4 decides against the same collaborators the rest of the pass
+  // used. The deps hold a store that has never heard of these bytes; the context
+  // holds the pass's, which has them.
+  const h = makeHarness();
+  const id = nid('A');
+  const bytes = png(11);
+  h.nodes.set(id, dead(blob('', 'shot.png', { s: 1, b: await blobRef(bytes) })));
+  h.vault.seed(SHARE, 'd');
+  await placeBinary(h, id, 'Shared/shot.png', bytes);
+
+  const passStore = new FakeBlobs();
+  await passStore.seed(bytes);
+  await h.deletions.apply(h.ctx('remote', { blobs: passStore }));
+
+  assert.equal(h.vault.callsTo('trashLocal').length, 1, 'the context answered');
+  assert.equal(passStore.callsTo('has').length, 1);
+  assert.deepEqual(h.blobs.calls, [], 'and the constructor store was never consulted');
+});
+
+test('a dead node the same derivation also reports as live is rescued, never trashed (I2)', async () => {
+  const h = makeHarness();
+  const id = nid('A');
+  const bytes = png(12);
+  const ref = await blobRef(bytes);
+  h.nodes.set(id, dead(blob('', 'shot.png', { s: 1, b: ref })));
+  h.vault.seed(SHARE, 'd');
+  await placeBinary(h, id, 'Shared/shot.png', bytes);
+  await h.blobs.seed(bytes);
+
+  // The two halves of one derivation contradict each other: dead here, live and
+  // published there. Acting on a contradiction is how a file goes missing.
+  const live = new Map([[id, { sha256: ref.slice(0, 64), bytes: bytes.length, parent: null }]]);
+  await h.deletions.apply(h.ctx('remote', { blobRefs: live }));
+
+  assert.equal(h.vault.callsTo('trashLocal').length, 0, 'nothing removed');
+  assert.equal(rescuedInto(h.vault).length, 1, 'the copy was kept');
+  assert.deepEqual(h.blobs.calls, [], 'and no verdict was even attempted');
 });
 
 test('B14: a note is still decided by the markdown rule and never touches the store', async () => {
