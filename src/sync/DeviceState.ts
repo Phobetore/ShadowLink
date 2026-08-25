@@ -91,7 +91,19 @@ export interface DeviceStateData {
   // why they are here and not in the tree: another device's disk, budget and
   // dismissed notices are none of this one's business.
 
-  /** nodeId -> the attachment this device chose not to fetch yet. Nothing is on disk for it. */
+  /**
+   * nodeId -> attachment BYTES this device chose not to fetch yet (§7.2).
+   *
+   * Usually there is nothing on disk for it at all — the node was never
+   * materialized here. It also covers the narrower case where an older version IS
+   * on disk and the REPLACEMENT was held back, which from the user's side is the
+   * same fact ("this version has not been downloaded") and takes the same remedy.
+   * The `sha256` says which of the two it is: it always names the bytes the tree
+   * wants here, never the bytes on disk.
+   *
+   * A session-budget refusal is deliberately absent from here — that is a
+   * statement about one run of the plugin, not about the share.
+   */
   fetchDeferred: Record<string, { sha256: string; bytes: number }>;
   /** nodeIds the user explicitly approved for fetching despite the policy. */
   fetchApproved: Record<string, true>;

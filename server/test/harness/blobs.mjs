@@ -10,14 +10,15 @@
 // finalisation, and — C10, the reason the concurrency cap exists at all — that a
 // saturated store does not stall the relay.
 
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
-import { existsSync, readFileSync, utimesSync } from 'node:fs';
+import { existsSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as Y from 'yjs';
 
 import { test, assert } from './runner.mjs';
-import { startServer } from './server.mjs';
+import { startServer, REPO_ROOT } from './server.mjs';
 import { DocLink, sleep } from './net.mjs';
 import { ObsidianBlobPort } from '../../../src/sync/ObsidianBlobPort.ts';
 import {
@@ -551,6 +552,118 @@ export function registerBlobCases(getServer, basePort) {
       await small.stop();
       small.cleanup();
     }
+  });
+
+  // ------------------------------------------------------------------ C9
+
+  // ⚠ The only code in this project that removes a blob, run as the real script,
+  // against a snapshot the real `DocHub` wrote, over a real socket.
+  //
+  // Everything below is about the sweeper's REFUSALS, because the way it goes
+  // wrong is not subtle: it decides what to remove by reading one file, and every
+  // way that file can be wrong — absent, truncated, empty, stale — produces the
+  // same wrong answer, "nothing references these bytes", about a workspace that
+  // references all of them. The unit suite covers each refusal in isolation; what
+  // is proved HERE is that the shipped script, invoked the way an operator invokes
+  // it, reads what the server actually writes.
+  test('C9 the offline sweeper is dry by default, keeps tombstoned bytes, and refuses what it cannot trust', async () => {
+    const server = getServer();
+    const ws = 'sweepc9';
+    const sweeper = join(REPO_ROOT, 'server', 'tools', 'sweep-blobs.mjs');
+
+    const run = (...args) => {
+      const out = spawnSync(process.execPath, [sweeper, '--json', ...args], {
+        cwd: REPO_ROOT, encoding: 'utf8',
+      });
+      assert.equal(out.status, 0, `sweep-blobs exited ${out.status}: ${out.stderr}`);
+      const report = JSON.parse(out.stdout);
+      return report.workspaces.find((w) => w.workspace === ws);
+    };
+    const objectPath = (sha) => join(server.dir, 'blobs', ws, sha.slice(0, 2), sha.slice(2, 4), sha);
+    const atticPath = (sha) => join(server.dir, 'blobs', ws, '.attic', sha);
+
+    // Three objects. One a live node names, one only a TOMBSTONED node names, and
+    // one nothing names at all.
+    const live = bytes(2048, 61);
+    const dead = bytes(2048, 62);
+    const orphan = bytes(2048, 63);
+    for (const buf of [live, dead, orphan]) {
+      const done = await upload(server, ws, sha256(buf), buf);
+      assert.equal(done.status, 201, `upload finished with ${done.status}`);
+    }
+
+    // A real tree, written through the relay, so what the sweeper reads is what
+    // `DocHub._writeSnapshot` produced rather than something this test invented.
+    const doc = new Y.Doc();
+    const link = new DocLink(server.url('_tree', ws), doc);
+    try {
+      link.connect();
+      assert.equal(await link.waitSync(4000), true, 'the tree never synced');
+      doc.transact(() => {
+        const nodes = doc.getMap('nodes');
+        const a = new Y.Map();
+        a.set('k', 'b'); a.set('d', ''); a.set('n', 'live.png');
+        a.set('g', 1); a.set('c', 1); a.set('s', 1);
+        a.set('b', `${sha256(live)}:${live.length}:-`);
+        nodes.set('AAAAAAAAAAAAAAAAAAAAAA', a);
+        const b = new Y.Map();
+        b.set('k', 'b'); b.set('d', ''); b.set('n', 'deleted.png');
+        b.set('g', 1); b.set('c', 1); b.set('s', 1); b.set('x', 1);
+        b.set('b', `${sha256(dead)}:${dead.length}:-`);
+        nodes.set('BBBBBBBBBBBBBBBBBBBBBB', b);
+      });
+      assert.equal(await link.flush(4000), true, 'the tree write was never acknowledged');
+    } finally {
+      link.destroy();
+    }
+
+    // The snapshot rides a 2 s debounce, and the sweeper reads the FILE.
+    const treePath = join(server.dir, 'yjs', ws, '_tree.bin');
+    const deadline = Date.now() + 8000;
+    let nodeCount = 0;
+    while (Date.now() < deadline && nodeCount < 2) {
+      await sleep(100);
+      if (!existsSync(treePath)) continue;
+      try {
+        const probe = new Y.Doc();
+        Y.applyUpdate(probe, new Uint8Array(readFileSync(treePath)));
+        nodeCount = probe.getMap('nodes').size;
+      } catch { /* mid-rename */ }
+    }
+    assert.equal(nodeCount, 2, 'the server never wrote a tree snapshot holding both nodes');
+
+    // Age the objects past a one-day TTL. This also keeps them comfortably OLDER
+    // than the snapshot, so the staleness guard has nothing to complain about.
+    const old = (Date.now() - 30 * 86_400_000) / 1000;
+    for (const buf of [live, dead, orphan]) utimesSync(objectPath(sha256(buf)), old, old);
+
+    // 1. `--dry-run` is the default: it says what it would do, and does none of it.
+    const dry = run('--dir', server.dir, '--workspace', ws, '--ttl-days', '1');
+    assert.equal(dry.refused, null, `the workspace was refused: ${dry.refused}`);
+    assert.deepEqual(dry.attic, [sha256(orphan)], 'exactly the one nothing references');
+    assert.equal(existsSync(objectPath(sha256(orphan))), true, 'and nothing moved');
+
+    // 2. …and with --apply, only the orphan moves, to `.attic` rather than away.
+    const applied = run('--dir', server.dir, '--workspace', ws, '--ttl-days', '1', '--apply');
+    assert.deepEqual(applied.attic, [sha256(orphan)]);
+    assert.deepEqual(applied.unlinked, [], 'a second TTL stands between .attic and gone');
+    assert.equal(existsSync(atticPath(sha256(orphan))), true);
+    assert.equal(existsSync(objectPath(sha256(orphan))), false);
+
+    // ⚠ 3. The tombstoned node's bytes are STILL THERE. A resurrect, an undelete
+    // from the vault-local `.trash`, and the `proven` probe every peer runs before
+    // it removes its own copy all need exactly these bytes.
+    assert.equal(existsSync(objectPath(sha256(dead))), true, 'a deleted file is not a deleted blob');
+    assert.equal(existsSync(objectPath(sha256(live))), true);
+
+    // ⚠ 4. A snapshot it cannot decode refuses the whole workspace. Without this,
+    // a truncated file reads as "nothing is referenced" and empties the store.
+    writeFileSync(treePath, Buffer.from([0xff, 0x00, 0x13, 0x37]));
+    const refused = run('--dir', server.dir, '--workspace', ws, '--ttl-days', '1', '--apply');
+    assert.notEqual(refused.refused, null, 'a corrupt snapshot must refuse the workspace');
+    assert.deepEqual(refused.attic, []);
+    assert.equal(existsSync(objectPath(sha256(live))), true, 'and touches nothing');
+    assert.equal(existsSync(objectPath(sha256(dead))), true);
   });
 
   // ----------------------------------------------------------------- C10

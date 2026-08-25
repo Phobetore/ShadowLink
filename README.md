@@ -150,12 +150,29 @@ a failed network request is never mistaken for a deletion.
 This section is honest on purpose. These are real limitations of the current
 release, not hypothetical ones.
 
-- **Only `.md` files sync.** Images, PDFs and other attachments are ignored, so a
-  note containing `![[diagram.png]]` shows a broken link for everybody else. This
-  is the biggest gap and the next thing being built.
-- **Unopened notes go stale.** A note's content is fetched once, when it appears.
+- **Large attachments are not downloaded on their own.** Notes, images, PDFs,
+  canvases and other attachments all sync now. But an attachment over about 10 MB
+  — 2 MB on a phone — is held back rather than pulled down in the background, and
+  so is anything past a per-session download budget. Nothing is missing and nothing
+  is broken: the file stays in the shared folder for everybody, the status bar says
+  how many are waiting and how big they are, and a **Download** button appears
+  where the embed would be. The *ShadowLink: Download attachments* command lists
+  them with their sizes.
+- **New attachments can land outside the shared folder.** ShadowLink shares one
+  folder; Obsidian's *Default location for new attachments* is a vault-wide setting
+  whose default is the vault root. If yours points outside the shared folder, an
+  image you drag into a shared note is saved somewhere nobody else will see it.
+  ShadowLink warns about this once on startup and names the setting to change,
+  but it cannot change it for you.
+- **Unopened notes go stale.** A *note's* content is fetched once, when it appears.
   Until somebody opens it, later edits are not written to that peer's disk — so
   Obsidian search, `git` and any external tool can read out-of-date bytes.
+  Attachments are not affected: their bytes are re-checked on every pass.
+- **The server keeps attachment bytes nothing references any more.** Deleting a
+  file never deletes its bytes from the server, deliberately — that is what makes
+  undelete and restore work at all. Reclaiming that space is a command a
+  self-hoster runs (`server/tools/sweep-blobs.mjs`), never something the server
+  decides on its own.
 - **One shared folder per vault.**
 - **One shared key per server.** Anyone holding it can join any workspace on that
   server. No invitations, no per-member permissions, no read-only members yet.
@@ -237,10 +254,9 @@ that a failure is never allowed to look like a deletion.
 
 ## What is coming
 
-Attachments and images, the gap people will hit first. Continuous content sync,
-so unopened notes stop going stale. Invitation links with per-member permissions,
-replacing the single shared key. Then opt-in end-to-end encryption, which is
-rather the point of having built it self-hosted and open.
+Continuous content sync, so unopened notes stop going stale. Invitation links with
+per-member permissions, replacing the single shared key. Then opt-in end-to-end
+encryption, which is rather the point of having built it self-hosted and open.
 
 Contributions are welcome — [CONTRIBUTING.md](CONTRIBUTING.md) explains how, and
 what this project declines. Security reports go through

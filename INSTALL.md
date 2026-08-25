@@ -239,8 +239,17 @@ Look in `ShadowLink Recovered/` first, then in Obsidian's own trash
 anything, so it is in one of the two.
 
 **An image is a broken link.**
-Expected, for now. Attachments do not sync yet — see
-[What it does not do yet](README.md#what-it-does-not-do-yet).
+Two ordinary causes, and neither of them is a fault.
+
+It may be an attachment this device chose not to download: anything over about
+10 MB — 2 MB on a phone — waits to be asked for. The status bar says how many are
+waiting and how big they are, a **Download** button appears where the embed would
+be, and the *ShadowLink: Download attachments* command lists them.
+
+Or it was never shared, because Obsidian saved it outside the shared folder.
+**Settings → Files and links → Default location for new attachments** is
+vault-wide, and its default is the vault root. Set it to *Same folder as current
+file*, or to a folder inside the shared one, and move the image in.
 
 **I changed a setting and nothing changed.**
 Settings are read when the plugin loads. Toggle it off and on.
@@ -286,3 +295,34 @@ schedule, and it goes through once you raise the limit or free some space.
 Back up `PERSISTENCE_DIR`. It holds the server's copy of the share and the key
 file. Everyone's vault also holds a full copy of every note, so losing it is
 recoverable — but it is not nothing.
+
+**Reclaiming space from deleted attachments.** Deleting a file never removes its
+bytes from the server: that is what makes undelete, restore and "someone deleted
+it, put it back" work at all. Nothing on the server removes them either — there is
+no delete route and no automatic collection. When you want the space back, run the
+sweeper yourself:
+
+```bash
+node server/tools/sweep-blobs.mjs --dir /var/lib/shadowlink        # a dry run
+node server/tools/sweep-blobs.mjs --dir /var/lib/shadowlink --apply
+```
+
+It is a **dry run by default** and prints what it would do. With `--apply` it
+moves attachments that nothing references and that are older than
+`BLOB_ORPHAN_TTL_DAYS` (90) into `blobs/<workspace>/.attic/`, and only removes an
+attic entry after a further full TTL — so there are two grace periods between
+"unreferenced" and "gone".
+
+It refuses a whole workspace, and touches nothing in it, whenever it cannot prove
+the picture is complete: no tree snapshot, one it cannot read, one holding no
+files at all, or one more than an hour older than the newest thing beside it. It
+also keeps the bytes of files that have been *deleted*, because a restore needs
+them.
+
+Run it while the server is stopped, or during quiet hours; the staleness check
+will simply refuse a workspace that is being written to. Nothing has to be run
+at all — the cost of never running it is disk, bounded by `MAX_TOTAL_STORAGE_GB`.
+The cost of running it with a very short TTL is that a peer which has been offline
+for longer than the TTL may find an attachment it never downloaded is no longer
+available; its own files are untouched, and it reports the attachment as
+unavailable rather than deleting anything.

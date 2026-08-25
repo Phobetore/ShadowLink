@@ -127,7 +127,7 @@ export function deferredEmbedProcessor(
 
     for (const node of Array.from(el.querySelectorAll('.internal-embed'))) {
       const src = node.getAttribute('src');
-      if (src === null) return;
+      if (src === null) continue;                          // never `return`: the next one may match
       // Only an embed Obsidian could NOT resolve. One it could resolve is a file
       // that is on disk, and replacing that would hide the user's own image.
       if (!node.classList.contains('is-unresolved') && node.childElementCount > 0) continue;

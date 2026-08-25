@@ -64,7 +64,14 @@ export interface ReconcileDiagnostics {
    * is the correct state — the alternative is a phone that dies on every pass.
    */
   tooLarge: string[];
-  /** Attachment nodes the fetch policy has not cleared yet (§7.2). Nothing is on disk. */
+  /**
+   * Attachment nodes the fetch policy has not cleared yet (§7.2).
+   *
+   * Usually there is NOTHING on disk for them — no file, no placeholder, no stub,
+   * no sidecar (§7.3). The narrower case is a node whose REPLACEMENT was held
+   * back, where an older version is still at the path. Both are "this version has
+   * not been downloaded", and both take the same remedy.
+   */
   deferred: string[];
   /**
    * Attachment nodes whose bytes the store no longer holds (§6.5).
