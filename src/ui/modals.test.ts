@@ -171,6 +171,7 @@ function confirmation(over: Partial<BootstrapConfirmation> = {}): BootstrapConfi
     downloadDeferred: { count: 0, bytes: 0 },
     uploadNotes: { count: 0, bytes: 0 },
     uploadAttachments: { count: 0, bytes: 0 },
+    uploadAttachmentsTooLarge: { count: 0, bytes: 0 },
     ...over,
   };
 }
@@ -301,3 +302,50 @@ test('a first sync with nothing held back says nothing about held-back attachmen
     modal.close();
     await answer;
   });
+
+/**
+ * ⚠ The upload half of the same promise, and it was worse than the download half.
+ *
+ * Every local attachment under the share was counted as one that "can be uploaded
+ * to this workspace", including files past this device's memory cap. The user
+ * agreed to that sentence, and the publish queue then RETRACTED each of them:
+ * node tombstoned, binding dropped, path recorded as oversized, and one notice per
+ * file saying the file is not being shared — which is what the modal had just
+ * promised the opposite of.
+ */
+test('the first-sync modal does not offer to upload what this device cannot hold',
+  async () => {
+    const m = await install();
+    const { answer, modal } = shown(() => m.confirmFirstSync(
+      {} as never,
+      confirmation({
+        uploadAttachments: { count: 2, bytes: 3 * 1024 * 1024 },
+        uploadAttachmentsTooLarge: { count: 1, bytes: 220 * 1024 * 1024 },
+      }),
+    ));
+    const text = allText(modal.contentEl);
+
+    assert.match(text, /2 local attachment\(s\)/, 'the shareable ones are still counted');
+    assert.match(text, /1 local attachment\(s\)[\s\S]*too large for this device/);
+    assert.match(text, /220 MB/, 'with the size, because that is what makes the decision');
+    assert.match(
+      text, /will not be shared/,
+      'and it says what happens, since nothing here can raise the ceiling',
+    );
+
+    modal.close();
+    await answer;
+  });
+
+test('a first sync with nothing over the device cap says nothing about the cap', async () => {
+  const m = await install();
+  const { answer, modal } = shown(() => m.confirmFirstSync(
+    {} as never,
+    confirmation({ uploadAttachments: { count: 2, bytes: 3 * 1024 * 1024 } }),
+  ));
+
+  assert.doesNotMatch(allText(modal.contentEl), /too large for this device/);
+
+  modal.close();
+  await answer;
+});

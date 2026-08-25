@@ -147,6 +147,22 @@ class FirstSyncModal extends DecisionModal<BootstrapDecision> {
           + `(${sizeOf(info.uploadAttachments.bytes)}) can be uploaded to this workspace.`,
       });
     }
+    if (info.uploadAttachmentsTooLarge.count > 0) {
+      // §7.4's device arm, and its own line rather than a footnote on the one
+      // above. These files are not merely uncounted: agreeing to this dialog
+      // TOMBSTONES each of them — node dead, binding dropped, path recorded as
+      // oversized — and produces one notice per file saying it is not being
+      // shared. Counting them as uploadable promised the opposite of that.
+      //
+      // No remedy is offered because there is none here: the cap is compiled in,
+      // no setting raises it, and the file has to be smaller or opened somewhere
+      // with more memory.
+      summary.createEl('li', {
+        text: `${info.uploadAttachmentsTooLarge.count} local attachment(s) `
+          + `(${sizeOf(info.uploadAttachmentsTooLarge.bytes)}) are too large for this `
+          + 'device to handle and will not be shared. They stay exactly where they are.',
+      });
+    }
     if (info.pending.length > 0) {
       summary.createEl('li', {
         text: `${info.pending.length} file(s) are waiting for their author to upload them, `

@@ -42,7 +42,7 @@ import { deriveTree } from '../tree/TreeIndex.ts';
 import type { TreeDoc } from '../tree/TreeDoc.ts';
 import type { DeviceState } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
-import { fetchVerdict, type FetchLimits } from './FetchPolicy.ts';
+import { fetchVerdict, publishVerdict, type FetchLimits } from './FetchPolicy.ts';
 import type { ReconcileCause } from './Reconciler.ts';
 import type { VaultPort } from './VaultPort.ts';
 import type { Phase } from './VaultWatcher.ts';
@@ -102,6 +102,22 @@ export interface BootstrapBuckets {
   uploadNotes: BucketTotals;
   /** Local attachments that would be shared, sized from disk. */
   uploadAttachments: BucketTotals;
+  /**
+   * Local attachments past THIS DEVICE's memory cap (§7.4), which will not be.
+   *
+   * Split off for the same reason `downloadDeferred` is, and with a sharper
+   * consequence: these are not merely uncounted, they are RETRACTED. The publish
+   * queue reaches the cap, tombstones the node, drops the binding, records the
+   * path as oversized and shows one notice per file — so a modal that counted
+   * them as uploadable was promising the opposite of what the user was about to
+   * be told.
+   *
+   * The DEVICE arm only. The server's ceiling is not asked for here: `limits()`
+   * has exactly one production caller and this is not it, a first-join modal must
+   * not wait on the network to count files already on the disk, and a ceiling that
+   * cannot be asked for is never a small one (I2).
+   */
+  uploadAttachmentsTooLarge: BucketTotals;
 }
 
 /** What the confirmation modal is handed. The modal itself is P1c Task 4's. */
@@ -524,6 +540,7 @@ export class Bootstrap {
     upload.sort(cmp);
     uploadNotePaths.sort(cmp);
     uploadAttachmentPaths.sort(cmp);
+    const attachments = await this.splitUploads(uploadAttachmentPaths);
 
     return {
       adopt,
@@ -534,8 +551,47 @@ export class Bootstrap {
       downloadNow,
       downloadDeferred,
       uploadNotes: await this.sizeOf(uploadNotePaths),
-      uploadAttachments: await this.sizeOf(uploadAttachmentPaths),
+      uploadAttachments: attachments.shareable,
+      uploadAttachmentsTooLarge: attachments.tooLarge,
     };
+  }
+
+  /**
+   * §7.4's device arm, over the local files this device is offering to share.
+   *
+   * The byte count was already in hand — `sizeOf` stats every one of these — and
+   * the split was simply never made, so the modal counted a 200 MB screen
+   * recording as uploadable and the publish queue then retracted it.
+   *
+   * `publishVerdict` rather than a comparison written here, because it is the same
+   * predicate the queue will apply, and two copies of a rule agree on the day they
+   * are written. `serverCap` is null BY CONSTRUCTION and not by omission: this
+   * count is a local question and must not wait on the network, and an unknown
+   * ceiling is never a small one.
+   *
+   * A `stat` that could not look contributes nothing and counts as SHAREABLE. "I
+   * could not measure it" is not evidence that a file is huge, and hiding it from
+   * the only list the user is shown would be the same silence in a new place.
+   */
+  private async splitUploads(
+    paths: readonly string[],
+  ): Promise<{ shareable: BucketTotals; tooLarge: BucketTotals }> {
+    const cap = this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
+    const shareable: BucketTotals = { count: 0, bytes: 0 };
+    const tooLarge: BucketTotals = { count: 0, bytes: 0 };
+    for (const path of paths) {
+      let bytes = 0;
+      try {
+        const st = await this.deps.vault.stat(path);
+        if (st !== null) bytes = st.bytes;
+      } catch {
+        // Counted, unsized, and never refused: a plan is not a decision.
+      }
+      const bucket = publishVerdict(bytes, cap, null) === 'ok' ? shareable : tooLarge;
+      bucket.count += 1;
+      bucket.bytes += bytes;
+    }
+    return { shareable, tooLarge };
   }
 
   /**
@@ -705,6 +761,7 @@ function emptyBuckets(): BootstrapBuckets {
     adopt: new Map(), download: new Map(), upload: [], pending: [],
     downloadNotes: noTotals(), downloadNow: noTotals(), downloadDeferred: noTotals(),
     uploadNotes: noTotals(), uploadAttachments: noTotals(),
+    uploadAttachmentsTooLarge: noTotals(),
   };
 }
 

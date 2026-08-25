@@ -944,3 +944,75 @@ test('Bootstrap.ts imports no obsidian and calls nothing irreversible', () => {
   }
   assert.equal(source.includes("from 'obsidian'"), false, 'no obsidian import');
 });
+
+// ------------------------------------- §7.5: the upload bucket the modal promised
+
+/**
+ * ⚠ The download side has been split by the memory cap since B25/B30. The UPLOAD
+ * side never was, and the consequence is worse than a wrong number.
+ *
+ * `classify` filtered upload candidates by kind, by `validateRel`, by the declined
+ * list and by whether the tree already claims the path — and by no size test at
+ * all — while it already had a `stat` on every one of them. So the modal counted
+ * a 200 MB screen recording as something that "can be uploaded to this workspace",
+ * the user agreed, and the publish queue then hit the device cap and RETRACTED it:
+ * the node tombstoned, the binding dropped, the path recorded as oversized, and a
+ * notice saying the opposite of what the modal had just said.
+ *
+ * Device arm only, and `serverCap` is null by construction: `limits()` has exactly
+ * one production caller and bootstrap is not it. A first-join modal must not need
+ * the network to count local files, and a server ceiling that is not knowable here
+ * is never a small one (I2).
+ */
+test('the upload count splits on the device cap, so the modal cannot promise a tombstone', async () => {
+  const h = makeHarness({ deps: { memoryCapBytes: () => 1_000 } });
+  h.vault.seed(`${SHARE}/mine.md`, 'f', 'abcde');                       // 5 bytes
+  h.vault.seedBinary(`${SHARE}/scan.png`, new Uint8Array(64));
+  h.vault.seedBinary(`${SHARE}/clip.mov`, new Uint8Array(5_000));       // over the cap
+  h.vault.seedBinary(`${SHARE}/exact.png`, new Uint8Array(1_000));      // exactly at it
+
+  const b = (await h.boot.run()).buckets;
+
+  assert.deepEqual(b.uploadNotes, { count: 1, bytes: 5 });
+  assert.deepEqual(
+    b.uploadAttachments, { count: 2, bytes: 1_064 },
+    'a ceiling is "this much is fine": exactly at the cap is still shareable',
+  );
+  assert.deepEqual(b.uploadAttachmentsTooLarge, { count: 1, bytes: 5_000 });
+
+  // The union is untouched: it is what the confirmation acts on, and dropping a
+  // file between the counts and the decision is its own bug.
+  assert.deepEqual(b.upload, [
+    `${SHARE}/clip.mov`, `${SHARE}/exact.png`, `${SHARE}/mine.md`, `${SHARE}/scan.png`,
+  ]);
+  assert.deepEqual(h.confirms[0].uploadAttachmentsTooLarge, { count: 1, bytes: 5_000 });
+});
+
+// A share with nothing over the cap says nothing about the cap, exactly as the
+// download side does. An empty bucket is not a line of copy.
+test('a first sync with nothing over the device cap reports an empty bucket', async () => {
+  const h = makeHarness({ deps: { memoryCapBytes: () => 1_000 } });
+  h.vault.seedBinary(`${SHARE}/scan.png`, new Uint8Array(64));
+
+  const b = (await h.boot.run()).buckets;
+
+  assert.deepEqual(b.uploadAttachments, { count: 1, bytes: 64 });
+  assert.deepEqual(b.uploadAttachmentsTooLarge, { count: 0, bytes: 0 });
+});
+
+// I2, on the one read this count depends on. A `stat` that could not look is not
+// evidence that the file is huge, and refusing on it would hide a perfectly
+// shareable file from the only list the user gets to see.
+test('a file whose size could not be read is counted as shareable, not as too large', async () => {
+  const h = makeHarness({ deps: { memoryCapBytes: () => 1_000 } });
+  h.vault.seedBinary(`${SHARE}/scan.png`, new Uint8Array(64));
+  h.vault.failNext('stat', new Error('EIO: the volume is unreadable'));
+
+  const b = (await h.boot.run()).buckets;
+
+  assert.equal(b.uploadAttachments.count + b.uploadAttachmentsTooLarge.count, 1);
+  assert.deepEqual(
+    b.uploadAttachmentsTooLarge, { count: 0, bytes: 0 },
+    '"I could not look" must never be read as "it is over the ceiling"',
+  );
+});
