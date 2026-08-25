@@ -175,18 +175,23 @@ and on again** so it picks up the settings.
 ## Step 4: the first sync
 
 The first time a vault joins a workspace, ShadowLink shows one dialog before
-touching anything. It tells you what is about to happen:
+touching anything. It tells you what is about to happen, in counts — and for
+attachments in sizes too, because joining a mature share is a decision about
+gigabytes rather than about files:
 
 - **adopt** — files you already have that the workspace also has
-- **download** — files the workspace has and you do not
-- **upload** — files you have that the workspace does not
+- **download** — notes the workspace has and you do not, plus the attachments that
+  will come down straight away
+- **not yet** — attachments this device will not fetch on its own, with their
+  total size
+- **upload** — notes and attachments you have that the workspace does not
 
-The upload box is ticked by default. Untick it to keep those files local, and
-share them later with the **ShadowLink: Resolve kept files** command from the
-command palette.
+The toggle marked *Share my local files with this workspace* is on by default.
+Turn it off to keep those files on this device, and share them later with the
+**ShadowLink: Resolve kept files** command from the command palette.
 
-Press **Start**. Pressing Escape or Cancel does nothing at all — the safe answer
-is always the default.
+Press **Start syncing**. Pressing Escape or Cancel does nothing at all — the safe
+answer is always the default.
 
 If your copy of a file differs from the workspace's, the workspace version wins on
 disk and *your* version is saved into `ShadowLink Recovered/`. Nothing is thrown
@@ -207,7 +212,10 @@ With two people connected:
    anywhere else.
 
 The status bar at the bottom of Obsidian shows the current state. `paused` with a
-reason means sync has stopped on purpose; hover for why.
+reason means sync has stopped on purpose; hover for why. `synced` on its own means
+everything is here; `synced · 12 attachment(s) available` means the notes are all
+here and twelve attachments have deliberately not been downloaded — hover for
+their sizes and what to do about them.
 
 ---
 
@@ -239,17 +247,35 @@ Look in `ShadowLink Recovered/` first, then in Obsidian's own trash
 anything, so it is in one of the two.
 
 **An image is a broken link.**
-Two ordinary causes, and neither of them is a fault.
+Three ordinary causes, and none of them is a fault.
 
 It may be an attachment this device chose not to download: anything over about
-10 MB — 2 MB on a phone — waits to be asked for. The status bar says how many are
-waiting and how big they are, a **Download** button appears where the embed would
+10 MB — 2 MB on a phone — waits to be asked for. The status bar counts them and
+its tooltip gives the sizes, a **Download** button appears where the embed would
 be, and the *ShadowLink: Download attachments* command lists them.
 
 Or it was never shared, because Obsidian saved it outside the shared folder.
 **Settings → Files and links → Default location for new attachments** is
 vault-wide, and its default is the vault root. Set it to *Same folder as current
 file*, or to a folder inside the shared one, and move the image in.
+
+Or — the one nobody at this end can fix — the sender's copy was refused for being
+over a limit, so it was never shared with anybody. There is no **Download**
+button and no entry in the download command for this case, because on this side
+there is nothing to download and nothing that says why: the note arrived, the
+image never existed here. The *sender* was told, with a notice naming the file,
+its size and the limit. If an embed is broken for everybody except the person who
+made it, ask them whether they saw that notice, and see **About the attachment
+limits** below.
+
+Two further causes are rarer, and both name themselves in the status bar rather
+than leaving you guessing. *"N too large for this device"* means the attachment is
+past what this device will load into memory at all — 100 MB on a desktop, 32 MB on
+a phone — and no button will fetch it; open it on a machine with more room.
+*"N unavailable"* means the workspace store no longer holds those bytes, which is
+what running the sweeper below with a short TTL does to a peer that has been
+offline for a long time. Nothing on this device can fetch those either; ask
+whoever still has a copy to add it again.
 
 **I changed a setting and nothing changed.**
 Settings are read when the plugin loads. Toggle it off and on.
@@ -273,11 +299,20 @@ Environment variables, all optional:
 | `MAX_TOTAL_STORAGE_GB` | `10` | Ceiling on the whole attachment store. `0` means no limit |
 | `INCOMPLETE_UPLOAD_TTL_HOURS` | `24` | How long a half-finished upload waits to be resumed before it is discarded |
 | `MAX_BLOB_CONCURRENCY` | `6` | Attachment transfers at once per shared folder, so uploads cannot crowd out typing |
-| `BLOB_CHUNK_BYTES` | `4194304` | Size of the pieces an upload is cut into (4 MB) |
+| `BLOB_CHUNK_BYTES` | `4194304` | **Does nothing yet.** Declared and validated, but no server code reads it — see below |
 | `BLOB_ORPHAN_TTL_DAYS` | `90` | How long an attachment nothing references is kept. Only the cleanup tool reads this — the server never removes an attachment on its own |
 
 A value that is not a whole number is refused at startup rather than ignored: a
 typo in a limit would otherwise remove it instead of changing it.
+
+**`BLOB_CHUNK_BYTES` is not a working knob**, and it is listed rather than hidden
+so that nobody finds it in `server/config.js` and assumes it is. The server reads
+the variable, validates it, and then no part of the server consults the value:
+uploads are cut up by the *plugin*, using its own 4 MB constant, and the server
+accepts any chunk whose `content-range` and `content-length` agree. Setting it
+changes nothing on either side today. Making it real would mean advertising it
+through the `limits` endpoint and having the plugin honour what it is told, which
+is a code change rather than a documentation one.
 
 To use them:
 
@@ -287,10 +322,28 @@ PORT=5000 PERSISTENCE_DIR=/var/lib/shadowlink npm run server
 
 **About the attachment limits.** `MAX_FILE_SIZE_MB` is 100 because the plugin
 holds a whole attachment in memory to verify it — on a phone as well as on a
-laptop — so a larger ceiling is a promise the other end cannot keep. When the
-store is full, or a file is over the limit, nothing breaks and nothing is
-deleted: that attachment stays unshared, the sender keeps retrying on its own
-schedule, and it goes through once you raise the limit or free some space.
+laptop — so a larger ceiling is a promise the other end cannot keep. The plugin
+has a ceiling of its own for the same reason, 100 MB on a desktop and 32 MB on a
+phone, and that one is compiled into the plugin: no environment variable and no
+setting raises it. Whichever of the two is lower is the one that decides.
+
+Nothing breaks and nothing is deleted when a file is over a limit or the store is
+full. The file stays exactly where its owner put it, and if it had already been
+shared, only the new bytes are refused — the version everybody has stays shared.
+What happens next differs by cause, and the difference matters:
+
+- **The store is full** (`MAX_TOTAL_STORAGE_GB`). The sender keeps retrying on its
+  own backoff, up to five minutes apart, indefinitely. Free some space and it goes
+  through on its own.
+- **The file is over a size limit.** It does *not* go through when you raise the
+  limit. Raising `MAX_FILE_SIZE_MB` needs the server restarted **and** each
+  member's plugin toggled off and on, because the plugin asks the server for its
+  limit once and remembers the answer for as long as it stays loaded. The device
+  ceiling cannot be raised at all. And the refusal itself is remembered: an
+  attachment that was never shared is offered again only once it becomes *smaller*
+  than the size that was refused, and a refused replacement is retried only when
+  the file changes again. The way an over-limit attachment gets shared is to
+  shrink it, not to raise the ceiling.
 
 Back up `PERSISTENCE_DIR`. It holds the server's copy of the share and the key
 file. Everyone's vault also holds a full copy of every note, so losing it is
@@ -311,18 +364,45 @@ It is a **dry run by default** and prints what it would do. With `--apply` it
 moves attachments that nothing references and that are older than
 `BLOB_ORPHAN_TTL_DAYS` (90) into `blobs/<workspace>/.attic/`, and only removes an
 attic entry after a further full TTL — so there are two grace periods between
-"unreferenced" and "gone".
+"unreferenced" and "gone". `--workspace <id>` limits a run to one share,
+`--ttl-days <n>` overrides the TTL for that run, and `--json` prints the report
+as JSON instead of prose.
+
+**The first pass does not give you the disk back.** This is the part that
+surprises people. Moving an object into `.attic/` frees nothing at all — the bytes
+are still on the volume, under a different name, for another full TTL. What it
+frees immediately is *quota*: the store's accounting counts objects and in-flight
+uploads and deliberately does not count `.attic/`, so a workspace that was against
+`MAX_TOTAL_STORAGE_GB` can accept uploads again while the disk it sits on is no
+emptier than before. The report says how many objects moved and how many were
+unlinked, and only the unlinked line is space you have actually recovered. If you
+are sweeping because a volume is full rather than because a quota is, you need two
+runs a TTL apart — or a shorter `--ttl-days`.
 
 It refuses a whole workspace, and touches nothing in it, whenever it cannot prove
-the picture is complete: no tree snapshot, one it cannot read, one holding no
-files at all, or one more than an hour older than the newest thing beside it. It
-also keeps the bytes of files that have been *deleted*, because a restore needs
-them.
+the picture is complete: no tree snapshot, one it cannot decode, one holding no
+nodes at all, one carrying a reference this build cannot parse, or one more than
+an hour older than the newest thing beside it. A refusal is per workspace and
+never stops the run — eleven good shares are still swept. It also keeps the bytes
+of files that have been *deleted*, because a restore needs them.
 
 Run it while the server is stopped, or during quiet hours; the staleness check
-will simply refuse a workspace that is being written to. Nothing has to be run
-at all — the cost of never running it is disk, bounded by `MAX_TOTAL_STORAGE_GB`.
-The cost of running it with a very short TTL is that a peer which has been offline
-for longer than the TTL may find an attachment it never downloaded is no longer
-available; its own files are untouched, and it reports the attachment as
-unavailable rather than deleting anything.
+will simply refuse a workspace that is being written to. Note edits alone do not
+rewrite the tree snapshot, so a share that has seen a busy day of typing and no
+structural change can be refused for staleness even though nothing is wrong —
+a create, rename, move or delete rewrites it, and so does a server restart or
+every peer disconnecting.
+
+Two things a run may tell you, both worth reading rather than scrolling past. A
+`FAILED` line is one object the filesystem would not move or unlink; the run
+carries on through the rest and exits non-zero, so a scheduled job will not report
+success. A `WARNING` line is an object sitting in `.attic/` that the tree names
+again — an earlier run condemned bytes that turned out to be live. This run
+declines to remove them, and until you move that file back into
+`blobs/<workspace>/<first two>/<next two>/` by hand it is a 404 for every peer.
+
+Nothing has to be run at all — the cost of never running it is disk, bounded by
+`MAX_TOTAL_STORAGE_GB`. The cost of running it with a very short TTL is that a
+peer which has been offline for longer than the TTL may find an attachment it
+never downloaded is no longer available; its own files are untouched, and it
+reports the attachment as unavailable rather than deleting anything.
