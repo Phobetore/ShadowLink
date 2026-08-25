@@ -27,7 +27,7 @@ import { RECOVERED_DIR, STAGING_DIR } from '../tree/constants.ts';
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
 import {
-  assertInsideShare, extOf, fold, hashOf, isLive, relPath, validateRel,
+  assertInsideShare, extOf, fold, hashOf, isLive, nodeKindOf, relPath, splitRel, validateRel,
 } from '../tree/paths.ts';
 import type { DeviceState } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
@@ -971,6 +971,16 @@ export class Reconciler {
       if (ctx.boundAtFold.has(key)) continue;                     // bound to some live node
       if (declined.has(key)) continue;
       if (ctx.removedThisPass.has(key)) continue;
+      // §7's path filter, with the kind this path DERIVES (§3.1). A refused
+      // extension can never become a node of either kind, so asking the
+      // filesystem about it is pure cost and handing it over only routes it into
+      // `onCreate`, which refuses it again.
+      if (!this.isPublishable(path)) continue;
+      // §3.2: a path publication has already refused as too large stays refused
+      // until the file itself shrinks. Separate from `declinedPaths` on purpose —
+      // this one self-heals, and a size refusal must never poison a path the way a
+      // user's keep decision does (I13).
+      if (await this.stillOversized(ctx, path)) continue;
       let present = false;
       await this.guarded(ctx.failures, `exists:${path}`, async () => {
         present = await this.deps.vault.exists(path);             // the index can be stale
@@ -982,6 +992,49 @@ export class Reconciler {
     const hand = this.deps.publishUntracked;
     if (hand === undefined) return;
     await this.guarded(ctx.failures, 'publishUntracked', () => hand(candidates));
+  }
+
+  /**
+   * Could this vault path become a node at all? The tree kind is derived from the
+   * path (`nodeKindOf`), never assumed, so an attachment is offered exactly as a
+   * note is and an executable is offered as neither.
+   *
+   * The share-relative path is sliced by SEGMENT COUNT off the real path (SD-5):
+   * the share root's casing on disk need not match the configured one.
+   */
+  private isPublishable(path: string): boolean {
+    const segs = path.split('/');
+    if (segs.length <= depthOf(this.shareRoot)) return false;      // the root itself (I14)
+    const rel = segs.slice(depthOf(this.shareRoot)).join('/');
+    const { d, n } = splitRel(rel);
+    return validateRel(d, n, nodeKindOf(rel, 'f'));
+  }
+
+  /**
+   * Is this path still the oversized file publication refused (§3.2)?
+   *
+   * One `stat` per recorded path per pass — a handful of paths, not a sweep. The
+   * record is dropped as soon as the file is smaller than the size that was
+   * refused, so trimming an attachment re-shares it with no user action and no
+   * command. A `stat` that could not answer keeps the record (I2): "I could not
+   * look" is not evidence that the file shrank.
+   */
+  private async stillOversized(ctx: PassContext, path: string): Promise<boolean> {
+    const key = fold(path);
+    const record = this.deps.state.data.oversized[key];
+    if (record === undefined) return false;
+
+    let st: { bytes: number } | null = null;
+    let looked = false;
+    await this.guarded(ctx.failures, `oversized:${path}`, async () => {
+      st = await this.deps.vault.stat(path);
+      looked = true;
+    });
+    if (!looked || st === null) return true;
+    if ((st as { bytes: number }).bytes >= record.bytes) return true;
+
+    delete this.deps.state.data.oversized[key];
+    return false;
   }
 
   // ---------------------------------------------------------- bookkeeping

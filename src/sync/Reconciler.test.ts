@@ -1474,3 +1474,50 @@ test('a directory that predates the session is still swept once the pass itself 
   );
   assert.equal(h.vault.wasTrashed('Shared/X'), true);
 });
+
+// ---------------------------------------------------------------- P2 §3.2 / §3.4: step 6
+
+// B31. Both filters run BEFORE the per-candidate `exists` call, and both exist for
+// the same reason: a path that can never become a node is pure cost to ask the
+// filesystem about, and handing it to `publishUntracked` only routes it into
+// `onCreate`, which refuses it again.
+test('B31: step 6 skips refused extensions and oversized paths without calling exists', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed('Shared/setup.exe', 'f', 'MZ');            // refused in both kinds (§2.3)
+  h.vault.seed('Shared/huge.mov', 'f', 'x'.repeat(64));   // publication already refused it
+  h.vault.seed('Shared/diagram.png', 'f', 'PNG');
+  h.vault.seed('Shared/notes.md', 'f', 'body');
+  h.state.data.oversized[fold('Shared/huge.mov')] = { bytes: 64, cap: 32, why: 'server' };
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(
+    h.published, [['Shared/diagram.png', 'Shared/notes.md']],
+    'an attachment is offered exactly like a note; the other two never are',
+  );
+  const asked = h.vault.callsTo('exists').map((c) => c.args[0]);
+  assert.equal(asked.includes('Shared/setup.exe'), false, 'no existence probe for a refused path');
+  assert.equal(asked.includes('Shared/huge.mov'), false, 'nor for one publication refused');
+  assert.deepEqual(h.vault.snapshot()['Shared/huge.mov'], 'x'.repeat(64), 'and nothing is touched');
+});
+
+// §3.2's self-healing clause: an oversized record is a statement about a file at a
+// size, not a permanent poisoning of the path (that is what `declinedPaths` is for,
+// and why the two are separate maps — I13).
+test('an oversized record is dropped once the file has shrunk, and the path is offered again', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed('Shared/clip.mov', 'f', 'small');
+  h.state.data.oversized[fold('Shared/clip.mov')] = { bytes: 4_000, cap: 1_000, why: 'server' };
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(h.published, [['Shared/clip.mov']]);
+  assert.equal(
+    h.state.data.oversized[fold('Shared/clip.mov')], undefined,
+    'the record self-heals rather than being re-decided from a stale number',
+  );
+});

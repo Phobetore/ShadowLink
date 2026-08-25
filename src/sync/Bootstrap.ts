@@ -34,7 +34,7 @@ import {
   FOUNDER_WAIT_CAP_MS,
   TREE_SYNC_TIMEOUT_MS,
 } from '../tree/constants.ts';
-import { fold, isLive, relPath, splitRel, validateRel } from '../tree/paths.ts';
+import { fold, isLive, nodeKindOf, relPath, splitRel, validateRel } from '../tree/paths.ts';
 import { deriveTree } from '../tree/TreeIndex.ts';
 import type { TreeDoc } from '../tree/TreeDoc.ts';
 import type { DeviceState } from './DeviceState.ts';
@@ -404,7 +404,11 @@ export class Bootstrap {
       // configured one.
       const rel = path.split('/').slice(rootDepth).join('/');
       const { d, n } = splitRel(rel);
-      if (!validateRel(d, n, 'f')) continue;             // §7: not eligible to become a node
+      // The TREE kind, derived from the path (§3.1). Hardcoding `'f'` here dropped
+      // every attachment in the vault on the floor: the counts the user is shown
+      // before their first sync would then describe a pass that does something
+      // else, and 3 GB of scans would be uploaded — or not — without a word.
+      if (!validateRel(d, n, nodeKindOf(rel, 'f'))) continue;   // §7: not eligible
       upload.push(path);
     }
     upload.sort(cmp);

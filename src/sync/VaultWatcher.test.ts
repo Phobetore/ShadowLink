@@ -129,6 +129,11 @@ function mint(tree: TreeDoc, f: Omit<NodeFields, 'g' | 'c'> & { g?: number; c?: 
   return tree.createNode(f, NOW);
 }
 
+/** Zero-padded index, so a generated batch of names sorts the way it was built. */
+function pad(n: number): string {
+  return String(n).padStart(3, '0');
+}
+
 function fieldsOf(
   tree: TreeDoc,
 ): Array<{ id: string; k: NodeKind; rel: string; g: number; live: boolean }> {
@@ -301,8 +306,15 @@ test('creates outside the share, and of the share root itself, are ignored', asy
 
 test('an unsyncable local path is never adopted', async () => {
   const h = makeHarness();
-  await h.watcher.onCreate(`${SHARE}/image.png`, 'f');       // not markdown (§7)
-  await h.watcher.onCreate(`${SHARE}/.hidden/note.md`, 'f'); // dot segment (§7)
+  // `image.png` used to belong in this list: before attachments existed, every
+  // non-markdown file was unsyncable. It now mints a 'b' node, covered by
+  // 'an attachment dropped into the share mints a b node …'. What is left here
+  // is unsyncable for reasons that have nothing to do with kind.
+  await h.watcher.onCreate(`${SHARE}/.hidden/note.md`, 'f');  // dot segment (§7)
+  await h.watcher.onCreate(`${SHARE}/.DS_Store`, 'f');        // leading-dot name (§7)
+  await h.watcher.onCreate(`${SHARE}/setup.exe`, 'f');        // refused extension (§2.3)
+  await h.watcher.onCreate(`${SHARE}/payload.dll`, 'f');      // refused extension (§2.3)
+  await h.watcher.onCreate(`${SHARE}/noextension`, 'f');      // a 'b' node needs one (§2.3)
   assert.equal(h.tree.size(), 0);
 });
 
@@ -1347,6 +1359,154 @@ test('a delete arriving before ready is queued and applied on replay (I9)', asyn
   await h.watcher.flushPending();
 
   assert.equal(isLive(h.tree.get(id)!), false);
+});
+
+// ---------------------------------------------------------------- P2 §3.1: kind derivation
+
+// The whole `'f'`/`'b'` split rests on ONE rule — `nodeKindOf` — being the only
+// place a path becomes a tree kind. The handler is handed Obsidian's DISK kind,
+// which is all Obsidian knows, and derives the tree kind itself.
+test('an attachment dropped into the share mints a b node and is offered to the publisher', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/diagram.png`, new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+
+  await h.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+
+  const nodes = fieldsOf(h.tree);
+  assert.equal(nodes.length, 1);
+  assert.equal(nodes[0].k, 'b', 'a non-markdown file is an attachment node');
+  assert.equal(nodes[0].rel, 'diagram.png');
+  assert.equal(h.state.data.owned[nodes[0].id], true, 'I5: creator-ness is recorded locally');
+  assert.deepEqual(h.published, [nodes[0].id], 'and its bytes are offered for publication');
+  assert.equal(h.state.data.materialized[nodes[0].id], `${SHARE}/diagram.png`);
+  assert.equal(h.tree.get(nodes[0].id)!.s, undefined, 'nothing is published by the watcher');
+  assert.equal(h.vault.callsTo('read').length, 0, 'and the bytes are never decoded as text');
+});
+
+test('markdown still mints f, in any casing, and a folder still mints d', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+  h.vault.seed(`${SHARE}/Notes.MD`, 'f', 'body');
+  h.vault.seed(`${SHARE}/Album`, 'd');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+  await h.watcher.onCreate(`${SHARE}/Notes.MD`, 'f');
+  await h.watcher.onCreate(`${SHARE}/Album`, 'd');
+
+  const byRel = new Map(fieldsOf(h.tree).map((n) => [n.rel, n.k]));
+  assert.deepEqual(
+    [...byRel].sort(),
+    [['Album', 'd'], ['Notes.MD', 'f'], ['todo.md', 'f']],
+    'the extension test is case-folded: Notes.MD is a note and never an attachment',
+  );
+});
+
+test('a refused extension mints nothing at all', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/setup.exe`, 'f', 'MZ');
+  h.resetCounts();
+
+  await h.watcher.onCreate(`${SHARE}/setup.exe`, 'f');
+
+  assert.equal(h.tree.size(), 0, 'an executable is not shareable in either kind');
+  assert.equal(h.counts.txns, 0);
+  assert.deepEqual(h.published, []);
+});
+
+// B19. The single most common attachment operation there is. The scope test used
+// to be handed Obsidian's DISK kind, so `validateRel(d, n, 'f')` refused every
+// non-`.md` name and the move was misrouted to `queueUnshare` — a workspace-wide
+// tombstone, or a silent undo of the user's move.
+test('B19: moving an attachment inside the share rewrites d and never asks to unshare', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = mint(h.tree, { k: 'b', d: '', n: 'x.png', s: 1, b: `${'a'.repeat(64)}:12:-` });
+  h.state.data.materialized[id] = `${SHARE}/x.png`;
+  h.vault.seedBinary(`${SHARE}/img/x.png`, new Uint8Array([1, 2, 3]));
+  h.resetCounts();
+
+  await h.watcher.onRename(`${SHARE}/img/x.png`, `${SHARE}/x.png`, 'f');
+  await h.watcher.flushUnshare();
+
+  const f = h.tree.get(id)!;
+  assert.equal(relPath(f), 'img/x.png', 'the move is a `d` rewrite, nothing more');
+  assert.equal(isLive(f), true, 'and never a tombstone');
+  assert.equal(f.x, undefined);
+  assert.deepEqual(h.unsharePrompts, [], 'the user is not asked to stop sharing their own move');
+  assert.equal(h.state.data.materialized[id], `${SHARE}/img/x.png`);
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'a move never reads the bytes');
+});
+
+// B20. A folder rename is one `d` rewrite per descendant and nothing else: the
+// bytes never move over the wire, and renaming a 200 MB video costs nothing.
+test('B20: renaming a folder of 50 attachments rewrites one d per node and moves no bytes', async () => {
+  const h = makeCountingHarness();
+  h.vault.seed(SHARE, 'd');
+  const folder = mint(h.counting, { k: 'd', d: '', n: 'Album' });
+  h.state.data.materialized[folder] = `${SHARE}/Album`;
+  const ids: string[] = [];
+  for (let i = 0; i < 50; i++) {
+    const name = `photo-${pad(i)}.png`;
+    const id = mint(h.counting, { k: 'b', d: 'Album', n: name, s: 1, b: `${'b'.repeat(64)}:9:-` });
+    h.state.data.materialized[id] = `${SHARE}/Album/${name}`;
+    ids.push(id);
+  }
+  h.vault.seed(`${SHARE}/Photos`, 'd');
+  for (let i = 0; i < 50; i++) h.vault.seedBinary(`${SHARE}/Photos/photo-${pad(i)}.png`, new Uint8Array([i]));
+  h.resetCounts();
+  h.counting.patches = 0;
+
+  await h.watcher.onRename(`${SHARE}/Photos`, `${SHARE}/Album`, 'd');
+
+  assert.equal(h.counts.txns, 1, 'one transaction for the whole subtree');
+  assert.equal(h.counting.patches, 51, 'the folder plus one `d` rewrite per attachment');
+  for (const id of ids) {
+    const f = h.counting.get(id)!;
+    assert.equal(f.d, 'Photos');
+    assert.equal(isLive(f), true);
+    assert.equal(h.state.data.materialized[id]?.startsWith(`${SHARE}/Photos/`), true);
+  }
+  assert.deepEqual(h.unsharePrompts, []);
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'zero byte transfers');
+
+  // Obsidian may or may not emit an event per descendant; either way the tree
+  // already says what those events are about to claim (I8).
+  h.counting.patches = 0;
+  h.resetCounts();
+  for (let i = 0; i < 50; i++) {
+    await h.watcher.onRename(
+      `${SHARE}/Photos/photo-${pad(i)}.png`,
+      `${SHARE}/Album/photo-${pad(i)}.png`,
+      'f',
+    );
+  }
+  assert.equal(h.counting.patches, 0, 'every descendant event is a no-op');
+  assert.equal(h.counts.txns, 0);
+});
+
+// §3.8's first clause. A dead node's `xh` is a hash of TEXT for a note and of RAW
+// BYTES for an attachment; letting one kind adopt the other's tombstone binds a
+// node whose `b` names completely different content.
+test('a dead note never resurrects into an attachment at the same path', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const gone = mint(h.tree, {
+    k: 'b', d: '', n: 'diagram.png', s: 1, b: `${'c'.repeat(64)}:3:-`,
+    x: 1, xa: NOW - 1_000, xh: 'c'.repeat(64),
+  });
+  h.vault.seed(`${SHARE}/diagram.png`, 'f', '');       // a zero-length file at the same path
+
+  await h.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+
+  assert.equal(isLive(h.tree.get(gone)!), false, 'the dead attachment stays dead');
+  const live = fieldsOf(h.tree).filter((n) => n.live);
+  assert.equal(live.length, 1, 'a fresh node is minted instead');
+  assert.notEqual(live[0].id, gone);
+  assert.equal(live[0].k, 'b');
+  assert.equal(h.vault.callsTo('read').length, 0, 'and the PNG is never decoded as text');
 });
 
 // ---------------------------------------------------------------- I1 guard

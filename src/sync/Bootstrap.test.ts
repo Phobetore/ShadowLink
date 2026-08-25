@@ -236,14 +236,25 @@ test('a path already declined is never offered for upload again', async () => {
   assert.deepEqual(result.buckets.upload, []);
 });
 
+// CHANGED IN P2-c. This test used to assert that `diagram.png` was NOT offered
+// for upload, because P1 shared markdown only and `classify` hardcoded
+// `validateRel(d, n, 'f')`. P2 shares attachments, so an image under the share is
+// now a `'b'` node the user is told about — dropping it on the floor is exactly
+// what spec §7.5 names as the bug this hardcoded kind caused. The refusal the
+// test is really about is still asserted, with a path P2 also refuses.
 test('a local file the path filter rejects is never offered for upload', async () => {
   const h = makeHarness();
-  h.vault.seed(`${SHARE}/diagram.png`, 'f', 'binary');       // §8: not markdown, out of scope
+  h.vault.seed(`${SHARE}/setup.exe`, 'f', 'MZ');             // §2.3: refused in both kinds
+  h.vault.seed(`${SHARE}/diagram.png`, 'f', 'binary');
   h.vault.seed(`${SHARE}/notes.md`, 'f', 'fine');
 
   const result = await h.boot.run();
 
-  assert.deepEqual(result.buckets.upload, [`${SHARE}/notes.md`]);
+  assert.deepEqual(
+    result.buckets.upload,
+    [`${SHARE}/diagram.png`, `${SHARE}/notes.md`],
+    'the attachment is classified with the tree kind its path derives, never as markdown',
+  );
 });
 
 // ================================================================ I3 — step 4

@@ -39,7 +39,9 @@ import {
   STAGING_DIR,
 } from '../tree/constants.ts';
 import { DIR_SENTINEL, deriveTree, type DerivedTree } from '../tree/TreeIndex.ts';
-import { fold, hashOf, isUnderDir, relPath, splitRel, validateRel } from '../tree/paths.ts';
+import {
+  fold, hashOf, isUnderDir, nodeKindOf, relPath, splitRel, validateRel,
+} from '../tree/paths.ts';
 import type { NodePatch, TreeDoc } from '../tree/TreeDoc.ts';
 import type { NodeFields, NodeKind } from '../tree/types.ts';
 import type { DeviceState } from './DeviceState.ts';
@@ -253,6 +255,16 @@ export class VaultWatcher {
    * Spec §4.1. A create is a claim that something exists at a path; the handler's
    * job is to make sure the tree agrees, which most of the time means doing
    * nothing at all.
+   *
+   * `kind` is Obsidian's DISK kind (`'f' | 'd'`), which is all Obsidian reports.
+   * The TREE kind is derived here, through `nodeKindOf` and nowhere else, so a
+   * `.png` becomes a `'b'` node and `Notes.MD` stays an `'f'` (spec §3.1).
+   *
+   * There is deliberately NO size check here. Obsidian fires `create` when a file
+   * APPEARS, not when it is complete, so a `stat` at this moment would refuse a
+   * file that is fine or mint a node for one that is not. Size is decided at
+   * publish, where the bytes have settled, and a permanent refusal is retracted
+   * (§3.2) rather than left as a ghost in every peer's Pending list.
    */
   async onCreate(path: string, kind: Kind): Promise<void> {
     if (this.shareRootGuard(path) === 'handled') return;
@@ -261,7 +273,9 @@ export class VaultWatcher {
       return;
     }
     const rel = this.toRel(path);
-    if (rel === null || !this.isSyncable(rel, kind)) return;
+    if (rel === null) return;
+    const nodeKind = nodeKindOf(rel, kind);
+    if (!this.isSyncable(rel, nodeKind)) return;
     if (this.deps.tickets.claim('create', path)) return;
     // I13. `declinedPaths` holds fold(VAULT path) — the key Deletions writes when
     // it rescues a file or when the user keeps their copies. Re-adopting one of
@@ -285,20 +299,21 @@ export class VaultWatcher {
     // exist so that an EMPTY folder can sync, nothing more. Minting one here is
     // how `ensureDirs`' echo (spec §4.2) turns into a permanent duplicate folder
     // node on every client once its ticket has expired.
-    if (kind === 'd' && idx.tree.wantAtFold.get(key) === DIR_SENTINEL) return;
+    if (nodeKind === 'd' && idx.tree.wantAtFold.get(key) === DIR_SENTINEL) return;
 
     const dead = idx.tree.deadByFoldRel.get(key);
-    if (dead !== undefined && await this.canResurrect(dead, path, kind)) {
+    if (dead !== undefined && await this.canResurrect(dead, path, nodeKind)) {
       this.resurrect(dead.nodeId, path);
       return;
     }
 
     const { d, n } = splitRel(rel);
-    const id = this.deps.tree.createNode({ k: kind, d, n }, this.nowFn());
+    const id = this.deps.tree.createNode({ k: nodeKind, d, n }, this.nowFn());
     this.bind(id, path);
-    if (kind === 'f') {
+    if (nodeKind !== 'd') {
       // I5: creator-ness is recorded HERE, in local state, and never in the tree.
-      // Exactly one client may ever seed a content doc.
+      // Exactly one client may ever seed a content doc, and only a node's creator
+      // may publish an attachment's FIRST version (I5a).
       this.deps.state.data.owned[id] = true;
       this.deps.enqueuePublish?.(id);
       this.persist();
@@ -320,13 +335,23 @@ export class VaultWatcher {
    * state a recreate passes through.
    */
   private async canResurrect(
-    dead: { nodeId: string; xa?: number; xh?: string },
+    dead: { nodeId: string; k: NodeKind; xa?: number; xh?: string },
     path: string,
-    kind: Kind,
+    kind: NodeKind,
   ): Promise<boolean> {
+    // §3.8: a dead `.md` never adopts a `.png`. `xh` is a hash of TEXT for a note
+    // and of RAW BYTES for an attachment, so a cross-kind reuse would bind a live
+    // node whose reference names entirely different content — and, through the
+    // zero-length escape below, would do it without comparing anything at all.
+    if (dead.k !== kind) return false;
     // A directory has no bytes to compare, so there is nothing to bound the reuse
     // with. A fresh dir node is free — directories carry no content and dedupe by
     // path (§1.4) — so the safe answer is always to mint one.
+    //
+    // An attachment is refused here for now: its arm of §3.8 compares RAW BYTES
+    // and has no zero-length escape, and it lands with the rest of the deletion
+    // work in P2-e. Refusing costs a fresh node and no content, because content
+    // addressing means the bytes are already in the store.
     if (kind !== 'f') return false;
     if (dead.xa === undefined) return false;
     if (this.nowFn() - dead.xa > RESURRECT_WINDOW_MS) return false;
@@ -382,7 +407,12 @@ export class VaultWatcher {
     const relOld = this.toRel(oldPath);
     const relNew = this.toRel(path);
     const was = relOld !== null;
-    const nowInside = relNew !== null && this.isSyncable(relNew, kind);
+    // The scope test uses the TREE kind (§3.6). Handing it Obsidian's disk kind
+    // asks `validateRel(d, n, 'f')`, which refuses every name that is not `.md` —
+    // so every attachment move INSIDE the share read as a drag-out and was
+    // misrouted to `queueUnshare`: a workspace-wide tombstone, or a silent undo of
+    // the user's own move. That is the most common attachment operation there is.
+    const nowInside = relNew !== null && this.isSyncable(relNew, nodeKindOf(relNew, kind));
 
     if (!was && !nowInside) return;
     if (!was) { await this.onCreate(path, kind); return; }
@@ -812,8 +842,15 @@ export class VaultWatcher {
     return segs.slice(depthOf(root)).join('/');
   }
 
-  /** §7's path filter, applied to a LOCAL path before it may become a node. */
-  private isSyncable(rel: string, kind: Kind): boolean {
+  /**
+   * §7's path filter, applied to a LOCAL path before it may become a node.
+   *
+   * The kind is the TREE kind, never the disk kind: `validateRel`'s rules differ
+   * per kind (an `'f'` must be `.md`, a `'b'` must have a short, non-`.md`,
+   * non-executable extension), so asking it about the wrong one refuses files that
+   * are perfectly shareable.
+   */
+  private isSyncable(rel: string, kind: NodeKind): boolean {
     const { d, n } = splitRel(rel);
     return validateRel(d, n, kind);
   }
