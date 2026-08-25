@@ -26,11 +26,29 @@ test('the per-file ceiling defers, and the memory cap refuses outright', () => {
   assert.equal(fetchVerdict(1_001, LIMITS, false, 0), 'tooLarge');
 });
 
+// Every comparison in the policy is `>`, so a file exactly at a ceiling is allowed.
+// There are THREE of them, and each line below is arranged so the ceiling its
+// message names is the only one that byte count can be sitting at: the other two
+// are pushed far out of reach. Turn any single `>` into `>=` and exactly one of
+// these three flips — which is the property the earlier version of this test
+// claimed and did not have, because two of its lines were the same call twice.
 test('a ceiling is inclusive: exactly at the limit still passes', () => {
-  assert.equal(fetchVerdict(100, LIMITS, false, 0), 'yes');
-  const wide = { ...LIMITS, autofetchMaxBytes: 1_000, sessionBudgetBytes: 1_000 };
-  assert.equal(fetchVerdict(1_000, wide, false, 0), 'yes', 'exactly the memory cap');
-  assert.equal(fetchVerdict(1_000, wide, false, 0), 'yes', 'and exactly the session budget');
+  // The auto-fetch ceiling: 100 is a tenth of the memory cap and a fifth of the
+  // budget, so `needsApproval` is the only verdict within reach of these bytes.
+  assert.equal(fetchVerdict(100, LIMITS, false, 0), 'yes', 'exactly the auto-fetch ceiling');
+
+  // The memory cap, tested first and here the only ceiling in play at all.
+  const atTheCap: FetchLimits = {
+    memoryCapBytes: 1_000, autofetchMaxBytes: 1e9, sessionBudgetBytes: 1e9,
+  };
+  assert.equal(fetchVerdict(1_000, atTheCap, false, 0), 'yes', 'exactly the memory cap');
+
+  // The session budget, filled in one go by a session that has spent nothing —
+  // the other half of the boundary the part-spent case below pins.
+  const atTheBudget: FetchLimits = {
+    memoryCapBytes: 1e9, autofetchMaxBytes: 1e9, sessionBudgetBytes: 500,
+  };
+  assert.equal(fetchVerdict(500, atTheBudget, false, 0), 'yes', 'exactly the session budget');
 });
 
 // The whole reason there are TWO gates. Four thousand files of one megabyte each
