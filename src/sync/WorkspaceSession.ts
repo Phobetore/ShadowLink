@@ -589,11 +589,17 @@ export class WorkspaceSession {
 // ============================================================ real ports
 
 /**
- * The P0 `Compartment` approach, unchanged, behind `EditorBinding`.
+ * The `Compartment` approach behind `EditorBinding`.
  *
  * `editorExtension()` must be registered exactly ONCE, via
  * `plugin.registerEditorExtension`. The compartment is then reconfigured in
  * place, which is what makes a rename of an open note invisible to the editor.
+ *
+ * This carried the P0 implementation unchanged until 2026-08-25, which is when
+ * it turned out that reconfiguring the compartment is not a mount: it binds a
+ * `Y.Text` into whatever document the editor happens to hold, and
+ * `y-codemirror.next` will not reconcile the two for you. `mount` below now
+ * establishes that equality itself, and reports honestly when it cannot.
  */
 export class CodeMirrorBinding implements EditorBinding {
   private readonly compartment = new Compartment();
