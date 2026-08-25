@@ -71,6 +71,11 @@ const MAX_NAMED = 3;
  * @param unavailable  bytes the workspace store no longer holds (§6.5).
  * @param memoryCapBytes  the cap `tooLarge` was measured against, so §7.5's
  *                  "naming the file, its size and the cap" can be honoured.
+ * @param uncheckable  local files this device cannot hash (§7.4's other half).
+ *                  TOOLTIP ONLY, and deliberately absent from the visible count:
+ *                  the count is already three segments long and this bucket is
+ *                  rarer than all three. It is also the one bucket where nothing
+ *                  is missing, so a count would overstate it.
  */
 export function syncedStatus(
   shareRoot: string,
@@ -78,8 +83,10 @@ export function syncedStatus(
   tooLarge: readonly NamedAttachment[] = [],
   unavailable: readonly NamedAttachment[] = [],
   memoryCapBytes?: number,
+  uncheckable: readonly NamedAttachment[] = [],
 ): StatusLine {
-  if (deferred.length === 0 && tooLarge.length === 0 && unavailable.length === 0) {
+  if (deferred.length === 0 && tooLarge.length === 0
+      && unavailable.length === 0 && uncheckable.length === 0) {
     return { text: 'ShadowLink: synced', tooltip: `Sharing ${shareRoot}` };
   }
 
@@ -97,8 +104,15 @@ export function syncedStatus(
   if (tooLarge.length > 0) counts.push(`${tooLarge.length} too large for this device`);
   if (unavailable.length > 0) counts.push(`${unavailable.length} unavailable`);
   lines.push(...unfetchableLines(shareRoot, tooLarge, unavailable, memoryCapBytes));
+  const local = uncheckableLine(shareRoot, uncheckable, memoryCapBytes);
+  if (local !== null) lines.push(local);
 
-  return { text: `ShadowLink: synced · ${counts.join(' · ')}`, tooltip: lines.join('\n') };
+  // No count segment for `uncheckable`, so a share where it is the only thing
+  // outstanding reads as plainly synced — which it is. Nothing is missing there.
+  const text = counts.length === 0
+    ? 'ShadowLink: synced'
+    : `ShadowLink: synced · ${counts.join(' · ')}`;
+  return { text, tooltip: lines.join('\n') };
 }
 
 /**
@@ -124,11 +138,20 @@ export function nothingToDownload(
   tooLarge: readonly NamedAttachment[],
   unavailable: readonly NamedAttachment[],
   memoryCapBytes?: number,
+  uncheckable: readonly NamedAttachment[] = [],
 ): string {
   const lines = unfetchableLines(shareRoot, tooLarge, unavailable, memoryCapBytes);
+  // NOT one of the lines above, and this is the whole reason it is a separate
+  // function. Those two are "this version is not on this disk", so they turn the
+  // answer into "nothing here can be downloaded". This one is a file that IS
+  // here — "already downloaded" stays true, and the consequence the user cannot
+  // otherwise learn is appended to it rather than contradicting it.
+  const local = uncheckableLine(shareRoot, uncheckable, memoryCapBytes);
   if (lines.length === 0) {
-    return `ShadowLink: every attachment in ${where} is already downloaded.`;
+    const head = `ShadowLink: every attachment in ${where} is already downloaded.`;
+    return local === null ? head : `${head} ${local}`;
   }
+  if (local !== null) lines.push(local);
   return `ShadowLink: nothing in ${where} can be downloaded here. ${lines.join(' ')}`;
 }
 
@@ -163,6 +186,36 @@ function unfetchableLines(
     );
   }
   return out;
+}
+
+/**
+ * The bucket where the bytes ARE here, as one sentence (§7.4, §7.5).
+ *
+ * Separate from the two above because it is the opposite claim, and three things
+ * about the wording are load-bearing rather than stylistic:
+ *
+ *  - It must not say the file CHANGED. The branch it reports never computed a
+ *    hash — that is the entire condition — and it fires just as readily for a file
+ *    nobody has touched since it arrived.
+ *  - It must not send the user to the download command. The file is on the disk;
+ *    that command would correctly answer "already downloaded" and read as a
+ *    contradiction.
+ *  - It must say the consequence, because nothing else on any surface does: an
+ *    edit made here cannot be detected, so it would not be shared.
+ *
+ * `bytes` is the size on THIS disk, which is what the stated limit is about.
+ */
+function uncheckableLine(
+  shareRoot: string,
+  uncheckable: readonly NamedAttachment[],
+  memoryCapBytes?: number,
+): string | null {
+  if (uncheckable.length === 0) return null;
+  const cap = memoryCapBytes === undefined ? '' : ` (limit ${formatBytes(memoryCapBytes)})`;
+  return `${uncheckable.length} attachment(s) here are too large for this device to `
+    + `check${cap}: ${sample(shareRoot, uncheckable)}. They are on this disk and nothing `
+    + 'is missing for anybody else, but a change to one cannot be detected here, so it '
+    + 'would not be shared.';
 }
 
 /**

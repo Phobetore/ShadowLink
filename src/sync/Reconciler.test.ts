@@ -4192,3 +4192,104 @@ test('the hash memo does not survive a restart, and no part of it is persisted',
     'a restart looks at the files again rather than trusting a cache it cannot check',
   );
 });
+
+// ----------------------------------- §7.5: a local file this device cannot check
+
+/**
+ * ⚠ THE FOURTH STATE, and the only one no surface had a word for.
+ *
+ * `tooLarge` has three writers and they do not mean the same thing. `mayFetch`
+ * means "the bytes are not on this disk" — which is why `fetchTooLarge` was split
+ * out of it, so the status bar would stop calling a downloaded attachment
+ * missing. The other two, here and in `adoptBlob`, mean the opposite: the file IS
+ * on this disk, complete, and only this device's QUESTION about it is unanswered.
+ *
+ * That state is not harmless and it was completely silent. The pass reaches no
+ * verdict, so an edit to the file is never noticed and never published, and
+ * nothing anywhere says so — not a notice, not the status bar, not the download
+ * command, which would be the wrong place anyway because there is nothing to
+ * download.
+ */
+test('a local attachment this device cannot hash is reported apart from the missing ones', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 32 });
+  h.vault.seed(SHARE, 'd');
+  const onDisk = png(3, 512);
+  const sha = await h.blobs.seed(png(4, 512));                  // the tree names something else
+  const id = nid('A');
+  const path = await bindBlob(h, id, 'clip.mov', onDisk, { sha256: sha, bytes: 512, parent: null });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(r.failures, [], 'this is a fact about the device, not an error');
+  assert.deepEqual(
+    r.diagnostics.localTooLarge, [{ id, bytes: onDisk.length }],
+    'the LOCAL size, not the tree\'s: they describe different versions of the file',
+  );
+  assert.deepEqual(r.diagnostics.tooLarge, [id], 'and the old channel is unchanged');
+  assert.deepEqual(
+    r.diagnostics.fetchTooLarge, [],
+    'reporting this as missing is the exact error fetchTooLarge was split out to avoid',
+  );
+  assert.deepEqual(h.reconciler.tooLargeAttachments, [], 'so no "not downloaded" list names it');
+  assert.deepEqual(h.reconciler.uncheckableAttachments, [{
+    id, path, sha256: sha, bytes: onDisk.length,
+  }]);
+  assert.deepEqual(
+    h.vault.binarySnapshot()[path], onDisk,
+    'and the user\'s file is exactly where they left it',
+  );
+});
+
+// The `adoptBlob` arm of the same thing: an unbound local file the device cannot
+// hash. A memo cannot help here and neither can a download — the bytes are here,
+// and the only missing thing is this device's ability to look at them.
+test('an unbound local attachment over the cap is reported the same way', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 32 });
+  h.vault.seed(SHARE, 'd');
+  const theirs = png(5, 16);                                    // small: the FETCH is fine
+  const theirsSha = await h.blobs.seed(theirs);
+  const id = nid('A');
+  const path = `${SHARE}/clip.mov`;
+  h.nodes.set(id, blob('', 'clip.mov', `${theirsSha}:${theirs.length}:-`));
+  const mine = png(6, 512);
+  h.vault.seedBinary(path, mine);
+
+  // A first pass with nothing bound is exactly the shape `mountMismatch` reads as
+  // a wrong mount, and a refused pass reports zero of everything — which looks
+  // identical to "nothing to report" unless `ran` is checked.
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.equal(r.ran, true, r.refusedReason);
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(r.diagnostics.localTooLarge, [{ id, bytes: mine.length }]);
+  assert.deepEqual(r.diagnostics.tooLarge, [id]);
+  assert.deepEqual(r.diagnostics.fetchTooLarge, [], 'nothing here is a refused download');
+  assert.equal(h.state.data.materialized[id], undefined, 'nothing was bound');
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'and nothing was touched');
+});
+
+// It is a PASSIVE surface, deliberately. The condition lasts as long as the file
+// and the device do, so a notice would be a notice every pass for ever — which is
+// how a user learns to dismiss notices without reading them.
+test('the uncheckable bucket is re-derived every pass and never becomes a notice', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 32 });
+  h.vault.seed(SHARE, 'd');
+  const sha = await h.blobs.seed(png(4, 512));
+  const id = nid('A');
+  await bindBlob(h, id, 'clip.mov', png(3, 512), { sha256: sha, bytes: 512, parent: null });
+
+  for (let pass = 0; pass < 5; pass++) {
+    const r = await h.reconciler.reconcile('sync');
+    assert.equal(r.ran, true, `pass ${pass} did not run: ${r.refusedReason}`);
+    assert.deepEqual(r.diagnostics.localTooLarge, [{ id, bytes: 512 }], `pass ${pass}`);
+    assert.equal(h.reconciler.uncheckableAttachments.length, 1, `pass ${pass}`);
+  }
+  assert.deepEqual(h.notices, [], 'five passes and not one popup');
+
+  // And it stops being reported the moment it stops being true.
+  h.nodes.delete(id);
+  const r = await h.reconciler.reconcile('sync');
+  assert.deepEqual(r.diagnostics.localTooLarge, []);
+  assert.deepEqual(h.reconciler.uncheckableAttachments, []);
+});

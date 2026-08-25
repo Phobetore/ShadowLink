@@ -178,3 +178,111 @@ test('no download command claims an attachment is downloaded on its own authorit
   );
   assert.match(MAIN, /nothingToDownload\(/, 'and main.ts has to actually call it');
 });
+
+// -------------------------------------------- §7.5: "on this disk, but unchecked"
+
+const UNCHECKABLE = [{ path: 'Shared/clip.mov', bytes: 220 * 1024 * 1024 }];
+
+/**
+ * ⚠ THE FOURTH BUCKET, and the one rule that makes it different from the other
+ * three: the bytes ARE here.
+ *
+ * Every other refusal on this page means "this version is not on this disk", so
+ * they belong in the visible count and in the download command's answer. This one
+ * means "the file is here and this device cannot look at it", which has three
+ * consequences for the wording and each of them is a separate way to get it wrong:
+ *
+ *  - It must NOT claim the file changed. The branch never computed a hash, and it
+ *    fires just as readily for a file nobody has touched since it arrived.
+ *  - It must NOT send the user to the download command. There is nothing to
+ *    download, and a command that answers "already downloaded" would be right.
+ *  - It must say what the actual consequence is, which no other bucket has: a
+ *    change made here cannot be detected, so it would not be shared.
+ */
+test('an unchecked local attachment is a tooltip line and never a visible count', () => {
+  const line = syncedStatus('Shared', [], [], [], 100 * 1024 * 1024, UNCHECKABLE);
+
+  assert.equal(
+    line.text, 'ShadowLink: synced',
+    'the count is already three segments long and this bucket is rarer than all three',
+  );
+  assert.match(line.tooltip, /clip\.mov/);
+  assert.match(line.tooltip, /too large for this device to check/);
+  assert.match(line.tooltip, /limit 100 MB/);
+  assert.match(line.tooltip, /on this disk/);
+  assert.match(line.tooltip, /nothing is missing for anybody else/);
+  assert.match(line.tooltip, /would not be shared/);
+  assert.doesNotMatch(
+    line.tooltip, /changed/,
+    'the branch never computed a hash: it cannot know whether anything changed',
+  );
+  assert.doesNotMatch(
+    line.tooltip, /Download attachments/,
+    'the file is here — a download command has nothing to fetch and would say so',
+  );
+});
+
+// It rides alongside the other three rather than replacing any of them: a share
+// can easily be in all four states at once, and each has a different remedy.
+test('the unchecked bucket is added to the tooltip without disturbing the three counts', () => {
+  const line = syncedStatus(
+    'Shared',
+    [{ bytes: 1024 }],
+    [{ path: 'Shared/big.mov', bytes: 300 * 1024 * 1024 }],
+    [{ path: 'Shared/gone.png', bytes: 2048 }],
+    100 * 1024 * 1024,
+    UNCHECKABLE,
+  );
+
+  assert.equal(
+    line.text,
+    'ShadowLink: synced · 1 attachment(s) available · 1 too large for this device · 1 unavailable',
+  );
+  assert.match(line.tooltip, /clip\.mov/, 'and the fourth still reaches the tooltip');
+  assert.match(line.tooltip, /big\.mov/);
+  assert.match(line.tooltip, /gone\.png/);
+});
+
+/**
+ * ⚠ And the reason this bucket is NOT folded into `unfetchableLines`.
+ *
+ * "Nothing in this note can be downloaded here" would be false: everything in it
+ * already is. The honest answer is the one the command has always given, with the
+ * consequence the user cannot otherwise learn appended to it.
+ */
+test('a download command with only unchecked attachments still says everything is downloaded', () => {
+  const answer = nothingToDownload('Shared', 'this note', [], [], 100 * 1024 * 1024, UNCHECKABLE);
+
+  assert.match(answer, /every attachment in this note is already downloaded/);
+  assert.match(answer, /clip\.mov/);
+  assert.match(answer, /too large for this device to check/);
+  assert.doesNotMatch(answer, /nothing in this note can be downloaded/);
+  assert.doesNotMatch(answer, /changed/);
+});
+
+test('a download command that really can fetch nothing still reports the unchecked ones', () => {
+  const answer = nothingToDownload(
+    'Shared', 'this workspace',
+    [{ path: 'Shared/big.mov', bytes: 300 * 1024 * 1024 }],
+    [],
+    100 * 1024 * 1024,
+    UNCHECKABLE,
+  );
+
+  assert.match(answer, /nothing in this workspace can be downloaded here/);
+  assert.match(answer, /big\.mov/);
+  assert.match(answer, /clip\.mov/);
+});
+
+// The whole bucket is optional at the type level, exactly like the other two, so
+// forgetting to pass it is not a type error — it is a silence that reads as
+// "everything here is fine". Same failure, same guard.
+test('main.ts hands the unchecked bucket to both surfaces', () => {
+  const start = MAIN.indexOf('syncedStatus(');
+  assert.notEqual(start, -1, 'main.ts no longer calls syncedStatus');
+  assert.match(
+    MAIN.slice(start, MAIN.indexOf(');', start)), /uncheckableAttachments/,
+    '§7.5\'s local half would otherwise reach no surface at all',
+  );
+  assert.match(MAIN, /uncheckableAttachments/, 'and the reconciler getter has to be read');
+});

@@ -692,12 +692,19 @@ class SyncRuntime {
     // file that is not on this disk exactly as §7.2's does, so a status bar
     // counting only `deferred` says "synced" beside it — the same falsehood,
     // now about the one bucket the user can do nothing about.
+    //
+    // FOUR buckets into the call and three into the visible count. §7.4's local
+    // half — a file that IS on this disk and that this device cannot hash — has no
+    // remedy, nothing to download, and no honest place in a count of what is
+    // outstanding, because nothing about it is outstanding for anybody else. It
+    // reaches the tooltip and stops there.
     return syncedStatus(
       this.shareRoot,
       this.reconciler.deferredAttachments,
       this.reconciler.tooLargeAttachments,
       this.reconciler.unavailableAttachments,
       blobMemoryCap(),
+      this.reconciler.uncheckableAttachments,
     );
   }
 
@@ -721,6 +728,19 @@ class SyncRuntime {
 
   get unavailableAttachments(): readonly DeferredAttachment[] {
     return this.reconciler.unavailableAttachments;
+  }
+
+  /**
+   * The bucket that is not a download at all (§7.4's local half).
+   *
+   * These files are on this disk. What is missing is this device's ability to
+   * hash them, so a change made here cannot be detected and would not be shared —
+   * and no command can fix that. It is threaded to the same surfaces as the other
+   * three purely so the user is told once, passively, in the place they already
+   * look.
+   */
+  get uncheckableAttachments(): readonly DeferredAttachment[] {
+    return this.reconciler.uncheckableAttachments;
   }
 
   /**
@@ -783,6 +803,7 @@ class SyncRuntime {
       'this workspace',
       this.reconciler.tooLargeAttachments,
       this.reconciler.unavailableAttachments,
+      this.reconciler.uncheckableAttachments,
     );
   }
 
@@ -792,6 +813,7 @@ class SyncRuntime {
       'this note',
       this.inNote(path, this.reconciler.tooLargeAttachments),
       this.inNote(path, this.reconciler.unavailableAttachments),
+      this.inNote(path, this.reconciler.uncheckableAttachments),
     );
   }
 
@@ -799,8 +821,11 @@ class SyncRuntime {
     where: string,
     tooLarge: readonly DeferredAttachment[],
     unavailable: readonly DeferredAttachment[],
+    uncheckable: readonly DeferredAttachment[],
   ): string {
-    return nothingToDownload(this.shareRoot, where, tooLarge, unavailable, blobMemoryCap());
+    return nothingToDownload(
+      this.shareRoot, where, tooLarge, unavailable, blobMemoryCap(), uncheckable,
+    );
   }
 
   /**
@@ -810,7 +835,9 @@ class SyncRuntime {
    * or not it resolves — and for an attachment that is not here it never resolves,
    * because there is deliberately nothing on disk to resolve to. That is why the
    * match runs against a list of paths rather than against a `TFile`, and it is why
-   * the same routine serves all three buckets: none of them has a file to look at.
+   * the same routine serves every bucket: three of the four have no file to look
+   * at, and the fourth — a local file this device cannot hash — has one that
+   * resolves perfectly well, so matching on the link text works for both.
    */
   private inNote(path: string, entries: readonly DeferredAttachment[]): DeferredAttachment[] {
     if (entries.length === 0) return [];

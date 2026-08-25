@@ -191,6 +191,13 @@ release, not hypothetical ones.
   so. If that attachment was already shared, only the new bytes are refused and the
   version everybody has stays shared. The 100 MB and 32 MB figures are compiled in;
   there is no setting for them.
+
+  A file already sitting in the shared folder that is past the ceiling is the
+  quiet version of the same thing. It stays where it is and everybody who has it
+  keeps it, but this device cannot hash it, so it cannot tell whether you have
+  changed it — and a change it cannot see is a change it does not share. The
+  status bar's tooltip lists those files. There is no notice and nothing to press,
+  because nothing is missing: open them on a device with more memory.
 - **Some files are never shared, and nothing says so.** A file with no extension,
   one whose extension runs past 16 characters, and anything ending `.exe`, `.dll`,
   `.so`, `.dylib`, `.msi`, `.bat`, `.cmd`, `.com`, `.scr`, `.ps1`, `.vbs`, `.jar`,

@@ -83,6 +83,27 @@ export interface ReconcileDiagnostics {
    */
   fetchTooLarge: string[];
   /**
+   * The OTHER subset of `tooLarge`: a LOCAL file this device cannot hash (§7.4).
+   *
+   * A FIFTH channel, for the same reason `fetchTooLarge` is a fourth. The two
+   * writers here — step 2.5's re-hash and `adoptBlob`'s — fire for a file that is
+   * on this disk and complete, where only this device's question about it is
+   * unanswered. That is the opposite of "the bytes are not here", and the three
+   * buckets the UI already had have no line for it.
+   *
+   * It is not harmless and it was completely silent: no verdict is reached, so an
+   * edit to that file is never noticed and never published, and nothing said so.
+   * There is nothing to download and no button that could help — the remedy is a
+   * device with more memory — so it is a passive line and never a notice.
+   *
+   * The only channel of the five carrying a SIZE, and it carries the local file's
+   * rather than the tree's, because the two describe different versions of the
+   * file: a 200 MB local recording under a node whose published version is 2 MB is
+   * exactly the shape this fires for, and naming the 2 MB beside "too large to
+   * check" would be its own small lie.
+   */
+  localTooLarge: Array<{ id: string; bytes: number }>;
+  /**
    * Attachment nodes the fetch policy has not cleared yet (§7.2).
    *
    * Usually there is NOTHING on disk for them — no file, no placeholder, no stub,
@@ -507,6 +528,11 @@ export class Reconciler {
    */
   private lastTooLarge: DeferredAttachment[] = [];
   private lastUnavailable: DeferredAttachment[] = [];
+  /**
+   * §7.5's local half: files that ARE on this disk and that this device cannot
+   * hash. `bytes` is what the disk reported, not what the tree names.
+   */
+  private lastUncheckable: DeferredAttachment[] = [];
 
   constructor(deps: ReconcilerDeps) {
     this.deps = deps;
@@ -559,6 +585,22 @@ export class Reconciler {
    */
   get tooLargeAttachments(): readonly DeferredAttachment[] {
     return this.lastTooLarge;
+  }
+
+  /**
+   * Every attachment whose LOCAL file this device cannot hash (§7.4, §7.5).
+   *
+   * The opposite of the bucket above, and the reason it is its own list: the file
+   * is on this disk, complete, and nothing is missing for anybody. What is missing
+   * is this device's ability to look at it — so a change made here cannot be
+   * detected, and would not be shared. There is nothing to download, which is why
+   * no download command may offer to.
+   *
+   * `bytes` is the size on THIS disk, so it can be compared against the cap the
+   * surface names. The tree's number describes a different version of the file.
+   */
+  get uncheckableAttachments(): readonly DeferredAttachment[] {
+    return this.lastUncheckable;
   }
 
   /**
@@ -643,7 +685,7 @@ export class Reconciler {
     const failures: ReconcileFailure[] = [];
     const diagnostics: ReconcileDiagnostics = {
       pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
-      unavailable: [], rehashDeferred: [], fetchTooLarge: [],
+      unavailable: [], rehashDeferred: [], fetchTooLarge: [], localTooLarge: [],
     };
     // Stays null until bindings have been observed, so a refusal partway through
     // cannot let the `finally` block rebuild `materialized` from an empty map.
@@ -1188,6 +1230,9 @@ export class Reconciler {
     if (memo !== null) return memo;
     if (st.bytes > this.memoryCapBytes()) {
       ctx.diagnostics.tooLarge.push(id);
+      // ...and again in the channel that means "the file IS here". The old push
+      // stays exactly as it was, so nothing reading it changes.
+      ctx.diagnostics.localTooLarge.push({ id, bytes: st.bytes });
       return null;
     }
     const urgent = ctx.dirtyPaths.has(fold(path));
@@ -1489,6 +1534,13 @@ export class Reconciler {
     // here", and only the first has a remedy on this device.
     this.lastTooLarge = this.describe(ctx, ctx.diagnostics.fetchTooLarge);
     this.lastUnavailable = this.describe(ctx, ctx.diagnostics.unavailable);
+    // §7.5's LOCAL half, and the size comes from the disk rather than from the
+    // tree: the file this bucket is about is not the version the tree names.
+    this.lastUncheckable = this.describe(
+      ctx,
+      ctx.diagnostics.localTooLarge.map((e) => e.id),
+      new Map(ctx.diagnostics.localTooLarge.map((e) => [e.id, e.bytes])),
+    );
   }
 
   /**
@@ -1502,7 +1554,15 @@ export class Reconciler {
    * Rebuilt from scratch every pass and never accumulated, because a list still
    * counting what stopped being outstanding last week is worse than no list.
    */
-  private describe(ctx: PassContext, ids: readonly string[]): DeferredAttachment[] {
+  private describe(
+    ctx: PassContext,
+    ids: readonly string[],
+    /**
+     * Sizes measured on THIS disk, for the one bucket that is about the local
+     * file rather than about the version the tree names (§7.5).
+     */
+    localBytes?: ReadonlyMap<string, number>,
+  ): DeferredAttachment[] {
     const seen = new Set<string>();
     const out: DeferredAttachment[] = [];
     for (const id of ids) {
@@ -1511,7 +1571,7 @@ export class Reconciler {
       const ref = ctx.blobRefs.get(id);
       const want = ctx.desired.get(id);
       if (ref === undefined || want === undefined) continue;
-      out.push({ id, path: want.path, sha256: ref.sha256, bytes: ref.bytes });
+      out.push({ id, path: want.path, sha256: ref.sha256, bytes: localBytes?.get(id) ?? ref.bytes });
     }
     out.sort((a, b) => cmp(a.path, b.path));
     return out;
@@ -1659,6 +1719,7 @@ export class Reconciler {
         // binding (which would claim bytes we never compared), and no fork.
         if (st.bytes > this.memoryCapBytes()) {
           ctx.diagnostics.tooLarge.push(id);
+          ctx.diagnostics.localTooLarge.push({ id, bytes: st.bytes });
           return;
         }
         local = await hashOfBytes(await this.deps.vault.readBinary(path));
@@ -2274,7 +2335,7 @@ function refused(reason: string): ReconcileResult {
     failures: [],
     diagnostics: {
       pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
-      unavailable: [], rehashDeferred: [], fetchTooLarge: [],
+      unavailable: [], rehashDeferred: [], fetchTooLarge: [], localTooLarge: [],
     },
   };
 }
