@@ -117,7 +117,7 @@ no network.
 
 The consequence worth knowing up front is that attachments do not *merge*. If two
 people replace the same attachment at once — or if ShadowLink cannot tell whose
-version came first — the one that lands second in the tree keeps the name, and the
+version came first — the one that lands last in the tree keeps the name, and the
 other person's copy is renamed beside it to
 `diagram (conflicted copy — Ann, a71c4013).png` and shared under that name.
 Everybody ends up with both files and nobody loses bytes, but nobody gets one
@@ -183,9 +183,10 @@ release, not hypothetical ones.
   and **32 MB on a phone** — a screen recording made on that phone is over it
   immediately. This is not the deferral above and no button lifts it: the whole
   file has to fit in memory to be hashed and verified, in both directions, so a
-  device will neither publish nor download anything past its own ceiling. Your
-  server has a ceiling of its own (`MAX_FILE_SIZE_MB`, 100 MB by default) and the
-  lower of the two decides. Nothing is destroyed when this happens — the file stays
+  device will neither publish nor download anything past its own ceiling. Sharing
+  has a second ceiling on top of that — your server's `MAX_FILE_SIZE_MB`, 100 MB by
+  default — and the lower of the two decides what can be published. Nothing is
+  destroyed when this happens — the file stays
   exactly where you put it, it is simply not shared, and you get one notice saying
   so. If that attachment was already shared, only the new bytes are refused and the
   version everybody has stays shared. The 100 MB and 32 MB figures are compiled in;
@@ -205,12 +206,15 @@ release, not hypothetical ones.
 - **Unopened notes go stale.** A *note's* content is fetched once, when it appears.
   Until somebody opens it, later edits are not written to that peer's disk — so
   Obsidian search, `git` and any external tool can read out-of-date bytes.
-  Attachments are not affected: their bytes are re-checked on every pass.
+  Attachments are not affected: every pass checks whether each one is still
+  current, though on a cold share the re-hashing that needs is spread over several
+  passes rather than done all at once.
 - **The server keeps attachment bytes nothing references any more.** Deleting a
   file never deletes its bytes from the server, deliberately — that is what makes
-  undelete and restore work at all. Reclaiming that space is a command a
-  self-hoster runs (`server/tools/sweep-blobs.mjs`), never something the server
-  decides on its own.
+  undelete and restore work at all. Reclaiming that space is a tool a self-hoster
+  runs by hand (`server/tools/sweep-blobs.mjs`), never something the server decides
+  on its own — and it takes two runs a grace period apart, because the first only
+  moves the bytes aside.
 - **One shared folder per vault.**
 - **One shared key per server.** Anyone holding it can join any workspace on that
   server. No invitations, no per-member permissions, no read-only members yet.
@@ -225,7 +229,7 @@ release, not hypothetical ones.
 - **When two notes end up with the same name**, one keeps it and the other gains a
   ` (2)` suffix. Which one wins is arbitrary — but identical for everybody.
 - **Two people replacing one attachment produce two files, not one.** Notes merge;
-  attachments do not. The version that lands second in the tree keeps the name, and
+  attachments do not. The version that lands last in the tree keeps the name, and
   the loser's copy is renamed to
   `diagram (conflicted copy — Ann, a71c4013).png` and shared under that name, so
   everybody ends up with both and can see whose is whose. Because `.canvas` is a
