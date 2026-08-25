@@ -1,124 +1,354 @@
 // src/sync/wiring.test.ts
-// The plugin entry point is not testable headlessly — it imports `obsidian` — so
-// the one thing that can go wrong there and nowhere else is checked by reading it.
+// The handful of things `main.ts` must get right that a type cannot express.
 //
-// What can go wrong is always the same shape: an OPTIONAL dependency that is not
-// passed. Every collaborator below takes its ports and its platform numbers as
-// optional constructor arguments, because that is what makes the engine testable
-// against fakes with no Obsidian in sight. The cost of that choice is that
-// forgetting one is not a type error and not a test failure — it is a silently
-// different default, in production only, on a code path nobody exercises until a
-// user's attachment is involved:
+// This file used to be three times as long, because every platform number the
+// engine reads was an OPTIONAL constructor argument standing in front of a
+// `?? DESKTOP_CONSTANT` fallback. Forgetting one was then invisible in exactly
+// the way that matters: production quietly took the desktop value, every test
+// stayed green, and a phone got a 100 MB memory cap it cannot honour. The only
+// guard available was to read `main.ts` as text and check the argument was
+// spelled somewhere inside each `new X({ … })`.
 //
-//  * `Deletions` without `blobs` cannot ask the store whether an attachment's
-//    bytes still exist, so §5.1's `proven` check answers "I could not ask" for
-//    every attachment and every remote tombstone RESCUES — filling
-//    `ShadowLink Recovered/` with 200 MB files instead of deleting anything. Safe,
-//    and completely wrong.
-//  * `Reconciler` without the fetch-policy numbers falls back to the DESKTOP
-//    constants, so a phone downloads with a 10 MB per-file ceiling and a 512 MB
-//    session budget — the two numbers §7.2 lowered specifically for phones.
-//  * `Bootstrap` without them splits its download counts on a different rule from
-//    the one the pass applies, and the first-sync modal becomes a guess.
+// `memoryCapBytes`, `rehashBudgetBytes`, `autofetchMaxBytes` and
+// `sessionBudgetBytes` are now REQUIRED on every deps interface that declares
+// them, with no fallback behind them, so omitting one is a compile error. Every
+// assertion that only checked an argument was PRESENT is therefore gone, and so
+// are two others:
 //
-// These are deliberately assertions about ARGUMENTS BEING PASSED, not about what
-// they evaluate to: the values themselves are covered by the engine's own tests,
-// and a guard that re-asserted them here would just be a second copy of the
-// spec's constants table.
+//  * `Deletions` being handed `blobs`. Its headline claim — that a deletion pass
+//    without the store rescues every attachment for ever — was simply untrue:
+//    `isProvenBlob` reads `ctx.blobs ?? deps.blobs`, `DeletionContext.blobs` is
+//    required, and the reconciler fills it from its own required `blobs`. The
+//    compiler already guaranteed it. `PublishQueue` and `Reconciler` declare
+//    `blobs` required outright.
+//  * the ban on handing a collaborator a server ceiling under a name like
+//    `maxFileBytes`. None of these deps interfaces declares such a property, and
+//    an unknown property on a fresh object literal is an excess-property error —
+//    which TypeScript still reports when the literal also contains a spread.
+//
+// What survives is the part types cannot reach, and it is all about VALUES,
+// CALLS and REGISTRATIONS rather than about arguments existing:
+//
+//  * `memoryCapBytes: () => (await blobs.limits()).maxFileBytes` type-checks
+//    perfectly and is the §7.4 bug wearing a new hat — the memory cap is a fact
+//    about the DEVICE and must not move when the network does.
+//  * a platform helper that stopped branching on `Platform.isMobile` hands a
+//    phone the desktop ceiling, and is still a `() => number`.
+//  * a command that is never registered is a feature nobody can find.
+//  * an ORDER inside one method: approve, persist, then run a pass.
+//  * a method that must be REACHED from `start()`; defining it is not calling it.
+//
+// All of those read `main.ts` as text, so the reader is the first thing in this
+// file and the most carefully tested thing in it. The one it replaces counted
+// braces with no idea what a string was, and a stray `}` in a string ended a
+// block early while a stray `{` ran it PAST its own end into the next block —
+// where, since every constructor passes the same argument names, a deleted
+// argument would still have asserted green. A guard that fails closed is noisy.
+// A guard that fails open is worse than no guard at all.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const MAIN = readFileSync(fileURLToPath(new URL('../../main.ts', import.meta.url)), 'utf8');
+// Line endings normalized on the way in: this repository is CRLF, and an anchor
+// written with `\n` that silently matches nothing would be a guard that passes
+// because it never looked.
+const MAIN = readFileSync(fileURLToPath(new URL('../../main.ts', import.meta.url)), 'utf8')
+  .replace(/\r\n/g, '\n');
 
-/**
- * The `{ … }` literal handed to `new <name>(`, by brace balance.
- *
- * Balance rather than a regex, because every one of these blocks contains nested
- * objects, arrow functions and braces inside template strings; a lazy match would
- * stop at the first `}` and quietly assert against a fragment.
- */
-function constructorArgs(name: string): string {
-  return balancedFrom(`new ${name}({`, `main.ts no longer constructs ${name}`);
+// ============================================================ the reader
+
+interface Views {
+  /**
+   * Comments blanked, string and template CONTENTS intact.
+   *
+   * Searched by every assertion that looks for a literal, so a sentence in a
+   * comment can never be what satisfies it — the prose in this file mentions
+   * most of the identifiers it guards.
+   */
+  code: string;
+  /**
+   * Comments blanked AND the contents of strings, template text and regexes
+   * blanked with them, so brace balancing sees nothing but code.
+   *
+   * A template SUBSTITUTION is code and stays code, braces and all.
+   */
+  skeleton: string;
 }
 
-function balancedFrom(anchor: string, missing: string): string {
-  const start = MAIN.indexOf(anchor);
+/**
+ * Characters after which a `/` opens a regex rather than divides.
+ *
+ * Deliberately conservative: reading a division as a regex blanks code and ends
+ * in an unbalanced-braces throw, which is loud. Reading a regex as a division
+ * leaves its braces counted, which is the failure this reader exists to remove.
+ */
+const BEFORE_REGEX = new Set([
+  '', '(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '^', '<', '>',
+]);
+
+/**
+ * `src` twice over, each the same length as the original so an index into one is
+ * an index into the other.
+ *
+ * Blanking rather than deleting is the whole trick: a slice taken at a skeleton
+ * offset can be read back out of the real source, comments and strings and all.
+ */
+function readable(src: string): Views {
+  const code = [...src];
+  const skeleton = [...src];
+  const blank = (target: string[], at: number): void => {
+    const ch = src[at];
+    if (ch !== '\n' && ch !== '\r') target[at] = ' ';
+  };
+  const blankBoth = (at: number): void => { blank(code, at); blank(skeleton, at); };
+
+  // 'brace' is an ordinary block; 'subst' is a `${` inside a template, and
+  // popping one is what returns the scanner to template text.
+  const opened: Array<'brace' | 'subst'> = [];
+  let mode: 'code' | 'template' = 'code';
+  let previous = '';
+  let i = 0;
+
+  while (i < src.length) {
+    if (mode === 'template') {
+      if (src[i] === '\\') { blank(skeleton, i); blank(skeleton, i + 1); i += 2; continue; }
+      if (src[i] === '`') { i += 1; mode = 'code'; previous = '`'; continue; }
+      if (src[i] === '$' && src[i + 1] === '{') {
+        opened.push('subst');
+        i += 2;
+        mode = 'code';
+        previous = '{';
+        continue;
+      }
+      blank(skeleton, i);
+      i += 1;
+      continue;
+    }
+
+    const ch = src[i];
+    const next = src[i + 1];
+
+    if (ch === '/' && next === '/') {
+      while (i < src.length && src[i] !== '\n') { blankBoth(i); i += 1; }
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      blankBoth(i); blankBoth(i + 1); i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) { blankBoth(i); i += 1; }
+      blankBoth(i); blankBoth(i + 1); i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      i += 1;                                       // the quotes themselves stay
+      while (i < src.length && src[i] !== ch) {
+        const escape = src[i] === '\\';
+        blank(skeleton, i); i += 1;
+        if (escape && i < src.length) { blank(skeleton, i); i += 1; }
+      }
+      i += 1;
+      previous = 'x';
+      continue;
+    }
+    if (ch === '`') { mode = 'template'; i += 1; continue; }
+    if (ch === '/' && BEFORE_REGEX.has(previous)) {
+      i += 1;
+      let inClass = false;
+      while (i < src.length) {
+        if (src[i] === '\\') { blank(skeleton, i); blank(skeleton, i + 1); i += 2; continue; }
+        if (src[i] === '[') inClass = true;
+        else if (src[i] === ']') inClass = false;
+        else if (src[i] === '/' && !inClass) break;
+        blank(skeleton, i); i += 1;
+      }
+      i += 1;
+      previous = 'x';
+      continue;
+    }
+    if (ch === '{') { opened.push('brace'); previous = '{'; i += 1; continue; }
+    if (ch === '}') {
+      i += 1;
+      previous = '}';
+      if (opened.pop() === 'subst') mode = 'template';
+      continue;
+    }
+    if (!/\s/.test(ch)) previous = ch;
+    i += 1;
+  }
+
+  return { code: code.join(''), skeleton: skeleton.join('') };
+}
+
+/**
+ * The block `anchor` opens — from the anchor to the `}` that closes its first
+ * `{` — with the source's own strings and comments still in it.
+ *
+ * The anchor is required to be UNIQUE, because `indexOf` silently preferring the
+ * first of two matches is how a guard ends up asserting about the wrong method:
+ * `downloadAttachments` is declared twice in `main.ts`, once on the runtime and
+ * once on the plugin that forwards to it.
+ */
+function blockOf(src: string, anchor: string, missing: string): string {
+  const { code, skeleton } = readable(src);
+  const start = code.indexOf(anchor);
   assert.notEqual(start, -1, missing);
+  assert.equal(code.indexOf(anchor, start + 1), -1, `"${anchor.trim()}" is not unique in main.ts`);
+
   let depth = 0;
-  for (let i = MAIN.indexOf('{', start); i < MAIN.length; i++) {
-    if (MAIN[i] === '{') depth += 1;
-    else if (MAIN[i] === '}') {
+  for (let i = skeleton.indexOf('{', start); i < skeleton.length; i += 1) {
+    if (skeleton[i] === '{') depth += 1;
+    else if (skeleton[i] === '}') {
       depth -= 1;
-      if (depth === 0) return MAIN.slice(start, i + 1);
+      if (depth === 0) return src.slice(start, i + 1);
     }
   }
-  throw new Error(`unbalanced braces in main.ts after "${anchor}"`);
+  throw new Error(`unbalanced braces after "${anchor.trim()}"`);
 }
 
-/**
- * The body of one method, by brace balance from its signature.
- *
- * Bounded on purpose: "the file mentions this name somewhere" is satisfied by the
- * method's own DEFINITION, so a guard written that way passes whether or not
- * anything ever calls it.
- */
-function methodBody(signature: string): string {
-  return balancedFrom(signature, `main.ts no longer defines ${signature}`);
+const CODE = readable(MAIN).code;
+
+/** A block in `main.ts`. */
+function block(anchor: string, missing: string): string {
+  return blockOf(MAIN, anchor, missing);
 }
 
-function assertPasses(name: string, keys: string[]): void {
-  const args = constructorArgs(name);
-  for (const key of keys) {
+/** `blockOf` over a fixture, with the message this file would use. */
+function block4(src: string, anchor: string): string {
+  return blockOf(src, anchor, `no such block: ${anchor}`);
+}
+
+// ============================================================ the reader's own tests
+
+// Every assertion below rests on this, so it is checked against a source built
+// to break the previous reader in both directions at once.
+const FIXTURE = `
+function withBraces() {
+  const closing = '}';                    // a brace that ended the block early
+  const opening = "{";                    /* and one that ran it past the end */
+  const template = \`\${ { nested: 1 } } and a bare } in template text\`;
+  const pattern = /^[{}]+$/;
+  return closing + opening + template + String(pattern);
+}
+
+function next() {
+  return 'the block above must stop before this';
+}
+`;
+
+test('the source reader is not fooled by a brace in a string, a comment or a regex', () => {
+  const found = block4(FIXTURE, 'function withBraces() {');
+
+  assert.ok(
+    found.includes('return closing'),
+    'a `}` inside a string ended the block early — the old reader stopped here',
+  );
+  assert.equal(
+    found.includes('function next'), false,
+    'a `{` inside a string ran the block past its own end and spliced in the next one',
+  );
+  assert.ok(found.endsWith('}'));
+  assert.ok(found.includes('/^[{}]+$/'), 'the source is returned intact, not the skeleton');
+});
+
+test('the source reader refuses an anchor it cannot find, or one that is not unique', () => {
+  assert.throws(
+    () => block4(FIXTURE, 'function absent() {'),
+    /no such block/,
+    'a renamed function must fail the guard, not skip it',
+  );
+  assert.throws(
+    () => block4(`${FIXTURE}\nfunction next() {\n  return 2;\n}\n`, 'function next() {'),
+    /is not unique/,
+    'two matches means the guard is about to assert on whichever came first',
+  );
+});
+
+test('a comment can never be what satisfies a search', () => {
+  const { code } = readable("// id: 'download-all-attachments'\nconst real = 'kept';\n");
+  assert.equal(code.includes('download-all-attachments'), false, 'comment text is blanked');
+  assert.ok(code.includes('kept'), 'but string contents are not');
+});
+
+// ============================================================ §7.4 / §7.2: the values
+
+// The four numbers are required arguments now, so this is no longer about
+// whether they are passed. It is about WHAT is passed: `main.ts` is the only file
+// that holds both the platform test and the ports, so it is the only place the
+// device's memory cap and the SERVER's per-file ceiling could be joined. Four of
+// the five collaborators must never see a server limit at all — a reconciler, a
+// deletion pass, a watcher or a bootstrap classifier that knew `MAX_FILE_SIZE_MB`
+// would refuse to hash, bind, prove, resurrect or download bytes the store serves
+// happily, since `GET /blob/<ws>/<sha>` enforces no size limit and only the PATCH
+// ingress does. `PublishQueue` is the exception on purpose, and it reaches the
+// server ceiling through `blobs.limits()` rather than through this argument.
+const PLATFORM_ARGUMENTS: ReadonlyArray<readonly [string, string]> = [
+  ['memoryCapBytes', 'blobMemoryCap'],
+  ['rehashBudgetBytes', 'blobRehashBudget'],
+  ['autofetchMaxBytes', 'blobAutofetchMax'],
+  ['sessionBudgetBytes', 'blobSessionBudget'],
+];
+
+test('every platform number main.ts passes is the platform helper itself (§7.4)', () => {
+  for (const [key, helper] of PLATFORM_ARGUMENTS) {
+    const passed = [...CODE.matchAll(new RegExp(`(?:^|[\\s,{])${key}\\s*:([^\\n]*)`, 'gm'))];
+    assert.ok(passed.length > 0, `main.ts no longer passes ${key} to anything`);
+    for (const use of passed) {
+      assert.equal(
+        use[1].trim().replace(/,$/, ''), `() => ${helper}()`,
+        `${key} must be the platform helper and nothing else. A value derived from the `
+        + 'server\'s ceiling type-checks perfectly and is the §7.4 bug in a new place: the '
+        + 'memory cap is a property of the device and must not move when the network does.',
+      );
+    }
+  }
+});
+
+// §7.4, the other half. The helpers are where the platform test lives, and one
+// that stopped branching is still a `() => number` — so the compiler is content
+// and a phone gets the desktop ceiling.
+test('every platform number is chosen by a mobile test, in main.ts (§7.4)', () => {
+  for (const [, helper] of PLATFORM_ARGUMENTS) {
     assert.ok(
-      new RegExp(`(^|[\\s,{])${key}\\s*:`, 'm').test(args),
-      `main.ts must pass "${key}" to ${name}; without it the engine falls back to a `
-      + 'default that is wrong in production and invisible in tests.',
+      block(`function ${helper}(): number {`, `main.ts no longer defines ${helper}`)
+        .includes('Platform.isMobile'),
+      `${helper} must choose on Platform.isMobile — a phone silently given the desktop `
+      + 'number is the failure §7.4 exists to prevent.',
     );
   }
-}
-
-test('the deletion pass is given the attachment store (§5.1)', () => {
-  // Without it `isProvenBlob` can never reach a verdict, and every remote
-  // tombstone for an attachment rescues instead of deleting.
-  assertPasses('Deletions', ['blobs', 'memoryCapBytes']);
 });
 
-test('the reconciler is given both fetch-policy gates and both platform budgets (§7.2)', () => {
-  assertPasses('Reconciler', [
-    'blobs', 'memoryCapBytes', 'rehashBudgetBytes', 'autofetchMaxBytes', 'sessionBudgetBytes',
-  ]);
+// §7.5. The one argument in this family the compiler still cannot reach:
+// `sessionSpentBytes` is optional and defaults to zero, which is RIGHT on a first
+// join and wrong the moment the classifier is asked a second time in one session.
+// Its value is the other module's own tally or the two disagree about a pass that
+// has already spent part of the budget.
+test("the first-sync classifier reads the reconciler's own spend (§7.5)", () => {
+  assert.ok(
+    CODE.includes('sessionSpentBytes: () => this.reconciler.fetchedThisSession'),
+    'Bootstrap must be given the reconciler\'s session spend; a default of zero makes the '
+    + 'modal describe a pass with the whole budget still to play with.',
+  );
 });
 
-test('bootstrap classifies against the same three numbers the pass will apply (§7.5)', () => {
-  assertPasses('Bootstrap', [
-    'memoryCapBytes', 'autofetchMaxBytes', 'sessionBudgetBytes', 'sessionSpentBytes',
-  ]);
-});
+// ============================================================ §7.3: reachability
 
-test('the publish queue and the watcher are given the memory cap (§7.4)', () => {
-  assertPasses('PublishQueue', ['blobs', 'memoryCapBytes']);
-  assertPasses('VaultWatcher', ['memoryCapBytes']);
-});
-
-// §7.3. Three commands, and a markdown post-processor, all of them reachable only
+// Three commands and a markdown post-processor, all of them reachable only
 // through Obsidian's own registries. A command that is never registered is a
 // feature nobody can find, and the whole point of the deferral policy is that the
 // user has a way to say "yes, fetch that one".
-test('the three download commands and the embed post-processor are registered', () => {
+test('the three download commands and the embed post-processor are registered (§7.3)', () => {
   for (const id of [
     'download-attachments-in-note', 'download-all-attachments', 'download-attachments',
   ]) {
     assert.ok(
-      MAIN.includes(`id: '${id}'`),
+      CODE.includes(`id: '${id}'`),
       `main.ts must register the "${id}" command; a deferral the user cannot lift is a `
       + 'file they simply do not have.',
     );
   }
   assert.ok(
-    /registerMarkdownPostProcessor\(\s*deferredEmbedProcessor\(/.test(MAIN),
+    /registerMarkdownPostProcessor\(\s*deferredEmbedProcessor\(/.test(CODE),
     'main.ts must register the deferred-embed post-processor',
   );
 });
@@ -127,8 +357,11 @@ test('the three download commands and the embed post-processor are registered', 
 // approve, persist, then run a pass — because the pass owns every rule about what
 // may be written where. A command that fetched bytes itself would be a second
 // writer with none of them.
-test('downloading an attachment approves it, persists that, and then runs a pass', () => {
-  const body = methodBody('async downloadAttachments(ids: readonly string[]): Promise<void> {');
+test('downloading an attachment approves it, persists that, and then runs a pass (§7.3)', () => {
+  const body = block(
+    '\n  async downloadAttachments(ids: readonly string[]): Promise<void> {',
+    'main.ts no longer defines the runtime\'s downloadAttachments',
+  );
 
   const approve = body.indexOf('fetchApproved[id] = true');
   const persist = body.indexOf('state.flush()');
@@ -154,61 +387,21 @@ test('downloading an attachment approves it, persists that, and then runs a pass
 // not in the shared folder — so being told is the entire remedy.
 test('the attachment-folder warning is actually reachable on start (§7.5)', () => {
   assert.ok(
-    MAIN.includes('attachmentsLandInsideShare('),
-    'main.ts must run the attachment-location check',
-  );
-  assert.ok(MAIN.includes('warnAttachmentFolder('), 'and show the warning when it fails');
-  assert.ok(
-    methodBody('async start(): Promise<void> {').includes('this.warnIfAttachmentsLandOutside()'),
+    block('\n  async start(): Promise<void> {', 'main.ts no longer defines start()')
+      .includes('this.warnIfAttachmentsLandOutside()'),
     'the check must be CALLED from start(); defining it is not reaching it',
   );
+
+  const warn = block(
+    '\n  private async warnIfAttachmentsLandOutside(): Promise<void> {',
+    'main.ts no longer defines warnIfAttachmentsLandOutside',
+  );
+  assert.ok(warn.includes('attachmentsLandInsideShare('), 'it must run the location check');
+  assert.ok(warn.includes('warnAttachmentFolder('), 'and show the warning when that fails');
   // Dismissible, and the dismissal has to survive a restart — otherwise it is not
   // a dismissal, it is a delay.
   assert.ok(
-    MAIN.includes('attachmentFolderWarningDismissed = true')
-    && MAIN.includes('saveSettings()'),
+    warn.includes('attachmentFolderWarningDismissed = true') && warn.includes('saveSettings()'),
     'dismissing must be persisted',
   );
-});
-
-// §7.4: platform detection lives in `main.ts` and reaches the engine as plain
-// numbers. A helper that stopped branching would hand a phone the desktop
-// ceilings without a single test noticing.
-test('every platform number is chosen by a mobile test, in main.ts', () => {
-  for (const helper of [
-    'blobMemoryCap', 'blobRehashBudget', 'blobAutofetchMax', 'blobSessionBudget',
-  ]) {
-    const start = MAIN.indexOf(`function ${helper}()`);
-    assert.notEqual(start, -1, `main.ts no longer defines ${helper}`);
-    const body = MAIN.slice(start, MAIN.indexOf('\n}', start));
-    assert.ok(
-      body.includes('Platform.isMobile'),
-      `${helper} must choose on Platform.isMobile — a phone silently given the `
-      + 'desktop number is the failure §7.4 exists to prevent.',
-    );
-  }
-});
-
-// §7.4, from the other side: the memory cap is a fact about the DEVICE, so no
-// accessor for a server number may be wired into anything that reads it.
-//
-// `main.ts` is where the two could be joined, because it is the only file that
-// holds both the platform test and the ports. Four of the five collaborators must
-// never see a server ceiling at all — a reconciler, a deletion pass, a vault
-// watcher or a bootstrap classifier that knew `MAX_FILE_SIZE_MB` would refuse to
-// hash, bind, prove, resurrect or download bytes the store serves happily, since
-// `GET /blob/<ws>/<sha>` enforces no size limit and only the PATCH ingress does.
-// `PublishQueue` is the exception on purpose: acceptance is a policy about
-// writing, and writing is the one decision it may gate.
-test('no server-limit accessor is wired into anything but the publish path (§7.4)', () => {
-  for (const name of ['Reconciler', 'Deletions', 'VaultWatcher', 'Bootstrap']) {
-    const args = constructorArgs(name);
-    for (const banned of ['maxFileBytes', 'serverCap', 'serverMaxBytes', 'limits(']) {
-      assert.ok(
-        !args.includes(banned),
-        `${name} is being handed "${banned}". The memory cap is a property of the `
-        + 'device and must not move when the network does.',
-      );
-    }
-  }
 });
