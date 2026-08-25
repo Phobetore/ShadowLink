@@ -87,6 +87,18 @@ export const REHASH_BUDGET_BYTES = 268_435_456;         // 256 MB, desktop
 export const REHASH_BUDGET_BYTES_MOBILE = 33_554_432;   //  32 MB, mobile
 
 /**
+ * The largest attachment this device will hash purely to decide whether a remote
+ * tombstone may remove it (spec §5.1).
+ *
+ * Deliberately lower than the memory cap, and the gap between them is the point:
+ * the memory cap answers "could this device hold the whole file at once", this
+ * one answers "is answering worth what it costs". Above either, there is no
+ * guess — the file is rescued into `ShadowLink Recovered/`, which is what this
+ * module does with every other form of ignorance.
+ */
+export const PROVE_HASH_MAX_BYTES = 67_108_864;         //  64 MB
+
+/**
  * How long the modify handler waits before asking for a reconcile (spec §3.5).
  *
  * Obsidian fires `modify` while a file is still being written, and an editor that

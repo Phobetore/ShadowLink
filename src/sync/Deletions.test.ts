@@ -20,12 +20,17 @@ import { readFileSync } from 'node:fs';
 
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
-import { fold, hashOf, isLive, relPath, validateRel } from '../tree/paths.ts';
-import { REMOTE_DELETE_BUDGET, REMOTE_DELETE_WINDOW_MS } from '../tree/constants.ts';
+import {
+  fold, formatBlobRef, hashOf, hashOfBytes, isLive, relPath, validateRel,
+} from '../tree/paths.ts';
+import {
+  PROVE_HASH_MAX_BYTES, REMOTE_DELETE_BUDGET, REMOTE_DELETE_WINDOW_MS,
+} from '../tree/constants.ts';
+import { BlobTransport } from './BlobPort.ts';
 import { Deletions, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
-import { FakeDocs, FakeVault, type VaultOp } from './fakes.ts';
+import { FakeBlobs, FakeDocs, FakeVault, type VaultOp } from './fakes.ts';
 import type { DeletionContext, ReconcileCause, ReconcileFailure } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
 import type { VaultPort } from './VaultPort.ts';
@@ -53,6 +58,24 @@ function file(d: string, n: string, extra: Partial<NodeFields> = {}): NodeFields
 
 function dir(d: string, n: string, extra: Partial<NodeFields> = {}): NodeFields {
   return { k: 'd', d, n, g: 1, c: 0, ...extra };
+}
+
+/** An attachment node. `b` is set by `blobRef` at the call site, never guessed here. */
+function blob(d: string, n: string, extra: Partial<NodeFields> = {}): NodeFields {
+  return { k: 'b', d, n, g: 1, c: 0, ...extra };
+}
+
+/** The packed `b` field for `bytes`, as a first publish. */
+async function blobRef(bytes: Uint8Array, parent: string | null = null): Promise<string> {
+  return formatBlobRef(await hashOfBytes(bytes), bytes.length, parent);
+}
+
+/** Bytes no UTF-8 round trip survives, so a text read of them is visibly wrong. */
+function png(seed: number, length = 24): Uint8Array {
+  const out = new Uint8Array(length);
+  out.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  for (let i = 8; i < length; i++) out[i] = (seed * 31 + i * 7) & 0xff;
+  return out;
 }
 
 /** Tombstone a node exactly as §5.3 does: x = g, plus the display-only fields. */
@@ -110,11 +133,14 @@ interface HarnessOptions {
   openNodeId?: () => string | null;
   /** Replace the port handed to both the DeletionContext and the Deletions deps. */
   vaultPort?: (inner: FakeVault) => VaultPort;
+  /** §7.4's per-device whole-file allocation cap. Omitted means the desktop default. */
+  memoryCapBytes?: () => number;
 }
 
 interface Harness {
   vault: FakeVault;
   vaultPort: VaultPort;
+  blobs: FakeBlobs;
   docs: FakeDocs;
   state: DeviceState;
   tickets: Tickets;
@@ -138,6 +164,7 @@ interface Harness {
 function makeHarness(options: HarnessOptions = {}): Harness {
   const vault = new FakeVault();
   const vaultPort = options.vaultPort ? options.vaultPort(vault) : vault;
+  const blobs = new FakeBlobs();
   const docs = new FakeDocs();
   const port = new MemoryStatePort();
   const clock = { at: NOW };
@@ -164,10 +191,12 @@ function makeHarness(options: HarnessOptions = {}): Harness {
 
   const deletions = new Deletions({
     vault: vaultPort,
+    blobs,
     state,
     tickets,
     shareRoot: SHARE,
     now,
+    memoryCapBytes: options.memoryCapBytes,
     notice: (msg) => { notices.push(msg); },
     confirmBulk,
     openNodeId: options.openNodeId,
@@ -178,7 +207,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   });
 
   const h: Harness = {
-    vault, vaultPort, docs, state, tickets, port, nodes, notices, confirms,
+    vault, vaultPort, blobs, docs, state, tickets, port, nodes, notices, confirms,
     closed, closeSawOps, clock, deletions,
     ctx: (cause = 'remote', over = {}) => makeCtx(h, cause, over),
     answer: (choice) => {
@@ -265,6 +294,35 @@ async function place(
   if (opts.hash === false) return;
   const source = opts.hash ?? text;
   h.state.data.contentHash[id] = { sha256: await hashOf(source), len: source.length };
+}
+
+/**
+ * `place` for an attachment: seed the BYTES, bind, and record the base the way a
+ * converged pass would — the hash, the length and the mtime `stat` reports.
+ *
+ * `hash`, `len` and `mtime` are overridable one at a time on purpose: the
+ * staleness oracle has two independent clauses, and a fixture that could only
+ * make them wrong together would let either one be deleted unnoticed.
+ */
+async function placeBinary(
+  h: Harness,
+  id: string,
+  path: string,
+  bytes: Uint8Array,
+  opts: { hash?: string | false; len?: number; mtime?: number | null } = {},
+): Promise<void> {
+  h.vault.seedBinary(path, bytes);
+  h.state.data.materialized[id] = path;
+  if (opts.hash === false) return;
+  const st = await h.vault.stat(path);
+  const sha256 = opts.hash ?? await hashOfBytes(bytes);
+  const len = opts.len ?? bytes.length;
+  // `null` records a base with NO mtime — a hash this device confirmed without
+  // ever confirming when, which the oracle must refuse just as firmly.
+  h.state.data.contentHash[id] = opts.mtime === null
+    ? { sha256, len }
+    : { sha256, len, mtime: opts.mtime ?? st!.mtime };
+  h.vault.resetCalls();
 }
 
 function mutations(vault: FakeVault): number {
@@ -739,6 +797,252 @@ test('43: one failing item does not abort the batch (I15)', async () => {
   assert.equal(h.state.data.materialized[nid('B')], undefined);
   assert.equal(h.state.data.materialized[nid('C')], undefined);
   assert.equal(h.vault.callsTo('trashLocal').length, 0, 'and nothing was trashed on the way');
+});
+
+// ------------------------------------------------------- B14-B15: proving a binary
+
+test('B14: an attachment the store still holds is trashed, and the trash keeps its bytes', async () => {
+  const h = makeHarness();
+  const id = nid('A');
+  const bytes = png(1);
+  h.nodes.set(id, dead(blob('', 'shot.png', { s: 1, b: await blobRef(bytes) })));
+  h.vault.seed(SHARE, 'd');
+  await placeBinary(h, id, 'Shared/shot.png', bytes);
+  await h.blobs.seed(bytes);
+
+  const ctx = h.ctx();
+  await h.deletions.apply(ctx);
+
+  assert.deepEqual(ctx.failures, []);
+  assert.deepEqual(rescuedInto(h.vault), [], 'the common case does not fill Recovered/');
+
+  const trashed = h.vault.callsTo('trashLocal');
+  assert.equal(trashed.length, 1, 'exactly one removal');
+  assert.deepEqual(trashed[0].args, ['Shared/shot.png']);
+
+  // B32, and I1 asserted positively: a UTF-8 round trip would not give these back.
+  const retained = h.vault.trashedFor('Shared/shot.png');
+  assert.equal(retained.length, 1);
+  assert.deepEqual(retained[0].bytes, bytes, 'the exact bytes are retrievable from .trash');
+
+  // The live probe is what made this a trash rather than a rescue, and it asked
+  // about the TREE's digest.
+  const asked = h.blobs.callsTo('has');
+  assert.equal(asked.length, 1, 'one HEAD, never a cached answer');
+  assert.deepEqual(asked[0].args, [await hashOfBytes(bytes)]);
+
+  assert.equal(h.state.data.materialized[id], undefined, 'unbound');
+  assert.deepEqual(h.state.data.declinedNodes, [], 'a trash is not a decline');
+});
+
+test('B14: a HEAD that throws removes nothing at all and records one failure (I2)', async () => {
+  const h = makeHarness();
+  const id = nid('A');
+  const bytes = png(2);
+  h.nodes.set(id, dead(blob('', 'shot.png', { s: 1, b: await blobRef(bytes) })));
+  h.vault.seed(SHARE, 'd');
+  await placeBinary(h, id, 'Shared/shot.png', bytes);
+  await h.blobs.seed(bytes);
+  h.blobs.failNext('has', new BlobTransport('ECONNRESET'));
+
+  const ctx = h.ctx();
+  await h.deletions.apply(ctx);
+
+  // A transport failure is CONTAINED, not answered: nothing is trashed and
+  // nothing is rescued either, because "I could not ask" is evidence of nothing.
+  assert.equal(mutations(h.vault), 0, 'no rescue and no removal');
+  assert.deepEqual(h.vault.binarySnapshot()['Shared/shot.png'], bytes);
+  assert.equal(ctx.failures.length, 1, 'one contained failure');
+  assert.equal(ctx.failures[0].key, `delete:${id}`);
+
+  // And the decision is not remembered, so the next pass simply asks again.
+  assert.equal(h.state.data.materialized[id], 'Shared/shot.png', 'still bound');
+  assert.deepEqual(h.state.data.declinedNodes, []);
+  assert.deepEqual(h.state.data.declinedPaths, []);
+  assert.equal(ctx.removedThisPass.size, 0);
+  assert.equal(h.deletions.collectDeletable(h.ctx()).length, 1, 'a later pass retries it');
+});
+
+test('B14: a definite absence means this copy may be the only one, so it is rescued', async () => {
+  const h = makeHarness();
+  const id = nid('A');
+  const bytes = png(3);
+  h.nodes.set(id, dead(blob('', 'shot.png', { s: 1, b: await blobRef(bytes) })));
+  h.vault.seed(SHARE, 'd');
+  await placeBinary(h, id, 'Shared/shot.png', bytes);
+  // The store was swept, or never finished the upload: `has` answers a definite no.
+  h.blobs.setAbsent(await hashOfBytes(bytes));
+
+  const ctx = h.ctx();
+  await h.deletions.apply(ctx);
+
+  assert.deepEqual(ctx.failures, []);
+  assert.equal(h.vault.callsTo('trashLocal').length, 0, 'nothing was removed');
+  const rescued = rescuedInto(h.vault);
+  assert.equal(rescued.length, 1);
+  assert.match(rescued[0], /^ShadowLink Recovered\/shot\.png \(deleted by Ann \d{4}-\d\d-\d\d\)\.png$/);
+  assert.deepEqual(h.vault.binarySnapshot()[rescued[0]], bytes, 'byte-for-byte, moved not copied');
+  assert.deepEqual(h.state.data.declinedNodes, [id], 'and never revisited');
+});
+
+test('B14: bytes that are some other version are rescued without asking the store', async () => {
+  const h = makeHarness();
+  const id = nid('A');
+  const theirs = png(4);
+  const ours = png(5);
+  h.nodes.set(id, dead(blob('', 'shot.png', { s: 1, b: await blobRef(theirs) })));
+  h.vault.seed(SHARE, 'd');
+  // Our disk holds a different version, and the base agrees with the disk — a
+  // device-local memory of our OWN bytes is not evidence about the workspace's.
+  await placeBinary(h, id, 'Shared/shot.png', ours);
+  await h.blobs.seed(theirs);
+  await h.blobs.seed(ours);
+  h.blobs.resetCalls();
+
+  const ctx = h.ctx();
+  await h.deletions.apply(ctx);
+
+  assert.deepEqual(ctx.failures, []);
+  assert.equal(h.vault.callsTo('trashLocal').length, 0);
+  assert.equal(rescuedInto(h.vault).length, 1, 'our version was kept');
+  assert.deepEqual(h.blobs.calls, [], 'the tree already said these are not its bytes');
+});
+
+test('B14: an attachment that was never properly published is never proven', async () => {
+  const bytes = png(6);
+  const ref = await blobRef(bytes);
+  const cases: Array<{ label: string; node: NodeFields }> = [
+    { label: 'never seeded', node: dead(blob('', 'a.png', { b: ref })) },
+    { label: 'no reference at all', node: dead(blob('', 'a.png', { s: 1 })) },
+    { label: 'a malformed reference', node: dead(blob('', 'a.png', { s: 1, b: `${ref}:extra` })) },
+    {
+      label: 'an uppercase digest',
+      node: dead(blob('', 'a.png', { s: 1, b: ref.toUpperCase() })),
+    },
+  ];
+
+  for (const { label, node } of cases) {
+    const h = makeHarness();
+    const id = nid('A');
+    h.nodes.set(id, node);
+    h.vault.seed(SHARE, 'd');
+    await placeBinary(h, id, 'Shared/a.png', bytes);
+    await h.blobs.seed(bytes);
+    h.blobs.resetCalls();
+
+    await h.deletions.apply(h.ctx());
+
+    assert.equal(h.vault.callsTo('trashLocal').length, 0, `${label}: nothing removed`);
+    assert.equal(rescuedInto(h.vault).length, 1, `${label}: rescued`);
+    assert.deepEqual(h.blobs.calls, [], `${label}: the store was never asked`);
+  }
+});
+
+test('B14/B24: a file too big to prove is rescued rather than guessed at', async () => {
+  const PATH = 'Shared/video.webm';
+  const bytes = png(7);
+
+  // Case one: over PROVE_HASH_MAX_BYTES but under the memory cap — hashing it
+  // would work and is simply too expensive to spend on a deletion verdict.
+  const big = makeHarness({
+    vaultPort: (inner) => wrapVault(inner, {
+      stat: async (p) => {
+        const st = await inner.stat(p);
+        if (st === null || fold(p) !== fold(PATH)) return st;
+        return { ...st, bytes: PROVE_HASH_MAX_BYTES + 1 };
+      },
+    }),
+  });
+  const id = nid('A');
+  big.nodes.set(id, dead(blob('', 'video.webm', { s: 1, b: await blobRef(bytes) })));
+  big.vault.seed(SHARE, 'd');
+  await placeBinary(big, id, PATH, bytes, { hash: false });
+  await big.blobs.seed(bytes);
+
+  await big.deletions.apply(big.ctx());
+
+  assert.equal(big.vault.callsTo('trashLocal').length, 0, 'nothing removed');
+  assert.equal(rescuedInto(big.vault).length, 1, 'rescued');
+  assert.equal(big.vault.callsTo('readBinary').length, 0, 'and never read into memory');
+  assert.deepEqual(big.blobs.calls, [], 'no verdict was reached, so nothing was asked');
+
+  // Case two: under the prove cap but over what THIS device may hold at once.
+  const phone = makeHarness({ memoryCapBytes: () => 8 });
+  phone.nodes.set(id, dead(blob('', 'video.webm', { s: 1, b: await blobRef(bytes) })));
+  phone.vault.seed(SHARE, 'd');
+  await placeBinary(phone, id, PATH, bytes, { hash: false });
+  await phone.blobs.seed(bytes);
+
+  await phone.deletions.apply(phone.ctx());
+
+  assert.equal(phone.vault.callsTo('trashLocal').length, 0, 'nothing removed');
+  assert.equal(rescuedInto(phone.vault).length, 1, 'rescued');
+  assert.equal(phone.vault.callsTo('readBinary').length, 0, 'and never read into memory');
+});
+
+test('B15: a cached hash the disk contradicts is not trusted — either clause alone', async () => {
+  const theirs = png(8);
+  const ours = png(9);                                    // same length, different bytes
+  assert.equal(ours.length, theirs.length, 'the fixture must isolate the mtime clause');
+  const ref = await blobRef(theirs);
+
+  // The base claims the workspace's digest, so trusting it would prove the file.
+  // Only the staleness oracle stands between that claim and a deletion.
+  const claimed = await hashOfBytes(theirs);
+  const cases: Array<{ label: string; opts: { hash: string; len?: number; mtime?: number | null } }> = [
+    { label: 'a stale mtime', opts: { hash: claimed, mtime: 1 } },
+    { label: 'a stale length', opts: { hash: claimed, len: 999 } },
+    { label: 'no mtime at all', opts: { hash: claimed, mtime: null } },
+  ];
+
+  for (const { label, opts } of cases) {
+    const h = makeHarness();
+    const id = nid('A');
+    h.nodes.set(id, dead(blob('', 'shot.png', { s: 1, b: ref })));
+    h.vault.seed(SHARE, 'd');
+    await placeBinary(h, id, 'Shared/shot.png', ours, opts);
+    await h.blobs.seed(theirs);
+    h.blobs.resetCalls();
+    h.vault.resetCalls();
+
+    await h.deletions.apply(h.ctx());
+
+    assert.equal(h.vault.callsTo('readBinary').length, 1, `${label}: re-hashed from disk`);
+    assert.equal(h.vault.callsTo('trashLocal').length, 0, `${label}: nothing removed`);
+    assert.equal(rescuedInto(h.vault).length, 1, `${label}: our copy was kept`);
+    assert.deepEqual(h.blobs.calls, [], `${label}: the disk answered before the store was asked`);
+  }
+});
+
+test('B15: a base that still matches size and mtime answers without re-reading the file', async () => {
+  const h = makeHarness();
+  const id = nid('A');
+  const bytes = png(10);
+  h.nodes.set(id, dead(blob('', 'shot.png', { s: 1, b: await blobRef(bytes) })));
+  h.vault.seed(SHARE, 'd');
+  await placeBinary(h, id, 'Shared/shot.png', bytes);
+  await h.blobs.seed(bytes);
+
+  await h.deletions.apply(h.ctx());
+
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'the size+mtime cache was enough');
+  assert.equal(h.vault.callsTo('stat').length, 1, 'one stat per item');
+  assert.equal(h.blobs.callsTo('has').length, 1, 'but the store is asked every time');
+  assert.equal(h.vault.callsTo('trashLocal').length, 1);
+});
+
+test('B14: a note is still decided by the markdown rule and never touches the store', async () => {
+  const h = makeHarness();
+  const id = nid('A');
+  h.nodes.set(id, dead(file('', 'a.md', { s: 1 })));
+  h.vault.seed(SHARE, 'd');
+  await place(h, id, 'Shared/a.md', 'body');
+
+  await h.deletions.apply(h.ctx());
+
+  assert.equal(h.vault.callsTo('trashLocal').length, 1, 'proven by the recorded hash');
+  assert.deepEqual(h.blobs.calls, [], 'markdown has no bytes in the blob store');
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'and is read as text');
 });
 
 // ---------------------------------------------------------------- 44: the banned calls

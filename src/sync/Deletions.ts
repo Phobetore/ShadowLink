@@ -12,6 +12,17 @@
 // that no longer matches, or a note the user has open — is content this device
 // cannot prove is recoverable from the workspace.
 //
+// AN ATTACHMENT IS PROVEN DIFFERENTLY, and more strongly (spec §5.1). Its
+// authoritative digest rides in the TREE, where every peer can see it, and the
+// content-addressed store can be asked whether it still holds exactly those
+// bytes — so the comparison is against the workspace's own digest rather than a
+// device-local memory, and the store's answer is evidence the bytes are
+// retrievable NOW. The happy consequence is the one that matters at 200 MB: for
+// markdown `proven` fails often and `ShadowLink Recovered/` fills with small text
+// files, while for a binary it usually succeeds, so the common attachment delete
+// goes to the restorable `.trash` instead of becoming a permanent gigabyte in a
+// folder nobody prunes.
+//
 // THE POSTURE — rescue on ignorance. Unproven content is not left in place and it
 // is not removed: it is MOVED into `ShadowLink Recovered/` under a name that says
 // who deleted it and when, and the node is added to the declined set so no later
@@ -30,9 +41,14 @@
 //
 // No `obsidian` import, no node builtins.
 
-import { RECOVERED_DIR, REMOTE_DELETE_BUDGET } from '../tree/constants.ts';
-import { assertInsideShare, extOf, fold, hashOf, safeInFilename } from '../tree/paths.ts';
+import {
+  BLOB_MAX_BYTES, PROVE_HASH_MAX_BYTES, RECOVERED_DIR, REMOTE_DELETE_BUDGET,
+} from '../tree/constants.ts';
+import {
+  assertInsideShare, extOf, fold, hashOf, hashOfBytes, parseBlobRef, safeInFilename,
+} from '../tree/paths.ts';
 import type { NodeFields } from '../tree/types.ts';
+import type { BlobPort } from './BlobPort.ts';
 import type { DeviceState } from './DeviceState.ts';
 import type { DeletionContext } from './Reconciler.ts';
 import type { Tickets } from './Tickets.ts';
@@ -60,10 +76,24 @@ export interface Deletable {
 
 export interface DeletionsDeps {
   vault: VaultPort;
+  /**
+   * The attachment store (spec §8.3), used for one thing only: asking whether the
+   * exact bytes a tombstoned `'b'` node names are still retrievable (§5.1).
+   *
+   * Optional, and absent means "cannot ask" — which reads as rescue, like every
+   * other form of ignorance in this module.
+   */
+  blobs?: BlobPort;
   state: DeviceState;
   tickets: Tickets;
   shareRoot: string;
   now?: () => number;
+  /**
+   * §7.4's per-device whole-file allocation cap, injected as a plain number so
+   * nothing here has to know what platform it is running on. It gates the prove
+   * hash exactly as it gates every other whole-file read.
+   */
+  memoryCapBytes?: () => number;
   notice?: (msg: string, ms?: number) => void;
   /**
    * Ask the user about a batch that exceeds the budget. MUST default to 'keep':
@@ -103,6 +133,8 @@ const SAMPLE_PATHS = 5;
  */
 interface Env {
   vault: VaultPort;
+  /** Null when no store was wired: "cannot ask", which is never proof (I2). */
+  blobs: BlobPort | null;
   state: DeviceState;
   tickets: Tickets;
   shareRoot: string;
@@ -316,16 +348,89 @@ export class Deletions {
   }
 
   /**
-   * `proven` — spec §5.3. All three clauses are necessary and none is sufficient:
-   * `s` says the creator published SOMETHING, the recorded hash says this device
-   * confirmed WHAT, and the comparison says the disk still holds it.
+   * `proven`, split by kind — and the split is the whole of §5.1.
+   *
+   * The two rules answer the same question ("are these bytes recoverable from the
+   * workspace?") from different evidence, and a note read through the binary rule
+   * or an attachment read through the markdown one is not a near miss: markdown's
+   * `read` decodes a PNG to lossy UTF-8, so its hash could never match and every
+   * remote attachment delete would rescue — 200 MB at a time, into a folder
+   * nobody prunes.
    */
   private async isProven(env: Env, item: Deletable): Promise<boolean> {
+    return item.f.k === 'b'
+      ? await this.isProvenBlob(env, item)
+      : await this.isProvenNote(env, item);
+  }
+
+  /**
+   * `proven` for markdown — spec §5.3. All three clauses are necessary and none is
+   * sufficient: `s` says the creator published SOMETHING, the recorded hash says
+   * this device confirmed WHAT, and the comparison says the disk still holds it.
+   */
+  private async isProvenNote(env: Env, item: Deletable): Promise<boolean> {
     if (item.f.s !== 1) return false;
     const known = env.state.data.contentHash[item.id];
     if (known === undefined) return false;
     const local = normLF(await env.vault.read(item.path));
     return known.sha256 === await hashOf(local);
+  }
+
+  /**
+   * `proven` for an attachment — spec §5.1, and STRONGER than the markdown rule
+   * rather than weaker.
+   *
+   * Markdown can only ask a device-local memory what the shared bytes were. A
+   * binary's authoritative digest is in the TREE, where every peer can see it, and
+   * the store can be asked whether it still holds those exact bytes — so `H ===
+   * ref.sha256` compares against the workspace's own digest, and `has` is positive
+   * evidence that the bytes are retrievable NOW rather than that we once saw them.
+   *
+   * Both failure directions keep the user's file, and they are different failures:
+   * `has` THROWS on transport, which leaves through `guarded` with nothing
+   * removed and nothing decided; a definite `false` means this copy may be the
+   * only copy, which is a rescue. Anything above either ceiling is a rescue too —
+   * "defaults to rescue on ignorance", unchanged.
+   */
+  private async isProvenBlob(env: Env, item: Deletable): Promise<boolean> {
+    const ref = parseBlobRef(item.f.b);
+    if (item.f.s !== 1 || ref === null) return false;    // never published => never proven
+    const blobs = env.blobs;
+    if (blobs === null) return false;                    // no store to ask (I2)
+
+    const st = await env.vault.stat(item.path);
+    if (st === null) return false;                       // I2
+
+    // The SAME two-clause staleness oracle step 2.5 uses, and for the same reason:
+    // size alone misses every same-size edit, and without the mtime clause a
+    // recorded hash is trusted for ever — so an edit made while Obsidian was
+    // closed would be invisible at exactly the moment it decides a deletion. A
+    // base with no mtime at all confirmed a hash but never confirmed WHEN.
+    const known = env.state.data.contentHash[item.id];
+    const fresh = known !== undefined
+      && known.mtime !== undefined
+      && known.mtime === st.mtime
+      && known.len === st.bytes;
+
+    let H: string;
+    if (fresh) {
+      H = known!.sha256;                                 // cheap, and size+mtime gated
+    } else {
+      if (st.bytes > PROVE_HASH_MAX_BYTES) return false; // too costly to prove => rescue
+      if (st.bytes > this.memoryCapBytes()) return false; // cannot hash it at all => rescue
+      H = await hashOfBytes(await env.vault.readBinary(item.path));
+    }
+
+    if (H !== ref.sha256) return false;                  // some other version => rescue
+
+    // A LIVE probe, never a cached answer: the cache says what this device saw,
+    // and the question is what the workspace can still hand back.
+    return (await blobs.has(H)).present;
+  }
+
+  /** §7.4's cap on every whole-file allocation, this module's share of it. */
+  private memoryCapBytes(): number {
+    return this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
   }
 
   /**
@@ -431,6 +536,7 @@ export class Deletions {
     const shareRoot = ctx.shareRoot ?? this.deps.shareRoot;
     return {
       vault: ctx.vault ?? this.deps.vault,
+      blobs: this.deps.blobs ?? null,
       state: ctx.state ?? this.deps.state,
       tickets: ctx.tickets ?? this.deps.tickets,
       shareRoot: shareRoot.replace(/\/+$/, ''),
