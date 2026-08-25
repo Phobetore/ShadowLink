@@ -30,6 +30,20 @@ const WORKSPACE_ID_STORED_BAD =
   'This ID cannot work: letters, digits, _ or - only, at most 64 of them. The server '
   + 'refuses it, so nothing will sync until it is corrected.';
 
+/**
+ * The one line on this screen that reports state.
+ *
+ * It is REFRESHED IN PLACE rather than by re-running `display()`, and that is not
+ * a micro-optimisation: `display()` starts with `containerEl.empty()`, so
+ * re-rendering on a keystroke would destroy the box being typed into and take
+ * the caret with it.
+ */
+function statusDesc(configured: boolean): string {
+  return configured
+    ? 'Configured. The status bar shows whether syncing is running or paused.'
+    : 'Not configured yet — fill in every field above, then reload the plugin.';
+}
+
 /** Empty is "not filled in yet" (what `configured` reads), never an error. */
 function describeWorkspaceId(id: string): string {
   return id === '' || isValidWorkspaceId(id) ? WORKSPACE_ID_DESC : WORKSPACE_ID_STORED_BAD;
@@ -63,6 +77,13 @@ export class SettingsTab extends PluginSettingTab {
         }),
       );
 
+    // Declared before the four fields that refresh it, assigned where it is built:
+    // the line reports on the fields ABOVE it and is drawn below them.
+    let syncStatus: Setting | null = null;
+    const refreshStatus = (): void => {
+      syncStatus?.setDesc(statusDesc(this.plugin.configured));
+    };
+
     containerEl.createEl('h3', { text: 'Shared workspace' });
     containerEl.createEl('p', {
       text:
@@ -79,6 +100,7 @@ export class SettingsTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.share.serverUrl).onChange(async (v) => {
           this.plugin.settings.share.serverUrl = v.replace(/\/+$/, '');
           await this.plugin.saveSettings();
+          refreshStatus();
         }),
       );
 
@@ -90,6 +112,7 @@ export class SettingsTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.share.serverKey).onChange(async (v) => {
           this.plugin.settings.share.serverKey = v.trim();
           await this.plugin.saveSettings();
+          refreshStatus();
         });
       });
 
@@ -115,6 +138,7 @@ export class SettingsTab extends PluginSettingTab {
           workspaceId.setDesc(WORKSPACE_ID_DESC);
           this.plugin.settings.share.workspaceId = id;
           await this.plugin.saveSettings();
+          refreshStatus();
         }),
       );
 
@@ -125,6 +149,7 @@ export class SettingsTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.share.sharedFolder).onChange(async (v) => {
           this.plugin.settings.share.sharedFolder = v.replace(/^\/+|\/+$/g, '');
           await this.plugin.saveSettings();
+          refreshStatus();
         }),
       );
 
@@ -145,12 +170,7 @@ export class SettingsTab extends PluginSettingTab {
         t.setDisabled(true);
       });
 
-    new Setting(containerEl)
-      .setName('Sync status')
-      .setDesc(
-        this.plugin.configured
-          ? 'Configured. The status bar shows whether syncing is running or paused.'
-          : 'Not configured yet — fill in every field above, then reload the plugin.',
-      );
+    syncStatus = new Setting(containerEl).setName('Sync status');
+    syncStatus.setDesc(statusDesc(this.plugin.configured));
   }
 }

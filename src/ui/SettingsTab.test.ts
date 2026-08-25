@@ -483,56 +483,57 @@ test('the Device ID is shown, not editable, and its placeholder is never persist
 
 // ---------------------------------------------------------------- status line
 
-// ⚠ The one line on this screen that reports state is computed inside
-// `display()`, from `plugin.configured`, and `display()` runs only when the tab
-// is opened. So it is read at exactly the moment it cannot be right yet, and it
-// stays wrong for the whole visit in which the user does the thing that changes
-// it.
-test('the Sync status line still says "not configured" after the last field is typed',
-  async () => {
-    const plugin = fakePlugin();
-    const tab = await open(plugin);
-
-    assert.match(field(tab, 'Sync status').desc, /Not configured yet/);
-
-    await box(tab, 'Server URL').type('ws://host:4000');
-    await box(tab, 'Server key').type('sk_key');
-    await box(tab, 'Workspace ID').type('team');
-    await box(tab, 'Shared folder').type('Shared');
-
-    assert.equal(plugin.configured, true, 'the share IS configured now');
-    assert.match(field(tab, 'Sync status').desc, /Not configured yet/,
-      'and the only line that could say so still says the opposite');
-
-    tab.display();                            // reopening the tab is the remedy
-    assert.match(field(tab, 'Sync status').desc, /^Configured\./);
-  });
-
-test('the Sync status line agrees with the fields the user has just filled in', {
-  // DEFECT, unfixed. The line above is stale for the entire visit in which it
-  // matters most — a first-time self-hoster fills in all four fields and is told
-  // to "fill in every field above". Re-rendering from `onChange` is the obvious
-  // fix and is wrong: `display()` calls `containerEl.empty()`, so re-running it
-  // per keystroke destroys the input the user is typing into and takes the caret
-  // with it. A real fix updates that one `Setting` in place, which is a change to
-  // how this screen is built rather than a line edit.
-  //
-  // That change has since been made for one field: the Workspace ID keeps a handle
-  // on its `Setting` and calls `setDesc` from its own `onChange`. So the remedy is
-  // no longer hypothetical and it needs nothing outside `SettingsTab.ts` — give
-  // Sync status the same handle and refresh it from each of the four share
-  // handlers. Left undone here only because this branch was scoped away from it.
-  skip: 'defect: the status line is computed once per display() — see the comment',
-}, async () => {
+// ⚠ The one line on this screen that reports state used to be computed once,
+// inside `display()`, which runs only when the tab is opened — so it was read at
+// exactly the moment it could not be right yet, and stayed wrong for the whole
+// visit in which the user did the thing that changed it.
+test('the Sync status line follows the fields as they are typed', async () => {
   const plugin = fakePlugin();
   const tab = await open(plugin);
+
+  assert.match(field(tab, 'Sync status').desc, /Not configured yet/);
 
   await box(tab, 'Server URL').type('ws://host:4000');
   await box(tab, 'Server key').type('sk_key');
   await box(tab, 'Workspace ID').type('team');
-  await box(tab, 'Shared folder').type('Shared');
+  assert.match(field(tab, 'Sync status').desc, /Not configured yet/,
+    'three fields of four is not configured, and saying otherwise is the same lie backwards');
 
-  assert.match(field(tab, 'Sync status').desc, /^Configured\./);
+  await box(tab, 'Shared folder').type('Shared');
+  assert.equal(plugin.configured, true, 'the share IS configured now');
+  assert.match(field(tab, 'Sync status').desc, /^Configured./,
+    'and it says so without the tab being reopened');
+});
+
+// Emptying a field is the direction nobody thinks to test, and it is the one
+// where a stale "Configured." sends somebody hunting through server logs for a
+// share this screen already knows is incomplete.
+test('the Sync status line goes back when a field is emptied', async () => {
+  const plugin = fakePlugin({
+    serverUrl: 'ws://host:4000', serverKey: 'sk_key', workspaceId: 'team', sharedFolder: 'Shared',
+  });
+  const tab = await open(plugin);
+
+  assert.match(field(tab, 'Sync status').desc, /^Configured./);
+
+  await box(tab, 'Server key').type('');
+
+  assert.equal(plugin.configured, false);
+  assert.match(field(tab, 'Sync status').desc, /Not configured yet/);
+});
+
+// The obvious fix is the wrong one: `display()` calls `containerEl.empty()`, so
+// re-rendering per keystroke destroys the box being typed into and takes the
+// caret with it. This test is what stops somebody simplifying it into that.
+test('the status line is refreshed in place, never by re-rendering the screen', async () => {
+  const plugin = fakePlugin();
+  const tab = await open(plugin);
+  const typing = box(tab, 'Workspace ID');
+
+  await box(tab, 'Server URL').type('ws://host:4000');
+
+  assert.equal(box(tab, 'Workspace ID'), typing,
+    'the box the user is typing into is the same object it was before');
 });
 
 // ---------------------------------------------------------------- identity
