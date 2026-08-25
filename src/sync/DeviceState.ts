@@ -22,6 +22,7 @@ import {
   REMOTE_DELETE_BUDGET,
   REMOTE_DELETE_WINDOW_MS,
 } from '../tree/constants.ts';
+import { isValidWorkspaceId } from '../tree/ids.ts';
 
 /**
  * Persistence for one opaque blob. The real implementation writes through
@@ -118,8 +119,30 @@ export interface DeviceStateData {
 /** The schema version this client writes and accepts. */
 const STATE_VERSION = 1;
 
-/** Filename within the plugin's data directory; the port resolves the directory. */
+/**
+ * Filename within the plugin's data directory; the port resolves the directory.
+ *
+ * The id is CHECKED here, not trusted, and this is the half of that check that is
+ * a safety property. The settings tab refuses an unusable id at the keystroke,
+ * which protects ids typed since it started doing so — while `data.json` is a
+ * plain file people open, it is replicated between machines by everything that
+ * syncs `.obsidian/`, and it was written by whatever version of this plugin ran
+ * last. `ObsidianStatePort` joins what comes back from here onto
+ * `.obsidian/plugins/shadowlink/` with `normalizePath`, and `normalizePath` tidies
+ * slashes without resolving `..`.
+ *
+ * A THROW, never a substitute name (I15). A refusal costs a cold start, which is
+ * recoverable by construction (spec §4.5) and loses nothing; quietly falling back
+ * to some other filename would let two workspaces share one state file, each
+ * discarding the other's on load, for ever and without a word.
+ */
 export function deviceStateKey(workspaceId: string, deviceId: string): string {
+  if (!isValidWorkspaceId(workspaceId)) {
+    throw new Error(
+      'ShadowLink: refusing to name a device-state file after an unusable workspace id: '
+      + JSON.stringify(workspaceId),
+    );
+  }
   return `state-${workspaceId}-${deviceId}.json`;
 }
 

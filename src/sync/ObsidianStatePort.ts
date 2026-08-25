@@ -23,10 +23,24 @@
 import { normalizePath } from 'obsidian';
 import type { DataAdapter } from 'obsidian';
 
+import { isValidWorkspaceId } from '../tree/ids.ts';
 import type { StatePort } from './DeviceState.ts';
 
-/** Spec §2.6: `tree-<workspaceId>.bin`, beside the device state. */
+/**
+ * Spec §2.6: `tree-<workspaceId>.bin`, beside the device state.
+ *
+ * Checked for the same reason as `deviceStateKey`, and refused the same way. This
+ * name too is built out of a string a human typed into a settings box, and it too
+ * is joined onto the plugin's directory below by a `normalizePath` that tidies
+ * slashes without resolving `..`.
+ */
 export function treeSnapshotKey(workspaceId: string): string {
+  if (!isValidWorkspaceId(workspaceId)) {
+    throw new Error(
+      'ShadowLink: refusing to name a tree snapshot after an unusable workspace id: '
+      + JSON.stringify(workspaceId),
+    );
+  }
   return `tree-${workspaceId}.bin`;
 }
 
@@ -86,7 +100,25 @@ export class ObsidianStatePort implements StatePort {
 
   // ---------------------------------------------------------- internals
 
+  /**
+   * `<dir>/<key>` — and the one line in this file where a NAME becomes a PATH.
+   *
+   * `normalizePath` collapses separators and does not resolve `..`, so a key
+   * carrying one is joined verbatim and addresses a file outside the plugin's own
+   * directory. Both keys this port is ever handed are built from a charset-checked
+   * workspace id, so nothing here should ever fire — which is the point. A
+   * boundary that holds only while its callers are correct is not a boundary, and
+   * the callers include a `deviceId` this file has no rule for.
+   *
+   * A throw, never a repaired name: silently writing device state or a tree
+   * snapshot into some other file is worse than not writing it at all.
+   */
   private pathFor(key: string): string {
+    if (key === '' || key === '.' || key === '..' || /[/\\]/.test(key)) {
+      throw new Error(
+        `ShadowLink: refusing a state key that is not a plain filename: ${JSON.stringify(key)}`,
+      );
+    }
     return normalizePath(`${this.dir}/${key}`);
   }
 

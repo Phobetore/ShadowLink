@@ -156,6 +156,43 @@ test('a key that was never written reads as null, and never throws', async () =>
   assert.equal(await port.readBinary(treeSnapshotKey('ws')), null);
 });
 
+// ---------------------------------------------------------------- the id
+
+// Same rule as `deviceStateKey`, and here for the same reason: this name is built
+// out of a string a human typed, and it is joined onto the plugin's own directory
+// with `normalizePath`, which tidies slashes and does not resolve `..`. The
+// settings tab checks the id as well, but only for ids typed since it started to.
+test('an unusable workspace id never becomes a snapshot filename', async () => {
+  const { treeSnapshotKey } = await statePortModule();
+
+  assert.equal(treeSnapshotKey('ws-1'), 'tree-ws-1.bin');
+  for (const bad of ['../../../elsewhere', '..', 'a/b', 'a\\b', '', 'x'.repeat(65)]) {
+    assert.throws(() => treeSnapshotKey(bad), /workspace id/i,
+      `${JSON.stringify(bad)} is refused`);
+  }
+});
+
+// The boundary itself, independent of who derived the key. Both keys this port is
+// handed are built from a charset-checked id, so nothing here should ever fire —
+// that is the point of it. A boundary that holds only while its callers are
+// correct is not a boundary, and this is the exact line where a name becomes a
+// path.
+test('a key that is not a plain filename is refused rather than joined onto the directory',
+  async () => {
+    const { adapter, port } = await makePort();
+    adapter.calls.length = 0;
+
+    for (const bad of ['../evil.json', 'a/b.json', 'a\\b.json', '..', '.', '']) {
+      await assert.rejects(() => port.read(bad), /plain filename/, JSON.stringify(bad));
+      await assert.rejects(() => port.write(bad, 'x'), /plain filename/, JSON.stringify(bad));
+      await assert.rejects(() => port.readBinary(bad), /plain filename/, JSON.stringify(bad));
+      await assert.rejects(() => port.writeBinary(bad, new Uint8Array([1])), /plain filename/,
+        JSON.stringify(bad));
+    }
+
+    assert.deepEqual(adapter.calls, [], 'and none of it reached the adapter');
+  });
+
 test('an unreadable file is the caller’s problem, not a silent null', async () => {
   const { adapter, port } = await makePort();
   adapter.files.set(`${DIR}/state.json`, '{}');

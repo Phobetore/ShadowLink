@@ -102,6 +102,38 @@ test('the storage key is namespaced by workspace and device', () => {
   assert.equal(new DeviceState(port, DEVICE, WORKSPACE).key, `state-${WORKSPACE}-${DEVICE}.json`);
 });
 
+// ---------------------------------------------------------------- the id
+
+// The settings tab refuses a workspace id the charset forbids, and that is not
+// what makes this safe. A screen protects ids typed after it started checking,
+// while `data.json` is a plain file people open, is replicated between machines
+// by everything that syncs `.obsidian/`, and was written by whatever version of
+// this plugin ran last. So the site that turns the id into a FILENAME checks it
+// too, and it is this one that is the safety property.
+//
+// `ObsidianStatePort` joins whatever comes back here onto
+// `.obsidian/plugins/shadowlink/` with `normalizePath`, and `normalizePath` tidies
+// slashes without resolving `..`.
+test('an unusable workspace id never becomes a state filename', () => {
+  for (const bad of ['../../../elsewhere', '..', '.', 'a/b', 'a\\b', 'x'.repeat(65), '', 'a b']) {
+    assert.throws(() => deviceStateKey(bad, DEVICE), /workspace id/i,
+      `${JSON.stringify(bad)} is refused`);
+  }
+});
+
+// A THROW, never a substitute name. A refusal here costs a cold start, which is
+// recoverable by construction (spec §4.5) and loses nothing; quietly falling back
+// to some other filename would let two workspaces share one state file, each
+// discarding the other's on load, for ever and without a word (I15).
+test('a DeviceState cannot be built on an id it could not name a file for', () => {
+  const port = new MemoryStatePort();
+
+  assert.throws(() => new DeviceState(port, DEVICE, '../elsewhere'), /workspace id/i);
+
+  assert.equal(port.writes, 0, 'and nothing was written on the way out');
+  assert.equal(port.reads, 0);
+});
+
 // ---------------------------------------------------------------- discard
 
 test('a state file written by a different device is discarded entirely', async () => {
