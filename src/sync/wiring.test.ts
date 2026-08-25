@@ -214,7 +214,7 @@ function block(anchor: string, missing: string): string {
 }
 
 /** `blockOf` over a fixture, with the message this file would use. */
-function block4(src: string, anchor: string): string {
+function fixtureBlock(src: string, anchor: string): string {
   return blockOf(src, anchor, `no such block: ${anchor}`);
 }
 
@@ -237,7 +237,7 @@ function next() {
 `;
 
 test('the source reader is not fooled by a brace in a string, a comment or a regex', () => {
-  const found = block4(FIXTURE, 'function withBraces() {');
+  const found = fixtureBlock(FIXTURE, 'function withBraces() {');
 
   assert.ok(
     found.includes('return closing'),
@@ -253,12 +253,12 @@ test('the source reader is not fooled by a brace in a string, a comment or a reg
 
 test('the source reader refuses an anchor it cannot find, or one that is not unique', () => {
   assert.throws(
-    () => block4(FIXTURE, 'function absent() {'),
+    () => fixtureBlock(FIXTURE, 'function absent() {'),
     /no such block/,
     'a renamed function must fail the guard, not skip it',
   );
   assert.throws(
-    () => block4(`${FIXTURE}\nfunction next() {\n  return 2;\n}\n`, 'function next() {'),
+    () => fixtureBlock(`${FIXTURE}\nfunction next() {\n  return 2;\n}\n`, 'function next() {'),
     /is not unique/,
     'two matches means the guard is about to assert on whichever came first',
   );
