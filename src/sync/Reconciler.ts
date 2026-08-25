@@ -1778,8 +1778,10 @@ export class Reconciler {
 
     // Everything below re-reads the world this verdict was based on (I7, §4.3).
     if (this.deps.vault.isOpenInLeaf(path)) return;
-    const now = await this.deps.vault.stat(path);
-    if (now === null || now.mtime !== seen.mtime || now.bytes !== seen.bytes) return;
+    const current = await this.deps.vault.stat(path);
+    if (current === null
+        || current.mtime !== seen.mtime
+        || current.bytes !== seen.bytes) return;
 
     this.deps.tickets.arm('rename', path, forkPath);
     await this.deps.vault.rename(path, forkPath);             // I16, and I1: nothing is destroyed
