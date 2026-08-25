@@ -27,7 +27,7 @@ import type { NodeFields } from '../tree/types.ts';
 import { Deletions, type DeletionContext } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
-import { FakeDocs, FakeVault } from './fakes.ts';
+import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { KeptFiles, type KeptEntry } from './KeptFiles.ts';
 import { PublishQueue } from './PublishQueue.ts';
 import type { ReconcileFailure } from './Reconciler.ts';
@@ -104,6 +104,7 @@ function makeHarness(): Harness {
   const queue = new PublishQueue({
     docs,
     vault,
+    blobs: new FakeBlobs(),
     state,
     tree,
     openNodeId: () => null,

@@ -1521,3 +1521,111 @@ test('an oversized record is dropped once the file has shrunk, and the path is o
     'the record self-heals rather than being re-decided from a stale number',
   );
 });
+
+// ---------------------------------------------------------------- P2 §3.2: after a retract
+
+/** A published attachment node. `b` is the reference every peer fetches by. */
+function blob(d: string, n: string, ref: string, extra: Partial<NodeFields> = {}): NodeFields {
+  return { k: 'b', d, n, g: 1, c: 0, s: 1, b: ref, ...extra };
+}
+
+/** The state `PublishQueue.retract` leaves behind: dead, unpublished, unbound. */
+function retracted(d: string, n: string): NodeFields {
+  return { k: 'b', d, n, g: 1, c: 0, x: 1, xa: NOW - 60_000, xb: 'Ann' };
+}
+
+// ⚠ The retract's own promise, checked from the other side. A node that is DEAD
+// and still bound to a real file is exactly what step 4 reads as "a tombstone
+// arrived for a file I hold" — and, since a retracted node was never published,
+// `isProven` refuses it and the verdict is RESCUE: the user's 200 MB video would
+// be renamed into ShadowLink Recovered/ and its path permanently declined, for
+// the crime of being too large to share. `retract` drops the binding so that this
+// cannot happen; this test is what keeps it dropped.
+test('a retracted node leaves the file exactly where it is, and no pass rescues it', async () => {
+  const w = wireDeletions();
+  const { h } = w;
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/scan.tiff`, new Uint8Array([1, 2, 3, 4]));
+  const id = nid('A');
+  h.nodes.set(id, retracted('', 'scan.tiff'));
+  h.state.data.oversized[fold(`${SHARE}/scan.tiff`)] = { bytes: 4, cap: 2, why: 'server' };
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(
+    h.vault.binarySnapshot()[`${SHARE}/scan.tiff`], new Uint8Array([1, 2, 3, 4]),
+    'not moved, not trashed, not truncated',
+  );
+  assert.deepEqual(stashed(h.vault), {}, 'and nothing was rescued out of the share');
+  assert.equal(h.vault.wasTrashed(`${SHARE}/scan.tiff`), false);
+  assert.deepEqual(h.state.data.declinedPaths, [], 'the path is not poisoned (I13)');
+  assert.deepEqual(h.published, [[]], 'and it is not offered for publication while it is too large');
+});
+
+// B23's last clause. An `oversized` record is a statement about a file AT A SIZE,
+// not a permanent verdict about a path — that is what `declinedPaths` is, and why
+// the two are separate maps. The tombstone `retract` wrote sits at this very path,
+// so the self-heal has to outrank it; it can, because that tombstone was never
+// published and never materialized anywhere, so no peer can be acting on it.
+test('B23: shrinking a retracted file below the cap shares it again', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/scan.tiff`, 'f', 'tiny');            // the user re-exported it smaller
+  const id = nid('A');
+  h.nodes.set(id, retracted('', 'scan.tiff'));
+  h.state.data.oversized[fold(`${SHARE}/scan.tiff`)] = { bytes: 4_000, cap: 1_000, why: 'server' };
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(h.published, [[`${SHARE}/scan.tiff`]], 'offered again, as a fresh node');
+  assert.equal(h.state.data.oversized[fold(`${SHARE}/scan.tiff`)], undefined, 'the record healed');
+  assert.deepEqual(
+    r.diagnostics.deletedButPresent, [],
+    'and it is not reported as a file a tombstone is waiting for',
+  );
+});
+
+// The other half of the same rule: while the file is still too large, the dead
+// node it left behind must not turn the path into a publication candidate either.
+test('an oversized path is not offered even though a dead node names it', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/scan.tiff`, 'f', 'x'.repeat(9_000));
+  h.nodes.set(nid('A'), retracted('', 'scan.tiff'));
+  h.state.data.oversized[fold(`${SHARE}/scan.tiff`)] = { bytes: 4_000, cap: 1_000, why: 'server' };
+
+  await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(h.published, [[]]);
+  assert.deepEqual(h.state.data.oversized[fold(`${SHARE}/scan.tiff`)], {
+    bytes: 4_000, cap: 1_000, why: 'server',
+  }, 'a file that GREW keeps its record');
+});
+
+// The rebuild reads what was OBSERVED, and an unbinding performed by a
+// collaborator while the pass ran is an observation too. `retract` runs inside
+// step 7, long after `observeBindings` recorded the binding it is dropping, so a
+// rebuild that keyed on the pass's older view would hand the binding straight
+// back — and the next pass would rescue the file (see the test above).
+test('a binding a collaborator dropped mid-pass is not rebuilt from the older view', async () => {
+  const id = nid('A');
+  const h = makeHarness({
+    publishUntracked: async () => {
+      // Exactly what `PublishQueue.retract` does, at exactly the point it does it.
+      delete h.state.data.materialized[id];
+    },
+  });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/scan.tiff`, 'f', 'bytes');
+  h.nodes.set(id, blob('', 'scan.tiff', `${'a'.repeat(64)}:5:-`));
+  h.state.data.materialized[id] = `${SHARE}/scan.tiff`;
+
+  await h.reconciler.reconcile('sync');
+
+  assert.equal(
+    h.state.data.materialized[id], undefined,
+    'the drop stands: rebuilding it would resurrect a binding a tombstone can act on',
+  );
+});

@@ -13,12 +13,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { PUBLISH_BACKOFF_MS, PUBLISH_CONCURRENCY } from '../tree/constants.ts';
-import { hashOf } from '../tree/paths.ts';
+import {
+  BLOB_PUBLISH_CONCURRENCY, PUBLISH_BACKOFF_MS, PUBLISH_CONCURRENCY,
+} from '../tree/constants.ts';
+import { fold, hashOf, hashOfBytes } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
+import type { BlobPort } from './BlobPort.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
-import { FakeDocs, FakeVault } from './fakes.ts';
+import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { PublishQueue, type PublishQueueDeps } from './PublishQueue.ts';
 import type { VaultPort } from './VaultPort.ts';
 
@@ -48,6 +51,7 @@ class MemoryStatePort implements StatePort {
 interface Harness {
   vault: FakeVault;
   docs: FakeDocs;
+  blobs: FakeBlobs;
   state: DeviceState;
   tree: TreeDoc;
   port: MemoryStatePort;
@@ -55,16 +59,28 @@ interface Harness {
   /** Mutable clock, so a backoff can be waited out without a real timer. */
   clock: { now: number };
   open: { id: string | null };
+  notices: string[];
+  /**
+   * What the injected `sleep` does — the test's chance to change the file DURING
+   * the settle window, which is the only way to exercise the check that exists
+   * because Obsidian announces a file before it is finished (§3.2).
+   */
+  settle: { run: () => Promise<void> };
   /** Mint an owned, materialized, unpublished node holding `text` on disk. */
   add(name: string, text: string): string;
+  /** The same for an attachment: a `'b'` node over real bytes. */
+  addBlob(name: string, bytes: Uint8Array): string;
 }
 
 function makeHarness(over: Partial<PublishQueueDeps> = {}): Harness {
   const vault = new FakeVault();
   const docs = new FakeDocs();
+  const blobs = new FakeBlobs();
   const port = new MemoryStatePort();
   const clock = { now: NOW };
   const open: { id: string | null } = { id: null };
+  const notices: string[] = [];
+  const settle = { run: async (): Promise<void> => undefined };
   const state = new DeviceState(port, 'device-1', 'ws-1', () => clock.now, 0);
   const tree = new TreeDoc();
   vault.seed(SHARE, 'd');
@@ -72,18 +88,32 @@ function makeHarness(over: Partial<PublishQueueDeps> = {}): Harness {
   const queue = new PublishQueue({
     docs,
     vault,
+    blobs,
     state,
     tree,
     openNodeId: () => open.id,
     now: () => clock.now,
+    // Deterministic, so the settle window (§3.2) is a step the test controls
+    // rather than 400 ms of real time in every attachment case.
+    settleMs: 0,
+    sleep: () => settle.run(),
+    displayName: 'Ada',
+    notice: (m) => { notices.push(m); },
     ...over,
   });
 
   return {
-    vault, docs, state, tree, port, queue, clock, open,
+    vault, docs, blobs, state, tree, port, queue, clock, open, notices, settle,
     add(name, text) {
       const id = tree.createNode({ k: 'f', d: '', n: name }, clock.now);
       vault.seed(`${SHARE}/${name}`, 'f', text);
+      state.data.owned[id] = true;
+      state.data.materialized[id] = `${SHARE}/${name}`;
+      return id;
+    },
+    addBlob(name, bytes) {
+      const id = tree.createNode({ k: 'b', d: '', n: name }, clock.now);
+      vault.seedBinary(`${SHARE}/${name}`, bytes);
       state.data.owned[id] = true;
       state.data.materialized[id] = `${SHARE}/${name}`;
       return id;
@@ -253,6 +283,7 @@ test('`s` is written only after the flush has come back', async () => {
   const q = new PublishQueue({
     docs: probe,
     vault: h.vault,
+    blobs: h.blobs,
     state: h.state,
     tree: h.tree,
     openNodeId: () => null,
@@ -323,7 +354,7 @@ test('a doc seeded concurrently between the open and the insert is retried, not 
     close: (handle) => h.docs.close(handle),
   };
   const q = new PublishQueue({
-    docs: racing, vault: h.vault, state: h.state, tree: h.tree,
+    docs: racing, vault: h.vault, blobs: h.blobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now,
   });
 
@@ -413,7 +444,7 @@ test('no more than PUBLISH_CONCURRENCY publishes are ever in flight', async () =
     close: (handle) => { inFlight -= 1; h.docs.close(handle); },
   };
   const q = new PublishQueue({
-    docs: gated, vault: h.vault, state: h.state, tree: h.tree,
+    docs: gated, vault: h.vault, blobs: h.blobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now,
   });
 
@@ -449,7 +480,7 @@ test('a lower concurrency is honoured, and a second drain during one is not a se
     close: (handle) => { inFlight -= 1; h.docs.close(handle); },
   };
   const q = new PublishQueue({
-    docs: gated, vault: h.vault, state: h.state, tree: h.tree,
+    docs: gated, vault: h.vault, blobs: h.blobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now, concurrency: 2,
   });
 
@@ -492,7 +523,7 @@ test('one failing publish does not stop the others in the same drain', async () 
     },
   };
   const q = new PublishQueue({
-    docs: h.docs, vault: locked, state: h.state, tree: h.tree,
+    docs: h.docs, vault: locked, blobs: h.blobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now,
   });
 
@@ -585,4 +616,408 @@ test('requeue reopens an entry left over from the markdown path, which carries n
   assert.deepEqual(h.state.data.publish[id], {
     state: 'pending', attempts: 0, nextAt: 0, intent: sha,
   });
+});
+
+// ---------------------------------------------------------------- P2 §3.2: publishBlobOne
+//
+// The attachment arm. Everything below is about the four ways it can put bytes in
+// front of a peer that are not the bytes the user has: publishing a file that is
+// still being written, trusting our own account of an upload instead of the
+// store's, writing `s` and `b` where a peer can observe one without the other,
+// and letting a file that can never be published sit pending on every device.
+
+/** The `b` field a first publish writes: hash, length, and no parent. */
+function refOf(sha: string, len: number): string {
+  return `${sha}:${len}:-`;
+}
+
+/** Bytes that a UTF-8 round trip would destroy — a PNG header and then some. */
+function png(seed = 1, length = 64): Uint8Array {
+  const out = new Uint8Array(length);
+  out.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  for (let i = 8; i < length; i++) out[i] = (i * 31 + seed * 97) & 0xff;
+  return out;
+}
+
+/** A `BlobPort` view of the harness's store, so one method can be replaced. */
+function blobPortOf(inner: FakeBlobs, overrides: Partial<BlobPort>): BlobPort {
+  const base: BlobPort = {
+    has: (sha) => inner.has(sha),
+    put: (sha, data, onProgress) => inner.put(sha, data, onProgress),
+    get: (sha, n, signal, onProgress) => inner.get(sha, n, signal, onProgress),
+    limits: () => inner.limits(),
+    get lastError(): unknown { return inner.lastError; },
+  };
+  return { ...base, ...overrides };
+}
+
+test('B1: an attachment uploads once, sets `s` and `b` together, and records the base', async () => {
+  const h = makeHarness();
+  const bytes = png();
+  const id = h.addBlob('diagram.png', bytes);
+  const sha = await hashOfBytes(bytes);
+
+  // Every state the tree was OBSERVED in, one entry per transaction. A peer sees
+  // exactly this sequence, so a two-transaction publish shows up here as a frame
+  // in which the node is published and names no bytes.
+  const seen: Array<{ s?: number; b?: string }> = [];
+  h.tree.observe(() => { seen.push({ s: h.tree.get(id)?.s, b: h.tree.get(id)?.b }); });
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.blobs.callsTo('put').length, 1, 'uploaded exactly once');
+  assert.deepEqual(h.blobs.stored(sha), bytes, 'and the store holds the real bytes');
+  assert.equal(h.tree.get(id)!.s, 1);
+  assert.equal(h.tree.get(id)!.b, refOf(sha, bytes.length), 'first version: parent is "-"');
+  assert.deepEqual(
+    seen.filter((f) => f.s === 1 && f.b === undefined), [],
+    '`s` was never observable without `b` (§3.2)',
+  );
+
+  const st = (await h.vault.stat(`${SHARE}/diagram.png`))!;
+  assert.deepEqual(h.state.data.contentHash[id], {
+    sha256: sha, len: bytes.length, mtime: st.mtime,
+  }, 'the base carries the mtime, or every later pass re-hashes the whole share');
+  assert.deepEqual(h.state.data.publish[id], {
+    state: 'done', attempts: 0, nextAt: 0, intent: sha,
+  });
+  assert.equal(h.docs.calls.length, 0, 'no content doc is involved in an attachment at all');
+});
+
+// ⚠ B2. Obsidian fires `create` when a file APPEARS. A publish that skips the
+// settle check uploads whatever prefix has landed — and because the store
+// verifies what it is given, the truncated object is then authoritative for every
+// peer, for ever, under a hash that matches it perfectly.
+test('B2: a file still being written is not published, and publishes once it settles', async () => {
+  const h = makeHarness();
+  const half = png(1, 32);
+  const whole = png(1, 64);
+  const id = h.addBlob('capture.png', half);
+  const path = `${SHARE}/capture.png`;
+
+  // The rest of the file lands DURING the settle window — exactly the race the
+  // two stats exist to lose.
+  h.settle.run = async (): Promise<void> => { h.vault.seedBinary(path, whole); };
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.blobs.callsTo('put').length, 0, 'nothing was uploaded');
+  assert.equal(h.blobs.objectCount(), 0, 'and no truncated object exists anywhere');
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.equal(h.tree.get(id)!.b, undefined);
+  assert.equal(h.state.data.publish[id].state, 'pending');
+  assert.equal(h.state.data.publish[id].attempts, 1, 'behind a backoff, never dropped');
+
+  // It settles, and the SAME entry converges on the whole file.
+  h.settle.run = async (): Promise<void> => undefined;
+  h.clock.now = h.state.data.publish[id].nextAt;
+  await h.queue.drain();
+
+  const sha = await hashOfBytes(whole);
+  assert.deepEqual(h.blobs.stored(sha), whole);
+  assert.equal(h.tree.get(id)!.b, refOf(sha, whole.length));
+});
+
+// ⚠ B2, the half a length check cannot cover. A writer that replaces a file's
+// contents IN PLACE — an export re-run, a screenshot tool rewriting its buffer —
+// leaves the size identical, so "the bytes I read are as long as the bytes I
+// stat'd" agrees perfectly with a file that changed underneath. Only the mtime
+// clause of the settle check sees it, and without that clause a half-written
+// version is uploaded, verified and handed to every peer.
+test('B2: a file rewritten in place during the settle window is not published', async () => {
+  const h = makeHarness();
+  const before = png(1, 64);
+  const after = png(2, 64);                                   // same length, other bytes
+  const id = h.addBlob('capture.png', before);
+
+  h.settle.run = async (): Promise<void> => {
+    h.vault.seedBinary(`${SHARE}/capture.png`, after);
+  };
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.blobs.objectCount(), 0, 'neither version was uploaded');
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.equal(h.state.data.publish[id].attempts, 1, 'it waits for the writer to stop');
+
+  h.settle.run = async (): Promise<void> => undefined;
+  h.clock.now = h.state.data.publish[id].nextAt;
+  await h.queue.drain();
+
+  const sha = await hashOfBytes(after);
+  assert.equal(h.tree.get(id)!.b, refOf(sha, after.length), 'and then publishes what settled');
+  assert.equal(h.blobs.objectCount(), 1, 'exactly one object, ever');
+});
+
+test('B2: a zero-byte file is never published, however settled it looks', async () => {
+  const h = makeHarness();
+  const id = h.addBlob('empty.png', new Uint8Array(0));
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.blobs.calls.length, 0, 'not even a dedup probe');
+  assert.equal(h.tree.get(id)!.s, undefined, 'an empty attachment is a file mid-write (I6)');
+  assert.equal(h.state.data.publish[id].state, 'pending');
+});
+
+// ⚠ B3, and the sharpest form of I17. `put` resolving true is OUR account of a
+// round trip; only a fresh `has` is the store's. A node whose `s` is set is never
+// re-offered by anybody, so advancing it against bytes the store does not hold is
+// permanent — not a retry.
+test('B3: an upload the store will not confirm publishes nothing and retries', async () => {
+  const h = makeHarness();
+  const bytes = png();
+  const id = h.addBlob('diagram.png', bytes);
+  // Answers a definite "not stored" every time, and never throws: the store is
+  // reachable, it simply does not have the object the upload claims to have left.
+  const unconfirming = blobPortOf(h.blobs, { has: async () => ({ present: false }) });
+  const q = new PublishQueue({
+    docs: h.docs, vault: h.vault, blobs: unconfirming, state: h.state, tree: h.tree,
+    openNodeId: () => null, now: () => h.clock.now, settleMs: 0,
+  });
+
+  q.enqueue(id);
+  await q.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined, '`s` is not advanced on our own say-so (I17)');
+  assert.equal(h.tree.get(id)!.b, undefined);
+  assert.equal(h.state.data.contentHash[id], undefined, 'and no base is recorded');
+  assert.equal(h.state.data.publish[id].state, 'pending');
+  assert.equal(h.state.data.publish[id].attempts, 1);
+});
+
+test('a `has` that cannot answer is a retry, never a publish and never a refusal', async () => {
+  const h = makeHarness();
+  const id = h.addBlob('diagram.png', png());
+  h.blobs.failNext('has', new Error('ECONNRESET'));
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.blobs.callsTo('put').length, 0);
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.equal(h.state.data.publish[id].attempts, 1, 'the ladder, not a permanent refusal');
+  assert.deepEqual(h.notices, [], 'and the user is not told their file is unshareable');
+});
+
+test('a refused upload (413/507/422) charges the ladder and publishes nothing', async () => {
+  const h = makeHarness();
+  const id = h.addBlob('diagram.png', png());
+  const why = new Error('507: the workspace is full');
+  h.blobs.refuseNextPut(why);
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.equal(h.state.data.publish[id].state, 'pending');
+  assert.equal(h.queue.lastError(id), why, 'the reason is kept for diagnostics');
+  assert.equal(
+    h.state.data.oversized[fold(`${SHARE}/diagram.png`)], undefined,
+    'a refusal the server explained is not a size retraction: the node stays live',
+  );
+  assert.equal(h.tree.get(id)!.x, undefined);
+});
+
+// I8. The steady state of every converged attachment on every device: the tree
+// already names these exact bytes, so the pass costs one stat pair and nothing
+// else — no read, no upload, and above all no second object.
+test('a node whose reference already names the bytes on disk is not re-uploaded', async () => {
+  const h = makeHarness();
+  const bytes = png();
+  const id = h.addBlob('diagram.png', bytes);
+  const sha = await h.blobs.seed(bytes);
+  h.tree.patchNode(id, { s: 1, b: refOf(sha, bytes.length) });
+  h.blobs.resetCalls();
+
+  h.queue.requeue(id, sha);
+  await h.queue.drain();
+
+  assert.deepEqual(
+    h.blobs.calls.map((c) => c.op), ['limits'],
+    'the ceiling is asked for once per session, and nothing is uploaded or probed',
+  );
+  assert.equal(h.state.data.publish[id].state, 'done');
+  assert.equal(h.state.data.contentHash[id]?.sha256, sha, 'the base is recorded all the same');
+
+  // And the ceiling is CACHED: a second publish of the same node — here admitted
+  // with a stale intent, as a device that had not seen the tree yet would — costs
+  // the store nothing at all.
+  h.blobs.resetCalls();
+  h.queue.requeue(id, 'f'.repeat(64));
+  await h.queue.drain();
+  assert.deepEqual(h.blobs.calls.map((c) => c.op), []);
+  assert.equal(h.state.data.publish[id].intent, sha, 'and the entry converges on the real hash');
+});
+
+// I5a. The first publish stays creator-only, and the gate is re-checked at drain
+// rather than trusted from admission.
+test('an unpublished attachment this device does not own is never uploaded', async () => {
+  const h = makeHarness();
+  const id = h.addBlob('diagram.png', png());
+  h.state.data.publish[id] = { state: 'pending', attempts: 0, nextAt: 0 };
+  delete h.state.data.owned[id];
+
+  await h.queue.drain();
+
+  assert.equal(h.blobs.calls.length, 0);
+  assert.equal(h.vault.callsTo('readBinary').length, 0);
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.equal(h.queue.pendingCount(), 1, 'kept and reported, never dropped');
+});
+
+// I13. A node the user deleted while its publish was queued is not published back
+// into existence.
+test('a dead attachment node is never published', async () => {
+  const h = makeHarness();
+  const id = h.addBlob('diagram.png', png());
+  h.queue.enqueue(id);
+  h.tree.patchNode(id, { x: 1, xa: NOW });
+
+  await h.queue.drain();
+
+  assert.equal(h.blobs.calls.length, 0);
+  assert.equal(h.tree.get(id)!.s, undefined);
+});
+
+// I7, and no backoff is charged: the user merely has the image open in a leaf.
+test('an attachment open in a leaf defers without touching the disk or the ladder', async () => {
+  const h = makeHarness();
+  const id = h.addBlob('diagram.png', png());
+  h.vault.setOpen(`${SHARE}/diagram.png`, true);
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.vault.callsTo('stat').length, 0, 'not even a stat');
+  assert.equal(h.blobs.calls.length, 0);
+  assert.deepEqual(h.state.data.publish[id], { state: 'pending', attempts: 0, nextAt: 0 });
+});
+
+// ---------------------------------------------------------------- §3.2: retract
+
+// ⚠ B23, the publish arm. Above the cap the node is RETRACTED: tombstoned,
+// recorded, explained once — and the file is left exactly where the user put it.
+// The binding goes with it, because a dead node still bound to a real file is
+// what the deletion pass reads as "rescue this into ShadowLink Recovered/".
+test('B23: a file over the server limit is retracted, and the file is untouched', async () => {
+  const h = makeHarness();
+  const bytes = png(1, 4_096);
+  const id = h.addBlob('scan.tiff', bytes);
+  h.blobs.setLimits({ maxFileBytes: 1_024 });
+  const g = h.tree.get(id)!.g;
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  const f = h.tree.get(id)!;
+  assert.equal(f.x, g, 'tombstoned, so no peer keeps it in a Pending list for ever');
+  assert.equal(f.s, undefined, 'and it was never published');
+  assert.equal(f.xb, 'Ada');
+  assert.deepEqual(h.state.data.oversized[fold(`${SHARE}/scan.tiff`)], {
+    bytes: bytes.length, cap: 1_024, why: 'server',
+  });
+  assert.equal(h.state.data.materialized[id], undefined, 'unbound: no tombstone may claim it');
+  assert.deepEqual(
+    h.vault.binarySnapshot()[`${SHARE}/scan.tiff`], bytes,
+    'the file is not moved, not trashed, not truncated',
+  );
+  assert.equal(h.vault.wasTrashed(`${SHARE}/scan.tiff`), false);
+  assert.equal(h.blobs.callsTo('put').length, 0, 'and nothing was uploaded');
+  assert.equal(h.state.data.publish[id].state, 'done', 'the entry is closed, not retried for ever');
+  assert.equal(h.notices.length, 1, 'the user is told exactly once');
+  assert.match(h.notices[0], /scan\.tiff/);
+});
+
+// ⚠ B24, the publish arm: the cap is checked BEFORE the bytes are allocated. A
+// cap enforced after `readBinary` is no cap at all on the device it protects —
+// the phone is already out of memory by then.
+test('B24: a file over the device cap is retracted without ever being read', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 100 });
+  const id = h.addBlob('clip.mov', png(2, 512));
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'never held in memory');
+  assert.equal(h.blobs.calls.length, 0, 'and the store was never asked about it');
+  assert.equal(h.state.data.oversized[fold(`${SHARE}/clip.mov`)]?.why, 'device');
+  assert.equal(h.tree.get(id)!.x, 1);
+});
+
+// I2, in the one place where it cannot be undone by a later pass: an unknown
+// ceiling must never be read as a small one.
+test('a limits() that could not be asked does not retract anything', async () => {
+  const h = makeHarness();
+  const bytes = png();
+  const id = h.addBlob('diagram.png', bytes);
+  h.blobs.failNext('limits', new Error('ETIMEDOUT'));
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.x, undefined, 'the node is still live');
+  assert.deepEqual(h.state.data.oversized, {});
+  assert.equal(
+    h.tree.get(id)!.b, refOf(await hashOfBytes(bytes), bytes.length),
+    'and the publish went ahead: a server that really refuses it answers 413',
+  );
+});
+
+// ---------------------------------------------------------------- the ladder, with intent
+
+// A13's other half. `fail` must carry the intent forward, or the very next
+// requeue for the same bytes reads as new work and resets `attempts` to zero —
+// and §3.5 requeues on EVERY reconcile pass, so the ladder would never advance.
+test('a failed attachment publish keeps its intent, so requeueing cannot reset the ladder', async () => {
+  const h = makeHarness();
+  const bytes = png();
+  const id = h.addBlob('diagram.png', bytes);
+  const sha = await hashOfBytes(bytes);
+  h.blobs.failNext('has', new Error('ECONNRESET'));
+
+  h.queue.requeue(id, sha);
+  await h.queue.drain();
+
+  assert.equal(h.state.data.publish[id].attempts, 1);
+  assert.equal(h.state.data.publish[id].intent, sha, 'the entry still knows what it is publishing');
+
+  h.queue.requeue(id, sha);
+  assert.equal(h.state.data.publish[id].attempts, 1, 'a same-intent requeue is still a no-op');
+  assert.equal(h.state.data.publish[id].nextAt, NOW + PUBLISH_BACKOFF_MS[0]);
+});
+
+// One 200 MB upload must not occupy every slot and park the publication of every
+// note in the vault behind it.
+test('attachments drain in their own lane, and notes keep theirs', async () => {
+  const h = makeHarness();
+  for (let i = 0; i < 6; i++) h.addBlob(`img-${i}.png`, png(i));
+  for (let i = 0; i < 6; i++) h.add(`note-${i}.md`, `body ${i}`);
+
+  let inFlight = 0;
+  let peak = 0;
+  const gated = blobPortOf(h.blobs, {
+    has: async (sha) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await tick();
+      const answer = await h.blobs.has(sha);
+      inFlight -= 1;
+      return answer;
+    },
+  });
+  const q = new PublishQueue({
+    docs: h.docs, vault: h.vault, blobs: gated, state: h.state, tree: h.tree,
+    openNodeId: () => null, now: () => h.clock.now, settleMs: 0,
+  });
+
+  for (const id of Object.keys(h.state.data.owned)) q.enqueue(id);
+  await q.drain();
+
+  assert.equal(peak, BLOB_PUBLISH_CONCURRENCY, 'the attachment lane is capped at its own width');
+  assert.equal(q.pendingCount(), 0, 'and everything published');
 });

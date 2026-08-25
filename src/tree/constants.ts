@@ -36,3 +36,35 @@ export const FOUNDER_QUIET_MS = 500;
 /** Vault-root folders owned by ShadowLink. Never synced, never inside the share. */
 export const RECOVERED_DIR = 'ShadowLink Recovered';
 export const STAGING_DIR = 'ShadowLink Staging';
+
+// ---------------------------------------------------------------- attachments (spec §7.4)
+
+/**
+ * How long the two `stat`s that decide "this file has stopped being written" are
+ * separated by (spec §3.2).
+ *
+ * Obsidian fires `create` when a file APPEARS, not when it is complete. Publishing
+ * between those two moments puts a truncated-but-verified object in the store and
+ * hands it to every peer as the real thing — content addressing makes that
+ * permanent, because the corrupt bytes hash to exactly the name the tree carries.
+ */
+export const ATTACHMENT_SETTLE_MS = 400;
+
+/**
+ * The largest attachment this device will hold in memory, in either direction.
+ *
+ * It gates every WHOLE-FILE allocation, not just downloads: `createBinary` takes a
+ * whole buffer, `requestUrl`/`fetch` buffer a whole response, and Web Crypto has no
+ * incremental digest API, so there is no honest streaming path that also runs on a
+ * phone. A cap applied only to fetches leaves the two paths that most reliably kill
+ * a mobile renderer — the first-pass hash sweep and publishing a screen recording
+ * made on that phone — completely unguarded.
+ */
+export const BLOB_MAX_BYTES = 104_857_600;          // 100 MB, desktop
+export const BLOB_MAX_BYTES_MOBILE = 33_554_432;    //  32 MB, mobile
+
+/**
+ * Attachment publishes run in their own lane, so one video upload cannot occupy
+ * all four markdown slots and park every note's publication behind it.
+ */
+export const BLOB_PUBLISH_CONCURRENCY = 2;

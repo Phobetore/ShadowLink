@@ -281,6 +281,15 @@ export class VaultWatcher {
     // it rescues a file or when the user keeps their copies. Re-adopting one of
     // those would re-share, as a brand-new node, a file the user chose to keep.
     if (this.isDeclined(path)) return;
+    // §3.2. Publication has already refused this exact path as too large and
+    // retracted the node it minted for it. Minting a second one here puts the same
+    // file straight back into the same refusal — and a create event fires for
+    // every rename and every restore, so it would do it again and again.
+    //
+    // No `stat` is taken to re-decide: this handler runs at the moment a file
+    // APPEARS, where a size is not yet meaningful. The record self-heals in
+    // reconciler step 6, which stats it once per pass with the bytes at rest.
+    if (this.isOversized(path)) return;
 
     const idx = this.index();
     const key = fold(rel);
@@ -857,6 +866,17 @@ export class VaultWatcher {
 
   private isDeclined(path: string): boolean {
     return this.deps.state.data.declinedPaths.includes(fold(path));
+  }
+
+  /**
+   * §3.2. Is this path one publication refused as too large?
+   *
+   * Deliberately NOT the same map as `declinedPaths`: a keep decision is the
+   * user's and is permanent, while a size refusal is a statement about a file at a
+   * size and is dropped again the moment the file is smaller (I13).
+   */
+  private isOversized(path: string): boolean {
+    return this.deps.state.data.oversized[fold(path)] !== undefined;
   }
 
   // ---------------------------------------------------------- bookkeeping

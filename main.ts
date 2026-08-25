@@ -37,7 +37,7 @@
 //    cancelled first sync) survives until it is lifted. A latched one-shot event
 //    would show the first kind for ever.
 
-import { MarkdownView, Notice, Plugin, TFolder, normalizePath } from 'obsidian';
+import { MarkdownView, Notice, Platform, Plugin, TFolder, normalizePath } from 'obsidian';
 import type { TAbstractFile } from 'obsidian';
 import type { EditorView } from '@codemirror/view';
 import { WebsocketProvider } from 'y-websocket';
@@ -52,12 +52,18 @@ import {
 } from './src/ui/modals';
 import { DEFAULT_SETTINGS, ShadowLinkSettings } from './src/types';
 
-import { RECONCILE_DEBOUNCE_MS, TREE_SNAPSHOT_DEBOUNCE_MS } from './src/tree/constants';
+import {
+  BLOB_MAX_BYTES,
+  BLOB_MAX_BYTES_MOBILE,
+  RECONCILE_DEBOUNCE_MS,
+  TREE_SNAPSHOT_DEBOUNCE_MS,
+} from './src/tree/constants';
 import { TreeDoc } from './src/tree/TreeDoc';
 import { Bootstrap } from './src/sync/Bootstrap';
 import { DeviceState } from './src/sync/DeviceState';
 import { Deletions } from './src/sync/Deletions';
 import { KeptFiles } from './src/sync/KeptFiles';
+import { ObsidianBlobPort } from './src/sync/ObsidianBlobPort';
 import { ObsidianDocPort } from './src/sync/ObsidianDocPort';
 import { ObsidianStatePort, treeSnapshotKey } from './src/sync/ObsidianStatePort';
 import { ObsidianVaultPort } from './src/sync/ObsidianVaultPort';
@@ -78,6 +84,20 @@ const STATUS_POLL_MS = 1_000;
  * something asks.
  */
 const PUBLISH_RETRY_MS = 30_000;
+
+/**
+ * Spec §7.4's `memoryCapBytes`, the platform half of it.
+ *
+ * Obsidian's `createBinary` takes a whole `ArrayBuffer`, `fetch` buffers a whole
+ * response and Web Crypto has no incremental digest, so every attachment this
+ * plugin touches is held whole in memory once. A phone cannot do that with a
+ * 100 MB screen recording, so the cap is lower there — and it is applied to
+ * uploads as well as downloads, because the file the user made ON the phone is
+ * the one most likely to be huge.
+ */
+function blobMemoryCap(): number {
+  return Platform.isMobile ? BLOB_MAX_BYTES_MOBILE : BLOB_MAX_BYTES;
+}
 
 /** Spec §2.5: 16 random hex characters, minted once per device. */
 function newDeviceId(): string {
@@ -135,6 +155,7 @@ function waitForSync(provider: WebsocketProvider, ms: number): Promise<boolean> 
 class SyncRuntime {
   readonly vault: ObsidianVaultPort;
   readonly docs: ObsidianDocPort;
+  readonly blobs: ObsidianBlobPort;
   readonly statePort: ObsidianStatePort;
   readonly state: DeviceState;
   readonly tickets: Tickets;
@@ -192,6 +213,14 @@ class SyncRuntime {
       workspaceId: share.workspaceId,
     });
 
+    // Attachments travel over HTTP to the server's content-addressed store, not
+    // through Yjs (spec §1.1). Same host, same key, same workspace.
+    this.blobs = new ObsidianBlobPort({
+      serverUrl: share.serverUrl,
+      serverKey: share.serverKey,
+      workspaceId: share.workspaceId,
+    });
+
     this.session = new WorkspaceSession({
       vault: this.vault,
       state: this.state,
@@ -212,9 +241,15 @@ class SyncRuntime {
     this.queue = new PublishQueue({
       docs: this.docs,
       vault: this.vault,
+      blobs: this.blobs,
       state: this.state,
       tree: this.tree,
       openNodeId: this.session.openNodeId,
+      displayName: plugin.settings.displayName,
+      notice: (msg) => { new Notice(msg); },
+      // §7.4: the platform test lives HERE and reaches the engine as a plain
+      // number, so nothing under src/sync has to know what Obsidian is running on.
+      memoryCapBytes: () => blobMemoryCap(),
     });
 
     this.watcher = new VaultWatcher({

@@ -960,11 +960,25 @@ export class Reconciler {
     for (const path of ctx.disk.filesUnderShare()) {
       const key = fold(path);
       if (ctx.wantAtFold.has(key)) continue;                      // a live node owns it
+      // §3.2: a path publication has already refused as too large stays refused
+      // until the file itself shrinks. Separate from `declinedPaths` on purpose —
+      // this one self-heals, and a size refusal must never poison a path the way a
+      // user's keep decision does (I13).
+      const size = await this.oversizedVerdict(ctx, path);
+      if (size === 'refused') continue;
       // I13 + CF-1: `deadFold` holds a dead node's PLAIN path, so a file that
       // materialized at a collision suffix is only recognisable through the
       // device state's record of where that node actually lived. Without the
       // second test, this pass republishes the file the deletion just removed.
-      if (ctx.deadFold.has(key) || ctx.deadMaterializedFold.has(key)) {
+      //
+      // `healed` is the ONE exemption, and it is narrow by construction: the only
+      // tombstone that can sit at a path carrying an `oversized` record is the one
+      // `retract` wrote for a node that was never published and never materialized
+      // anywhere, so no peer can act on it and nothing here can be re-deleting
+      // what a peer removed. Without the exemption the retract would be permanent
+      // — the file could never be shared again however small it became, which is
+      // exactly the path-poisoning I13 keeps `oversized` separate to avoid.
+      if (size !== 'healed' && (ctx.deadFold.has(key) || ctx.deadMaterializedFold.has(key))) {
         ctx.diagnostics.deletedButPresent.push(path);
         continue;
       }
@@ -976,11 +990,6 @@ export class Reconciler {
       // filesystem about it is pure cost and handing it over only routes it into
       // `onCreate`, which refuses it again.
       if (!this.isPublishable(path)) continue;
-      // §3.2: a path publication has already refused as too large stays refused
-      // until the file itself shrinks. Separate from `declinedPaths` on purpose —
-      // this one self-heals, and a size refusal must never poison a path the way a
-      // user's keep decision does (I13).
-      if (await this.stillOversized(ctx, path)) continue;
       let present = false;
       await this.guarded(ctx.failures, `exists:${path}`, async () => {
         present = await this.deps.vault.exists(path);             // the index can be stale
@@ -1013,16 +1022,24 @@ export class Reconciler {
   /**
    * Is this path still the oversized file publication refused (§3.2)?
    *
+   *   'none'    — no record: an ordinary path, decided by the other filters.
+   *   'refused' — the record stands; the path is not offered.
+   *   'healed'  — the file has shrunk, the record is dropped, and the path is
+   *               offered again even though `retract`'s tombstone still names it.
+   *
    * One `stat` per recorded path per pass — a handful of paths, not a sweep. The
    * record is dropped as soon as the file is smaller than the size that was
    * refused, so trimming an attachment re-shares it with no user action and no
    * command. A `stat` that could not answer keeps the record (I2): "I could not
    * look" is not evidence that the file shrank.
    */
-  private async stillOversized(ctx: PassContext, path: string): Promise<boolean> {
+  private async oversizedVerdict(
+    ctx: PassContext,
+    path: string,
+  ): Promise<'none' | 'refused' | 'healed'> {
     const key = fold(path);
     const record = this.deps.state.data.oversized[key];
-    if (record === undefined) return false;
+    if (record === undefined) return 'none';
 
     let st: { bytes: number } | null = null;
     let looked = false;
@@ -1030,11 +1047,11 @@ export class Reconciler {
       st = await this.deps.vault.stat(path);
       looked = true;
     });
-    if (!looked || st === null) return true;
-    if ((st as { bytes: number }).bytes >= record.bytes) return true;
+    if (!looked || st === null) return 'refused';
+    if ((st as { bytes: number }).bytes >= record.bytes) return 'refused';
 
     delete this.deps.state.data.oversized[key];
-    return false;
+    return 'healed';
   }
 
   // ---------------------------------------------------------- bookkeeping
@@ -1108,6 +1125,14 @@ export class Reconciler {
     if (ctx !== null) {
       const materialized: Record<string, string> = {};
       for (const id of [...ctx.have.keys()].sort(cmp)) {
+        // A binding that was dropped from device state WHILE the pass ran is
+        // honoured rather than rebuilt from the pass's older view. `bindPath` and
+        // `unbindPath` write both structures together, so the only way to be in
+        // `have` and absent here is a collaborator that unbound deliberately —
+        // today that is `retract` (§3.2), which drops the binding precisely so
+        // the next pass's deletion step cannot find a dead node holding a real
+        // file and "rescue" the user's oversized attachment out of the share.
+        if (data.materialized[id] === undefined) continue;
         const literal = ctx.disk.literal(ctx.have.get(id)!);
         if (literal !== undefined) materialized[id] = literal;
       }

@@ -346,6 +346,41 @@ test('a create at a declined path is never re-shared (I13)', async () => {
   assert.deepEqual(h.published, []);
 });
 
+// §3.2. Publication has already refused this exact path as too large and
+// tombstoned the node it minted for it. A create event fires again for every
+// rename, every restore from the trash and every restart's replay, so without
+// this gate the same file is re-minted, re-refused and re-retracted for ever —
+// and the user is told about it every time.
+test('B23: a create at a path publication refused as too large mints nothing', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/scan.tiff`, new Uint8Array([1, 2, 3, 4]));
+  h.state.data.oversized[fold(`${SHARE}/scan.tiff`)] = { bytes: 4, cap: 2, why: 'server' };
+
+  await h.watcher.onCreate(`${SHARE}/scan.tiff`, 'f');
+
+  assert.equal(h.tree.size(), 0, 'no second node for a file that cannot be published');
+  assert.deepEqual(h.published, []);
+  assert.deepEqual(h.state.data.materialized, {}, 'and nothing was bound');
+  assert.equal(
+    h.vault.callsTo('stat').length, 0,
+    'and no size is re-decided here: a create fires before the bytes have landed',
+  );
+});
+
+// The record is about a FILE AT A SIZE, not about the path: a different, smaller
+// attachment dropped at a path whose record has been healed is ordinary work.
+test('a create at a path whose oversized record is gone mints a node again', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/scan.tiff`, new Uint8Array([1, 2]));
+
+  await h.watcher.onCreate(`${SHARE}/scan.tiff`, 'f');
+
+  assert.equal(h.tree.size(), 1);
+  assert.equal(h.tree.entries()[0][1].k, 'b');
+});
+
 // I8 through the FOLDER set: `Notes` is implied by `Notes/todo.md`, so the tree
 // already describes a folder there and a folder node would be pure duplication.
 // This is what makes `ensureDirs`' echo harmless once its ticket has expired.
