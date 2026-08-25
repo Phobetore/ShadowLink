@@ -131,6 +131,17 @@ interface HarnessOptions {
    * all — which must itself read as 'keep' (test 42).
    */
   answer?: BulkChoice | 'reject' | 'defer';
+  /**
+   * Wire a dialog that RESOLVES with a value outside `BulkChoice` — §5.3's third
+   * "means keep" case. `BulkChoice` is a narrowed union, so this state is
+   * unreachable without a cast and exists only at runtime: a modal torn down
+   * mid-answer resolves `undefined`, and a hand-rolled dialog can resolve any
+   * string it likes.
+   *
+   * Presence of the KEY wires the callback, not its value, so `undefined` is a
+   * testable answer here rather than a synonym for "no dialog at all".
+   */
+  answerUnrecognized?: unknown;
   openNodeId?: () => string | null;
   /** Replace the port handed to both the DeletionContext and the Deletions deps. */
   vaultPort?: (inner: FakeVault) => VaultPort;
@@ -179,10 +190,14 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const closeSawOps: VaultOp[] = [];
   let release: ((choice: BulkChoice) => void) | null = null;
 
-  const confirmBulk = options.answer === undefined
+  const unrecognized = 'answerUnrecognized' in options;
+  const confirmBulk = options.answer === undefined && !unrecognized
     ? undefined
     : async (summary: BulkSummary): Promise<BulkChoice> => {
       confirms.push(summary);
+      // The cast IS the test: no legal `BulkChoice` produces this value, and the
+      // runtime must still refuse to read it as consent.
+      if (unrecognized) return options.answerUnrecognized as BulkChoice;
       if (options.answer === 'reject') throw new Error('the user closed the window');
       if (options.answer === 'defer') {
         return new Promise<BulkChoice>((resolve) => { release = resolve; });
@@ -772,6 +787,51 @@ test('42: a missing or rejected dialog means keep — never a silent apply', asy
     assert.equal(h.state.data.declinedPaths.length, 12, label);
     assert.equal(h.state.data.deleteBudget.length, 0, label);
     assert.equal(ctx.removedThisPass.size, 0, label);
+  }
+});
+
+test('42b: a dialog that resolves an UNRECOGNIZED value means keep too (§5.3)', async () => {
+  // §5.3 names three answers that all mean keep — missing, rejected and
+  // unrecognized — and test 42 drives only the first two. The third cannot be
+  // reached through `BulkChoice`, which is exactly why it needs saying out loud:
+  // only the literal 'apply' may apply. A modal torn down mid-answer resolves
+  // `undefined`, and a guard reading "anything that is not 'keep' applies" would
+  // turn that torn-down modal into a twelve-file delete with nothing failing.
+  const cases: Array<{ label: string; value: unknown }> = [
+    { label: 'a modal torn down mid-answer', value: undefined },
+    { label: 'a promise resolved with nothing', value: null },
+    { label: 'a third button nobody told this module about', value: 'cancel' },
+    { label: 'a truthy answer that is still not consent', value: 'APPLY' },
+  ];
+
+  for (const { label, value } of cases) {
+    const h = makeHarness({ answerUnrecognized: value });
+    h.vault.seed(SHARE, 'd');
+    const ids: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      const id = nid(`D${pad3(i)}`);
+      ids.push(id);
+      h.nodes.set(id, dead(file('', `f${pad3(i)}.md`, { s: 1 })));
+      await place(h, id, `Shared/f${pad3(i)}.md`, `body ${i}`);
+    }
+
+    const ctx = h.ctx();
+    await h.deletions.apply(ctx);
+
+    assert.equal(h.confirms.length, 1, `${label}: the dialog WAS asked`);
+    assert.equal(mutations(h.vault), 0, `${label}: and nothing was applied`);
+    assert.equal(h.vault.callsTo('trashLocal').length, 0, `${label}: nothing trashed`);
+    assert.deepEqual(ctx.failures, [], `${label}: and it is not an error either`);
+    assert.deepEqual(h.state.data.declinedNodes.sort(), [...ids].sort(), `${label}: all declined`);
+    assert.equal(h.state.data.declinedPaths.length, 12, label);
+    assert.equal(h.state.data.deleteBudget.length, 0, `${label}: no deletion was recorded`);
+    assert.equal(ctx.removedThisPass.size, 0, label);
+    for (let i = 0; i < 12; i++) {
+      assert.equal(
+        h.vault.snapshot()[`Shared/f${pad3(i)}.md`], `body ${i}`,
+        `${label}: every file is still exactly where the user left it`,
+      );
+    }
   }
 });
 
