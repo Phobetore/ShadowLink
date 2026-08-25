@@ -438,3 +438,72 @@ export function chooseAttachments(
 ): Promise<string[]> {
   return new DeferredAttachmentsModal(app, entries).ask();
 }
+
+// ============================================================ §7.5
+
+/**
+ * The attachment-folder warning: one check, one string, and the reason this
+ * feature is usable at all on a default install.
+ *
+ * ShadowLink shares one FOLDER. Obsidian's "Default location for new attachments"
+ * is VAULT-GLOBAL, and its default is the vault root — so the very first image a
+ * user drags into a shared note lands outside the share, `![[diagram.png]]`
+ * resolves to a file no peer will ever see, and the conclusion they draw is that
+ * attachment sync does not work.
+ *
+ * It names the exact setting, and the exact value to choose, because "check your
+ * attachment settings" is advice nobody can act on. The safe answer — Escape, the
+ * close button, a workspace teardown — is KEEP WARNING: this dialog is not asking
+ * permission for anything, and the cost of showing it again is a click, while the
+ * cost of hiding it is a feature that silently does not work.
+ */
+class AttachmentFolderModal extends DecisionModal<'dismiss' | 'later'> {
+  constructor(
+    app: App,
+    private readonly shareRoot: string,
+    private readonly folder: string,
+  ) {
+    super(app, 'later');
+  }
+
+  override onOpen(): void {
+    const { contentEl, titleEl, shareRoot, folder } = this;
+    titleEl.setText('ShadowLink — new attachments would not be shared');
+
+    const where = folder.trim() === '' || folder.trim() === '/'
+      ? 'the vault root'
+      : `"${folder}"`;
+    contentEl.createEl('p', {
+      text: `Obsidian saves new attachments to ${where}, which is outside the shared `
+        + `folder "${shareRoot}". Images and PDFs you add to a shared note will stay on `
+        + 'this device, and everybody else will see a broken embed.',
+    });
+    contentEl.createEl('p', {
+      text: 'Fix it in Settings → Files and links → "Default location for new '
+        + 'attachments". Choose "Same folder as current file", or a folder inside '
+        + `"${shareRoot}".`,
+    });
+    contentEl.createEl('p', {
+      text: 'Attachments already inside the shared folder sync normally either way; '
+        + 'this is only about where new ones are created.',
+      cls: 'setting-item-description',
+    });
+
+    new Setting(contentEl)
+      .addButton((b) => b
+        .setButtonText('I\'ll fix the setting')
+        .setCta()
+        .onClick(() => { this.choose('later'); }))
+      .addButton((b) => b
+        .setButtonText('Don\'t warn me again')
+        .onClick(() => { this.choose('dismiss'); }));
+  }
+}
+
+export function warnAttachmentFolder(
+  app: App,
+  shareRoot: string,
+  folder: string,
+): Promise<'dismiss' | 'later'> {
+  return new AttachmentFolderModal(app, shareRoot, folder).ask();
+}

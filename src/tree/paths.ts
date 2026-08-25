@@ -363,6 +363,45 @@ export function assertInsideShare(shareRoot: string, path: string, allowReserved
   return path === root || path.startsWith(root + '/');
 }
 
+/**
+ * Spec §7.5. Would a new attachment, created from a note inside the share, land
+ * inside the share?
+ *
+ * This is the single most reported problem with the closest comparable product,
+ * and it is nobody's mistake: folder-scoped sharing is ShadowLink's design, while
+ * Obsidian's "Default location for new attachments" is VAULT-GLOBAL. A user on the
+ * default setting drags an image into a shared note, Obsidian writes it to the
+ * vault root, and `![[diagram.png]]` resolves to a file no peer will ever see —
+ * silently, on the very first thing they try.
+ *
+ * The settings Obsidian offers map onto two answers:
+ *
+ *  - `./` and `./sub`  — relative to the note. A note inside the share therefore
+ *                        puts its attachments inside the share. SAFE.
+ *  - `/` and `''`      — the vault root, which is by definition not inside a
+ *                        folder-scoped share.
+ *  - a specific folder — safe only when that folder IS the share or lies within it.
+ *
+ * `null` means "the setting could not be read", which is not evidence of anything
+ * and must never produce a warning — I2's habit, applied to a preference.
+ */
+export function attachmentsLandInsideShare(
+  attachmentFolderPath: string | null,
+  shareRoot: string,
+): boolean {
+  if (attachmentFolderPath === null) return true;          // no evidence is not bad evidence
+  const setting = attachmentFolderPath.trim();
+  // Relative to the note: whatever folder the note is in — and a note in the share
+  // is in the share.
+  if (setting === '.' || setting === './' || setting.startsWith('./')) return true;
+
+  const root = fold(shareRoot.replace(/^\/+|\/+$/g, ''));
+  const target = fold(setting.replace(/^\/+|\/+$/g, ''));
+  if (root === '') return false;                           // no share is not a safe share
+  if (target === '') return false;                         // '' and '/' are the vault root
+  return target === root || target.startsWith(`${root}/`);
+}
+
 /** True when `dir` is `root` itself or lies beneath it. Pure string containment. */
 export function isUnderDir(dir: string, root: string): boolean {
   return dir === root || dir.startsWith(root + '/');

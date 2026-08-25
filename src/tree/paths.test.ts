@@ -638,3 +638,57 @@ test('a name too long to decorate is rejected by validateRel, so the caller can 
     'while the fallback fits',
   );
 });
+
+// ---------------------------------------------------------------- §7.5
+
+import { attachmentsLandInsideShare } from './paths.ts';
+
+// ⚠ The single most reported problem with the closest comparable product, and it
+// is nobody's mistake: this plugin shares one FOLDER, while Obsidian's "Default
+// location for new attachments" is VAULT-GLOBAL. On the default setting the very
+// first image a user drags into a shared note lands outside the share, and
+// `![[diagram.png]]` resolves to a file no peer will ever see.
+test('the vault root is never inside a folder-scoped share', () => {
+  assert.equal(attachmentsLandInsideShare('/', 'Shared'), false);
+  assert.equal(attachmentsLandInsideShare('', 'Shared'), false);
+  assert.equal(attachmentsLandInsideShare('  ', 'Shared'), false);
+});
+
+// "Same folder as the current file" is the setting that always works, because a
+// note inside the share is, by construction, inside the share.
+test('a location relative to the note is always inside the share', () => {
+  assert.equal(attachmentsLandInsideShare('./', 'Shared'), true);
+  assert.equal(attachmentsLandInsideShare('.', 'Shared'), true);
+  assert.equal(attachmentsLandInsideShare('./attachments', 'Shared'), true);
+});
+
+test('a specific folder is safe only when it is the share, or inside it', () => {
+  assert.equal(attachmentsLandInsideShare('Shared', 'Shared'), true);
+  assert.equal(attachmentsLandInsideShare('Shared/files', 'Shared'), true);
+  assert.equal(attachmentsLandInsideShare('/Shared/files/', 'Shared'), true);
+  assert.equal(attachmentsLandInsideShare('Attachments', 'Shared'), false);
+  assert.equal(attachmentsLandInsideShare('SharedOther', 'Shared'), false, 'not a prefix match');
+  assert.equal(attachmentsLandInsideShare('Work/Shared', 'Shared'), false);
+});
+
+// Case folding, because every other path comparison in this file does it and a
+// warning that fired on `shared` but not `Shared` would be worse than none.
+test('the containment test folds case like every other path comparison here', () => {
+  assert.equal(attachmentsLandInsideShare('shared/files', 'Shared'), true);
+  assert.equal(attachmentsLandInsideShare('Shared/Files', 'shared'), true);
+});
+
+// I2's habit, applied to a preference: a setting this plugin could not read is
+// not a setting that is wrong. Obsidian's `getConfig` is undocumented, and a
+// version that stops answering must not start accusing the user of a problem
+// nobody has confirmed.
+test('a setting that could not be read never produces a warning', () => {
+  assert.equal(attachmentsLandInsideShare(null, 'Shared'), true);
+});
+
+// An unconfigured share is not a safe one — nothing can land inside a folder
+// that has not been named.
+test('an empty share root is never satisfied', () => {
+  assert.equal(attachmentsLandInsideShare('Anything', ''), false);
+  assert.equal(attachmentsLandInsideShare('/', ''), false);
+});

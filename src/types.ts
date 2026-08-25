@@ -19,6 +19,17 @@ export interface ShadowLinkSettings {
    * Empty means "not minted yet".
    */
   deviceId: string;
+  /**
+   * Spec §7.5. Has the user said they do not want to be told again that new
+   * attachments would land outside the shared folder?
+   *
+   * It lives in the plugin's settings rather than in device state because it is a
+   * preference about a VAULT-GLOBAL Obsidian setting, and device state is
+   * discarded whole whenever it names another device or another workspace — which
+   * would re-open a dialog the user already dismissed, on a schedule they could
+   * not predict.
+   */
+  attachmentFolderWarningDismissed: boolean;
 }
 
 /**
@@ -42,4 +53,5 @@ export const DEFAULT_SETTINGS: ShadowLinkSettings = {
   cursorColor: '#7c6af7',
   share: { serverUrl: '', serverKey: '', workspaceId: '', sharedFolder: '' },
   deviceId: '',
+  attachmentFolderWarningDismissed: false,
 };

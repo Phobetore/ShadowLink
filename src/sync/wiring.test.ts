@@ -41,8 +41,12 @@ const MAIN = readFileSync(fileURLToPath(new URL('../../main.ts', import.meta.url
  * stop at the first `}` and quietly assert against a fragment.
  */
 function constructorArgs(name: string): string {
-  const start = MAIN.indexOf(`new ${name}({`);
-  assert.notEqual(start, -1, `main.ts no longer constructs ${name}`);
+  return balancedFrom(`new ${name}({`, `main.ts no longer constructs ${name}`);
+}
+
+function balancedFrom(anchor: string, missing: string): string {
+  const start = MAIN.indexOf(anchor);
+  assert.notEqual(start, -1, missing);
   let depth = 0;
   for (let i = MAIN.indexOf('{', start); i < MAIN.length; i++) {
     if (MAIN[i] === '{') depth += 1;
@@ -51,7 +55,18 @@ function constructorArgs(name: string): string {
       if (depth === 0) return MAIN.slice(start, i + 1);
     }
   }
-  throw new Error(`unbalanced braces in main.ts's ${name} construction`);
+  throw new Error(`unbalanced braces in main.ts after "${anchor}"`);
+}
+
+/**
+ * The body of one method, by brace balance from its signature.
+ *
+ * Bounded on purpose: "the file mentions this name somewhere" is satisfied by the
+ * method's own DEFINITION, so a guard written that way passes whether or not
+ * anything ever calls it.
+ */
+function methodBody(signature: string): string {
+  return balancedFrom(signature, `main.ts no longer defines ${signature}`);
 }
 
 function assertPasses(name: string, keys: string[]): void {
@@ -113,9 +128,7 @@ test('the three download commands and the embed post-processor are registered', 
 // may be written where. A command that fetched bytes itself would be a second
 // writer with none of them.
 test('downloading an attachment approves it, persists that, and then runs a pass', () => {
-  const start = MAIN.indexOf('async downloadAttachments(');
-  assert.notEqual(start, -1, 'main.ts no longer has the shared download path');
-  const body = MAIN.slice(start, MAIN.indexOf('\n  }', start));
+  const body = methodBody('async downloadAttachments(ids: readonly string[]): Promise<void> {');
 
   const approve = body.indexOf('fetchApproved[id] = true');
   const persist = body.indexOf('state.flush()');
@@ -130,6 +143,31 @@ test('downloading an attachment approves it, persists that, and then runs a pass
   assert.equal(
     /blobs\.get\(/.test(body), false,
     'a command must never fetch bytes itself — the pass owns every rule about writing them',
+  );
+});
+
+// §7.5. The check is one line and the string is one paragraph, and without both
+// this feature does not work on a default Obsidian install: the vault-global
+// "Default location for new attachments" points at the vault root, so the first
+// image dragged into a shared note lands outside the share and every peer sees a
+// broken embed. Nothing in the sync engine can fix that — the file genuinely is
+// not in the shared folder — so being told is the entire remedy.
+test('the attachment-folder warning is actually reachable on start (§7.5)', () => {
+  assert.ok(
+    MAIN.includes('attachmentsLandInsideShare('),
+    'main.ts must run the attachment-location check',
+  );
+  assert.ok(MAIN.includes('warnAttachmentFolder('), 'and show the warning when it fails');
+  assert.ok(
+    methodBody('async start(): Promise<void> {').includes('this.warnIfAttachmentsLandOutside()'),
+    'the check must be CALLED from start(); defining it is not reaching it',
+  );
+  // Dismissible, and the dismissal has to survive a restart — otherwise it is not
+  // a dismissal, it is a delay.
+  assert.ok(
+    MAIN.includes('attachmentFolderWarningDismissed = true')
+    && MAIN.includes('saveSettings()'),
+    'dismissing must be persisted',
   );
 });
 

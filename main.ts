@@ -50,6 +50,7 @@ import {
   confirmFirstSync,
   confirmLocalBulkDelete,
   confirmUnshare,
+  warnAttachmentFolder,
 } from './src/ui/modals';
 import { deferredEmbedProcessor, matchDeferred } from './src/ui/DeferredEmbeds';
 import { formatBytes, syncedStatus } from './src/ui/format';
@@ -67,6 +68,7 @@ import {
   REHASH_BUDGET_BYTES_MOBILE,
   TREE_SNAPSHOT_DEBOUNCE_MS,
 } from './src/tree/constants';
+import { attachmentsLandInsideShare } from './src/tree/paths';
 import { TreeDoc } from './src/tree/TreeDoc';
 import { Bootstrap } from './src/sync/Bootstrap';
 import { DeviceState } from './src/sync/DeviceState';
@@ -155,6 +157,27 @@ function newDeviceId(): string {
 /** `TFolder`, not an extension test: a `delete` event hands back a live object. */
 function kindOf(file: TAbstractFile): Kind {
   return file instanceof TFolder ? 'd' : 'f';
+}
+
+/**
+ * Obsidian's "Default location for new attachments", or null (spec §7.5).
+ *
+ * `getConfig` is undocumented and absent from the public typings, which is why
+ * every failure to read it answers NULL rather than a default. `null` means "this
+ * plugin could not tell", and `attachmentsLandInsideShare` treats that as no
+ * reason to warn — the same habit as I2, applied to a preference. Guessing `''`
+ * instead would accuse every user on a future Obsidian of a problem nobody has
+ * confirmed they have.
+ */
+function attachmentFolderSetting(app: { vault: unknown }): string | null {
+  const holder = app.vault as { getConfig?: (key: string) => unknown };
+  if (typeof holder?.getConfig !== 'function') return null;
+  try {
+    const value = holder.getConfig('attachmentFolderPath');
+    return typeof value === 'string' ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -527,6 +550,39 @@ class SyncRuntime {
     if (active !== null && this.isSharedNote(active.path)) {
       void this.session.open(active.path);
     }
+
+    // Last, so it lands on top of the first-sync modal rather than under it, and
+    // never on a client that failed to start.
+    await this.warnIfAttachmentsLandOutside();
+  }
+
+  /**
+   * Spec §7.5. One check, one string — and skipping it ships a feature that does
+   * not work on a default install.
+   *
+   * ShadowLink shares one FOLDER; Obsidian's "Default location for new
+   * attachments" is vault-global and defaults to the vault root. So the very first
+   * image the user drags into a shared note is written outside the share, is never
+   * published, and shows every peer a broken embed. Nothing in the sync engine can
+   * fix that — the file genuinely is not in the shared folder — so the only honest
+   * remedy is to say so once, name the setting, and let them dismiss it.
+   *
+   * Checked on every start rather than only on a first join, because the share
+   * root can move (§4.1) and the vault setting can change under it. Dismissing is
+   * what makes that bounded, and a user who fixes the setting stops seeing it with
+   * no dismissal at all.
+   */
+  private async warnIfAttachmentsLandOutside(): Promise<void> {
+    if (this.plugin.settings.attachmentFolderWarningDismissed) return;
+    const folder = attachmentFolderSetting(this.plugin.app);
+    if (attachmentsLandInsideShare(folder, this.shareRoot)) return;
+
+    const answer = await warnAttachmentFolder(
+      this.plugin.app, this.shareRoot, folder ?? '',
+    );
+    if (answer !== 'dismiss') return;
+    this.plugin.settings.attachmentFolderWarningDismissed = true;
+    await this.plugin.saveSettings();
   }
 
   async dispose(): Promise<void> {
