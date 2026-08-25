@@ -14,15 +14,21 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  BLOB_PUBLISH_CONCURRENCY, PUBLISH_BACKOFF_MS, PUBLISH_CONCURRENCY,
+  BLOB_PUBLISH_CONCURRENCY, PUBLISH_BACKOFF_MS, PUBLISH_CONCURRENCY, RECOVERED_DIR,
 } from '../tree/constants.ts';
-import { fold, hashOf, hashOfBytes } from '../tree/paths.ts';
+import { fold, hashOf, hashOfBytes, isLive, relPath, validateRel } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
+import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
+import type { NodeFields } from '../tree/types.ts';
 import type { BlobPort } from './BlobPort.ts';
+import { Deletions } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
+import { DiskIndex } from './DiskIndex.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
 import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { PublishQueue, type PublishQueueDeps } from './PublishQueue.ts';
+import type { DeletionContext, ReconcileFailure } from './Reconciler.ts';
+import { Tickets } from './Tickets.ts';
 import type { VaultPort } from './VaultPort.ts';
 
 // ---------------------------------------------------------------- fixtures
@@ -639,6 +645,125 @@ function png(seed = 1, length = 64): Uint8Array {
   return out;
 }
 
+/** What a peer's deletion pass did with the tree this queue produced. */
+interface PeerVerdict {
+  /** How many tombstones `collectDeletable` was willing to act on. */
+  batch: number;
+  trashed: boolean;
+  /** Moved aside into `ShadowLink Recovered/`. */
+  rescued: boolean;
+  /** The bytes still at the shared path afterwards, or undefined if it is gone. */
+  onDisk: Uint8Array | undefined;
+  notices: string[];
+}
+
+/**
+ * Run the REAL deletion pass on a second device against the tree this harness's
+ * queue just wrote.
+ *
+ * A queue test can only assert what the tree says; the harm a bad tombstone does
+ * happens on the other machine, so this builds Ben: his own vault holding the
+ * last published version, his own device state with the node bound and its base
+ * recorded, and the SAME content-addressed store Ada uploaded to. The context is
+ * assembled the way `Reconciler.describeDesiredState` assembles it, deliberately
+ * spelled out rather than shared with a helper, so a change to either one shows
+ * up here as a difference instead of as a silently agreeing abstraction.
+ */
+async function peerDeletionPass(
+  h: Harness, id: string, name: string, bytes: Uint8Array,
+): Promise<PeerVerdict> {
+  const path = `${SHARE}/${name}`;
+  const vault = new FakeVault();
+  vault.seed(SHARE, 'd');
+  vault.seedBinary(path, bytes);
+
+  const now = (): number => h.clock.now;
+  const state = new DeviceState(new MemoryStatePort(), 'device-2', 'ws-1', now, 0);
+  const tickets = new Tickets(now);
+  const notices: string[] = [];
+  state.data.materialized[id] = path;                      // Ben materialized it (§3.3)
+  const st = (await vault.stat(path))!;
+  state.data.contentHash[id] = {
+    sha256: await hashOfBytes(bytes), len: bytes.length, mtime: st.mtime,
+  };
+  vault.resetCalls();
+
+  const entries = h.tree.entries();
+  const derived = deriveTree(entries);
+  const wantAtFold = new Map<string, string>();
+  for (const [nodeId, rel] of derived.files) wantAtFold.set(fold(`${SHARE}/${rel}`), nodeId);
+  for (const rel of derived.folders) wantAtFold.set(fold(`${SHARE}/${rel}`), DIR_SENTINEL);
+
+  const deadNodes = new Map<string, NodeFields>();
+  const deadFold = new Set<string>();
+  for (const [nodeId, f] of entries) {
+    if (!validateRel(f.d, f.n, f.k)) continue;
+    if (isLive(f)) continue;
+    deadNodes.set(nodeId, f);
+    deadFold.add(fold(`${SHARE}/${relPath(f)}`));
+  }
+
+  const disk = DiskIndex.build(vault, SHARE);
+  const have = new Map<string, string>();
+  for (const [nodeId, p] of Object.entries(state.data.materialized)) {
+    const literal = disk.literal(p);
+    if (literal !== undefined) have.set(nodeId, literal);
+  }
+
+  const failures: ReconcileFailure[] = [];
+  const ctx: DeletionContext = {
+    cause: 'remote',
+    deadNodes,
+    deadFold,
+    wantAtFold,
+    have,
+    blobRefs: derived.blobs,
+    disk,
+    failures,
+    removedThisPass: new Set<string>(),
+    vault,
+    blobs: h.blobs,
+    docs: h.docs,
+    state,
+    tickets,
+    shareRoot: SHARE,
+    notice: (msg: string) => { notices.push(msg); },
+    now,
+    guarded: async (key, fn) => {
+      try {
+        await fn();
+      } catch (err) {
+        failures.push({ key, err });
+      }
+    },
+    unbind: (nodeId) => {
+      have.delete(nodeId);
+      delete state.data.materialized[nodeId];
+    },
+  };
+
+  const deletions = new Deletions({
+    vault, blobs: h.blobs, state, tickets, shareRoot: SHARE, now,
+    notice: (msg) => { notices.push(msg); },
+    // A batch big enough to need the dialog would be answered 'keep'; this one is
+    // a single file, so nothing here depends on how the dialog answers.
+    confirmBulk: async () => 'keep',
+  });
+
+  const batch = deletions.collectDeletable(ctx).length;
+  await deletions.apply(ctx);
+  assert.deepEqual(failures, [], "the peer's pass ran cleanly");
+
+  const after = vault.binarySnapshot();
+  return {
+    batch,
+    trashed: vault.wasTrashed(path),
+    rescued: Object.keys(vault.snapshot()).some((p) => p.startsWith(`${RECOVERED_DIR}/`)),
+    onDisk: after[path],
+    notices,
+  };
+}
+
 /** A `BlobPort` view of the harness's store, so one method can be replaced. */
 function blobPortOf(inner: FakeBlobs, overrides: Partial<BlobPort>): BlobPort {
   const base: BlobPort = {
@@ -947,6 +1072,145 @@ test('B24: a file over the device cap is retracted without ever being read', asy
   assert.equal(h.blobs.calls.length, 0, 'and the store was never asked about it');
   assert.equal(h.state.data.oversized[fold(`${SHARE}/clip.mov`)]?.why, 'device');
   assert.equal(h.tree.get(id)!.x, 1);
+});
+
+// ------------------------------------------------- §3.2: retract, on a REPLACE
+//
+// ⚠ Everything above tests retract against a node that was NEVER PUBLISHED, and
+// that is the only case §3.2's safety argument covers: "the node was never
+// published, so no peer materialized it and `collectDeletable` skips it".
+//
+// `publishBlobOne` admits a published node on purpose — I5a at PublishQueue.ts
+// lets any peer holding the node materialized publish a REPLACE — so the
+// argument's precondition is one `requeue` away from being false, and §3.5's
+// rule 2 makes that requeue on every pass. Against a published node the
+// tombstone retract writes is indistinguishable from a deliberate delete: every
+// peer has the file materialized, its bytes still hash to the reference the tree
+// names, and the store still holds them, so the peer's deletion pass PROVES the
+// content and trashes it. Worse than a delete, in fact — retract writes no `xh`,
+// so `canResurrect` can never bring the node back.
+//
+// A size refusal must therefore refuse the BYTES, never the node. §7.5 promises
+// the user "the file untouched and simply not shared. Nothing is moved, nothing
+// is deleted", and for a replace that promise is about the previous version too.
+
+test('an oversized replace refuses the new bytes and leaves the published node live', async () => {
+  const h = makeHarness();
+  const old = png(1, 512);
+  const id = h.addBlob('scan.tiff', old);
+  const oldSha = await h.blobs.seed(old);
+  h.tree.patchNode(id, { s: 1, b: refOf(oldSha, old.length) });        // already shared
+  const g = h.tree.get(id)!.g;
+  const st = (await h.vault.stat(`${SHARE}/scan.tiff`))!;
+  h.state.data.contentHash[id] = { sha256: oldSha, len: old.length, mtime: st.mtime };
+  h.vault.resetCalls();
+  h.blobs.resetCalls();
+
+  // The user drops a 4 KB scan over the 512-byte one, against a server that
+  // accepts 1 KB. This is the server arm; the device cap is nowhere near.
+  const big = png(2, 4_096);
+  const bigSha = await hashOfBytes(big);
+  h.vault.seedBinary(`${SHARE}/scan.tiff`, big);
+  h.blobs.setLimits({ maxFileBytes: 1_024 });
+
+  h.queue.requeue(id, bigSha);
+  await h.queue.drain();
+
+  const f = h.tree.get(id)!;
+  assert.equal(f.x, undefined, 'still LIVE: a tombstone here deletes it on every peer');
+  assert.notEqual(f.x, g);
+  assert.equal(f.s, 1, 'still published');
+  assert.equal(f.b, refOf(oldSha, old.length), 'and still names the last good version');
+  assert.equal(h.state.data.materialized[id], `${SHARE}/scan.tiff`, 'still bound');
+  assert.deepEqual(
+    h.state.data.contentHash[id], { sha256: oldSha, len: old.length, mtime: st.mtime },
+    'the base still names what is simultaneously in the tree and on some disk (I17)',
+  );
+  // `oversized` is keyed by folded PATH and self-heals in reconciler step 6 —
+  // which skips any path a LIVE node claims, before it ever asks the size. A
+  // record written here would sit in device state for ever and, if the node were
+  // properly deleted later, stop `onCreate` re-adopting the file at all.
+  assert.deepEqual(h.state.data.oversized, {}, 'and no path was poisoned');
+  assert.equal(h.blobs.callsTo('put').length, 0, 'nothing was uploaded');
+  assert.equal(h.vault.wasTrashed(`${SHARE}/scan.tiff`), false);
+  assert.deepEqual(
+    h.vault.binarySnapshot()[`${SHARE}/scan.tiff`], big,
+    'the file the user just put there is left exactly where they put it',
+  );
+  assert.equal(h.state.data.publish[id].state, 'done', 'the entry is closed, not retried for ever');
+  assert.equal(h.state.data.publish[id].intent, bigSha, 'carrying what it refused');
+  assert.ok(h.queue.lastError(id) !== undefined, 'the reason reaches diagnostics');
+  assert.equal(h.notices.length, 1, 'the user is told exactly once');
+  assert.match(h.notices[0], /scan\.tiff/);
+  assert.match(
+    h.notices[0], /previous version/,
+    '"it is not being shared" would be a lie about the version that still is',
+  );
+
+  // §3.5 rule 2 requeues on EVERY pass. The intent travels with the closed entry,
+  // so the same disk bytes are a no-op rather than a Notice per pass.
+  h.queue.requeue(id, bigSha);
+  await h.queue.drain();
+  assert.equal(h.notices.length, 1, 'and not once per pass');
+  assert.equal(h.tree.get(id)!.x, undefined);
+  assert.equal(h.blobs.callsTo('put').length, 0);
+});
+
+test('the device-cap arm refuses a published attachment too, without ever reading it', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 100 });
+  const old = png(1, 64);
+  const id = h.addBlob('clip.mov', old);
+  const oldSha = await h.blobs.seed(old);
+  h.tree.patchNode(id, { s: 1, b: refOf(oldSha, old.length) });
+  h.vault.resetCalls();
+
+  // A file that grew past the device cap between the pass that queued it and the
+  // drain that reached it — the route that needs no lowered server ceiling at all.
+  const big = png(3, 512);
+  h.vault.seedBinary(`${SHARE}/clip.mov`, big);
+
+  h.queue.requeue(id, await hashOfBytes(big));
+  await h.queue.drain();
+
+  const f = h.tree.get(id)!;
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'never held in memory');
+  assert.equal(f.x, undefined, 'and never tombstoned: peers hold this file');
+  assert.equal(f.b, refOf(oldSha, old.length), 'the last good version stays shared');
+  assert.equal(h.state.data.materialized[id], `${SHARE}/clip.mov`);
+  assert.deepEqual(h.state.data.oversized, {});
+  assert.equal(h.notices.length, 1);
+  assert.match(h.notices[0], /this device can handle/);
+  assert.match(h.notices[0], /previous version/);
+});
+
+// The user-visible half, and the only assertion that measures the actual harm:
+// what the OTHER device does with the tree the queue just produced. Ben's pass
+// is the real `Deletions`, over a context assembled the way the reconciler
+// assembles it — so this fails today for the reason it would fail a user.
+test('a peer holding the published attachment does not lose it to an oversized replace', async () => {
+  const h = makeHarness();
+  const old = png(1, 512);
+  const id = h.addBlob('scan.tiff', old);
+  const oldSha = await h.blobs.seed(old);
+  h.tree.patchNode(id, { s: 1, b: refOf(oldSha, old.length) });
+
+  const big = png(2, 4_096);
+  h.vault.seedBinary(`${SHARE}/scan.tiff`, big);
+  h.blobs.setLimits({ maxFileBytes: 1_024 });
+
+  h.queue.requeue(id, await hashOfBytes(big));
+  await h.queue.drain();
+
+  const ben = await peerDeletionPass(h, id, 'scan.tiff', old);
+
+  assert.equal(ben.trashed, false, 'his copy is not trashed');
+  assert.equal(ben.batch, 0, "Ada's size refusal is not a deletion on Ben's device");
+  assert.equal(ben.rescued, false, 'and not exiled to ShadowLink Recovered/ either');
+  assert.deepEqual(ben.onDisk, old, 'the last good version is still his file');
+  assert.deepEqual(
+    ben.notices, [],
+    'and he is not told Ada deleted a file she only tried to replace',
+  );
 });
 
 // I2, in the one place where it cannot be undone by a later pass: an unknown

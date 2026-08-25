@@ -37,7 +37,10 @@
 //    node is tombstoned, the path is recorded in `oversized`, the user is told
 //    once, and the file is left exactly where they put it: not moved, not deleted,
 //    and unbound, so no later deletion pass can mistake it for a file a tombstone
-//    is entitled to remove.
+//    is entitled to remove. That is the FIRST publish. A size refusal on a node
+//    that is already published refuses the BYTES instead and leaves the node
+//    alone: peers hold that file, and a tombstone on it is a remote delete of the
+//    last good version, not a refusal to share a new one.
 //
 // Failure policy: an entry is never silently dropped. Every failure charges one
 // step of the backoff ladder, the entry stays `pending`, and the whole ladder
@@ -530,13 +533,21 @@ export class PublishQueue {
    * every peer's Pending list for ever, so the node is tombstoned — and the file
    * is left EXACTLY where the user put it.
    *
-   * Nothing is moved and nothing is removed: the node was never published, so no
-   * peer materialized it and no peer's `collectDeletable` can see it. The local
-   * binding is dropped for the same reason in reverse — THIS device would
-   * otherwise hold a dead node bound to a real file, which is precisely the shape
-   * the deletion pass reads as "rescue it into ShadowLink Recovered/". The user
-   * would find their 200 MB video moved out of the share, its path permanently
-   * declined, for the crime of being too large.
+   * §3.2's entire safety argument for that tombstone is "the node was never
+   * published, so no peer materialized it and `collectDeletable` skips it", and
+   * the argument is sound only for a FIRST publish. `publishBlobOne` is reachable
+   * with `f.s === 1` by design — I5a admits any peer holding the node
+   * materialized, and §3.5's rule 2 requeues a replace on every pass — so the
+   * published case is split off above, where refusing the node would be a remote
+   * delete of the last good version rather than a refusal of the new bytes.
+   *
+   * Below this branch the node is unpublished, and there the tombstone is safe.
+   * Nothing is moved and nothing is removed. The local binding is dropped for the
+   * same reason in reverse — THIS device would otherwise hold a dead node bound to
+   * a real file, which is precisely the shape the deletion pass reads as "rescue
+   * it into ShadowLink Recovered/". The user would find their 200 MB video moved
+   * out of the share, its path permanently declined, for the crime of being too
+   * large.
    *
    * `oversized` is keyed by folded path and is consulted by `onCreate` and by
    * reconciler step 6, where it self-heals: a later `stat` showing the file has
@@ -550,6 +561,10 @@ export class PublishQueue {
     cap: number,
     why: 'server' | 'device',
   ): void {
+    if (f.s === 1) {
+      this.refuseReplace(id, path, bytes, cap, why);
+      return;
+    }
     const data = this.deps.state.data;
     this.deps.tree.transactLocal(() => {
       this.deps.tree.patchNode(id, { x: f.g, xa: this.now(), xb: this.deps.displayName });
@@ -563,6 +578,61 @@ export class PublishQueue {
       `"${baseOf(path)}" is ${mb(bytes)} MB — over the ${mb(cap)} MB limit `
       + `${why === 'server' ? 'this server accepts' : 'this device can handle'}. `
       + 'It is not being shared.',
+    );
+  }
+
+  /**
+   * A size refusal on a node that is ALREADY PUBLISHED (§3.2, the replace case).
+   *
+   * The new bytes are refused; the node is not. Every peer has this file
+   * materialized, its bytes still hash to the reference the tree names, and the
+   * store still holds them — so a tombstone here is proven content on the far
+   * side and their copy is TRASHED, under a notice naming a user who deleted
+   * nothing. It is worse than a real delete, because `retract` writes no `xh` and
+   * `canResurrect` can never bring the node back.
+   *
+   * So: the tree is not touched at all, and the last good version stays shared.
+   *
+   * Three things this deliberately does NOT do, each of which would be a bug:
+   *
+   *  * It does not write `oversized`. That record is keyed by folded PATH and
+   *    self-heals in reconciler step 6 — which skips any path a LIVE node claims
+   *    before it ever asks for a size. A record written here would never be swept,
+   *    and if the node were properly deleted later it would stop `onCreate` from
+   *    ever re-adopting the file (I13's path-poisoning, which `oversized` is kept
+   *    separate from `declinedPaths` precisely to avoid).
+   *  * It does not unbind. The node is live and the file at that path is the same
+   *    file every peer holds; dropping the binding would hide it from step 2.5 and
+   *    strand the tree naming bytes no device is watching any more.
+   *  * It does not touch `contentHash`. The base still names what is
+   *    simultaneously in the tree and on some disk (I17) — the oversized bytes on
+   *    this disk are unpublished local work, exactly like rule 4's fork loser.
+   *
+   * The entry is CLOSED carrying the intent it refused. §3.5 requeues on every
+   * pass, and `requeue` is a no-op for a matching intent, so the refusal costs one
+   * Notice rather than one per pass. The intent must be read before `markDone`,
+   * which replaces the entry.
+   */
+  private refuseReplace(
+    id: string,
+    path: string,
+    bytes: number,
+    cap: number,
+    why: 'server' | 'device',
+  ): void {
+    const data = this.deps.state.data;
+    const intent = data.publish[id]?.intent;
+    this.markDone(id, intent);
+    // §7.5's "permanent diagnostics entry". Refusing is not failing, so no rung of
+    // the ladder is charged and the entry does not stay pending.
+    this.errors.set(id, new Error(
+      `${path} is ${bytes} bytes, over the ${why} limit of ${cap}: the new version is not shared`,
+    ));
+    this.deps.state.schedulePersist();
+    this.deps.notice?.(
+      `"${baseOf(path)}" is ${mb(bytes)} MB — over the ${mb(cap)} MB limit `
+      + `${why === 'server' ? 'this server accepts' : 'this device can handle'}. `
+      + 'Your change is not being shared; the previous version still is.',
     );
   }
 
