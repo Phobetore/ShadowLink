@@ -974,6 +974,18 @@ export class Reconciler {
    * original has been overwritten, because the original IS the stash.
    */
   private async adopt(ctx: PassContext, id: string, path: string): Promise<void> {
+    // THE KIND BRANCH, before anything reads. Everything below this line assumes
+    // the file is text: `vault.read` decodes it as UTF-8, the comparison is a
+    // string comparison, and the resolution writes a string. Handed a PNG, that
+    // path decodes to mojibake, concludes it differs from the content doc,
+    // renames the user's real attachment into `ShadowLink Recovered/` and creates
+    // an EMPTY FILE at the canonical path — on every cold start, on every second
+    // device, and for every entry in Bootstrap's adopt bucket.
+    const ref = ctx.blobRefs.get(id);
+    if (ref !== undefined) {
+      await this.adoptBlob(ctx, id, path, ref);
+      return;
+    }
     await this.guarded(ctx.failures, `adopt:${id}`, async () => {
       if (ctx.disk.kindOf(path) !== 'f') {
         throw new Error(`adopt: ${path} is not a file`);          // never touched, never deleted
@@ -1008,6 +1020,85 @@ export class Reconciler {
         this.deps.docs.close(opened.handle);
       }
     });
+  }
+
+  /**
+   * Spec §3.4. A local file already sits where a live, published `'b'` node wants
+   * to be. Decide by its BYTES, and by nothing else.
+   *
+   * This function never calls `vault.read`, `vault.create` or `openHeadless`, and
+   * that is a promise about behaviour rather than about source text: the tests
+   * that hold it drive a real pass and assert on the calls that were made.
+   *
+   * The only two outcomes are "these are the bytes the tree names, so bind" and
+   * "these are not, so decide nothing yet". There is deliberately no third one
+   * that writes: the local file is the user's, it is the only copy of whatever it
+   * holds, and no amount of divergence makes overwriting it the right answer.
+   */
+  private async adoptBlob(
+    ctx: PassContext,
+    id: string,
+    path: string,
+    ref: BlobRef,
+  ): Promise<void> {
+    await this.guarded(ctx.failures, `adopt:${id}`, async () => {
+      if (ctx.disk.kindOf(path) !== 'f') {
+        throw new Error(`adopt: ${path} is not a file`);        // never touched, never deleted
+      }
+      // I7. A file the user has open in a view is one this pass does not touch,
+      // and the fork below would rename it out from under that view.
+      if (this.deps.vault.isOpenInLeaf(path)) return;           // deferred to the next pass
+
+      // I2: `stat` resolves null only for a definite not-found and REJECTS when
+      // the lookup failed, so a null here means the file went away between
+      // `list()` and now — step 3 re-materializes it on a later pass — and a
+      // rejection leaves through `guarded` without a decision being made at all.
+      const st = await this.deps.vault.stat(path);
+      if (st === null) return;
+
+      // §7.4. Hashing needs the whole file in memory. A file this device cannot
+      // hash is one it cannot decide anything about, so it decides nothing: no
+      // binding (which would claim bytes we never compared), and no fork.
+      if (st.bytes > this.memoryCapBytes()) {
+        ctx.diagnostics.tooLarge.push(id);
+        return;
+      }
+
+      const local = await hashOfBytes(await this.deps.vault.readBinary(path));
+      if (local === ref.sha256) {
+        // Converged before the pass even started: the file the user has IS the
+        // file the workspace names. Binding is the entire job.
+        this.bindPath(ctx, id, path);
+        this.recordBlobHash(id, ref.sha256, st.bytes, st.mtime);
+        return;
+      }
+      await this.forkAndTake(ctx, id, path, local, ref);
+    });
+  }
+
+  /**
+   * §4.3, STUBBED for this slice: leave both files alone, record the divergence,
+   * retry on the next pass.
+   *
+   * The real rule renames the local file to a deterministic conflict name and
+   * re-fills the canonical path with the tree's bytes, so that both versions
+   * survive as visible files. It needs the replace decision table to know which
+   * of the four cases this is, and that table is P2-d — so until then the honest
+   * answer is to decide nothing. Recording the failure is what makes "nothing"
+   * visible and repeatable: the node stays unbound, the next pass asks again, and
+   * neither copy can be lost in the meantime.
+   */
+  private async forkAndTake(
+    _ctx: PassContext,
+    id: string,
+    path: string,
+    local: string,
+    ref: BlobRef,
+  ): Promise<void> {
+    throw new RetryLater(
+      `${path} holds ${local.slice(0, 8)} but node ${id} names ${ref.sha256.slice(0, 8)}: `
+      + 'left untouched until the replace rule lands',
+    );
   }
 
   // ---------------------------------------------------------- step 4

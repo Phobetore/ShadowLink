@@ -18,10 +18,12 @@ import assert from 'node:assert/strict';
 
 import type { NodeFields } from '../tree/types.ts';
 import { fold, hashOfBytes } from '../tree/paths.ts';
+import { TreeDoc } from '../tree/TreeDoc.ts';
 import { Deletions, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import type { BlobPort } from './BlobPort.ts';
 import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import { PublishQueue } from './PublishQueue.ts';
 import { Reconciler, RetryLater, type ReconcilerDeps, type DeletionContext } from './Reconciler.ts';
 import { Tickets, type TicketOp } from './Tickets.ts';
 import type { VaultPort } from './VaultPort.ts';
@@ -1855,4 +1857,232 @@ test('the fetch and the verify both precede the write', async () => {
   // because the bytes it returned are what was written.
   assert.deepEqual(h.vault.callsTo('createBinary')[0].args[0], `${SHARE}/img/diagram.png`);
   assert.equal(h.blobs.callsTo('get').length, 1, 'and the fetch happened exactly once');
+});
+
+// ---------------------------------------------------------------- P2 §3.4: adopt
+
+// Every call the string-only path would make, for the two tests below. `adopt`
+// runs BEFORE materialize whenever a local file already sits at a node's path —
+// on every cold start, on every second device, and for every entry in Bootstrap's
+// adopt bucket — so an attachment reaching the markdown arm is not an edge case.
+function stringCalls(vault: FakeVault, path: string): string[] {
+  return vault.calls
+    .filter((c) => (c.op === 'read' || c.op === 'create') && c.args[0] === path)
+    .map((c) => c.op);
+}
+
+// B6, the converged half: the file the user already has IS the file the workspace
+// names. Binding is the whole job — writing anything would be a way to get it
+// wrong.
+test('B6: a local attachment whose bytes match the tree is bound, and nothing is written', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  const path = `${SHARE}/diagram.png`;
+  h.vault.seedBinary(path, bytes);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'diagram.png', bytes));
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.deepEqual(r.failures, []);
+  assert.equal(h.state.data.materialized[id], path, 'bound to the file that was already there');
+  assert.equal(h.state.data.contentHash[id]?.sha256, await hashOfBytes(bytes));
+  assert.ok(h.state.data.contentHash[id]?.mtime !== undefined, 'with the mtime it has on disk');
+  assert.deepEqual(h.vault.binarySnapshot()[path], bytes, 'the file is untouched');
+  assert.equal(mutations(h.vault), 0, 'not one create, rename or trash');
+  assert.deepEqual(stringCalls(h.vault, path), [], 'and it was never read as text');
+  assert.deepEqual(h.docs.calls, [], 'nor opened as a content doc');
+  assert.deepEqual(h.blobs.calls, [], 'and nothing was fetched: the bytes are already here');
+});
+
+// ⚠ B6, and the worst outcome available in P2. Unbranched, `adopt` reads a PNG
+// through `cachedRead`, compares the mojibake to a content doc that is empty,
+// concludes they differ, renames the user's real attachment into
+// `ShadowLink Recovered/` and writes `vault.create(path, '')` — a ZERO-BYTE FILE
+// at the canonical path. On every cold start. On every second device. For every
+// entry in Bootstrap's adopt bucket.
+//
+// The assertions below are behavioural on purpose: a source grep for `vault.read`
+// proves nothing about which branch a `'b'` node actually takes.
+test('B6: a local attachment that differs is never read as text, never exiled, never zeroed', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2);
+  const path = `${SHARE}/diagram.png`;
+  h.vault.seedBinary(path, mine);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'diagram.png', theirs));
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.deepEqual(
+    h.vault.binarySnapshot()[path], mine,
+    'the user’s bytes are still at the path, in full',
+  );
+  assert.deepEqual(stashed(h.vault), {}, 'nothing was exiled to ShadowLink Recovered/');
+  assert.equal(h.vault.wasTrashed(path), false);
+  assert.deepEqual(stringCalls(h.vault, path), [], 'no lossy decode, and no empty create');
+  assert.deepEqual(h.docs.calls, [], 'no content doc for a `b` node, ever');
+  for (const [p, data] of Object.entries(h.vault.binarySnapshot())) {
+    assert.notEqual(data.length, 0, `${p} is not a zero-byte file`);
+  }
+  // The conflict POLICY is P2-d. Until then the divergence is recorded and
+  // retried, which is the only answer that cannot lose either version.
+  assert.deepEqual(r.failures.map((f) => f.key), [`adopt:${id}`]);
+  assert.equal(h.state.data.materialized[id], undefined, 'and nothing was bound to it');
+
+  // Idempotent: a second pass makes exactly the same non-decision.
+  const before = h.vault.binarySnapshot();
+  const second = await h.reconciler.reconcile('retry');
+  assert.deepEqual(h.vault.binarySnapshot(), before, 'the pass is repeatable and inert');
+  assert.deepEqual(second.failures.map((f) => f.key), [`adopt:${id}`]);
+});
+
+// ⚠ B24, the adopt arm. The hash needs the whole file in memory, so the cap has
+// to be applied before the read — and a file this device cannot hash is a file it
+// cannot make a decision about, so it does not make one: no binding, no fork, no
+// verdict of any kind.
+test('B24: a local attachment over the memory cap is not hashed and not bound', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 32 });
+  h.vault.seed(SHARE, 'd');
+  const bytes = png(4, 512);
+  h.vault.seedBinary(`${SHARE}/clip.mov`, bytes);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'clip.mov', bytes));
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'never held in memory');
+  assert.deepEqual(r.diagnostics.tooLarge, [id]);
+  assert.equal(h.state.data.materialized[id], undefined, 'no binding from a decision never made');
+  assert.deepEqual(h.vault.binarySnapshot()[`${SHARE}/clip.mov`], bytes);
+});
+
+// I7. The user has the image open; a second writer under a live view is exactly
+// what the invariant exists to prevent. Deferring costs one pass.
+test('an attachment open in a leaf is not adopted, and not read', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  h.vault.seedBinary(`${SHARE}/diagram.png`, bytes);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'diagram.png', bytes));
+  h.vault.setOpen(`${SHARE}/diagram.png`, true);
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.deepEqual(r.failures, []);
+  assert.equal(h.vault.callsTo('readBinary').length, 0);
+  assert.equal(h.state.data.materialized[id], undefined, 'deferred to the next pass');
+
+  // `bootstrap` again only because this vault holds exactly one file: a pass with
+  // nothing bound at all is what the mount guard is for, and that guard is not
+  // what this test is about.
+  h.vault.setOpen(`${SHARE}/diagram.png`, false);
+  await h.reconciler.reconcile('bootstrap');
+  assert.equal(h.state.data.materialized[id], `${SHARE}/diagram.png`, 'and adopted once closed');
+});
+
+// I2. "I could not look" is not an answer. A `stat` that rejects must not become
+// a fork, a rescue, or a fetch that overwrites what is there.
+test('a stat that could not answer adopts nothing and touches nothing', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  h.vault.seedBinary(`${SHARE}/diagram.png`, bytes);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'diagram.png', bytes));
+  h.vault.failNext('stat', new Error('EIO: the volume is unreadable'));
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.deepEqual(r.failures.map((f) => f.key), [`adopt:${id}`]);
+  assert.equal(mutations(h.vault), 0);
+  assert.deepEqual(h.vault.binarySnapshot()[`${SHARE}/diagram.png`], bytes);
+  assert.equal(h.state.data.materialized[id], undefined);
+});
+
+// ---------------------------------------------------------------- the round trip
+
+// The slice's whole point, in one test: a file dropped into the share on A is on
+// B, byte for byte, with the store as the only thing between them — and B never
+// holds an empty file at any instant, which is the failure this design keeps
+// choosing shapes to avoid (I6).
+//
+// Both engines share one tree (a `Y.Doc` is what a real workspace shares) and one
+// store; everything else — vault, device state, tickets — is per device.
+test('an attachment round-trips: published on A, materialized byte-identically on B', async () => {
+  const store = new FakeBlobs();
+  const tree = new TreeDoc();
+  const bytes = png(7, 128);
+
+  // ---- device A: the user drops an image into the shared folder.
+  const vaultA = new FakeVault();
+  vaultA.seed(SHARE, 'd');
+  vaultA.seed(`${SHARE}/img`, 'd');
+  vaultA.seedBinary(`${SHARE}/img/diagram.png`, bytes);
+  const stateA = new DeviceState(new MemoryStatePort(), 'device-A', 'ws-1', () => NOW, 0);
+  const idA = tree.createNode({ k: 'b', d: 'img', n: 'diagram.png' }, NOW);
+  stateA.data.owned[idA] = true;
+  stateA.data.materialized[idA] = `${SHARE}/img/diagram.png`;
+
+  const queue = new PublishQueue({
+    docs: new FakeDocs(),
+    vault: vaultA,
+    blobs: store,
+    state: stateA,
+    tree,
+    openNodeId: () => null,
+    now: () => NOW,
+    settleMs: 0,
+  });
+  queue.enqueue(idA);
+  await queue.drain();
+
+  const sha = await hashOfBytes(bytes);
+  assert.equal(tree.get(idA)!.b, `${sha}:${bytes.length}:-`, 'A published the reference');
+  assert.deepEqual(store.stored(sha), bytes);
+
+  // ---- device B: has never seen this file.
+  const vaultB = new FakeVault();
+  vaultB.seed(SHARE, 'd');
+  const stateB = new DeviceState(new MemoryStatePort(), 'device-B', 'ws-1', () => NOW, 0);
+  const reconcilerB = new Reconciler({
+    vault: vaultB,
+    docs: new FakeDocs(),
+    blobs: store,
+    state: stateB,
+    tickets: new Tickets(() => NOW),
+    shareRoot: SHARE,
+    entries: () => tree.entries(),
+    now: () => NOW,
+  });
+
+  const r = await reconcilerB.reconcile('bootstrap');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(
+    vaultB.binarySnapshot()[`${SHARE}/img/diagram.png`], bytes,
+    'byte-identical on the other side of the store',
+  );
+  // "Never an empty file at any point" is asserted over the CALL LOG, not over the
+  // end state: a stub that was written and then filled in would leave no trace in
+  // a snapshot taken afterwards.
+  for (const call of vaultB.calls) {
+    if (call.op === 'create') assert.fail(`B wrote a note-shaped file: ${String(call.args[0])}`);
+    if (call.op === 'createBinary') {
+      assert.equal((call.args[1] as Uint8Array).length, bytes.length, 'one full write, no stub');
+    }
+  }
+  assert.equal(stateB.data.contentHash[idA]?.sha256, sha, 'and B recorded what it confirmed');
+
+  // A second pass on B changes nothing and fetches nothing: converged.
+  store.resetCalls();
+  vaultB.resetCalls();
+  await reconcilerB.reconcile('sync');
+  assert.deepEqual(store.calls, [], 'no re-fetch');
+  assert.equal(mutations(vaultB), 0, 'and no second write');
 });
