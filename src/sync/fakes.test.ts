@@ -7,7 +7,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import * as Y from 'yjs';
+import { FakeBlobs, FakeDocs, FakeEditorBinding, FakeVault } from './fakes.ts';
 import {
   BlobDigestMismatch,
   BlobTooLarge,
@@ -15,6 +16,7 @@ import {
   BlobUnavailable,
   type BlobPort,
 } from './BlobPort.ts';
+import type { EditorBinding, SessionAwareness } from './WorkspaceSession.ts';
 import { hashOfBytes } from '../tree/paths.ts';
 
 // ---------------------------------------------------------------- case folding
@@ -784,4 +786,143 @@ test('a BlobPort binding accepts either implementation', async () => {
     new ObsidianBlobPort({ serverUrl: 'ws://127.0.0.1:9', serverKey: 'sk_x', workspaceId: 'w' }),
   ];
   assert.equal(ports.length, 2);
+});
+
+// ---------------------------------------------------------------- the editor
+
+// `FakeEditorBinding` is the fake this failure was hiding behind. Its
+// predecessor recorded `mount(notePath, text)` and returned true, so no test
+// could distinguish "the editor is showing the shared document" from "a dispatch
+// was issued at an editor showing something else entirely". The tests below are
+// about the fake itself: that it really does keep a document, that the document
+// really can diverge from the `Y.Text`, and that a divergence really does hurt.
+
+class TestAwareness implements SessionAwareness {
+  readonly fields = new Map<string, unknown>();
+  setLocalStateField(field: string, value: unknown): void {
+    this.fields.set(field, value);
+  }
+}
+
+function ytext(content: string): Y.Text {
+  const doc = new Y.Doc();
+  const text = doc.getText('content');
+  if (content.length > 0) text.insert(0, content);
+  return text;
+}
+
+test('the fake editor keeps its own document, which the shared text does not touch', () => {
+  const editor = new FakeEditorBinding();
+  editor.openLeaf('Shared/a.md', 'what the file holds');
+
+  assert.equal(editor.document('Shared/a.md'), 'what the file holds');
+  assert.equal(editor.document('Shared/absent.md'), undefined, 'no leaf, no document');
+});
+
+test('a mount makes the editor equal the Y.Text it binds', () => {
+  const editor = new FakeEditorBinding();
+  editor.openLeaf('Shared/a.md', 'the stale local revision');
+  const text = ytext('the workspace revision');
+
+  assert.equal(editor.mount('Shared/a.md', text, new TestAwareness()), true);
+  assert.equal(editor.document('Shared/a.md'), 'the workspace revision');
+});
+
+test('a remote delta into a DIVERGED editor raises the production RangeError', () => {
+  // This is the fake earning its place. `YSyncPluginValue._observer` translates a
+  // Y.Text delta into CodeMirror changes at Y.Text offsets and checks nothing
+  // about the editor's length; the observer in the fake is that translation,
+  // verbatim, over a real `EditorState`. Force the divergence back open after
+  // the mount — which is the state a mount that never equalised anything leaves
+  // behind — and the error the user's console was full of appears headlessly:
+  //
+  //   RangeError: Invalid change range 15 to 16 (in doc of length 0)
+  const editor = new FakeEditorBinding();
+  editor.openLeaf('Shared/a.md', 'fourteen chars');
+  const text = ytext('fourteen chars');
+  editor.mount('Shared/a.md', text, new TestAwareness());
+
+  editor.openLeaf('Shared/a.md', '');
+
+  assert.throws(
+    () => { text.insert(text.length, '!'); },
+    /Invalid change range 14 to 14 \(in doc of length 0\)/,
+  );
+});
+
+test('a remote delta into an EQUAL editor applies cleanly', () => {
+  const editor = new FakeEditorBinding();
+  editor.openLeaf('Shared/a.md', 'the stale local revision');
+  const text = ytext('the workspace revision');
+  editor.mount('Shared/a.md', text, new TestAwareness());
+
+  text.insert(text.length, ', extended');
+
+  assert.equal(editor.document('Shared/a.md'), 'the workspace revision, extended');
+});
+
+test('unmounting stops the editor tracking the document', () => {
+  const editor = new FakeEditorBinding();
+  editor.openLeaf('Shared/a.md', 'body');
+  const text = ytext('body');
+  editor.mount('Shared/a.md', text, new TestAwareness());
+
+  editor.unmount();
+  text.insert(text.length, ' more');
+
+  assert.equal(editor.document('Shared/a.md'), 'body', 'the delta went nowhere');
+  assert.equal(editor.unmounts, 1);
+});
+
+test('a mount into a leaf whose state has no compartment is refused', () => {
+  const editor = new FakeEditorBinding();
+  editor.openLeaf('Shared/a.md', 'body', { initialized: false });
+
+  assert.equal(editor.mount('Shared/a.md', ytext('shared'), new TestAwareness()), false);
+  assert.deepEqual(editor.refused, ['Shared/a.md']);
+  assert.equal(editor.document('Shared/a.md'), 'body', 'and it wrote nothing');
+});
+
+test('a mount for a path with no leaf, or a missing one, is refused', () => {
+  const editor = new FakeEditorBinding();
+  editor.openLeaf('Shared/a.md', 'body');
+  editor.missing.add('Shared/a.md');
+
+  assert.equal(editor.mount('Shared/a.md', ytext('shared'), new TestAwareness()), false);
+  assert.equal(editor.mount('Shared/never-opened.md', ytext('shared'), new TestAwareness()), false);
+  assert.equal(editor.mounts.length, 0);
+});
+
+// I7. The plugin may not write an open note's bytes, and `VaultPort` has no
+// `modify` — so in production Obsidian's save of the dirty buffer is the only
+// route by which that file changes, and it happens when Obsidian gets round to
+// it. `save()` is that route, and it is explicit so a test has to say when the
+// disk caught up rather than pretending it always has.
+test('the editor is the only writer of an open note, and its save is explicit', async () => {
+  const vault = new FakeVault();
+  const editor = new FakeEditorBinding(vault);
+  vault.seed('Shared/a.md', 'f', 'the stale local revision');
+  editor.openLeaf('Shared/a.md', 'the stale local revision');
+
+  editor.mount('Shared/a.md', ytext('the workspace revision'), new TestAwareness());
+  assert.equal(await vault.read('Shared/a.md'), 'the stale local revision', 'the disk lags');
+
+  editor.save('Shared/a.md');
+  assert.equal(await vault.read('Shared/a.md'), 'the workspace revision');
+
+  // And the port the plugin is handed genuinely cannot do this itself.
+  await assert.rejects(() => vault.create('Shared/a.md', 'engine bytes'), /exists/i);
+});
+
+test('FakeEditorBinding and CodeMirrorBinding present the same surface', async () => {
+  const { CodeMirrorBinding } = await import('./WorkspaceSession.ts');
+  const fake: EditorBinding = new FakeEditorBinding();
+  const real: EditorBinding = new CodeMirrorBinding(() => null);
+
+  for (const method of ['mount', 'unmount'] as const) {
+    assert.equal(
+      fake[method].length, real[method].length,
+      `${method}() takes a different number of arguments on the fake than on the real port`,
+    );
+  }
 });

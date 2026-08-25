@@ -8,25 +8,40 @@
 //        of the note into every peer's editor.
 //  - I7: mounting the wrong document into the wrong leaf, which the (up to ~11 s)
 //        wait window makes reachable whenever the user switches notes.
-//  - I17: marking a node published before the server acknowledged the write.
+//  - I17: marking a node published before the server acknowledged the write, or
+//        recording a watermark for bytes this device does not hold.
 //
-// Everything except the CodeMirror mount runs against the in-memory fakes; the
-// mount itself is behind `EditorBinding` and is GUI-verified (spec §10 Group D).
+// This header used to end "everything except the CodeMirror mount runs against
+// the in-memory fakes; the mount itself is behind `EditorBinding` and is
+// GUI-verified (spec §10 Group D)". That sentence cost a live share. `mount` was
+// binding a shared document into an editor it never made equal to it, and the
+// fake behind `EditorBinding` had no document to be wrong about — so "mounted a
+// 184-character document into an editor showing 166 characters" and "mounted
+// correctly" were the same assertion, in every one of these tests.
+//
+// `EditorState` needs no DOM. `CodeMirrorBinding` is therefore driven directly,
+// at the bottom of this file, and the session runs against `FakeEditorBinding`,
+// which keeps a real document per leaf and runs that same shipped binding over
+// it. What is genuinely GUI-only is narrower than it looked: whether Obsidian
+// saves the buffer the mount dirtied, and how soon.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import * as Y from 'yjs';
+import { EditorState, Transaction } from '@codemirror/state';
+import type { Extension, TransactionSpec } from '@codemirror/state';
+import type { EditorView } from '@codemirror/view';
 
 import { RECOVERED_DIR } from '../tree/constants.ts';
 import { hashOf } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
-import { FakeVault } from './fakes.ts';
+import { FakeEditorBinding, FakeVault } from './fakes.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 import {
+  CodeMirrorBinding,
   WorkspaceSession,
-  type EditorBinding,
   type ProviderPort,
   type SessionAwareness,
   type SessionProvider,
@@ -153,32 +168,6 @@ class FakeProviders implements ProviderPort {
   }
 }
 
-interface Mount {
-  notePath: string;
-  text: Y.Text;
-}
-
-class FakeEditor implements EditorBinding {
-  readonly mounts: Mount[] = [];
-  unmounts = 0;
-  /** Paths that have no editor view — `mount` refuses them, as a closed leaf would. */
-  readonly missing = new Set<string>();
-
-  mount(notePath: string, text: Y.Text, _awareness: SessionAwareness): boolean {
-    if (this.missing.has(notePath)) return false;
-    this.mounts.push({ notePath, text });
-    return true;
-  }
-
-  unmount(): void {
-    this.unmounts += 1;
-  }
-
-  get current(): Mount | undefined {
-    return this.mounts[this.mounts.length - 1];
-  }
-}
-
 /**
  * `FakeVault` with one operation parked until the test releases it, so an open
  * can be superseded at a precise await point rather than by luck of scheduling.
@@ -236,12 +225,19 @@ interface Harness {
   state: DeviceState;
   tree: TreeDoc;
   providers: FakeProviders;
-  editor: FakeEditor;
+  editor: FakeEditorBinding;
   session: WorkspaceSession;
   notices: string[];
   active: { path: string | null };
-  /** Mint a live file node at `Shared/<name>` and put `text` on disk. */
-  add(name: string, text: string, over?: { s?: 1; owned?: boolean }): string;
+  /**
+   * Mint a live file node at `Shared/<name>`, put `text` on disk, and open a leaf
+   * showing it. The leaf holds the FILE's bytes, because that is what Obsidian
+   * puts in an editor — which is the whole point: it may differ from the shared
+   * document, and until this fake had a document no test could say so.
+   */
+  add(name: string, text: string, over?: { s?: 1; owned?: boolean; initialized?: boolean }): string;
+  /** Every path under `ShadowLink Recovered/`, with its contents. */
+  stashes(): Array<[string, string]>;
 }
 
 function makeHarness(
@@ -252,7 +248,7 @@ function makeHarness(
   const state = new DeviceState(new MemoryStatePort(), 'device-1', 'ws-1', () => NOW, 0);
   const tree = new TreeDoc();
   const providers = new FakeProviders();
-  const editor = new FakeEditor();
+  const editor = new FakeEditorBinding(vault);
   const notices: string[] = [];
   const active: { path: string | null } = { path: null };
   vault.seed(SHARE, 'd');
@@ -281,10 +277,14 @@ function makeHarness(
     add(name, text, opts = {}) {
       const id = tree.createNode({ k: 'f', d: '', n: name, ...(opts.s ? { s: 1 } : {}) }, NOW);
       vault.seed(`${SHARE}/${name}`, 'f', text);
+      editor.openLeaf(`${SHARE}/${name}`, text, { initialized: opts.initialized ?? true });
       state.data.materialized[id] = `${SHARE}/${name}`;
       if (opts.owned) state.data.owned[id] = true;
       active.path = `${SHARE}/${name}`;
       return id;
+    },
+    stashes() {
+      return Object.entries(vault.snapshot()).filter(([p]) => p.startsWith(`${RECOVERED_DIR}/`));
     },
   };
 }
@@ -292,6 +292,21 @@ function makeHarness(
 /** Let queued microtasks and 0 ms timers run. */
 function tick(ms = 0): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Spin the event loop until `cond` holds.
+ *
+ * A fixed number of ticks is a bet on how many awaits a code path contains, and
+ * the bet goes stale the moment one is added or removed. This waits for the
+ * CONDITION and says what it was waiting for when it never arrives.
+ */
+async function until(cond: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    if (cond()) return;
+    await tick();
+  }
+  throw new Error(`timed out waiting for ${what}`);
 }
 
 function mutations(vault: FakeVault): number {
@@ -348,6 +363,7 @@ test('a path with no node yet falls back to local-only editing, never a guessed 
 test('a node that appears while the open is waiting is picked up', async () => {
   const h = makeHarness({ nodeWaitMs: 500 });
   h.vault.seed(`${SHARE}/late.md`, 'f', 'body');
+  h.editor.openLeaf(`${SHARE}/late.md`, 'body');
   h.active.path = `${SHARE}/late.md`;
 
   const opening = h.session.open(`${SHARE}/late.md`);
@@ -524,6 +540,9 @@ test('an already-seeded empty document is never re-seeded', async () => {
 });
 
 // ================================================================ divergence
+
+const STALE = '# Sans titre\n\nAn earlier revision, still sitting on the peer\'s disk.'.padEnd(166, '.');
+const SHARED = '# Sans titre\n\nThe workspace\'s revision, which that peer has never seen.'.padEnd(184, '.');
 
 test('a local copy that differs from the shared document is stashed, not overwritten', async () => {
   const h = makeHarness();
@@ -775,8 +794,7 @@ test('an open superseded while stashing the local copy never mounts', async () =
 
   h.active.path = `${SHARE}/a.md`;
   const first = h.session.open(`${SHARE}/a.md`);
-  await tick();
-  assert.equal(vault.parked, true, 'the first open is parked writing the stash');
+  await until(() => vault.parked, 'the first open to park writing the stash');
 
   h.active.path = `${SHARE}/b.md`;
   const second = h.session.open(`${SHARE}/b.md`);
@@ -784,10 +802,7 @@ test('an open superseded while stashing the local copy never mounts', async () =
   await Promise.all([first, second]);
 
   // The stash itself must still complete — those are the user's bytes.
-  assert.equal(
-    Object.keys(h.vault.snapshot()).filter((p) => p.startsWith(`${RECOVERED_DIR}/`)).length,
-    1,
-  );
+  assert.deepEqual(h.stashes().map(([, text]) => text), ['my offline edit']);
   assert.equal(h.providers.forRoom(`n_${a}`)[0].destroyed, true);
   assert.equal(h.editor.mounts.length, 1);
   assert.equal(h.editor.current?.notePath, `${SHARE}/b.md`);
@@ -807,8 +822,7 @@ test('a re-open of the SAME note supersedes the stashing one without mounting tw
   vault.gates.add('create');
 
   const first = h.session.open(`${SHARE}/a.md`);
-  await tick();
-  assert.equal(vault.parked, true);
+  await until(() => vault.parked, 'the first open to park writing the stash');
   const second = h.session.open(`${SHARE}/a.md`);
   vault.release();
   await Promise.all([first, second]);
@@ -889,6 +903,102 @@ test('opening a second note closes the first', async () => {
   assert.equal(h.providers.forRoom(`n_${b}`)[0].destroyed, false);
   assert.equal(h.session.openNodeId(), b);
   assert.equal(h.editor.unmounts, 1);
+});
+
+// ================================================================ CodeMirrorBinding
+//
+// The shipped binding, driven directly against a real `EditorState`. This used
+// to be declared untestable and left to a GUI checklist, which is how a mount
+// that never made the editor equal the document it bound survived three phases.
+// `EditorState` needs no DOM; the only thing that does is `EditorView`, and
+// `CodeMirrorBinding` uses nothing from it but `state` and `dispatch`.
+
+/** A leaf, as `CodeMirrorBinding` sees one: a state and a way to update it. */
+function leafOf(doc: string, extension: Extension | null): {
+  view: EditorView;
+  doc: () => string;
+  transactions: Transaction[];
+} {
+  const transactions: Transaction[] = [];
+  const view = {
+    state: EditorState.create({ doc, extensions: extension === null ? [] : [extension] }),
+    dispatch(spec: TransactionSpec): void {
+      const tr = view.state.update(spec);
+      transactions.push(tr);
+      view.state = tr.state;
+    },
+  };
+  return { view: view as unknown as EditorView, doc: () => view.state.doc.toString(), transactions };
+}
+
+function ytextOf(content: string): Y.Text {
+  const doc = new Y.Doc();
+  const text = doc.getText('content');
+  if (content.length > 0) text.insert(0, content);
+  return text;
+}
+
+test('mount makes the editor hold the shared document before it binds anything', () => {
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf(STALE, binding.editorExtension());
+
+  assert.equal(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), true);
+
+  assert.equal(leaf.doc(), SHARED, 'the editor holds the workspace\'s text');
+  assert.equal(leaf.transactions.length, 2, 'the replacement and the bind are separate dispatches');
+  assert.equal(leaf.transactions[0].docChanged, true, 'the replacement goes first…');
+  assert.equal(leaf.transactions[1].docChanged, false, '…and the bind changes nothing');
+});
+
+test('the replacement is kept out of the undo history', () => {
+  // Once `yCollab` is installed, one Ctrl+Z over an undoable replacement would
+  // push the stale local revision back through `YSyncPluginValue.update` as a
+  // local edit — and broadcast it to every peer.
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf(STALE, binding.editorExtension());
+
+  binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+
+  assert.equal(leaf.transactions[0].annotation(Transaction.addToHistory), false);
+});
+
+test('mount leaves a document that already matches completely alone', () => {
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf(SHARED, binding.editorExtension());
+
+  assert.equal(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), true);
+
+  assert.deepEqual(leaf.transactions.map((tr) => tr.docChanged), [false], 'one dispatch, no change');
+});
+
+test('mount into a state without the compartment is refused, and writes nothing', () => {
+  // The silent hole: `Compartment.reconfigure` aimed at a state that does not
+  // contain the compartment is inert, and `compartment.get(state)` is undefined
+  // there. Checking that BEFORE the replacement is what keeps a mount that
+  // cannot bind from having thrown the user's buffer away first.
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf(STALE, null);
+
+  assert.equal(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), false);
+
+  assert.equal(leaf.doc(), STALE, 'the user\'s document is exactly as it was found');
+  assert.deepEqual(leaf.transactions, [], 'and nothing was dispatched at it');
+});
+
+test('mount with no view for the path is refused', () => {
+  const binding = new CodeMirrorBinding(() => null);
+  assert.equal(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), false);
+});
+
+test('unmount removes the binding and leaves the document where it is', () => {
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf(STALE, binding.editorExtension());
+  binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+
+  binding.unmount();
+
+  assert.equal(leaf.doc(), SHARED, 'the shared text stays: it is what the file will hold');
+  binding.unmount();                                  // idempotent
 });
 
 // ================================================================ source guards

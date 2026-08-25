@@ -34,17 +34,23 @@
 //
 // TESTABILITY. Everything that does not need a running Obsidian is behind a port:
 // the vault (`VaultPort`), the network (`ProviderPort`) and the editor
-// (`EditorBinding`). The CodeMirror mount is the only part that cannot be
-// exercised headlessly, so it is the only part behind `EditorBinding` — and its
-// real implementation, `CodeMirrorBinding`, is the P0 `Compartment` approach
-// unchanged. This file imports `@codemirror/*`, `y-codemirror.next` and
+// (`EditorBinding`). This file imports `@codemirror/*`, `y-codemirror.next` and
 // `y-websocket`, but never `obsidian`: the leaf/view lookup arrives as an
 // injected callback so the whole module stays loadable in a headless test.
+//
+// This header used to say the CodeMirror mount was the one part that could not
+// be exercised headlessly, and left it to a GUI checklist. That was wrong, and
+// it was expensive: `EditorState` needs no DOM, so `CodeMirrorBinding` can be
+// driven against a real document with nothing but `@codemirror/state`, and
+// `FakeEditorBinding` in `fakes.ts` does exactly that. The belief that the mount
+// was untestable is why a fake editor with no document went unnoticed for three
+// phases, and why "mounted a 184-character document into an editor showing 166
+// characters" and "mounted correctly" were the same assertion in every test.
 
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { yCollab } from 'y-codemirror.next';
-import { Compartment } from '@codemirror/state';
+import { Compartment, Transaction } from '@codemirror/state';
 import type { Extension } from '@codemirror/state';
 import type { EditorView } from '@codemirror/view';
 
@@ -100,7 +106,26 @@ export interface ProviderPort {
  * nothing is looking at.
  */
 export interface EditorBinding {
-  /** Bind `text` into the editor showing `notePath`. False when there is no such editor. */
+  /**
+   * Make the editor showing `notePath` HOLD `text`, then bind it.
+   *
+   * The ordering in that sentence is the contract, and it is not decorative.
+   * `y-codemirror.next` never reconciles an editor with the `Y.Text` it is
+   * handed: `YSyncPluginValue`'s constructor installs an observer and nothing
+   * else, so its documented usage is `EditorState.create({ doc: ytext.toString(),
+   * … })` — the caller is expected to have made the two equal already. Bind a
+   * 184-character `Y.Text` into an editor showing 166 characters and every
+   * later remote delta addresses a position in a document that does not exist:
+   * `RangeError: Invalid change range 15 to 16 (in doc of length 0)`, and a note
+   * whose content never appears and whose file is never rewritten.
+   *
+   * So a `true` return is a claim about what the editor now CONTAINS, not about
+   * a dispatch having been issued. Callers rely on it: for an open note the
+   * editor is the only writer of the file's bytes (I7), so "the shared document
+   * wins on disk" is delivered by this method or not at all.
+   *
+   * False means no binding was installed.
+   */
   mount(notePath: string, text: Y.Text, awareness: SessionAwareness): boolean;
   /** Remove any binding. Idempotent, and safe once the view is gone. */
   unmount(): void;
@@ -488,10 +513,81 @@ export class CodeMirrorBinding implements EditorBinding {
   mount(notePath: string, text: Y.Text, awareness: SessionAwareness): boolean {
     const view = this.viewFor(notePath);
     if (view === null) return false;
+
+    // LIVENESS FIRST, before anything is written. `Compartment.reconfigure`
+    // aimed at a state that does not contain the compartment is inert and
+    // silent — `compartment.get(state)` is `undefined` there — so without this
+    // check a mount into an editor Obsidian has not finished building returns
+    // true having bound nothing at all, and the session then behaves as though
+    // the user were editing collaboratively. Checking BEFORE the replacement
+    // also means a mount that cannot bind has not thrown the user's buffer away.
+    if (this.compartment.get(view.state) === undefined) return false;
+
+    // I18: compare on normalized line endings, in BOTH directions. A peer on
+    // Windows can seed a document holding CRLF, and CodeMirror normalizes line
+    // endings on the way in — so `view.state.doc.toString()` can never be equal
+    // to such a `shared` string, and an exact comparison would replace the
+    // document on every single open and then refuse the mount it just performed.
+    // (A CRLF `Y.Text` remains a hazard of its own: its offsets are not the
+    // editor's, so a remote delta lands one position out per line ending. That
+    // is not this method's to fix — it is upstream of anything the editor can
+    // see — but it is worth knowing that this comparison hides it rather than
+    // solving it.)
+    const shared = text.toString();
+    if (normLF(view.state.doc.toString()) !== normLF(shared)) {
+      // WHAT THIS COSTS, deliberately. Replacing the whole document is the
+      // bluntest possible convergence: the user's selection is remapped through
+      // a change that touches every character, so a cursor mid-note lands at the
+      // start, and any inline decoration state for the old text is discarded.
+      // The alternative — a minimal diff — is not available here, because the
+      // two sides are not two revisions of one edit history but two independent
+      // revisions of one note, and a diff that guesses wrong writes the guess
+      // into the CRDT for every peer. The blunt version is the one whose result
+      // is knowable: after it, the editor holds exactly the workspace's text.
+      //
+      // `addToHistory: false` keeps the replacement out of the undo stack. It
+      // has to: once `yCollab` is installed one Ctrl+Z would push the stale
+      // local revision back through `YSyncPluginValue.update` as a local edit,
+      // and broadcast it to every peer.
+      view.dispatch({
+        changes: { from: 0, to: view.state.doc.length, insert: shared },
+        annotations: Transaction.addToHistory.of(false),
+      });
+    }
+
+    // TWO dispatches, not one, and the replacement goes first. Going first
+    // matters because `yCollab` is not installed yet, so `YSyncPluginValue`
+    // cannot see the replacement and cannot echo the old bytes back into the
+    // shared document. Keeping them separate matters because a single dispatch
+    // would depend on CodeMirror constructing a newly added `ViewPlugin` from
+    // the POST-transaction state and never handing it that transaction's
+    // `update()` — true of the copy in this repo, but `@codemirror/state` and
+    // `@codemirror/view` are `external` in the build, so at runtime this is
+    // Obsidian's CodeMirror and not one this suite can pin.
+    //
     // `yCollab` types its awareness parameter as `any`; the structural interface
     // above is what the session is allowed to depend on, and the real provider
     // hands over a y-protocols Awareness that satisfies both.
     view.dispatch({ effects: this.compartment.reconfigure([yCollab(text, awareness)]) });
+
+    if (
+      this.compartment.get(view.state) === undefined
+      || normLF(view.state.doc.toString()) !== normLF(shared)
+    ) {
+      // Belt and braces: the two claims `true` makes are that the binding is
+      // installed and that the editor holds the shared text. If either is false
+      // after the dispatches, say so rather than let the session record a
+      // watermark and defer repairs for a note nothing is bound to. The buffer
+      // is left holding the shared text — restoring the stale revision would
+      // only re-dirty it with bytes the workspace has already moved past.
+      try {
+        view.dispatch({ effects: this.compartment.reconfigure([]) });
+      } catch {
+        /* the view was destroyed with its leaf */
+      }
+      return false;
+    }
+
     this.mounted = view;
     return true;
   }
