@@ -23,12 +23,14 @@
 //
 // No `obsidian` import, no node builtins.
 
-import { RECOVERED_DIR, STAGING_DIR } from '../tree/constants.ts';
+import { BLOB_MAX_BYTES, RECOVERED_DIR, STAGING_DIR } from '../tree/constants.ts';
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
 import {
-  assertInsideShare, extOf, fold, hashOf, isLive, nodeKindOf, relPath, splitRel, validateRel,
+  assertInsideShare, extOf, fold, hashOf, hashOfBytes, isLive, nodeKindOf, relPath, splitRel,
+  validateRel, type BlobRef,
 } from '../tree/paths.ts';
+import type { BlobPort } from './BlobPort.ts';
 import type { DeviceState } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
 import type { DocPort } from './DocPort.ts';
@@ -52,6 +54,14 @@ export interface ReconcileDiagnostics {
   invalid: string[];
   /** Literal paths held by a file a dead node used to own. Reported, never touched. */
   deletedButPresent: string[];
+  /**
+   * Attachment nodes this device will not hold in memory (§7.4). Not a failure:
+   * the node stays live, valid, published and simply unmaterialized HERE, which
+   * is the correct state — the alternative is a phone that dies on every pass.
+   */
+  tooLarge: string[];
+  /** Attachment nodes the fetch policy has not cleared yet (§7.2). Nothing is on disk. */
+  deferred: string[];
 }
 
 export interface ReconcileResult {
@@ -104,6 +114,8 @@ export interface DeletionContext {
 export interface ReconcilerDeps {
   vault: VaultPort;
   docs: DocPort;
+  /** The attachment store (spec §8.3). Only `'b'` nodes ever reach it. */
+  blobs: BlobPort;
   state: DeviceState;
   tickets: Tickets;
   shareRoot: string;
@@ -126,6 +138,11 @@ export interface ReconcilerDeps {
   publishUntracked?: (paths: string[]) => Promise<void>;
   notice?: (msg: string) => void;
   now?: () => number;
+  /**
+   * The largest attachment this device will hold in memory (§7.4). Injected as a
+   * plain number so nothing here has to know what platform it is running on.
+   */
+  memoryCapBytes?: () => number;
 }
 
 /**
@@ -162,6 +179,17 @@ interface PassContext extends DeletionContext {
   deadMaterializedFold: Set<string>;
   /** fold(literal path) -> nodeId, the inverse of `have`. */
   boundAtFold: Map<string, string>;
+  /**
+   * nodeId -> the parsed `b` of every LIVE, VALID, PUBLISHED `'b'` node, from the
+   * same derivation as `desired`.
+   *
+   * Membership here IS the kind test for the whole pass. Deriving it once means
+   * `materialize` and `adopt` cannot disagree about what a node is — and the way
+   * they could disagree is not academic: `adopt` reading an attachment as a note
+   * decodes a PNG to lossy UTF-8, decides it differs from the shared copy, and
+   * exiles the user's real file (§3.4).
+   */
+  blobRefs: Map<string, BlobRef>;
   diagnostics: ReconcileDiagnostics;
   bind: (id: string, path: string) => void;
 }
@@ -364,7 +392,9 @@ export class Reconciler {
 
     this.running = true;
     const failures: ReconcileFailure[] = [];
-    const diagnostics: ReconcileDiagnostics = { pending: [], invalid: [], deletedButPresent: [] };
+    const diagnostics: ReconcileDiagnostics = {
+      pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
+    };
     // Stays null until bindings have been observed, so a refusal partway through
     // cannot let the `finally` block rebuild `materialized` from an empty map.
     let ctx: PassContext | null = null;
@@ -452,6 +482,9 @@ export class Reconciler {
     const wantAtFold = new Map<string, string>();
     for (const [id, rel] of derived.files) {
       const path = this.vaultPathOf(rel);
+      // The DISK kind, which is `'f'` for a note and for an attachment alike: an
+      // attachment is an ordinary file on disk, and `DiskIndex` speaks the disk's
+      // vocabulary. WHICH of the two a node is, is `blobRefs` below.
       desired.set(id, { path, kind: 'f' });
       wantAtFold.set(fold(path), id);
     }
@@ -504,6 +537,7 @@ export class Reconciler {
       notice: this.notice,
       now: this.now,
       desired,
+      blobRefs: derived.blobs,
       folderPaths,
       deadFolderPaths,
       vacatedDirs: new Set<string>(),
@@ -797,6 +831,17 @@ export class Reconciler {
         await this.adopt(ctx, id, ctx.disk.literal(path)!);       // I11: the LITERAL casing
         continue;
       }
+      // The kind branch, BEFORE anything opens a room or reads a file. A `'b'`
+      // node's content lives in the store, not in a content doc, and opening one
+      // for it would wait out the sync timeout on a room that will never hold
+      // anything — once per attachment, on every pass.
+      const ref = ctx.blobRefs.get(id);
+      if (ref !== undefined) {
+        await this.guarded(
+          ctx.failures, `materialize:${id}`, () => this.materializeBlob(ctx, id, path, ref),
+        );
+        continue;
+      }
       await this.guarded(ctx.failures, `materialize:${id}`, async () => {
         const opened = await this.deps.docs.openHeadless(`n_${id}`);
         try {
@@ -815,6 +860,103 @@ export class Reconciler {
         }
       });
     }
+  }
+
+  /**
+   * Spec §3.3. An attachment arrives: fetch, verify what arrived, then ONE write.
+   *
+   * The discipline is the markdown path's, for the same reason — a file that
+   * exists but holds the wrong bytes looks correct, so the user deletes it by
+   * hand — and two things make it stricter here. The bytes are checked TWICE,
+   * once inside `BlobPort.get` and once again below, because two independent
+   * checks is the entire point of having both ends verify. And nothing is written
+   * on a failure: a fetch that did not complete is a `RetryLater`, never a stub,
+   * never a zero-byte file, and never a delete (I2, I6).
+   */
+  private async materializeBlob(
+    ctx: PassContext,
+    id: string,
+    path: string,
+    ref: BlobRef,
+  ): Promise<void> {
+    // §7.4. Refused BEFORE the request is made: `get` buffers the whole object, so
+    // a device that discovers the problem afterwards has already paid for it. The
+    // node stays live, valid, published and simply unmaterialized here, which is
+    // the correct state — this is a fact about this device, not about the file.
+    if (ref.bytes > this.memoryCapBytes()) {
+      ctx.diagnostics.tooLarge.push(id);
+      return;
+    }
+    // §7.2's policy lands in P2-f. Until then every fetch is allowed, and the
+    // shape is here so the decision is taken BEFORE the request — and so that a
+    // refusal writes nothing at all: no stub, no sidecar, no zero-byte
+    // placeholder standing in for the file (I6).
+    if (!this.mayFetch(id, ref)) {
+      ctx.diagnostics.deferred.push(id);
+      return;
+    }
+
+    const bytes = await this.deps.blobs.get(ref.sha256, ref.bytes);
+    // `get` never throws and answers null for every failure there is. Not one of
+    // them is evidence about the user's disk (I2).
+    if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    // The second of two independent checks. `get` verified the length and the
+    // digest already; this is what makes that a claim rather than an assumption,
+    // and it costs one hash of bytes that are already in memory.
+    if (await hashOfBytes(bytes) !== ref.sha256) {
+      throw new Error(`materialize: ${path} did not match its digest`);
+    }
+    if (!assertInsideShare(this.shareRoot, path)) {
+      throw new Error(`materialize: path is outside the share: ${path}`);
+    }
+
+    await this.ensureDirs(ctx, dirOf(path));
+    // BOTH tickets, and both before the write. `create` suppresses the echo the
+    // watcher would otherwise read as the user adding a file; `modify` suppresses
+    // the one P2-d's handler would read as the user editing it, which for a `'b'`
+    // node means requeueing a publish of the bytes we have just fetched.
+    this.deps.tickets.arm('create', path);
+    this.deps.tickets.arm('modify', path);
+    await this.deps.vault.createBinary(path, bytes);              // ONE write, never a stub
+    ctx.disk.add(path, 'f');
+    this.bindPath(ctx, id, path);
+    // I17: the base is recorded only once the write has RETURNED, and it carries
+    // the mtime that write produced — which is what lets the next pass decide "is
+    // my copy current?" with one `stat` instead of re-hashing the file.
+    const st = await this.deps.vault.stat(path);
+    this.recordBlobHash(id, ref.sha256, ref.bytes, st?.mtime);
+  }
+
+  /**
+   * §7.2's fetch policy, stubbed to "yes" for this slice.
+   *
+   * It is a seam rather than a TODO because the call site is the part that has to
+   * be right: the decision is taken before any request is made, and a refusal
+   * writes nothing whatsoever. P2-f fills in the ceilings, the session budget and
+   * the user's approvals behind it.
+   */
+  private mayFetch(_id: string, _ref: BlobRef): boolean {
+    return true;
+  }
+
+  /** The largest attachment this device will hold in memory (§7.4). */
+  private memoryCapBytes(): number {
+    return this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
+  }
+
+  /**
+   * The base for a `'b'` node: what this device confirmed is simultaneously on
+   * disk and named by the tree.
+   *
+   * Never `recordHash`, which normalizes line endings before hashing. That rule is
+   * about text; applied to a PNG it both changes the file's identity — so the hash
+   * this device computes is not the hash the store holds — and can make two
+   * genuinely different files hash equal (I18).
+   */
+  private recordBlobHash(id: string, sha256: string, len: number, mtime?: number): void {
+    this.deps.state.data.contentHash[id] = mtime === undefined
+      ? { sha256, len }
+      : { sha256, len, mtime };
   }
 
   /**
@@ -1219,6 +1361,8 @@ function refused(reason: string): ReconcileResult {
     ran: false,
     refusedReason: reason,
     failures: [],
-    diagnostics: { pending: [], invalid: [], deletedButPresent: [] },
+    diagnostics: {
+      pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
+    },
   };
 }

@@ -25,7 +25,14 @@
 import { fold } from '../tree/paths.ts';
 import { TICKET_TTL_MS } from '../tree/constants.ts';
 
-export type TicketOp = 'create' | 'rename' | 'delete';
+/**
+ * `'modify'` is armed alongside every plugin-initiated BINARY write (spec §3.3).
+ * There is no in-place write for a note — the CRDT owns those bytes — so it is an
+ * attachment-only expectation, and like every other ticket it is an optimization:
+ * `onModify` (P2-d) is idempotent with or without one, and a modify echo that
+ * finds no ticket lands on the "the tree already agrees" rule and does nothing.
+ */
+export type TicketOp = 'create' | 'rename' | 'delete' | 'modify';
 
 /**
  * Key separator. NUL, because validateRel rejects control characters in a name,
@@ -50,7 +57,7 @@ export class Tickets {
     this.ttlMs = ttlMs;
   }
 
-  arm(op: 'create' | 'delete', path: string): void;
+  arm(op: 'create' | 'delete' | 'modify', path: string): void;
   arm(op: 'rename', from: string, to: string): void;
   arm(op: TicketOp, a: string, b?: string): void {
     const key = this.keyOf(op, a, b);
@@ -65,7 +72,7 @@ export class Tickets {
    * A non-matching claim consumes nothing: a ticket must never be spent by an
    * event it was not armed for.
    */
-  claim(op: 'create' | 'delete', path: string): boolean;
+  claim(op: 'create' | 'delete' | 'modify', path: string): boolean;
   claim(op: 'rename', from: string, to: string): boolean;
   claim(op: TicketOp, a: string, b?: string): boolean {
     const key = this.keyOf(op, a, b);

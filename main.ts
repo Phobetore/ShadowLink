@@ -296,7 +296,9 @@ class SyncRuntime {
     this.reconciler = new Reconciler({
       vault: this.vault,
       docs: this.docs,
+      blobs: this.blobs,
       state: this.state,
+      memoryCapBytes: () => blobMemoryCap(),
       tickets: this.tickets,
       shareRoot: this.shareRoot,
       entries: () => this.tree.entries(),

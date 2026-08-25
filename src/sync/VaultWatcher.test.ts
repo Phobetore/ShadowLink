@@ -21,7 +21,7 @@ import { TreeDoc } from '../tree/TreeDoc.ts';
 import type { NodeFields, NodeKind } from '../tree/types.ts';
 import { Deletions } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
-import { FakeDocs, FakeVault } from './fakes.ts';
+import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { Reconciler } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
 import type { Kind } from './VaultPort.ts';
@@ -979,6 +979,7 @@ test('44: replaying every reconciler mutation with no tickets writes nothing to 
   const reconciler = new Reconciler({
     vault: h.vault,
     docs,
+    blobs: new FakeBlobs(),
     state: h.state,
     tickets: h.tickets,
     shareRoot: SHARE,

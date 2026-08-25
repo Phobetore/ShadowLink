@@ -17,12 +17,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { NodeFields } from '../tree/types.ts';
-import { fold } from '../tree/paths.ts';
+import { fold, hashOfBytes } from '../tree/paths.ts';
 import { Deletions, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
-import { FakeDocs, FakeVault } from './fakes.ts';
+import type { BlobPort } from './BlobPort.ts';
+import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { Reconciler, RetryLater, type ReconcilerDeps, type DeletionContext } from './Reconciler.ts';
-import { Tickets } from './Tickets.ts';
+import { Tickets, type TicketOp } from './Tickets.ts';
 import type { VaultPort } from './VaultPort.ts';
 
 // ---------------------------------------------------------------- fixtures
@@ -98,9 +99,31 @@ function wrapVault(inner: FakeVault, overrides: Partial<VaultPort>): VaultPort {
   return { ...base, ...overrides };
 }
 
+/**
+ * A ticket book that remembers what was armed.
+ *
+ * The reconciler clears the whole book in its `finally`, so "was a ticket armed
+ * before that write?" cannot be answered after the pass by looking at the book —
+ * and the echo it suppresses belongs to a handler (`onModify`) that does not
+ * exist until P2-d. Recording the arms is the only way to hold this slice to a
+ * promise the next one depends on.
+ */
+class RecordingTickets extends Tickets {
+  readonly armed: string[] = [];
+
+  arm(op: 'create' | 'delete' | 'modify', path: string): void;
+  arm(op: 'rename', from: string, to: string): void;
+  arm(op: TicketOp, a: string, b?: string): void {
+    this.armed.push(b === undefined ? `${op} ${a}` : `${op} ${a} -> ${b}`);
+    if (op === 'rename') super.arm(op, a, b as string);
+    else super.arm(op, a);
+  }
+}
+
 interface Harness {
   vault: FakeVault;
   docs: FakeDocs;
+  blobs: FakeBlobs;
   state: DeviceState;
   tickets: Tickets;
   port: MemoryStatePort;
@@ -116,6 +139,7 @@ function makeHarness(over: Partial<ReconcilerDeps> & { vaultPort?: VaultPort } =
   const log: string[] = [];
   const vault = new FakeVault();
   const docs = new FakeDocs();
+  const blobs = new FakeBlobs();
   const port = new MemoryStatePort(log);
   const now = () => NOW;
   const state = new DeviceState(port, 'device-1', 'ws-1', now, 0);
@@ -127,6 +151,7 @@ function makeHarness(over: Partial<ReconcilerDeps> & { vaultPort?: VaultPort } =
   const reconciler = new Reconciler({
     vault: over.vaultPort ?? vault,
     docs,
+    blobs,
     state,
     tickets,
     shareRoot: SHARE,
@@ -137,7 +162,7 @@ function makeHarness(over: Partial<ReconcilerDeps> & { vaultPort?: VaultPort } =
     ...over,
   });
 
-  return { vault, docs, state, tickets, port, nodes, reconciler, published, notices, log };
+  return { vault, docs, blobs, state, tickets, port, nodes, reconciler, published, notices, log };
 }
 
 /** Files only, so an empty reserved folder never shows up as a phantom difference. */
@@ -393,8 +418,8 @@ test('27: a crash between stageOut and unstageAll loses nothing', async () => {
   const nodes = new Map<string, NodeFields>();
   const docs = new FakeDocs();
   const crashed = new Reconciler({
-    vault: crashing, docs, state, tickets: new Tickets(() => NOW), shareRoot: SHARE,
-    entries: () => [...nodes], now: () => NOW,
+    vault: crashing, docs, blobs: new FakeBlobs(), state, tickets: new Tickets(() => NOW),
+    shareRoot: SHARE, entries: () => [...nodes], now: () => NOW,
   });
 
   inner.seed('Shared/a.md', 'f', 'AAA');
@@ -420,7 +445,7 @@ test('27: a crash between stageOut and unstageAll loses nothing', async () => {
   assert.ok(restarted.data.staging[a], 'the replayable journal survived the restart');
 
   const recovered = new Reconciler({
-    vault: inner, docs, state: restarted, tickets: new Tickets(() => NOW),
+    vault: inner, docs, blobs: new FakeBlobs(), state: restarted, tickets: new Tickets(() => NOW),
     shareRoot: SHARE, entries: () => [...nodes], now: () => NOW,
   });
   await recovered.reconcile('retry');
@@ -1628,4 +1653,206 @@ test('a binding a collaborator dropped mid-pass is not rebuilt from the older vi
     h.state.data.materialized[id], undefined,
     'the drop stands: rebuilding it would resurrect a binding a tombstone can act on',
   );
+});
+
+// ---------------------------------------------------------------- P2 §3.3: materialize
+
+/** Bytes that a UTF-8 round trip would destroy — a PNG header and then some. */
+function png(seed = 1, length = 64): Uint8Array {
+  const out = new Uint8Array(length);
+  out.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  for (let i = 8; i < length; i++) out[i] = (i * 31 + seed * 97) & 0xff;
+  return out;
+}
+
+/** A `BlobPort` view of the harness's store, so one method can be replaced. */
+function blobPortOf(inner: FakeBlobs, overrides: Partial<BlobPort>): BlobPort {
+  const base: BlobPort = {
+    has: (sha) => inner.has(sha),
+    put: (sha, data, onProgress) => inner.put(sha, data, onProgress),
+    get: (sha, n, signal, onProgress) => inner.get(sha, n, signal, onProgress),
+    limits: () => inner.limits(),
+    get lastError(): unknown { return inner.lastError; },
+  };
+  return { ...base, ...overrides };
+}
+
+/** Put bytes in the store and return the node fields that name them. */
+async function publishedBlob(
+  blobs: FakeBlobs,
+  d: string,
+  n: string,
+  bytes: Uint8Array,
+): Promise<NodeFields> {
+  const sha = await blobs.seed(bytes);
+  return blob(d, n, `${sha}:${bytes.length}:-`);
+}
+
+// B4. The peer's side of an attachment: fetch, verify, ONE write. A content doc
+// is not involved at any point — `openHeadless` on a `'b'` node would open a room
+// that will never hold anything, and the timeout it waits out is charged to every
+// attachment in the vault.
+test('B4: an attachment materializes in one binary write, with no content doc at all', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, 'img', 'diagram.png', bytes));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(
+    h.vault.binarySnapshot()[`${SHARE}/img/diagram.png`], bytes,
+    'byte-identical to what the publisher had',
+  );
+  const writes = h.vault.callsTo('createBinary');
+  assert.equal(writes.length, 1, 'exactly one write, never create-then-fill (I6)');
+  assert.equal(h.vault.callsTo('create').length, 0, 'and never the string API');
+  assert.deepEqual(h.docs.calls, [], 'no content doc was opened for a `b` node');
+  assert.equal(h.state.data.materialized[id], `${SHARE}/img/diagram.png`);
+  assert.equal(
+    h.state.data.contentHash[id]?.sha256, await hashOfBytes(bytes),
+    'the base is recorded, so the next pass costs one stat',
+  );
+  assert.ok(h.state.data.contentHash[id]?.mtime !== undefined, 'with the mtime the write produced');
+});
+
+// ⚠ B5. `BlobPort.get` already verifies length and digest, so this is the second
+// of two independent checks — and the point of the second is that the first can
+// be wrong. Whatever the reason, the answer is the same: nothing is written. A
+// zero-byte file at the canonical path is worse than no file, because it looks
+// correct and gets deleted by hand.
+test('B5: bytes that do not verify are never written, and the pass records one failure', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  const fields = await publishedBlob(h.blobs, '', 'diagram.png', bytes);
+  const id = nid('A');
+  h.nodes.set(id, fields);
+  h.blobs.corrupt(fields.b!.slice(0, 64));                   // same length, other bytes
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(inShare(h.vault), {}, 'not a stub, not a partial file, nothing');
+  assert.equal(h.vault.callsTo('createBinary').length, 0);
+  assert.deepEqual(r.failures.map((f) => f.key), [`materialize:${id}`]);
+  assert.equal(h.state.data.materialized[id], undefined, 'and nothing was bound (I17)');
+  assert.equal(h.state.data.contentHash[id], undefined);
+});
+
+// The point of TWO independent checks is that the first one can be wrong. A port
+// whose `get` hands back bytes it did not verify is not a hypothetical: it is one
+// refactor of `ObsidianBlobPort`, or one proxy that rewrites a response body, and
+// nothing else between the network and the vault would notice.
+test('bytes that arrive unverified are refused by the second check, and nothing is written', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  const fields = await publishedBlob(h.blobs, '', 'diagram.png', bytes);
+  const id = nid('A');
+  h.nodes.set(id, fields);
+  const other = png(9);                                       // same length, other bytes
+  h.reconciler = new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: blobPortOf(h.blobs, { get: async () => other }),   // a port that verified nothing
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    now: () => NOW,
+  });
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(inShare(h.vault), {}, 'the wrong bytes never reached the disk');
+  assert.equal(h.vault.callsTo('createBinary').length, 0);
+  assert.deepEqual(r.failures.map((f) => f.key), [`materialize:${id}`]);
+  assert.equal(h.state.data.materialized[id], undefined);
+});
+
+test('a fetch that could not complete is a retry, never a delete and never a stub', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  const fields = await publishedBlob(h.blobs, '', 'diagram.png', bytes);
+  h.nodes.set(nid('A'), fields);
+  h.blobs.setAbsent(fields.b!.slice(0, 64));                 // swept, or never finished
+
+  const first = await h.reconciler.reconcile('remote');
+
+  assert.equal(first.failures.length, 1);
+  assert.ok(first.failures[0].err instanceof RetryLater, 'a missing object is "not yet" (I2)');
+  assert.deepEqual(inShare(h.vault), {});
+
+  // And it converges the moment the bytes are there.
+  await h.blobs.seed(bytes);
+  const second = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(second.failures, []);
+  assert.deepEqual(h.vault.binarySnapshot()[`${SHARE}/diagram.png`], bytes);
+});
+
+// ⚠ B24, the fetch arm. The cap is applied BEFORE the request is made: a phone
+// that refuses a 200 MB video keeps working, and one that discovers the problem
+// while holding it in a buffer does not. Refusing costs nothing anywhere else —
+// the node stays live, valid, published and simply unmaterialized here.
+test('B24: an attachment over the memory cap is not fetched and not written', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 32 });
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'clip.mov', png(3, 512)));
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(h.blobs.calls, [], 'not one request was made');
+  assert.deepEqual(inShare(h.vault), {});
+  assert.deepEqual(r.diagnostics.tooLarge, [id], 'reported, so the user can be told why');
+  assert.deepEqual(r.failures, [], 'and it is not an error: this device simply cannot hold it');
+});
+
+// Both tickets, before the write. Without the `create` ticket the watcher reads
+// our own write as a user action; without the `modify` one, so does the modify
+// handler P2-d registers — and a `'b'` node's modify handler resolves the node
+// and requeues a publish, so the echo becomes an upload of what we just fetched.
+test('materializing an attachment arms a create AND a modify ticket before writing', async () => {
+  const tickets = new RecordingTickets(() => NOW);
+  const h = makeHarness({ tickets });
+  h.vault.seed(SHARE, 'd');
+  h.nodes.set(nid('A'), await publishedBlob(h.blobs, '', 'diagram.png', png()));
+
+  await h.reconciler.reconcile('remote');
+
+  const path = `${SHARE}/diagram.png`;
+  const write = h.vault.calls.findIndex((c) => c.op === 'createBinary');
+  assert.ok(write >= 0, 'the file was written');
+  assert.deepEqual(
+    tickets.armed.filter((a) => a.endsWith(path)),
+    [`create ${path}`, `modify ${path}`],
+    'both armed, and both before the write',
+  );
+});
+
+// Ordering, stated as a property rather than as a call count: nothing touches the
+// disk until the bytes are in hand and have been checked (§3.3, I6).
+test('the fetch and the verify both precede the write', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.nodes.set(nid('A'), await publishedBlob(h.blobs, 'img', 'diagram.png', png()));
+
+  await h.reconciler.reconcile('remote');
+
+  const fetched = h.blobs.calls.findIndex((c) => c.op === 'get');
+  assert.ok(fetched >= 0);
+  const mutations = h.vault.calls
+    .map((c, i) => ({ op: c.op, i }))
+    .filter((c) => c.op === 'createBinary' || c.op === 'createFolder');
+  assert.equal(mutations.length, 2, 'one folder, one file');
+  // The store call log and the vault call log are separate, so ordering is
+  // asserted through the only thing they share: the fetch had to have finished,
+  // because the bytes it returned are what was written.
+  assert.deepEqual(h.vault.callsTo('createBinary')[0].args[0], `${SHARE}/img/diagram.png`);
+  assert.equal(h.blobs.callsTo('get').length, 1, 'and the fetch happened exactly once');
 });
