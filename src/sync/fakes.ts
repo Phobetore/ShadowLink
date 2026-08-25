@@ -25,7 +25,7 @@
 // No `obsidian` import, no node builtins.
 
 import { extOf, fold, hashOfBytes } from '../tree/paths.ts';
-import type { BlobLimits, BlobPort, BlobPresence } from './BlobPort.ts';
+import { BlobUnavailable, type BlobLimits, type BlobPort, type BlobPresence } from './BlobPort.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 
@@ -812,7 +812,15 @@ export class FakeBlobs implements BlobPort {
     }
     const stored = this.objects.get(sha256);
     if (stored === undefined) {
-      this.lastError = new Error(`no such object: ${sha256}`);
+      // The TYPE matters, not just the null. `ObsidianBlobPort` answers a 404 with
+      // `BlobUnavailable` and everything else with one of the other five, and the
+      // reconciler reads that difference to tell "the store no longer holds these
+      // bytes" from "the network did not answer" — the first is reported to the
+      // user as unavailable, the second is retried. A fake that flattened both to
+      // a plain Error would make that check untestable, and the check is the only
+      // thing standing between a hiccuping proxy and telling somebody their
+      // attachment is lost.
+      this.lastError = new BlobUnavailable(`no such object: ${sha256}`);
       return null;
     }
     if (stored.length !== expectBytes) {

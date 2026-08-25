@@ -1777,7 +1777,15 @@ test('bytes that arrive unverified are refused by the second check, and nothing 
   assert.equal(h.state.data.materialized[id], undefined);
 });
 
-test('a fetch that could not complete is a retry, never a delete and never a stub', async () => {
+// CHANGED IN P2-f. This used to assert that a store which does not hold the
+// object produces a `RetryLater` FAILURE. It no longer does, and the reason is
+// §6.5: a definite 404 is the one null `get` can answer that is a statement about
+// the object rather than about the network, so it is reported through the
+// `unavailable` channel instead of being retried as though the bytes were merely
+// late. Nothing about the DISK changed — which is the half this test was really
+// for, and it is asserted exactly as before. The node is still re-attempted on
+// every later pass, which is what the second half below proves.
+test('a fetch that could not complete is a no-op, never a delete and never a stub', async () => {
   const h = makeHarness();
   h.vault.seed(SHARE, 'd');
   const bytes = png();
@@ -1787,8 +1795,8 @@ test('a fetch that could not complete is a retry, never a delete and never a stu
 
   const first = await h.reconciler.reconcile('remote');
 
-  assert.equal(first.failures.length, 1);
-  assert.ok(first.failures[0].err instanceof RetryLater, 'a missing object is "not yet" (I2)');
+  assert.deepEqual(first.failures, [], 'the bytes are gone, not late: retrying is not the fix');
+  assert.deepEqual(first.diagnostics.unavailable, [nid('A')], 'and the user is told which file');
   assert.deepEqual(inShare(h.vault), {});
 
   // And it converges the moment the bytes are there.
@@ -2417,6 +2425,134 @@ test('a fetchDeferred record for a node the tree no longer has is dropped', asyn
   assert.deepEqual(h.state.data.fetchDeferred, {});
 });
 
+// ---------------------------------------------------------------- P2 §7.3: deferred is NOTHING
+
+// ⚠ B26. A deferred node is not a node that stepped out of the tree: it is
+// published, so it RESERVES ITS PATH, and the next attachment with the same name
+// gets the collision suffix exactly as it would have if the bytes were here.
+// Without that, the moment a device defers a fetch it starts handing that path to
+// somebody else — and the two peers disagree about which file lives where.
+test('B26: a deferred attachment still reserves its path', async () => {
+  const h = makeHarness({ autofetchMaxBytes: () => 100 });
+  h.vault.seed(SHARE, 'd');
+  const deferredId = nid('A');
+  const fetchedId = nid('B');
+  h.nodes.set(deferredId, await publishedBlob(h.blobs, '', 'diagram.png', png(1, 512)));
+  h.nodes.set(fetchedId, await publishedBlob(h.blobs, '', 'diagram.png', png(2, 50)));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(r.diagnostics.deferred, [deferredId]);
+  assert.deepEqual(
+    Object.keys(inShare(h.vault)), [`${SHARE}/diagram (2).png`],
+    'the deferred node holds "diagram.png" — and holds it EMPTY, which is the point',
+  );
+  assert.equal(h.state.data.materialized[fetchedId], `${SHARE}/diagram (2).png`);
+  assert.equal(h.state.data.materialized[deferredId], undefined);
+
+  // A second pass, because that is the first one that runs with the deferral
+  // already written down: a reconciler that read `fetchDeferred` as "this node is
+  // no longer my business" would hand `diagram.png` over here.
+  const second = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(second.diagnostics.deferred, [deferredId]);
+  assert.deepEqual(Object.keys(inShare(h.vault)), [`${SHARE}/diagram (2).png`]);
+});
+
+// ⚠ B26, the structural half. `deferred` is not `pending`: a pending node is one
+// NOBODY may materialize, so it reserves nothing at all, while a deferred node is
+// fully published and this device merely chose not to fetch it. Folding the two
+// channels together would be a statement that the two states are the same, and
+// they differ on exactly the question that matters — who owns that path.
+test('B26: a deferred node is a full structural participant, never a deletion candidate', async () => {
+  let seen: DeletionContext | null = null;
+  const h = makeHarness({
+    autofetchMaxBytes: () => 100,
+    applyDeletions: async (ctx) => { seen = ctx; },
+  });
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, 'img', 'big.png', png(1, 512)));
+
+  const r = await h.reconciler.reconcile('remote');
+  const ctx = seen as unknown as DeletionContext;
+
+  assert.deepEqual(r.diagnostics.deferred, [id]);
+  assert.deepEqual(r.diagnostics.pending, [], 'published: nothing here is waiting on an author');
+  assert.deepEqual(r.diagnostics.invalid, []);
+  assert.equal(ctx.deadNodes.has(id), false, 'live, so step 4 cannot reach it at all');
+  assert.equal(
+    ctx.wantAtFold.get(fold(`${SHARE}/img/big.png`)), id,
+    'claimed in wantAtFold, which is what keeps the empty-folder sweep off its directory',
+  );
+  assert.equal(ctx.blobRefs.has(id), true, 'and it is still an attachment to the whole pass');
+});
+
+// ⚠ B26's last clause, over two passes because the first is the one that creates
+// the directory: `preexistingDirs` exempts only folders that were there before
+// the session began, so `Shared/img` is a live sweep candidate from pass two on.
+// The only thing standing between it and the trash is the deferred node claiming
+// it — and the directory is EMPTY, which is exactly the shape the sweep removes.
+test('B26: the empty folder a deferred attachment lives in is never swept', async () => {
+  const h = makeHarness({ autofetchMaxBytes: () => 100 });
+  h.vault.seed(SHARE, 'd');
+  h.nodes.set(nid('A'), await publishedBlob(h.blobs, 'img', 'big.png', png(1, 512)));
+
+  await h.reconciler.reconcile('remote');
+  assert.deepEqual(foldersIn(h.vault), [`${SHARE}/img`], 'created for a file that never arrived');
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(foldersIn(h.vault), [`${SHARE}/img`], 'and still there a pass later');
+  assert.equal(h.vault.wasTrashed(`${SHARE}/img`), false);
+  assert.deepEqual(r.diagnostics.deferred, [nid('A')]);
+});
+
+// §6.5, from the other end. The offline sweeper ran with a short TTL and removed
+// bytes a long-absent peer still needed. The consequence is bounded by design —
+// I2 makes a failed fetch a no-op — but "bounded" only means something if the
+// user is TOLD, and `unavailable` is the channel that tells them. It is neither a
+// failure (retrying will not bring the bytes back) nor a deferral (nobody chose
+// this), so it gets a channel of its own.
+test('an attachment whose bytes the store no longer holds is reported as unavailable', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  const node = await publishedBlob(h.blobs, '', 'gone.png', png(1, 64));
+  h.nodes.set(id, node);
+  h.blobs.setAbsent(parseBlobRef(node.b)!.sha256);
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(r.diagnostics.unavailable, [id]);
+  assert.deepEqual(r.diagnostics.deferred, [], 'nobody decided this');
+  assert.deepEqual(r.diagnostics.tooLarge, []);
+  assert.deepEqual(r.failures, [], 'and it is not a retry: the bytes are gone, not late');
+  assert.deepEqual(inShare(h.vault), {}, 'I2: a missing blob is never a change on disk');
+  assert.equal(h.state.data.materialized[id], undefined);
+  assert.deepEqual(h.state.data.fetchDeferred, {}, 'nor a file the UI should offer to download');
+});
+
+// The distinction the channel rests on. A `get` that answered null WITHOUT a
+// definite 404 behind it is a network that did not answer, and reporting that as
+// "the bytes are gone" would tell the user their attachment is lost every time a
+// proxy hiccups.
+test('a fetch that returns nothing for any other reason is a retry, never "unavailable"', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'diagram.png', png()));
+
+  const r = await freshSession(h, {
+    blobs: blobPortOf(h.blobs, { get: async () => null }),
+  }).reconcile('remote');
+
+  assert.deepEqual(r.diagnostics.unavailable, []);
+  assert.equal(r.failures.length, 1, 'a RetryLater, so the next pass asks again');
+  assert.ok(r.failures[0].err instanceof RetryLater);
+  assert.deepEqual(inShare(h.vault), {});
+});
+
 // ⚠ The staleness oracle, and the reason it has two clauses. A recorded hash is
 // trusted only when size AND mtime agree; drop the mtime clause and an external
 // edit that happens to keep the file's size is invisible for ever.
@@ -2810,6 +2946,11 @@ test('B12: a same-size rewrite during the fetch is still not overwritten', async
 });
 
 // ⚠ A fetch that did not complete is a no-op, never a hole and never a delete.
+//
+// CHANGED IN P2-f, for the reason given at the materialize-arm test above: a
+// store that answers a definite 404 is reported as `unavailable` rather than
+// retried as a failure (§6.5). Every assertion about the user's file is
+// untouched, because that is what this test exists to hold.
 test('a replacement whose bytes will not fetch leaves the local file in place', async () => {
   const h = makeHarness();
   h.vault.seed(SHARE, 'd');
@@ -2817,12 +2958,12 @@ test('a replacement whose bytes will not fetch leaves the local file in place', 
   const theirs = png(2, 96);
   const id = nid('A');
   const { path, theirsSha } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
-  h.blobs.setAbsent(theirsSha);                    // swept, or never finished
+  h.blobs.setAbsent(theirsSha);                    // swept, or lost with the volume
 
   const first = await h.reconciler.reconcile('sync');
 
-  assert.equal(first.failures.length, 1);
-  assert.ok(first.failures[0].err instanceof RetryLater, 'a missing object is "not yet" (I2)');
+  assert.deepEqual(first.failures, []);
+  assert.deepEqual(first.diagnostics.unavailable, [id]);
   assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'nothing moved, nothing was staged');
   assert.deepEqual(h.state.data.staging, {});
 
@@ -2831,6 +2972,29 @@ test('a replacement whose bytes will not fetch leaves the local file in place', 
   const second = await h.reconciler.reconcile('retry');
   assert.deepEqual(second.failures, []);
   assert.deepEqual(h.vault.binarySnapshot()[path], theirs);
+});
+
+// The other side of the same branch, on the replace path: a `get` that answered
+// null with no definite verdict behind it is a network that did not answer, and
+// it stays a retry. Without this the RetryLater arm here would be dead code that
+// no test distinguishes from the 404 arm above.
+test('a replacement whose fetch merely failed is still a retry', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+
+  const r = await freshSession(h, {
+    blobs: blobPortOf(h.blobs, { get: async () => null }),
+  }).reconcile('sync');
+
+  assert.equal(r.failures.length, 1);
+  assert.ok(r.failures[0].err instanceof RetryLater);
+  assert.deepEqual(r.diagnostics.unavailable, []);
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine);
+  assert.deepEqual(h.state.data.staging, {});
 });
 
 // The second of two independent checks, on the replace path. A port that hands
@@ -2903,7 +3067,13 @@ test('B13: a crash between the stage-out and the write restores the old bytes ne
   assert.equal(h.state.data.materialized[id], path, 'with the binding restored');
   assert.equal(h.state.data.contentHash[id]?.sha256, mineSha, 'and the base still names what is there');
   // The replace itself is simply owed again; it is a deferral, not a loss.
-  assert.deepEqual(next.failures.map((f) => f.key), [`bytes:${id}`]);
+  //
+  // CHANGED IN P2-f: the store answering "I do not hold that" is now reported
+  // through `unavailable` rather than as a `bytes:<id>` failure (§6.5). What this
+  // test is actually about — the RESTORE, and the absence of a hole — is
+  // unchanged above.
+  assert.deepEqual(next.failures, []);
+  assert.deepEqual(next.diagnostics.unavailable, [id]);
 });
 
 // The same interruption from the other direction: the write itself failed. The
@@ -3093,8 +3263,10 @@ test('a fork whose fetch fails moves nothing at all', async () => {
 
   const r = await h.reconciler.reconcile('sync');
 
-  assert.equal(r.failures.length, 1);
-  assert.ok(r.failures[0].err instanceof RetryLater);
+  // CHANGED IN P2-f: a definite 404 is `unavailable`, not a retryable failure
+  // (§6.5). The three assertions this test exists for are untouched.
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(r.diagnostics.unavailable, [id]);
   assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'still there, still called what it was');
   assert.equal(h.vault.callsTo('rename').length, 0, 'not renamed aside on a fetch that failed');
   assert.deepEqual(h.notices, [], 'and the user was not told about a fork that did not happen');

@@ -33,7 +33,7 @@ import {
   assertInsideShare, extOf, fallbackForkName, fold, forkName, hashOf, hashOfBytes, isLive,
   nodeKindOf, relPath, replaceVerdict, splitRel, validateRel, type BlobRef,
 } from '../tree/paths.ts';
-import type { BlobPort } from './BlobPort.ts';
+import { BlobUnavailable, type BlobPort } from './BlobPort.ts';
 import type { DeviceState } from './DeviceState.ts';
 import { fetchVerdict, type FetchLimits } from './FetchPolicy.ts';
 import { DiskIndex } from './DiskIndex.ts';
@@ -66,6 +66,23 @@ export interface ReconcileDiagnostics {
   tooLarge: string[];
   /** Attachment nodes the fetch policy has not cleared yet (§7.2). Nothing is on disk. */
   deferred: string[];
+  /**
+   * Attachment nodes whose bytes the store no longer holds (§6.5).
+   *
+   * A THIRD channel, and foldable into neither of the two above. `deferred` is a
+   * decision this device took and can take back; `tooLarge` is a fact about this
+   * device that a bigger one does not share; this is a fact about the WORKSPACE —
+   * a self-hoster ran the orphan sweeper with a short TTL, or the volume lost a
+   * file — and it is the only one of the three that nothing done on this device
+   * can resolve.
+   *
+   * It is deliberately not a `failure` either. A failure means "ask again", and
+   * asking again for bytes the store has definitely answered 404 for is a retry
+   * loop with no end. The consequence stays bounded exactly as §6.5 promises: I2
+   * makes the fetch a no-op, nothing is written and nothing is deleted — and
+   * "bounded" is only worth something if the user is told, which is this.
+   */
+  unavailable: string[];
   /**
    * Attachment nodes whose local bytes this pass ran out of re-hash budget for
    * (§3.5). A separate channel from `deferred` on purpose: the file IS on disk
@@ -531,7 +548,7 @@ export class Reconciler {
     const failures: ReconcileFailure[] = [];
     const diagnostics: ReconcileDiagnostics = {
       pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
-      rehashDeferred: [],
+      unavailable: [], rehashDeferred: [],
     };
     // Stays null until bindings have been observed, so a refusal partway through
     // cannot let the `finally` block rebuild `materialized` from an empty map.
@@ -1182,8 +1199,13 @@ export class Reconciler {
 
     const bytes = await this.fetchBlob(ref);
     // `get` never throws and answers null for every failure there is. Not one of
-    // them is evidence about the user's disk (I2).
-    if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    // them is evidence about the user's disk (I2) — but one of them, a definite
+    // 404, is evidence about the STORE, and that one is reported rather than
+    // retried for ever.
+    if (bytes === null) {
+      if (this.reportUnavailable(ctx, id)) return;
+      throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    }
     // The second of two independent checks. `get` verified the length and the
     // digest already; this is what makes that a claim rather than an assumption,
     // and it costs one hash of bytes that are already in memory.
@@ -1272,6 +1294,25 @@ export class Reconciler {
     if (bytes === null) return null;
     this.sessionFetchedBytes += bytes.length;
     return bytes;
+  }
+
+  /**
+   * Did the fetch fail because the store has DEFINITELY answered that it does not
+   * hold those bytes (§6.5)?
+   *
+   * The distinction is the whole value of the `unavailable` channel. `get` answers
+   * null for a socket that closed, a proxy that lied, a truncated body and a 404
+   * alike, and only the last of those is a statement about the object. Reporting
+   * the others as "the bytes are gone" would tell the user their attachment is
+   * lost every time the network hiccups — so anything that is not a definite
+   * `BlobUnavailable` stays a `RetryLater`, and the next pass asks again.
+   *
+   * @returns true when the caller should stop, having reported it.
+   */
+  private reportUnavailable(ctx: PassContext, id: string): boolean {
+    if (!(this.deps.blobs.lastError instanceof BlobUnavailable)) return false;
+    ctx.diagnostics.unavailable.push(id);
+    return true;
   }
 
   /**
@@ -1502,7 +1543,10 @@ export class Reconciler {
     if (!this.mayFetch(ctx, id, ref)) return;
 
     const bytes = await this.fetchBlob(ref);
-    if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    if (bytes === null) {
+      if (this.reportUnavailable(ctx, id)) return;
+      throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    }
     // The second of two independent checks — the first lives inside the port, and
     // the point of the second is that the first can be wrong.
     if (await hashOfBytes(bytes) !== ref.sha256) {
@@ -1602,7 +1646,13 @@ export class Reconciler {
 
     const forkPath = await this.forkPathFor(path, local);
     const bytes = await this.fetchBlob(ref);
-    if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    if (bytes === null) {
+      // Nothing has moved yet — the rename is still three lines away — so a store
+      // that no longer holds the incoming version leaves the user's file exactly
+      // where it is, under its own name, and says so.
+      if (this.reportUnavailable(ctx, id)) return;
+      throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    }
     if (await hashOfBytes(bytes) !== ref.sha256) {
       throw new Error(`fork: ${path} did not match its digest`);
     }
@@ -2022,7 +2072,7 @@ function refused(reason: string): ReconcileResult {
     failures: [],
     diagnostics: {
       pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
-      rehashDeferred: [],
+      unavailable: [], rehashDeferred: [],
     },
   };
 }
