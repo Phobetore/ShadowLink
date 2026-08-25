@@ -29,8 +29,13 @@
 //        window (up to ~11 s: 3 s for the node plus 8 s for the doc) lets note A's
 //        Y.Text be seeded with note B's body and mounted into B's editor —
 //        adversarial review demonstrated exactly that, end to end.
-//  I17 — `s` and `contentHash` are claims that the workspace holds this content.
-//        They advance only after `flush()` reports a genuine acknowledgement.
+//  I17 — `s` and `contentHash` are claims about content, and they are different
+//        claims. `s` says the workspace holds it, and advances only after
+//        `flush()` reports a genuine acknowledgement. `contentHash` says THIS
+//        DISK holds it, and may name only bytes that are simultaneously in the
+//        workspace and in this device's own file — never the CRDT's text on the
+//        strength of a mount, which is how one vault came to record another
+//        vault's file as its own base.
 //
 // TESTABILITY. Everything that does not need a running Obsidian is behind a port:
 // the vault (`VaultPort`), the network (`ProviderPort`) and the editor
@@ -184,6 +189,23 @@ export class WorkspaceSession {
   /** Opens are serialized: a session fully closes before the next one starts. */
   private queue: Promise<void> = Promise.resolve();
 
+  /**
+   * The digest of the local bytes already preserved for a node in this session.
+   *
+   * Obsidian's save of the editor's buffer is asynchronous and the plugin cannot
+   * make it happen, so between a divergent open and that save the file on disk
+   * still holds the revision that was just stashed. Obsidian fires `file-open`
+   * more than once for one file — an existing test says so — and a restored
+   * layout fires it again, so without this every one of those opens inside the
+   * save window writes another identical copy: nine of them in three minutes, in
+   * the incident this was written for.
+   *
+   * Keyed by node rather than path, so a rename cannot lose track of it, and
+   * never cleared: "these exact bytes are already preserved somewhere" does not
+   * stop being true, and a second copy of them would preserve nothing new.
+   */
+  private readonly stashed = new Map<string, string>();
+
   constructor(deps: WorkspaceSessionDeps) {
     this.deps = deps;
     this.now = deps.now ?? ((): number => Date.now());
@@ -284,6 +306,13 @@ export class WorkspaceSession {
     const text = doc.getText('content');
     const seeded = this.deps.tree.get(nodeId)?.s === 1;
 
+    /**
+     * Whether this open has to resolve a difference between the file on disk and
+     * the shared document. Recorded here, ACTED ON after the mount: the local
+     * bytes are only worth preserving once something has actually replaced them.
+     */
+    let diverged = false;
+
     if (text.length === 0 && !seeded) {
       // I5. Not an error and not a failure: the author simply has not uploaded
       // yet. Mounting an empty document here would strand their content, because
@@ -303,10 +332,21 @@ export class WorkspaceSession {
       if (confirmed) this.deps.tree.patchNode(nodeId, { s: 1 });
       else this.deps.notice('This note has not reached the server yet; it will retry.');
     } else if (normLF(text.toString()) !== localText) {
-      // The shared document wins on disk (spec §8 item 15: there is no merge UI),
-      // so the local copy is preserved out of the way BEFORE the editor is bound.
-      await this.stashLocalCopy(notePath, localText);
-      if (token !== this.token) { release(provider, doc); return; }
+      // The shared document wins on disk (spec §8 item 15: there is no merge UI).
+      // WHO WRITES: not this class. `VaultPort` has no `modify` and `create`
+      // refuses an occupied path, precisely because writing a note that is live
+      // under a `yCollab` binding turns Obsidian's external-change reload into a
+      // whole-document overwrite broadcast to every peer (I7). The editor is the
+      // legal writer, and `editor.mount` below is what makes it hold the shared
+      // text; Obsidian's save of that dirty buffer is what puts it on disk.
+      //
+      // This branch used to stash here and then mount, on the belief — written
+      // out at `stashLocalCopy` — that the mount would replace the file. It did
+      // not: the mount changed nothing, so every open stashed a fresh copy of a
+      // file that was never replaced, and in the incident this was written for
+      // the preserved copy was byte-identical to the file left at the canonical
+      // path. Nine of them in three minutes.
+      diverged = true;
     }
 
     // The target must still be the file the user is looking at. Between the first
@@ -319,14 +359,52 @@ export class WorkspaceSession {
     }
     this.active = { nodeId, notePath, doc, provider };
 
-    // I17: the watermark is recorded only now, because only now is this device
-    // genuinely bound to that text — `PublishQueue` and §5.3's `proven` check
-    // both read it. The token is tested once more on the far side of the hash,
-    // because mounting is itself an observable event: a `file-open` fired by the
-    // dispatch above can supersede this session before the digest resolves, and
-    // recording a watermark for a session that is already being torn down would
-    // claim this device holds content it no longer has open.
+    if (diverged) {
+      // Only now. `mount` returning true is the promise that the editor holds
+      // the shared text, so this is the first moment at which the local bytes
+      // are genuinely being replaced — and the only moment at which preserving
+      // them preserves anything. A failed mount leaves the file exactly as it
+      // was and leaves no stash behind to explain a replacement that never
+      // happened.
+      await this.stashLocalCopy(nodeId, notePath, localText);
+    }
+
+    // I17. A watermark names bytes that are simultaneously in the workspace and
+    // on THIS disk, and it may advance only once a write has returned. This
+    // method performs no disk write and can observe none, so the only string in
+    // it that this device is known to hold is `localText` — the bytes it read
+    // off its own disk a moment ago. Recording is therefore honest in exactly
+    // one case: when the workspace's text IS that string.
+    //
+    // It used to record `text.toString()` unconditionally, which is how vault A
+    // came to record vault B's file as its own base and vault B came to record
+    // the server's content it did not have. That is not cosmetic: §5.3's
+    // `proven` check reads this watermark to choose between the vault trash and
+    // a rescue.
+    //
+    // The divergent case deliberately records NOTHING and removes what it finds,
+    // because after the mount the disk holds a revision the workspace has moved
+    // past and the editor holds one the disk has not caught up with — there is
+    // no text that is on both. The evidence arrives at the next open of this
+    // note: `vault.read` returns the bytes Obsidian saved, they equal the shared
+    // text, and the watermark is recorded from a string this device read off its
+    // own disk. Absence in the meantime is the safe direction — an unproven note
+    // is rescued rather than trashed.
+    //
+    // The token is tested once more on the far side of the hash, because
+    // mounting is itself an observable event: a `file-open` fired by the dispatch
+    // above can supersede this session before the digest resolves, and recording
+    // a watermark for a session that is already being torn down would claim this
+    // device holds content it no longer has open.
     const finalText = normLF(text.toString());
+    if (finalText !== localText) {
+      if (token !== this.token) return;
+      if (this.deps.state.data.contentHash[nodeId] !== undefined) {
+        delete this.deps.state.data.contentHash[nodeId];
+        this.deps.state.schedulePersist();
+      }
+      return;
+    }
     const sha256 = await hashOf(finalText);
     if (token !== this.token) return;
     if (this.deps.tree.get(nodeId)?.s === 1) {
@@ -449,16 +527,34 @@ export class WorkspaceSession {
    * at the vault root and outside the share by construction — so the watcher
    * ignores it and no node is ever minted for a stashed copy.
    *
-   * The original is left exactly where it is: the editor is about to bind the
-   * shared document into it, and a stash that removed the file first would leave
-   * the user staring at a missing note if the mount then failed.
+   * Called only after a successful mount, i.e. only once the editor genuinely
+   * holds the shared text and the local revision is on its way out. The file at
+   * the canonical path is not removed: Obsidian is about to write the editor's
+   * buffer over it, and a stash that deleted it first would leave the user
+   * staring at a missing note for as long as that save took.
+   *
+   * Two things are deliberately not stashed, because a copy of them preserves
+   * nothing and the notice that goes with it is not true:
+   *  - bytes already preserved for this node in this session (see `stashed`);
+   *  - an empty file. Nine 0-byte "local copies" is what the incident looked
+   *    like from the user's side, and not one of them held anything.
    */
-  private async stashLocalCopy(notePath: string, localText: string): Promise<void> {
+  private async stashLocalCopy(
+    nodeId: string,
+    notePath: string,
+    localText: string,
+  ): Promise<void> {
+    if (localText.length === 0) return;
+    const digest = await hashOf(localText);
+    if (this.stashed.get(nodeId) === digest) return;
     const dest = await this.uniquify(`${RECOVERED_DIR}/${stashName(notePath, this.now())}`);
     if (!assertInsideShare(this.deps.shareRoot(), dest, true)) return;
     try {
       if (!(await this.exists(RECOVERED_DIR))) await this.deps.vault.createFolder(RECOVERED_DIR);
       await this.deps.vault.create(dest, localText);
+      // Recorded only once the bytes are genuinely on disk somewhere else. A
+      // stash that failed has preserved nothing and must be attempted again.
+      this.stashed.set(nodeId, digest);
       this.deps.notice(
         `Your local "${baseOf(notePath)}" differed from the shared copy. `
         + `A copy was saved to ${RECOVERED_DIR}/.`,

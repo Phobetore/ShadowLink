@@ -525,7 +525,7 @@ test('an unconfirmed flush leaves the node unseeded (I17)', async () => {
   assert.equal(h.state.data.contentHash[id], undefined, 'and no watermark advanced');
 });
 
-test('an already-seeded empty document is never re-seeded', async () => {
+test('an already-seeded empty document is never re-seeded, and the empty doc wins', async () => {
   const h = makeHarness();
   const id = h.add('a.md', 'local leftovers', { s: 1, owned: true });
   h.providers.configure(`n_${id}`, { remote: '' });
@@ -534,29 +534,144 @@ test('an already-seeded empty document is never re-seeded', async () => {
 
   const provider = h.providers.created[0];
   assert.equal(provider.flushes, 0, 'no seed was attempted');
-  // The shared (empty) doc wins; the local bytes are preserved out of the way.
   assert.equal(provider.doc.getText('content').toString(), '');
   assert.equal(h.editor.current?.notePath, `${SHARE}/a.md`);
+  // This test's comment used to say "The shared (empty) doc wins; the local
+  // bytes are preserved out of the way" and assert neither half. Both halves are
+  // the point: the second is I1, and the first is the only thing that stops the
+  // next open finding the same divergence and stashing again.
+  assert.equal(h.editor.document(`${SHARE}/a.md`), '', 'the shared (empty) doc wins in the editor');
+  assert.deepEqual(h.stashes().map(([, text]) => text), ['local leftovers'], 'and the bytes are kept');
 });
 
 // ================================================================ divergence
+//
+// The lengths below are the ones that were on disk in the incident: the
+// workspace held 184 characters, the peer's file held 166, and the peer's 166
+// were NOT a prefix of the 184 — an earlier revision, not a truncation. Nothing
+// in this product could tell those apart, which is why the peer displayed a
+// stale note indefinitely and nothing ever noticed.
 
 const STALE = '# Sans titre\n\nAn earlier revision, still sitting on the peer\'s disk.'.padEnd(166, '.');
 const SHARED = '# Sans titre\n\nThe workspace\'s revision, which that peer has never seen.'.padEnd(184, '.');
 
-test('a local copy that differs from the shared document is stashed, not overwritten', async () => {
+test('the divergence fixture matches the incident: 166 vs 184, and not a prefix', () => {
+  assert.equal(STALE.length, 166);
+  assert.equal(SHARED.length, 184);
+  assert.equal(SHARED.startsWith(STALE), false, 'an earlier revision, not a truncation');
+});
+
+test('a peer holding a stale revision gets the shared document, on screen and on disk', async () => {
+  // The failure the user met, in the shape it was found in: vault B's file is an
+  // earlier revision of a note the workspace has moved past, B's editor shows
+  // B's file, and no pass in this product will ever revisit a bound note.
+  //
+  // Before the fix this stopped at the first assertion: `mount` reconfigured a
+  // compartment and touched neither the editor nor the file, so the editor still
+  // showed the 166 stale characters and the disk still held them — for ever.
   const h = makeHarness();
-  const id = h.add('a.md', 'my offline edit', { s: 1, owned: true });
-  h.providers.configure(`n_${id}`, { remote: 'the shared text' });
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  const path = `${SHARE}/Sans titre.md`;
+
+  await h.session.open(path);
+
+  assert.equal(h.editor.document(path), SHARED, 'the editor shows the shared document');
+  assert.equal(h.session.openNodeId(), id, 'and it is genuinely bound');
+
+  // Obsidian, not the plugin, is what puts an open note's bytes on disk (I7).
+  assert.equal(h.vault.snapshot()[path], STALE, 'until Obsidian saves, the disk still lags');
+  h.editor.save(path);
+  assert.equal(h.vault.snapshot()[path], SHARED, 'and then the file is the workspace\'s copy');
+
+  // The bytes that were replaced were preserved first, exactly once.
+  assert.deepEqual(h.stashes().map(([, text]) => text), [STALE]);
+  assert.equal(h.vault.wasTrashed(path), false, 'nothing was destroyed (I1)');
+  assert.ok(h.notices.some((n) => n.includes(RECOVERED_DIR)), h.notices.join('|'));
+});
+
+test('nine opens of a stale note produce one copy, not nine', async () => {
+  // `ShadowLink Recovered/` held nine near-identical files three minutes after
+  // the share was created, and one of them — in the surviving evidence — was
+  // byte-identical to the file still sitting at the canonical path. A stash of
+  // bytes nothing replaced preserves nothing; a second stash of bytes already
+  // preserved preserves nothing either.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  const path = `${SHARE}/Sans titre.md`;
+
+  for (let i = 0; i < 9; i++) {
+    await h.session.open(path);
+    await h.session.open(null);
+    // Deliberately NOT saving: this models the window in which Obsidian has not
+    // written the buffer yet, which is the window all nine landed in.
+  }
+
+  const stashes = h.stashes();
+  assert.equal(stashes.length, 1, stashes.map(([p]) => p).join(' | '));
+  assert.equal(stashes[0][1], STALE, 'and it holds the revision that was replaced');
+});
+
+test('a stale copy that is empty is not stashed at all', async () => {
+  // The loud version of the same failure: a peer materialized a 0-byte file from
+  // a document that was empty at that instant, and every open wrote a 0-byte
+  // "local copy" of it. Nine files, not one of which held anything.
+  const h = makeHarness();
+  const id = h.add('Sans fasdfa1.md', '', { s: 1 });
+  h.providers.configure(`n_${id}`, { remote: 'fasdffasdfsdfs' });
+  const path = `${SHARE}/Sans fasdfa1.md`;
+
+  await h.session.open(path);
+
+  assert.deepEqual(h.stashes(), [], 'a copy of nothing preserves nothing');
+  assert.equal(
+    h.notices.some((n) => n.includes(RECOVERED_DIR)),
+    false,
+    'and no notice claims a copy was saved',
+  );
+  assert.equal(h.editor.document(path), 'fasdffasdfsdfs', 'the content finally appears');
+  h.editor.save(path);
+  assert.equal(h.vault.snapshot()[path], 'fasdffasdfsdfs');
+});
+
+test('a remote edit after a divergent open lands in the editor instead of raising', async () => {
+  // The user's console, and the reason it was full of RangeErrors:
+  //
+  //   RangeError: Invalid change range 15 to 16 (in doc of length 0)
+  //   RangeError: Invalid position 184 in document of length 166
+  //
+  // `YSyncPluginValue._observer` turns a Y.Text delta into CodeMirror changes at
+  // Y.Text offsets and checks nothing about the editor's length, because the
+  // library's contract is that the two were equal at bind time. A mount that
+  // does not establish that makes every subsequent remote keystroke an error.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  const path = `${SHARE}/Sans titre.md`;
+
+  await h.session.open(path);
+  const text = h.providers.created[0].doc.getText('content');
+  text.insert(text.length, ' and one more sentence.');
+
+  assert.equal(h.editor.document(path), `${SHARED} and one more sentence.`);
+});
+
+test('a mount into an editor whose state has no compartment is refused, not assumed', async () => {
+  // `Compartment.reconfigure` aimed at a state that does not contain the
+  // compartment is inert and SILENT. Without a liveness check the session is
+  // told a binding exists when none does — so it defers the reconciler's repairs
+  // for that node and records a watermark, for a note nothing is bound to.
+  const h = makeHarness();
+  const id = h.add('a.md', 'body', { s: 1, owned: true, initialized: false });
+  h.providers.configure(`n_${id}`, { remote: 'body' });
 
   await h.session.open(`${SHARE}/a.md`);
 
-  const stashed = Object.entries(h.vault.snapshot()).filter(([p]) => p.startsWith(`${RECOVERED_DIR}/`));
-  assert.equal(stashed.length, 1, JSON.stringify(h.vault.snapshot()));
-  assert.equal(stashed[0][1], 'my offline edit');
-  assert.equal(h.vault.wasTrashed(`${SHARE}/a.md`), false, 'nothing was destroyed (I1)');
-  assert.equal(h.editor.current?.notePath, `${SHARE}/a.md`);
-  assert.ok(h.notices.some((n) => n.includes(RECOVERED_DIR)), h.notices.join('|'));
+  assert.deepEqual(h.editor.refused, [`${SHARE}/a.md`], 'the mount reported failure');
+  assert.equal(h.session.openNodeId(), null, 'so nothing claims to be bound');
+  assert.equal(h.providers.created[0].destroyed, true, 'and the provider was released');
+  assert.equal(h.state.data.contentHash[id], undefined, 'and no watermark was recorded');
 });
 
 test('a local copy matching the shared document is not stashed', async () => {
@@ -568,6 +683,56 @@ test('a local copy matching the shared document is not stashed', async () => {
 
   assert.equal(mutations(h.vault), 0, 'CRLF on disk vs LF in the doc is not a difference (I18)');
   assert.equal(h.editor.current?.notePath, `${SHARE}/a.md`);
+});
+
+// ================================================================ I17 — the watermark
+
+test('a divergent open records no watermark, and removes the one it finds (I17)', async () => {
+  // Read off the two live vaults on the day this was written:
+  //
+  //   SL-A: file 184 bytes (matches the server), watermark len 166 — B's file
+  //   SL-B: file 166 bytes,                      watermark len 184 — the server's
+  //
+  // Each device had recorded the OTHER side's content as its own base, because
+  // the base was taken from the CRDT immediately after a mount that wrote
+  // nothing. §5.3's `proven` check reads this to choose between the vault trash
+  // and a rescue, so it is a data-loss path, not a cosmetic one.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  h.state.data.contentHash[id] = { sha256: await hashOf(SHARED), len: SHARED.length };
+
+  await h.session.open(`${SHARE}/Sans titre.md`);
+
+  assert.equal(
+    h.state.data.contentHash[id],
+    undefined,
+    'a device that cannot vouch for its own copy names no bytes at all (I17)',
+  );
+});
+
+test('once the disk has caught up, the next open records what is on it (I17)', async () => {
+  // The evidence a watermark waits for is a `vault.read` of this path returning
+  // exactly the workspace's bytes. It arrives at the next open, because that is
+  // where the file is read; until then, absence is the honest answer and the
+  // safe one (an unproven note is rescued, never trashed).
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  const path = `${SHARE}/Sans titre.md`;
+
+  await h.session.open(path);
+  assert.equal(h.state.data.contentHash[id], undefined, 'nothing yet: the disk still lags');
+
+  h.editor.save(path);                       // Obsidian writes the dirty buffer
+  await h.session.open(null);
+  await h.session.open(path);
+
+  assert.deepEqual(
+    h.state.data.contentHash[id],
+    { sha256: await hashOf(SHARED), len: SHARED.length },
+    'and now it names bytes this device read off its own disk',
+  );
 });
 
 test('a shared document holding CRLF is not a difference either (I18)', async () => {
@@ -780,7 +945,16 @@ test('an open superseded by a read failure stays silent', async () => {
   assert.equal(a in h.state.data.contentHash, false);
 });
 
-test('an open superseded while stashing the local copy never mounts', async () => {
+// The stash now runs AFTER the mount, because it exists to preserve bytes the
+// mount is replacing and there is nothing to preserve until something replaces
+// them. These two tests used to gate the stash as a PRE-mount await point and
+// assert that the superseded open "never mounts". That assertion is no longer
+// about the stash — the mount happens first now — so they are rewritten around
+// what the ordering actually guarantees. The I7 property they were guarding, an
+// open that lost its token never reaching the editor, is still covered at every
+// pre-mount await: the node wait, the file read, the sync wait and the flush.
+
+test('an open superseded while stashing still preserves the bytes, and loses the editor', async () => {
   let gated: GatedVault | null = null;
   const h = makeHarness({ syncTimeoutMs: 5_000 }, {
     wrapVault: (inner) => { gated = new GatedVault(inner); return gated; },
@@ -804,14 +978,21 @@ test('an open superseded while stashing the local copy never mounts', async () =
   // The stash itself must still complete — those are the user's bytes.
   assert.deepEqual(h.stashes().map(([, text]) => text), ['my offline edit']);
   assert.equal(h.providers.forRoom(`n_${a}`)[0].destroyed, true);
-  assert.equal(h.editor.mounts.length, 1);
+  assert.equal(h.editor.unmounts, 1, 'the superseded session was torn down');
   assert.equal(h.editor.current?.notePath, `${SHARE}/b.md`);
+  assert.equal(h.session.openNodeId(), b);
 });
 
-test('a re-open of the SAME note supersedes the stashing one without mounting twice', async () => {
+test('a re-open of the SAME note stashes once and replaces the document once', async () => {
   // Obsidian fires `file-open` more than once for one file, so the newer open
   // targets the same path — the active-file re-check cannot tell the two apart
   // and the token is the only thing that can.
+  //
+  // The re-open matters more than it used to. Obsidian's save of the editor's
+  // buffer is asynchronous, so the second open still reads the STALE bytes off
+  // disk and still sees a divergence. Without the session remembering what it
+  // already preserved, that is a fresh "local copy" per `file-open` — the nine
+  // files in three minutes the user actually met.
   let gated: GatedVault | null = null;
   const h = makeHarness({}, {
     wrapVault: (inner) => { gated = new GatedVault(inner); return gated; },
@@ -827,9 +1008,13 @@ test('a re-open of the SAME note supersedes the stashing one without mounting tw
   vault.release();
   await Promise.all([first, second]);
 
-  assert.equal(h.editor.mounts.length, 1, 'the superseded open never reached the editor');
-  assert.equal(h.editor.unmounts, 0, 'and nothing had to be torn back down');
+  assert.deepEqual(h.stashes().map(([, text]) => text), ['my offline edit'], 'exactly one copy');
   assert.equal(h.session.openNodeId(), a);
+  assert.equal(h.editor.document(`${SHARE}/a.md`), 'the shared text');
+  // The second mount found the editor already holding the shared text, so it
+  // reconfigured the compartment and left the document alone.
+  const replacements = h.editor.transactions(`${SHARE}/a.md`).filter((tr) => tr.docChanged);
+  assert.equal(replacements.length, 1, 'the user\'s document was replaced once, not once per open');
 });
 
 test('a session superseded by its own mount records no content watermark (I17)', async () => {
