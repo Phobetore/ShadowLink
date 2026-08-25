@@ -27,6 +27,7 @@ import { VaultWatcher } from '../../../src/sync/VaultWatcher.ts';
 import { Deletions } from '../../../src/sync/Deletions.ts';
 import { PublishQueue } from '../../../src/sync/PublishQueue.ts';
 import { Bootstrap } from '../../../src/sync/Bootstrap.ts';
+import { ObsidianBlobPort } from '../../../src/sync/ObsidianBlobPort.ts';
 import * as Y from 'yjs';
 import { DocLink, WsDocPort, sleep } from './net.mjs';
 
@@ -62,6 +63,11 @@ class WatchedVault extends FakeVault {
     this._emit({ op: 'create', path, kind: 'f' });
   }
 
+  async createBinary(path, data) {
+    await super.createBinary(path, data);
+    this._emit({ op: 'create', path, kind: 'f' });
+  }
+
   async createFolder(path) {
     await super.createFolder(path);
     this._emit({ op: 'create', path, kind: 'd' });
@@ -77,6 +83,23 @@ class WatchedVault extends FakeVault {
     const kind = this._kind(path);
     await super.trashLocal(path);
     this._emit({ op: 'delete', path, kind });
+  }
+
+  /**
+   * The USER replacing an attachment's bytes — a re-export from an image editor,
+   * a re-scan, a file copied over the old one.
+   *
+   * Obsidian has no in-place binary write and neither does `VaultPort`, so this
+   * goes in under the port surface (like `seed`) rather than through it: it is
+   * something that happened TO the vault, not something the plugin did. The
+   * plugin learns about it exactly as it does in production — from the `modify`
+   * event, and from the size and mtime it finds on the next pass.
+   */
+  async userWriteBinary(path, bytes) {
+    const callCount = this.calls.length;
+    this.seedBinary(path, bytes);
+    this.calls.length = callCount;
+    this._emit({ op: 'modify', path, kind: 'f' });
   }
 
   /**
@@ -188,13 +211,33 @@ export class Client {
       flushTimeoutMs: docSyncTimeoutMs,
     });
 
+    // The REAL blob port, against the REAL server's HTTP routes on the same port
+    // the relay rides. `fetchImpl` only counts what goes over it, so a test can
+    // assert that publishing a conflicted copy uploads nothing.
+    this.blobPatches = [];
+    this.blobs = new ObsidianBlobPort({
+      serverUrl: `http://127.0.0.1:${server.port}`,
+      serverKey: server.serverKey,
+      workspaceId: workspace,
+      fetchImpl: (input, init) => {
+        if ((init?.method ?? 'GET') === 'PATCH') this.blobPatches.push(String(input));
+        return fetch(input, init);
+      },
+    });
+
     this.publishQueue = new PublishQueue({
       docs: this.docs,
       vault: this.vault,
+      blobs: this.blobs,
       state: this.state,
       tree: this.tree,
       openNodeId: () => null,                  // no editing session in a headless client
+      displayName: name,
       backoff: publishBackoff,
+      // The settle check's premise is Obsidian's create-before-complete event, and
+      // this harness writes whole files in one call: a real 400 ms wait per
+      // attachment would only slow the suite down.
+      settleMs: 5,
     });
 
     this.watcher = new VaultWatcher({
@@ -236,11 +279,15 @@ export class Client {
     this.reconciler = new Reconciler({
       vault: this.vault,
       docs: this.docs,
+      blobs: this.blobs,
       state: this.state,
       tickets: this.tickets,
       shareRoot: SHARE_ROOT,
+      displayName: name,
       entries: () => this.tree.entries(),
       pendingDecision: () => this.watcher.pendingDecision,
+      // §3.5 rule 2: a local replacement is published, never quietly reverted.
+      requeuePublish: (nodeId, intent) => { this.publishQueue.requeue(nodeId, intent); },
       // Spec §4.5: tombstones stay off until bootstrap's first reconcile is done.
       applyDeletions: (ctx) => (
         this.bootstrap.tombstonesEnabled ? this.deletions.apply(ctx) : Promise.resolve()
@@ -325,6 +372,9 @@ export class Client {
     let promise;
     if (ev.op === 'create') promise = this.watcher.onCreate(ev.path, ev.kind);
     else if (ev.op === 'rename') promise = this.watcher.onRename(ev.path, ev.oldPath, ev.kind);
+    // A modify is an optimization, never the mechanism: reconciler step 2.5 is a
+    // full recompute, so a client that hears nothing converges on the next pass.
+    else if (ev.op === 'modify') promise = Promise.resolve();
     else { this.watcher.onDelete(ev.path, ev.kind); promise = Promise.resolve(); }
     this._events.push(promise.catch((err) => { this.eventErrors.push(err); }));
   }
@@ -360,6 +410,21 @@ export class Client {
     const parent = target.slice(0, target.lastIndexOf('/'));
     if (parent !== SHARE_ROOT) await this.userCreateFolder(parent.slice(SHARE_ROOT.length + 1));
     await this.vault.create(target, text);
+    await this.drainEvents();
+  }
+
+  /** Drag an attachment into the share. The bytes are whole from the first event. */
+  async userCreateBinary(rel, bytes) {
+    const target = this.path(rel);
+    const parent = target.slice(0, target.lastIndexOf('/'));
+    if (parent !== SHARE_ROOT) await this.userCreateFolder(parent.slice(SHARE_ROOT.length + 1));
+    await this.vault.createBinary(target, bytes);
+    await this.drainEvents();
+  }
+
+  /** Save over an attachment that is already there — the replace half of §3.5. */
+  async userReplaceBinary(rel, bytes) {
+    await this.vault.userWriteBinary(this.path(rel), bytes);
     await this.drainEvents();
   }
 
@@ -474,6 +539,32 @@ export class Client {
   /** Paths that exist anywhere in the vault, including the reserved folders. */
   wholeVault() {
     return this.vault.snapshot();
+  }
+
+  /**
+   * Everything under the share as raw BYTES, hex-encoded so two clients can be
+   * compared with a plain deepEqual. Text would not do: a UTF-8 round trip is
+   * exactly what an attachment must never go through.
+   */
+  binaryLayout() {
+    const out = {};
+    for (const [path, bytes] of Object.entries(this.vault.binarySnapshot())) {
+      if (!path.startsWith(`${SHARE_ROOT}/`)) continue;
+      out[path] = Buffer.from(bytes).toString('hex');
+    }
+    return out;
+  }
+
+  /** The bytes at a share-relative path, hex-encoded, or null. */
+  binaryAt(rel) {
+    return this.binaryLayout()[this.path(rel)] ?? null;
+  }
+
+  /** The whole tree as comparable data, ids included: two synced peers must match. */
+  treeState() {
+    return JSON.stringify(
+      this.tree.entries().sort((a, b) => cmp(a[0], b[0])),
+    );
   }
 
   /** Everything the plugin moved into `ShadowLink Recovered/`. */

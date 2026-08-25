@@ -224,6 +224,49 @@ export function safeInFilename(name: string): string {
   return cleaned.slice(0, MAX_NAME_IN_FILENAME).trim();
 }
 
+/**
+ * What a forked file is called, and it says what happened in the file explorer,
+ * where the user will actually meet it.
+ */
+const CONFLICT_TAG = 'conflicted copy';
+
+/** `diagram.png` -> `['diagram', '.png']`, splitting on the LAST extension only. */
+function stemAndExt(name: string): [string, string] {
+  const ext = extOf(name);
+  return ext === '' ? [name, ''] : [name.slice(0, name.length - ext.length), ext];
+}
+
+/**
+ * The name a peer's own copy takes when two people replaced one attachment
+ * without seeing each other (spec §4.3).
+ *
+ * `<stem> (conflicted copy — <who>, <first 8 of the hash>)<ext>`, and there is
+ * DELIBERATELY NO TIMESTAMP in it. Determinism is load-bearing rather than
+ * cosmetic: if the same divergence is re-observed on a later pass — after a crash
+ * before the node was minted, or after a publish that failed — the candidate name
+ * has to be identical, so the file binds to the node already standing there
+ * instead of forking again into a second conflicted copy, and a third.
+ *
+ * The display name is remote-controlled and is about to become part of a
+ * filename, so it goes through `safeInFilename` first: a separator in it would
+ * otherwise place the file in a folder that does not exist, or in one nobody
+ * looks at.
+ */
+export function forkName(name: string, hash: string, displayName: string): string {
+  const [stem, ext] = stemAndExt(name);
+  return `${stem} (${CONFLICT_TAG} — ${safeInFilename(displayName)}, ${hash.slice(0, 8)})${ext}`;
+}
+
+/**
+ * The same name with the display name dropped, for when the decorated one will
+ * not pass `validateRel` — a stem already close to the rel-path cap, most
+ * likely. Still deterministic, for the same reason.
+ */
+export function fallbackForkName(name: string, hash: string): string {
+  const [stem, ext] = stemAndExt(name);
+  return `${stem} (${CONFLICT_TAG} ${hash.slice(0, 8)})${ext}`;
+}
+
 function validSegment(seg: string): boolean {
   if (seg === '' || seg === '.' || seg === '..') return false;
   // Spec §7: reject the whole leading-dot class, not a denylist — .obsidian, .trash,

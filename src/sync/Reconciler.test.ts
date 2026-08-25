@@ -17,7 +17,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { NodeFields } from '../tree/types.ts';
-import { fold, hashOfBytes } from '../tree/paths.ts';
+import * as Y from 'yjs';
+
+import { fold, forkName, hashOfBytes, parseBlobRef } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
 import { Deletions, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
@@ -26,6 +28,7 @@ import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { PublishQueue } from './PublishQueue.ts';
 import { Reconciler, RetryLater, type ReconcilerDeps, type DeletionContext } from './Reconciler.ts';
 import { Tickets, type TicketOp } from './Tickets.ts';
+import { VaultWatcher } from './VaultWatcher.ts';
 import type { VaultPort } from './VaultPort.ts';
 
 // ---------------------------------------------------------------- fixtures
@@ -1907,7 +1910,7 @@ test('B6: a local attachment whose bytes match the tree is bound, and nothing is
 // The assertions below are behavioural on purpose: a source grep for `vault.read`
 // proves nothing about which branch a `'b'` node actually takes.
 test('B6: a local attachment that differs is never read as text, never exiled, never zeroed', async () => {
-  const h = makeHarness();
+  const h = makeHarness({ displayName: 'Ann' });
   h.vault.seed(SHARE, 'd');
   const mine = png(1);
   const theirs = png(2);
@@ -1918,27 +1921,32 @@ test('B6: a local attachment that differs is never read as text, never exiled, n
 
   const r = await h.reconciler.reconcile('bootstrap');
 
+  // P2-c recorded the divergence and left both files alone, because the policy
+  // that decides between them was this slice. It has landed: unknown ancestry is
+  // rule 4, and rule 4 keeps BOTH versions as visible files (§4.1, §4.3). The
+  // half of this test that has not changed is the one about HOW: never as text,
+  // never exiled outside the share, never a zero-byte file.
+  const fork = `${SHARE}/${forkName('diagram.png', await hashOfBytes(mine), 'Ann')}`;
   assert.deepEqual(
-    h.vault.binarySnapshot()[path], mine,
-    'the user’s bytes are still at the path, in full',
+    h.vault.binarySnapshot()[fork], mine,
+    'the user’s bytes survive in full, under a name of their own',
   );
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs, 'and the workspace version is at the path');
   assert.deepEqual(stashed(h.vault), {}, 'nothing was exiled to ShadowLink Recovered/');
-  assert.equal(h.vault.wasTrashed(path), false);
+  assert.equal(h.vault.wasTrashed(path), false, 'and nothing was trashed');
   assert.deepEqual(stringCalls(h.vault, path), [], 'no lossy decode, and no empty create');
   assert.deepEqual(h.docs.calls, [], 'no content doc for a `b` node, ever');
   for (const [p, data] of Object.entries(h.vault.binarySnapshot())) {
     assert.notEqual(data.length, 0, `${p} is not a zero-byte file`);
   }
-  // The conflict POLICY is P2-d. Until then the divergence is recorded and
-  // retried, which is the only answer that cannot lose either version.
-  assert.deepEqual(r.failures.map((f) => f.key), [`adopt:${id}`]);
-  assert.equal(h.state.data.materialized[id], undefined, 'and nothing was bound to it');
+  assert.deepEqual(r.failures, []);
+  assert.equal(h.state.data.materialized[id], path, 'the node is bound to the file it names');
 
-  // Idempotent: a second pass makes exactly the same non-decision.
+  // Idempotent: the second pass is converged and forks nothing further.
   const before = h.vault.binarySnapshot();
   const second = await h.reconciler.reconcile('retry');
   assert.deepEqual(h.vault.binarySnapshot(), before, 'the pass is repeatable and inert');
-  assert.deepEqual(second.failures.map((f) => f.key), [`adopt:${id}`]);
+  assert.deepEqual(second.failures, []);
 });
 
 // ⚠ B24, the adopt arm. The hash needs the whole file in memory, so the cap has
@@ -2812,4 +2820,455 @@ test('B24: a replacement over the memory cap is not fetched and the local file s
   assert.deepEqual(h.vault.binarySnapshot()[path], mine);
   assert.deepEqual(r.diagnostics.tooLarge, [id]);
   assert.deepEqual(r.failures, []);
+});
+
+// ---------------------------------------------------------------- P2 §4.3: fork and take
+
+/** What `forkName` produces for these fixtures, spelled out rather than computed. */
+async function forkPathOf(dir: string, name: string, mine: Uint8Array, who: string): Promise<string> {
+  const hash = await hashOfBytes(mine);
+  return `${dir}/${forkName(name, hash, who)}`;
+}
+
+// ⚠ B9's local half, and the reason the whole P2 design was chosen: two people
+// changed one attachment without seeing each other, so BOTH versions survive as
+// visible files. The rename IS the preservation — there is no copy, and no
+// instant in which the user's bytes exist only in memory.
+test('rule 4: our version is renamed aside and the workspace version takes the path', async () => {
+  const h = makeHarness({ displayName: 'Ann' });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const base = png(3, 32);                       // what both versions descend from
+  const id = nid('A');
+  const theirsSha = await h.blobs.seed(theirs);
+  const path = await bindBlob(h, id, 'img/diagram.png', mine, {
+    sha256: theirsSha, bytes: theirs.length, parent: await hashOfBytes(base),
+  }, { sha256: await hashOfBytes(mine), len: mine.length });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  const fork = await forkPathOf(`${SHARE}/img`, 'diagram.png', mine, 'Ann');
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(h.vault.binarySnapshot()[fork], mine, 'our bytes, under a name of their own');
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs, 'and the workspace version at the path');
+  assert.equal(h.state.data.materialized[id], path, 'the node is bound to the canonical file');
+  assert.equal(h.state.data.contentHash[id]?.sha256, theirsSha, 'with the base it just confirmed');
+  assert.equal(h.vault.wasTrashed(path), false, 'nothing was trashed: both versions are files');
+  assert.deepEqual(stashed(h.vault), {}, 'and nothing was exiled outside the share');
+
+  // The order is the promise: RENAME first, and only then the new file. A copy
+  // would mean an interval in which the only copy of the user's bytes is a
+  // JavaScript array.
+  const ops = h.vault.calls
+    .filter((c) => c.op === 'rename' || c.op === 'createBinary' || c.op === 'trashLocal')
+    .map((c) => `${c.op} ${String(c.args[0])}`);
+  assert.deepEqual(ops, [`rename ${path}`, `createBinary ${path}`]);
+
+  assert.equal(h.notices.length, 1, 'the user is told, once');
+  assert.ok(h.notices[0].includes('diagram.png'), h.notices[0]);
+  assert.ok(h.notices[0].includes(baseOfPath(fork)), 'and the notice names the fork');
+});
+
+/** Basename helper for the assertions above — the tests read paths, users read names. */
+function baseOfPath(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
+// ⚠ A failed fetch must leave the user's file EXACTLY where it was. This is why
+// the fetch happens before the rename and not after it: the alternative is a
+// vault in which the canonical path is empty and the attachment has been renamed
+// to something the user never chose, because the network blinked.
+test('a fork whose fetch fails moves nothing at all', async () => {
+  const h = makeHarness({ displayName: 'Ann' });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const theirsSha = await h.blobs.seed(theirs);
+  const path = await bindBlob(h, id, 'diagram.png', mine, {
+    sha256: theirsSha, bytes: theirs.length, parent: 'f'.repeat(64),
+  }, { sha256: await hashOfBytes(mine), len: mine.length });
+  h.blobs.setAbsent(theirsSha);
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.equal(r.failures.length, 1);
+  assert.ok(r.failures[0].err instanceof RetryLater);
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'still there, still called what it was');
+  assert.equal(h.vault.callsTo('rename').length, 0, 'not renamed aside on a fetch that failed');
+  assert.deepEqual(h.notices, [], 'and the user was not told about a fork that did not happen');
+});
+
+// The second of two independent digest checks, on the fork path. Bytes that do
+// not verify never reach the disk — and, because the fetch comes first, they
+// never cause the rename either.
+test('fork bytes that arrive unverified are refused and nothing moves', async () => {
+  const h = makeHarness({ displayName: 'Ann' });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const theirsSha = await h.blobs.seed(theirs);
+  const path = await bindBlob(h, id, 'diagram.png', mine, {
+    sha256: theirsSha, bytes: theirs.length, parent: 'f'.repeat(64),
+  }, { sha256: await hashOfBytes(mine), len: mine.length });
+
+  h.reconciler = new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: blobPortOf(h.blobs, { get: async () => png(9, 96) }),   // a port that verified nothing
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    displayName: 'Ann',
+    now: () => NOW,
+  });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures.map((f) => f.key), [`bytes:${id}`]);
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine);
+  assert.equal(h.vault.callsTo('rename').length, 0);
+  assert.equal(h.vault.callsTo('createBinary').length, 0);
+});
+
+// I7. The file is open in a view; renaming it out from under that view is exactly
+// what the invariant exists to prevent. Deferring costs one pass.
+test('a conflicted attachment open in a leaf is not forked', async () => {
+  const h = makeHarness({ displayName: 'Ann' });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const theirsSha = await h.blobs.seed(theirs);
+  const path = await bindBlob(h, id, 'diagram.png', mine, {
+    sha256: theirsSha, bytes: theirs.length, parent: 'f'.repeat(64),
+  }, { sha256: await hashOfBytes(mine), len: mine.length });
+  h.vault.setOpen(path, true);
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(h.blobs.calls, [], 'not even fetched for');
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine);
+  assert.deepEqual(h.notices, []);
+});
+
+// ⚠ B10. Fork idempotence, which is what the missing timestamp buys. The fork
+// file is untracked until step 6 hands it to the publisher, so a pass that runs
+// before the node is minted must not fork a second time — and must offer the same
+// name it produced before.
+test('B10: a re-run pass forks once, keeps the name, and offers the fork for publication', async () => {
+  const h = makeHarness({ displayName: 'Ann' });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const theirsSha = await h.blobs.seed(theirs);
+  const path = await bindBlob(h, id, 'diagram.png', mine, {
+    sha256: theirsSha, bytes: theirs.length, parent: 'f'.repeat(64),
+  }, { sha256: await hashOfBytes(mine), len: mine.length });
+  const fork = await forkPathOf(SHARE, 'diagram.png', mine, 'Ann');
+
+  await h.reconciler.reconcile('sync');
+  const afterFirst = h.vault.binarySnapshot();
+  const second = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(second.failures, []);
+  assert.deepEqual(h.vault.binarySnapshot(), afterFirst, 'the second pass is inert');
+  const conflicted = Object.keys(h.vault.binarySnapshot()).filter((p) => p.includes('conflicted copy'));
+  assert.deepEqual(conflicted, [fork], 'exactly one conflicted copy, with the same name');
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs);
+  // Step 6 offers the untracked fork on every pass until a node claims it — that
+  // is the seam that mints and publishes it (§4.2 step 7).
+  assert.deepEqual(h.published[h.published.length - 1], [fork]);
+  assert.equal(h.notices.length, 1, 'and the user is told once, not once per pass');
+});
+
+// The adopt route reaches the same rule: a local file sitting at a published
+// node's path whose bytes are neither the tree's nor anything this device ever
+// confirmed. Unknown ancestry is rule 4, and rule 4 keeps both.
+test('an adopted file with unknown ancestry forks instead of being overwritten', async () => {
+  const h = makeHarness({ displayName: 'Ann' });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const path = `${SHARE}/diagram.png`;
+  h.vault.seedBinary(path, mine);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'diagram.png', theirs));
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  const fork = await forkPathOf(SHARE, 'diagram.png', mine, 'Ann');
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(h.vault.binarySnapshot()[fork], mine, 'the local file was preserved by name');
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs);
+  assert.equal(h.state.data.materialized[id], path);
+});
+
+// ---------------------------------------------------------------- P2 §4.2: the hard case
+
+/**
+ * One whole client: vault, device state, tickets, watcher, publish queue and
+ * reconciler, wired exactly as `main.ts` wires them.
+ *
+ * Only the tree and the store are shared, because in a real workspace those are
+ * the only two things that are.
+ */
+interface Peer {
+  name: string;
+  vault: FakeVault;
+  state: DeviceState;
+  tree: TreeDoc;
+  queue: PublishQueue;
+  watcher: VaultWatcher;
+  reconciler: Reconciler;
+  notices: string[];
+}
+
+function makePeer(name: string, tree: TreeDoc, store: FakeBlobs): Peer {
+  const vault = new FakeVault();
+  vault.seed(SHARE, 'd');
+  const docs = new FakeDocs();
+  const state = new DeviceState(new MemoryStatePort(), `device-${name}`, 'ws-1', () => NOW, 0);
+  const tickets = new Tickets(() => NOW);
+  const notices: string[] = [];
+
+  const queue = new PublishQueue({
+    docs,
+    vault,
+    blobs: store,
+    state,
+    tree,
+    openNodeId: () => null,
+    displayName: name,
+    now: () => NOW,
+    settleMs: 0,
+  });
+
+  const watcher = new VaultWatcher({
+    tree,
+    entries: () => tree.entries(),
+    vault,
+    state,
+    tickets,
+    getShareRoot: () => SHARE,
+    setShareRoot: () => undefined,
+    displayName: name,
+    phase: () => 'ready',
+    now: () => NOW,
+    notice: (m) => { notices.push(m); },
+    enqueuePublish: (id) => { queue.enqueue(id); },
+  });
+
+  const reconciler = new Reconciler({
+    vault,
+    docs,
+    blobs: store,
+    state,
+    tickets,
+    shareRoot: SHARE,
+    entries: () => tree.entries(),
+    displayName: name,
+    now: () => NOW,
+    notice: (m) => { notices.push(m); },
+    requeuePublish: (id, intent) => { queue.requeue(id, intent); },
+    publishUntracked: async (paths) => {
+      for (const path of paths) await watcher.onCreate(path, 'f');
+      await queue.drain();
+    },
+  });
+
+  return { name, vault, state, tree, queue, watcher, reconciler, notices };
+}
+
+/** A tree doc with a fixed clientID, so the LWW winner is the same in every run. */
+function treeWithClient(clientId: number): TreeDoc {
+  const doc = new Y.Doc();
+  doc.clientID = clientId;
+  return new TreeDoc(doc);
+}
+
+function syncTrees(a: TreeDoc, b: TreeDoc): void {
+  b.applyUpdate(a.encodeState());
+  a.applyUpdate(b.encodeState());
+}
+
+/** Everything under the share, as path -> bytes. */
+function shareBytes(vault: FakeVault): Record<string, Uint8Array> {
+  const out: Record<string, Uint8Array> = {};
+  for (const [path, data] of Object.entries(vault.binarySnapshot())) {
+    if (path.startsWith(`${SHARE}/`)) out[path] = data;
+  }
+  return out;
+}
+
+/** Byte-comparable, id-free view: the tree, keyed by what each node IS. */
+function treeShape(tree: TreeDoc): string {
+  return JSON.stringify(
+    tree.entries()
+      .map(([, f]) => [f.k, f.d, f.n, f.s ?? 0, f.b ?? ''])
+      .sort((x, y) => cmpJson(x, y)),
+  );
+}
+
+/** Device state with nodeIds replaced by the path each node claims: run-comparable. */
+function stateShape(peer: Peer): string {
+  const rel = new Map<string, string>();
+  for (const [id, f] of peer.tree.entries()) rel.set(id, `${f.d}/${f.n}`);
+  const materialized: Array<[string, string]> = Object.entries(peer.state.data.materialized)
+    .map(([id, path]) => [rel.get(id) ?? id, path]);
+  const hashes: Array<[string, string]> = Object.entries(peer.state.data.contentHash)
+    .map(([id, entry]) => [rel.get(id) ?? id, entry.sha256]);
+  return JSON.stringify({
+    materialized: materialized.sort((a, b) => cmpJson(a, b)),
+    contentHash: hashes.sort((a, b) => cmpJson(a, b)),
+  });
+}
+
+function cmpJson(a: unknown, b: unknown): number {
+  const x = JSON.stringify(a);
+  const y = JSON.stringify(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/**
+ * Spec §4.2's assigned hard case, run for real.
+ *
+ * Ann publishes an attachment; Bob materializes it; both replace it while
+ * partitioned; the partition heals. `order` decides which of them reconciles
+ * first afterwards — the outcome must not depend on it, which is the property
+ * that makes this design work with no coordinator.
+ */
+async function runConcurrentReplace(order: 'ann-first' | 'bob-first'): Promise<{
+  ann: Peer; bob: Peer; store: FakeBlobs; id: string;
+  original: Uint8Array; annBytes: Uint8Array; bobBytes: Uint8Array;
+  putsAfterMerge: number;
+}> {
+  const store = new FakeBlobs();
+  const ann = makePeer('Ann', treeWithClient(1), store);
+  const bob = makePeer('Bob', treeWithClient(2), store);
+  const rel = 'img/diagram.png';
+  const path = `${SHARE}/${rel}`;
+  const original = png(1, 120);
+  const annBytes = png(2, 130);
+  const bobBytes = png(3, 145);
+
+  // 1. Ann drops the image into the shared folder, and it publishes.
+  ann.vault.seed(`${SHARE}/img`, 'd');
+  ann.vault.seedBinary(path, original);
+  await ann.watcher.onCreate(path, 'f');
+  await ann.queue.drain();
+  const id = ann.tree.entries()[0][0];
+
+  // 2. Bob materializes it, byte for byte.
+  syncTrees(ann.tree, bob.tree);
+  await bob.reconciler.reconcile('bootstrap');
+
+  // 3. The partition. Neither tree is exchanged; both users edit and save.
+  ann.vault.seedBinary(path, annBytes);
+  await ann.reconciler.reconcile('sync');
+  bob.vault.seedBinary(path, bobBytes);
+  await bob.reconciler.reconcile('sync');
+
+  // 4. It heals. `b` is ONE register, so the workspace converges on one of the
+  //    two references — and the store holds both objects, because a
+  //    content-addressed store has no concept of overwriting.
+  syncTrees(ann.tree, bob.tree);
+  store.resetCalls();
+
+  const peers = order === 'ann-first' ? [ann, bob] : [bob, ann];
+  for (let round = 0; round < 3; round++) {
+    for (const peer of peers) await peer.reconciler.reconcile('remote');
+    syncTrees(ann.tree, bob.tree);
+  }
+
+  return {
+    ann, bob, store, id, original, annBytes, bobBytes,
+    putsAfterMerge: store.callsTo('put').length,
+  };
+}
+
+// ⚠ B9. The whole slice, end to end, against two engines and one store: both
+// peers publish, the LWW register settles on one of them, the loser's version
+// becomes a visible sibling instead of disappearing, and every peer ends up
+// holding BOTH files with identical names and identical bytes.
+test('B9: two concurrent replacements converge on two files, and nobody loses bytes', async () => {
+  const run = await runConcurrentReplace('ann-first');
+  const { ann, bob, store, id, annBytes, bobBytes } = run;
+
+  const winner = parseBlobRef(ann.tree.get(id)!.b)!;
+  assert.equal(
+    winner.sha256, parseBlobRef(bob.tree.get(id)!.b)!.sha256,
+    'both peers agree on which reference the workspace converged on',
+  );
+  const winnerBytes = winner.sha256 === await hashOfBytes(annBytes) ? annBytes : bobBytes;
+  const loserBytes = winnerBytes === annBytes ? bobBytes : annBytes;
+  const loser = winnerBytes === annBytes ? bob : ann;
+
+  // Neither upload destroyed the other: the store holds both objects.
+  assert.deepEqual(store.stored(await hashOfBytes(annBytes)), annBytes);
+  assert.deepEqual(store.stored(await hashOfBytes(bobBytes)), bobBytes);
+
+  const canonical = `${SHARE}/img/diagram.png`;
+  const fork = `${SHARE}/img/${forkName('diagram.png', await hashOfBytes(loserBytes), loser.name)}`;
+
+  for (const peer of [ann, bob]) {
+    const files = shareBytes(peer.vault);
+    assert.deepEqual(
+      Object.keys(files).sort(), [fork, canonical].sort(),
+      `${peer.name} does not hold both files`,
+    );
+    assert.deepEqual(files[canonical], winnerBytes, `${peer.name}'s canonical file`);
+    assert.deepEqual(files[fork], loserBytes, `${peer.name}'s conflicted copy`);
+  }
+
+  // The fork is a real shared node, owned by the peer whose bytes it holds.
+  assert.equal(ann.tree.entries().filter(([, f]) => isLiveNode(f)).length, 2);
+  assert.equal(treeShape(ann.tree), treeShape(bob.tree), 'and both trees say the same thing');
+
+  // ⚠ ZERO BYTES UPLOADED for the fork: the store already holds those bytes under
+  // that hash, so publishing it is a HEAD hit plus a tree write.
+  assert.equal(run.putsAfterMerge, 0, 'the conflicted copy was published without an upload');
+
+  // The loser is told, once, and the notice names both files.
+  const told = loser.notices.filter((m) => m.includes('conflicted copy'));
+  assert.equal(told.length, 1, loser.notices.join(' | '));
+  assert.ok(told[0].includes('diagram.png'));
+});
+
+/** `isLive` under a name that cannot be confused with the fixture helpers above. */
+function isLiveNode(f: NodeFields): boolean {
+  return f.x === undefined || f.x < f.g;
+}
+
+// ⚠ B33. The same events, delivered in the opposite order, and the outcome is
+// identical down to the bytes: which peer reconciles first is not an input to
+// anything. Nothing in the rule reads a clock, a device id or an arrival order,
+// and the fork's name carries no timestamp — this test is what would notice if
+// any of that changed.
+test('B33: the concurrent case converges identically whichever peer reconciles first', async () => {
+  const first = await runConcurrentReplace('ann-first');
+  const second = await runConcurrentReplace('bob-first');
+
+  for (const name of ['ann', 'bob'] as const) {
+    assert.deepEqual(
+      shareBytes(first[name].vault), shareBytes(second[name].vault),
+      `${name} converged on different files depending on who went first`,
+    );
+    assert.equal(
+      stateShape(first[name]), stateShape(second[name]),
+      `${name}'s device state depends on the order`,
+    );
+  }
+  assert.equal(treeShape(first.ann.tree), treeShape(second.ann.tree));
+  assert.equal(first.putsAfterMerge, second.putsAfterMerge);
+
+  // …and both peers hold the same two files as each other, in both runs.
+  assert.deepEqual(shareBytes(first.ann.vault), shareBytes(first.bob.vault));
+  assert.deepEqual(shareBytes(second.ann.vault), shareBytes(second.bob.vault));
 });

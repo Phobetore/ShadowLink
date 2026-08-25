@@ -581,3 +581,60 @@ test('an unknown base with differing bytes forks rather than assuming convergenc
   // …and a base that names neither side is just as unknown.
   assert.equal(replaceVerdict(HA, refOf(HB, H0), H0), 'fork');
 });
+
+// ── P2 §4.3: the fork name ───────────────────────────────────────────────────
+
+import { fallbackForkName, forkName } from './paths.ts';
+
+// Spec test A11. The name carries NO timestamp, and that is load-bearing rather
+// than cosmetic: if the same divergence is re-observed on a later pass — after a
+// crash, or a publish that failed — the candidate name has to be identical, so
+// the file binds to the node already standing there instead of forking again into
+// a second conflicted copy, and a third, and a fourth.
+test('forkName is deterministic and stamps the hash, never the clock', () => {
+  const hash = `${'a71c4013'}${'0'.repeat(56)}`;
+  const first = forkName('diagram.png', hash, 'Ann');
+  assert.equal(first, 'diagram (conflicted copy — Ann, a71c4013).png');
+  assert.equal(forkName('diagram.png', hash, 'Ann'), first, 'same inputs, same name, always');
+  assert.ok(!/\d{4}-\d{2}-\d{2}/.test(first), 'no date');
+  assert.ok(!/\d{2}-\d{2}-\d{2}/.test(first), 'and no time');
+  assert.equal(forkName('Scan 2026-08-24.pdf', hash, 'Ann'), 'Scan 2026-08-24 (conflicted copy — Ann, a71c4013).pdf');
+  assert.equal(forkName('archive.tar.gz', hash, 'Ann'), 'archive.tar (conflicted copy — Ann, a71c4013).gz');
+});
+
+// A display name is remote-controlled and is about to become part of a FILENAME.
+// A separator in it would place the file in a folder that does not exist, or in
+// one nobody looks at.
+test('forkName sanitizes the display name and still produces a valid attachment name', () => {
+  const hash = 'b'.repeat(64);
+  const hostile = `a/b\\c:d${String.fromCharCode(1)}`;
+  const name = forkName('diagram.png', hash, hostile);
+  assert.equal(name, `diagram (conflicted copy — a b c d, ${'b'.repeat(8)}).png`);
+  assert.equal(validateRel('img', name, 'b'), true, 'and the result is a name the tree accepts');
+  assert.equal(validateRel('img', forkName('diagram.png', hash, ''), 'b'), true, 'even with no name at all');
+});
+
+// The fallback drops the display name entirely — it is what the caller reaches
+// for when the full name will not validate, and it stays deterministic for the
+// same reason the first one does.
+test('fallbackForkName drops the display name and keeps the hash', () => {
+  const hash = 'c'.repeat(64);
+  const name = fallbackForkName('diagram.png', hash);
+  assert.equal(name, `diagram (conflicted copy ${'c'.repeat(8)}).png`);
+  assert.ok(name.length < forkName('diagram.png', hash, 'Wilhelmina Ashcombe-Whitfield').length);
+  assert.equal(validateRel('', name, 'b'), true);
+  assert.equal(fallbackForkName('diagram.png', hash), name, 'and it is deterministic too');
+});
+
+// The one case the caller has to branch on: a stem long enough that the decorated
+// name no longer validates. The rel path cap is what bites first.
+test('a name too long to decorate is rejected by validateRel, so the caller can fall back', () => {
+  const hash = 'd'.repeat(64);
+  const stem = 'N'.repeat(360);
+  const decorated = forkName(`${stem}.png`, hash, 'Wilhelmina Ashcombe-Whitfield');
+  assert.equal(validateRel('', decorated, 'b'), false, 'over the rel-path cap');
+  assert.equal(
+    validateRel('', fallbackForkName(`${stem}.png`, hash), 'b'), true,
+    'while the fallback fits',
+  );
+});

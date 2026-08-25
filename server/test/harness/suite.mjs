@@ -10,6 +10,7 @@
 // and C10 needs both halves of it at once — a saturated blob store and a relay
 // that still answers.
 
+import { createHash } from 'node:crypto';
 import { WebSocket } from 'ws';
 import * as Y from 'yjs';
 import { test, run, setFilter, assert } from './runner.mjs';
@@ -905,6 +906,109 @@ scenario('78 the server accepts _tree and n_<22 chars> and rejects a docId with 
 });
 
 // ============================================================ main
+
+// ============================================================ C8
+
+/** Deterministic pseudo-binary content: a PNG signature and then noise. */
+function attachmentBytes(length, seed) {
+  const out = new Uint8Array(length);
+  out.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  let x = (seed * 2654435761) >>> 0;
+  for (let i = 8; i < length; i++) {
+    x = (x * 1103515245 + 12345) >>> 0;
+    out[i] = (x >>> 16) & 0xff;
+  }
+  return out;
+}
+
+function hex(bytes) {
+  return Buffer.from(bytes).toString('hex');
+}
+
+function shaOf(bytes) {
+  return createHash('sha256').update(Buffer.from(bytes)).digest('hex');
+}
+
+// ⚠ C8, and the whole reason the P2 design was chosen: two REAL engines, one
+// REAL server, and an attachment that both of them replace while they cannot see
+// each other. `b` is one LWW register, so the workspace converges on one of the
+// two versions — and the other one must still be there, as a file, on every peer.
+scenario('C8 two engines replace one attachment while partitioned and nobody loses bytes', async ({ make }) => {
+  const ann = make('Ann');
+  const bob = make('Bob');
+  const original = attachmentBytes(120_000, 1);
+  const annVersion = attachmentBytes(130_000, 2);
+  const bobVersion = attachmentBytes(145_000, 3);
+
+  await ann.start();
+  await ann.userCreateBinary('img/diagram.png', original);
+  await ann.settle();
+  await bob.start();
+  assert.ok((await settleAll([ann, bob])).converged, 'clients did not reach quiescence');
+
+  // The one-way half first: B holds the same bytes, through the store, byte for byte.
+  assert.equal(bob.binaryAt('img/diagram.png'), hex(original), 'Bob did not materialize it');
+  const nodeId = ann.nodeAt('img/diagram.png');
+  assert.ok(nodeId, 'no node was minted for the attachment');
+
+  // Both go offline and save a new version of the same file.
+  ann.partition();
+  bob.partition();
+  await ann.userReplaceBinary('img/diagram.png', annVersion);
+  await ann.settle();
+  await bob.userReplaceBinary('img/diagram.png', bobVersion);
+  await bob.settle();
+
+  // Each published its own bytes: a content-addressed store has no concept of
+  // overwriting, so neither upload destroyed the other.
+  const annRef = ann.tree.get(nodeId).b;
+  const bobRef = bob.tree.get(nodeId).b;
+  assert.notEqual(annRef, bobRef, 'the two peers published the same reference');
+
+  // The partition heals. From here on, no bytes may be uploaded for the fork:
+  // the store already holds them.
+  ann.blobPatches.length = 0;
+  bob.blobPatches.length = 0;
+  await ann.reconnect();
+  await bob.reconnect();
+  assert.ok((await settleAll([ann, bob], { rounds: 30 })).converged, 'the peers never settled');
+
+  const winner = ann.tree.get(nodeId).b;
+  assert.equal(winner, bob.tree.get(nodeId).b, 'the peers disagree about the winning reference');
+  const winnerHex = winner.startsWith(shaOf(annVersion)) ? hex(annVersion) : hex(bobVersion);
+  const loserHex = winnerHex === hex(annVersion) ? hex(bobVersion) : hex(annVersion);
+
+  // Two files, on BOTH peers, with identical names and identical bytes.
+  const annFiles = ann.binaryLayout();
+  const bobFiles = bob.binaryLayout();
+  assert.deepEqual(
+    Object.keys(annFiles).sort(), Object.keys(bobFiles).sort(),
+    'the two peers hold different files',
+  );
+  assert.deepEqual(annFiles, bobFiles, 'the two peers hold different BYTES under the same names');
+  assert.equal(Object.keys(annFiles).length, 2, `expected two files, got ${Object.keys(annFiles)}`);
+  assert.equal(annFiles['Shared/img/diagram.png'], winnerHex, 'the winner is at the canonical path');
+  const forkPath = Object.keys(annFiles).find((p) => p !== 'Shared/img/diagram.png');
+  assert.ok(forkPath.includes('conflicted copy'), `the second file is not a conflicted copy: ${forkPath}`);
+  assert.equal(annFiles[forkPath], loserHex, 'the conflicted copy does not hold the losing bytes');
+
+  // Identical tree state, ids included: the fork is a real node both peers see.
+  assert.equal(ann.treeState(), bob.treeState(), 'the peers disagree about the tree');
+
+  // ⚠ ZERO BYTES UPLOADED after the merge. Publishing the conflicted copy is a
+  // HEAD hit plus a tree write, because the bytes are already in the store.
+  assert.deepEqual(
+    [...ann.blobPatches, ...bob.blobPatches], [],
+    'the conflicted copy was re-uploaded instead of being recognised by hash',
+  );
+
+  // And it is stable: another round changes nothing on either side.
+  const before = { ann: ann.binaryLayout(), bob: bob.binaryLayout(), tree: ann.treeState() };
+  await settleAll([ann, bob]);
+  assert.deepEqual(ann.binaryLayout(), before.ann, 'Ann kept working after convergence');
+  assert.deepEqual(bob.binaryLayout(), before.bob, 'Bob kept working after convergence');
+  assert.equal(ann.treeState(), before.tree, 'the tree kept changing after convergence');
+});
 
 async function main() {
   for (const arg of process.argv.slice(2)) {

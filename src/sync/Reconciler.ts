@@ -29,8 +29,8 @@ import {
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
 import {
-  assertInsideShare, extOf, fold, hashOf, hashOfBytes, isLive, nodeKindOf, relPath, replaceVerdict,
-  splitRel, validateRel, type BlobRef,
+  assertInsideShare, extOf, fallbackForkName, fold, forkName, hashOf, hashOfBytes, isLive,
+  nodeKindOf, relPath, replaceVerdict, splitRel, validateRel, type BlobRef,
 } from '../tree/paths.ts';
 import type { BlobPort } from './BlobPort.ts';
 import type { DeviceState } from './DeviceState.ts';
@@ -177,6 +177,12 @@ export interface ReconcilerDeps {
    * the loop that is deciding what to publish.
    */
   requeuePublish?: (nodeId: string, intent: string) => void;
+  /**
+   * This device's display name, which appears inside the name of a forked file
+   * (§4.3). Display only, and optional: with none, the fork keeps the hash and
+   * drops the name rather than inventing one.
+   */
+  displayName?: string;
 }
 
 /**
@@ -1357,28 +1363,111 @@ export class Reconciler {
   }
 
   /**
-   * §4.3, STUBBED for this slice: leave both files alone, record the divergence,
-   * retry on the next pass.
+   * §4.3 — rule 4, and the reason this whole design was chosen over a revision
+   * log in the tree.
    *
-   * The real rule renames the local file to a deterministic conflict name and
-   * re-fills the canonical path with the tree's bytes, so that both versions
-   * survive as visible files. It needs the replace decision table to know which
-   * of the four cases this is, and that table is P2-d — so until then the honest
-   * answer is to decide nothing. Recording the failure is what makes "nothing"
-   * visible and repeatable: the node stays unbound, the next pass asks again, and
-   * neither copy can be lost in the meantime.
+   * Two people changed one attachment without seeing each other, or this device
+   * has simply never confirmed what is on its own disk. There is no merge for a
+   * PNG, so the only answer that loses nothing is to keep BOTH versions as
+   * visible files: ours under a name of its own, theirs at the canonical path.
+   *
+   * THE ORDER IS THE PROMISE, and every step of it is load-bearing:
+   *
+   *  1. Fetch and verify FIRST, so a fetch that fails leaves the user's file
+   *     exactly where it was — not renamed aside with an empty path beside it
+   *     because the network blinked.
+   *  2. `vault.rename` the local file. THE RENAME IS THE PRESERVATION: no copy,
+   *     no read, and no instant in which the user's bytes exist only in memory
+   *     (I1, I16).
+   *  3. Write the incoming bytes at the canonical path — one write, never a stub.
+   *  4. Tell the user, naming both files, because a file they did not create has
+   *     just appeared next to one they did.
+   *
+   * NO TREE WRITE happens here. Step 6's `publishUntracked` seam mints and owns
+   * the fork's node, which is what keeps this class a pure driver over a snapshot
+   * of `entries()`. Because the store is content-addressed, publishing the fork is
+   * a `HEAD` hit plus a tree write — zero bytes uploaded, since the bytes were
+   * already put there by whoever published this version.
    */
   private async forkAndTake(
-    _ctx: PassContext,
+    ctx: PassContext,
     id: string,
     path: string,
     local: string,
     ref: BlobRef,
   ): Promise<void> {
-    throw new RetryLater(
-      `${path} holds ${local.slice(0, 8)} but node ${id} names ${ref.sha256.slice(0, 8)}: `
-      + 'left untouched until the replace rule lands',
+    // I7: renaming a file out from under an open view is precisely what this
+    // invariant exists to prevent. One pass of delay costs nothing.
+    if (this.deps.vault.isOpenInLeaf(path)) return;
+    // §7.4, before the request: a device that cannot hold the incoming object
+    // must not fork either — half of the operation is not an outcome.
+    if (ref.bytes > this.memoryCapBytes()) {
+      ctx.diagnostics.tooLarge.push(id);
+      return;
+    }
+    if (!this.mayFetch(id, ref)) {
+      ctx.diagnostics.deferred.push(id);
+      return;
+    }
+
+    const forkPath = await this.forkPathFor(path, local);
+    const bytes = await this.deps.blobs.get(ref.sha256, ref.bytes);
+    if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    if (await hashOfBytes(bytes) !== ref.sha256) {
+      throw new Error(`fork: ${path} did not match its digest`);
+    }
+    if (!assertInsideShare(this.shareRoot, forkPath)) {
+      throw new Error(`fork: destination is outside the share: ${forkPath}`);
+    }
+
+    this.deps.tickets.arm('rename', path, forkPath);
+    await this.deps.vault.rename(path, forkPath);             // I16, and I1: nothing is destroyed
+    ctx.disk.move(path, forkPath);
+    this.unbindPath(ctx, id);
+
+    this.deps.tickets.arm('create', path);
+    this.deps.tickets.arm('modify', path);
+    await this.deps.vault.createBinary(path, bytes);
+    ctx.disk.add(path, 'f');
+    this.bindPath(ctx, id, path);
+    // I17: the base names what was written, once the write has returned.
+    const st = await this.deps.vault.stat(path);
+    this.recordBlobHash(id, ref.sha256, ref.bytes, st?.mtime);
+
+    this.notice(
+      `"${baseOf(path)}" was replaced by a collaborator's version. `
+      + `Your version is now "${baseOf(forkPath)}".`,
     );
+  }
+
+  /**
+   * Where our version goes: the same folder, a deterministic name, and never over
+   * something that is already there.
+   *
+   * The decorated name is validated with the kind the path DERIVES, because the
+   * fork is about to be offered to `publishUntracked` as an ordinary untracked
+   * file — a name this client would refuse to publish is a file that would sit
+   * there for ever, shared with nobody. When the display name pushes it past the
+   * rel-path cap the fallback drops the name; when even that will not validate,
+   * nothing moves at all and the failure is recorded (both copies are still
+   * intact, which is the only thing that must never be negotiable).
+   */
+  private async forkPathFor(path: string, local: string): Promise<string> {
+    const dir = dirOf(path);
+    const name = baseOf(path);
+    const who = this.deps.displayName;
+    const decorated = who === undefined || who.trim() === ''
+      ? fallbackForkName(name, local)
+      : forkName(name, local, who);
+    const candidate = this.isPublishable(`${dir}/${decorated}`)
+      ? `${dir}/${decorated}`
+      : `${dir}/${fallbackForkName(name, local)}`;
+    if (!this.isPublishable(candidate)) {
+      throw new Error(`fork: no shareable name for ${path}`);
+    }
+    // `uniquify` only ever moves off a name something else already occupies, so
+    // the deterministic name is what a re-observed divergence lands on.
+    return await this.uniquify(candidate);
   }
 
   // ---------------------------------------------------------- step 4
