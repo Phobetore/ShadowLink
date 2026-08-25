@@ -21,7 +21,7 @@
 //  3. THE REPLACEMENT WAS A NO-OP. A replacement equal to the needle, or one
 //     differing only in line endings, applies "successfully" and changes nothing.
 //     Refused.
-//  4. THE RESTORE DESTROYED WORK. An agent here restored a probe with
+//  4. THE RESTORE DESTROYED WORK. A probe here was once put back with
 //     `git checkout -- <file>`, which reverts the whole file to HEAD and throws
 //     away every uncommitted edit in it. NOTHING in this tool consults git. The
 //     original bytes are copied to a backup first, the restore copies them back,
