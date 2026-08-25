@@ -29,6 +29,13 @@
 //    a no-op, nothing is written and nothing is deleted on that peer, and the node
 //    shows up in its diagnostics as unavailable. A missing file, never a corrupt
 //    one, and never a delete.
+//  * One who runs it against a tree that was WRONG — restored from a backup, say —
+//    condemns live bytes, and the recovery mechanism this design chose is a human
+//    noticing. So the unlink pass asks the tree again before it removes anything
+//    and reports a hash that has come back to life instead of expiring it. The
+//    bytes still have to be moved back by hand: `.attic` is not on the store's
+//    read path, so a condemned object is already a 404 for every peer, and this
+//    tool putting objects back into the store is not a thing the design describes.
 //
 // Usage:
 //   node server/tools/sweep-blobs.mjs                     # dry run, the default
@@ -40,6 +47,8 @@ import { readdir, readFile, rename, rm, stat, mkdir, utimes } from 'node:fs/prom
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as Y from 'yjs';
+
+import { renameWithRetry } from '../blobStore.js';
 
 /** The same charset `upgradeAuth.js` applies, so `<ws>` is a safe path component. */
 const WS_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -62,6 +71,14 @@ const BLOB_REF_RE = /^([0-9a-f]{64}):([0-9]+):([0-9a-f]{64}|-)$/;
 const STALENESS_SLACK_MS = 3_600_000;
 
 const DAY_MS = 86_400_000;
+
+const stampOf = (ms) => new Date(ms).toISOString();
+
+function gapOf(ms) {
+  if (ms < 2 * 3_600_000) return `${Math.round(ms / 60_000)} minute(s)`;
+  if (ms < 2 * DAY_MS) return `${Math.round(ms / 3_600_000)} hour(s)`;
+  return `${Math.round(ms / DAY_MS)} day(s)`;
+}
 
 async function statOrNull(path) {
   try {
@@ -161,28 +178,54 @@ async function objectsIn(dataDir, ws) {
 }
 
 /**
- * The staleness guard (spec §6.5).
+ * The staleness guard (spec §6.5): the newest artefact beside the tree snapshot,
+ * and WHICH ONE it was, because a refusal nobody can act on is a refusal people
+ * learn to ignore.
  *
  * A tree snapshot is written on a two-second debounce, so one that is an HOUR
  * behind the newest thing beside it is not a snapshot of this workspace's current
  * state — it is one that was written before a burst of work, or by a process that
- * died, or onto a volume restored from a backup. Every node minted since is
- * invisible to the scan, which means every blob those nodes reference reads as an
- * orphan.
+ * died, or onto a volume restored from a backup.
+ *
+ * The two arms of the walk are evidence about DIFFERENT things, and conflating
+ * them is how the refusal message ends up saying something untrue:
+ *
+ *  * A BLOB newer than the snapshot is direct evidence of a node the scan cannot
+ *    see: `s` and `b` are written together only after the upload answers, so a
+ *    fresh object with a stale tree means the tree write did not land.
+ *  * A DOC SNAPSHOT (`n_*.bin`) is not that. Typing in a note mints no nodes, and
+ *    a `k:'b'` node never opens a note room at all. It is a coarse canary — this
+ *    workspace kept working after the tree snapshot stopped moving — and it is the
+ *    ONLY signal available in the case the blob arm structurally cannot see: a new
+ *    node referencing bytes already in the store, where the upload dedupes, no
+ *    file is written, and not one mtime moves.
+ *
+ * So the arm stays, and the message says which file tripped it and what rewrites
+ * the tree, rather than implying the operator has lost data.
  *
  * The hour of slack is not politeness: a snapshot and the upload that provoked it
  * are not written in the same instant, and a guard that refused on a second of
  * clock skew would refuse for ever, which is its own kind of broken.
+ *
+ * @returns {Promise<{ mtimeMs: number, what: string|null }>}
  */
 async function newestBeside(dataDir, ws, objects) {
-  let newest = 0;
+  let newest = { mtimeMs: 0, what: null };
+  const consider = (mtimeMs, what) => {
+    if (mtimeMs > newest.mtimeMs) newest = { mtimeMs, what };
+  };
   for (const entry of await readdirOrEmpty(join(dataDir, 'yjs', ws))) {
     if (!entry.isFile() || !entry.name.endsWith('.bin')) continue;
     if (entry.name === '_tree.bin') continue;
     const found = await statOrNull(join(dataDir, 'yjs', ws, entry.name));
-    if (found !== null) newest = Math.max(newest, found.mtimeMs);
+    if (found !== null) consider(found.mtimeMs, `the doc snapshot yjs/${ws}/${entry.name}`);
   }
-  for (const object of objects) newest = Math.max(newest, object.stat.mtimeMs);
+  for (const object of objects) {
+    consider(
+      object.stat.mtimeMs,
+      `the object blobs/${ws}/${object.sha.slice(0, 2)}/${object.sha.slice(2, 4)}/${object.sha}`,
+    );
+  }
   return newest;
 }
 
@@ -192,8 +235,17 @@ async function newestBeside(dataDir, ws, objects) {
  * A refusal is per workspace and never stops the run: an operator with twelve
  * workspaces and one stale snapshot should still reclaim the other eleven.
  */
-async function sweepWorkspace(dataDir, ws, { ttlMs, apply, now }) {
-  const report = { workspace: ws, refused: null, live: 0, objects: 0, attic: [], unlinked: [] };
+async function sweepWorkspace(dataDir, ws, { ttlMs, apply, now, doRename, doUtimes }) {
+  const report = {
+    workspace: ws,
+    refused: null,
+    live: 0,
+    objects: 0,
+    attic: [],
+    unlinked: [],
+    liveInAttic: [],
+    failed: [],
+  };
 
   const treePath = join(dataDir, 'yjs', ws, '_tree.bin');
   const treeStat = await statOrNull(treePath);
@@ -221,9 +273,13 @@ async function sweepWorkspace(dataDir, ws, { ttlMs, apply, now }) {
   report.objects = objects.length;
 
   const newest = await newestBeside(dataDir, ws, objects);
-  if (newest > treeStat.mtimeMs + STALENESS_SLACK_MS) {
-    report.refused = 'a note snapshot or a blob is newer than the tree snapshot by more '
-      + 'than an hour; the tree may not describe this workspace\'s current state';
+  if (newest.mtimeMs > treeStat.mtimeMs + STALENESS_SLACK_MS) {
+    report.refused = `${newest.what} (${stampOf(newest.mtimeMs)}) is newer than the tree `
+      + `snapshot (${stampOf(treeStat.mtimeMs)}) by ${gapOf(newest.mtimeMs - treeStat.mtimeMs)}; `
+      + 'the tree may not describe this workspace\'s current state. Note edits mint no '
+      + 'nodes, so a doc snapshot alone often means nothing is wrong — what rewrites the '
+      + 'tree snapshot is any structural change (create, rename, move, delete), a server '
+      + 'restart, or every peer disconnecting from the workspace.';
     return report;
   }
 
@@ -231,36 +287,88 @@ async function sweepWorkspace(dataDir, ws, { ttlMs, apply, now }) {
   for (const object of objects) {
     if (parsed.live.has(object.sha)) continue;
     if (now() - object.stat.mtimeMs <= ttlMs) continue;      // still inside the grace period
-    report.attic.push(object.sha);
-    if (!apply) continue;
-    await mkdir(atticDir, { recursive: true });
-    // A move, not a delete. The gap between the two is the only chance anybody
-    // gets to notice that this tool was wrong — an operator reading the report, or
-    // a peer that comes back and finds its attachment unavailable.
-    const condemned = join(atticDir, object.sha);
-    await rename(object.path, condemned);
-    // AND RESTART ITS CLOCK. `rename` preserves mtime, so without this the attic
-    // entry is already older than the TTL the moment it lands — and the loop below
-    // unlinks it in the same run, collapsing two grace periods into none. The
-    // second TTL is about how long the bytes have been CONDEMNED, which is a fact
-    // that starts here.
-    const stamp = now() / 1000;
-    await utimes(condemned, stamp, stamp);
+    if (!apply) {
+      report.attic.push(object.sha);
+      continue;
+    }
+    // ONE OBJECT'S BAD DAY IS NOT THE RUN'S. `rename` and `utimes` on this exact
+    // path are what Windows and CIFS reject transiently when a scanner or backup
+    // agent holds a handle, and an unhandled rejection here unwound out of `main`
+    // before a single line was printed — so an operator lost the record of every
+    // move the run had already made, in the workspaces it had already finished.
+    try {
+      await mkdir(atticDir, { recursive: true });
+      const condemned = join(atticDir, object.sha);
+      // STAMP FIRST, THEN MOVE, and the order is the whole point. `rename`
+      // preserves mtime, so an attic entry that never got stamped arrives already
+      // older than the TTL and the loop below unlinks it on the very next run —
+      // two grace periods collapsed into none, silently. Stamping the object
+      // before it moves means there is no instant in which the bytes sit in
+      // `.attic` without the clock that says when they were condemned. The cost
+      // if the move then fails is that this orphan gets another full TTL in the
+      // store, which is the direction a tool like this should fail in.
+      const stamp = now() / 1000;
+      await doUtimes(object.path, stamp, stamp);
+      // A move, not a delete. The gap between the two is the only chance anybody
+      // gets to notice that this tool was wrong — an operator reading the report,
+      // or a peer that comes back and finds its attachment unavailable.
+      //
+      // ⚠ `cleanup` MUST be a no-op. `renameWithRetry`'s default is `rm(from)`,
+      // which is right for `_finalize`, where the source is a half-written `.part`
+      // and an incomplete object is never the file to keep. Here the source is the
+      // object itself, so the default would make an exhausted retry delete the
+      // very blob this tool had only decided to move.
+      await renameWithRetry(object.path, condemned, { rename: doRename, cleanup: () => {} });
+      // Recorded only now: a report that claims a move that did not happen is
+      // worse than no report, because it is the thing an operator reads instead of
+      // looking at the disk.
+      report.attic.push(object.sha);
+    } catch (err) {
+      report.failed.push({ sha: object.sha, stage: 'move', error: String(err?.message ?? err) });
+    }
   }
 
   // …and only bytes that have already served a full TTL in the attic are unlinked,
   // which is a second TTL, deliberately.
   for (const entry of await readdirOrEmpty(atticDir)) {
     if (!entry.isFile() || !SHA_RE.test(entry.name)) continue;
+    // ⚠ LOOK AGAIN BEFORE REMOVING. Ageing out of `.attic` is not a decision, it
+    // is the expiry of one — and the decision was made by a possibly-wrong earlier
+    // run. The case this exists for: an operator sweeps against a `_tree.bin`
+    // restored from a stale backup, hundreds of live blobs are condemned, they
+    // notice within the hour and put the right snapshot back — and then the cron
+    // keeps running. Every later run reads a tree that names those hashes and,
+    // without this test, removes them anyway when the second TTL expires. For an
+    // attachment no peer ever fetched, the store's copy was the only copy.
+    //
+    // It is REPORTED, not restored. Renaming bytes back into the store would make
+    // this tool the only thing outside `blobStore` that writes objects into it —
+    // able to clobber a re-uploaded duplicate and to desync `usage.json`. "An
+    // operator notices" is the recovery mechanism this design chose; the fix is to
+    // give them something to notice, on the first run rather than the ninetieth.
+    if (parsed.live.has(entry.name)) {
+      report.liveInAttic.push(entry.name);
+      continue;
+    }
     const path = join(atticDir, entry.name);
     const found = await statOrNull(path);
     if (found === null || now() - found.mtimeMs <= ttlMs) continue;
-    report.unlinked.push(entry.name);
-    if (apply) await rm(path, { force: true });
+    if (!apply) {
+      report.unlinked.push(entry.name);
+      continue;
+    }
+    try {
+      await rm(path, { force: true });
+      report.unlinked.push(entry.name);
+    } catch (err) {
+      report.failed.push({ sha: entry.name, stage: 'unlink', error: String(err?.message ?? err) });
+    }
   }
 
   report.attic.sort();
   report.unlinked.sort();
+  report.liveInAttic.sort();
+  report.failed.sort((a, b) => (a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
   return report;
 }
 
@@ -270,8 +378,15 @@ async function sweepWorkspace(dataDir, ws, { ttlMs, apply, now }) {
  * `apply` defaults to FALSE. An admin tool whose first run deletes things is a
  * tool people run once, by accident, on the wrong directory.
  *
+ * `rename` and `utimes` are seams, for the same reason `now` is one: the failure
+ * they exist to prove — a rejecting filesystem call halfway through a move — is a
+ * Windows/CIFS one that cannot be provoked from a temp directory. `rename` is
+ * handed to `renameWithRetry`, so a test that injects a transient rejection
+ * exercises the retry ladder and the cleanup path rather than short-circuiting it.
+ *
  * @param {{ dataDir: string, ttlDays?: number, apply?: boolean,
- *           workspace?: string|null, now?: () => number }} options
+ *           workspace?: string|null, now?: () => number,
+ *           rename?: Function, utimes?: Function }} options
  */
 export async function sweep(options) {
   const {
@@ -280,13 +395,17 @@ export async function sweep(options) {
     apply = false,
     workspace = null,
     now = () => Date.now(),
+    rename: doRename = rename,
+    utimes: doUtimes = utimes,
   } = options;
 
   const all = await workspacesIn(dataDir);
   const wanted = workspace === null ? all : all.filter((ws) => ws === workspace);
   const workspaces = [];
   for (const ws of wanted) {
-    workspaces.push(await sweepWorkspace(dataDir, ws, { ttlMs: ttlDays * DAY_MS, apply, now }));
+    workspaces.push(await sweepWorkspace(dataDir, ws, {
+      ttlMs: ttlDays * DAY_MS, apply, now, doRename, doUtimes,
+    }));
   }
   return { dataDir, ttlDays, apply, workspaces };
 }
@@ -323,10 +442,15 @@ sweep-blobs — move unreferenced attachment blobs out of the store (spec §6.5)
   --help
 
 Blobs are moved to blobs/<ws>/.attic/ first and unlinked only after a further
-full TTL. A workspace is refused whole — and nothing in it is touched — when its
-tree snapshot is absent, unreadable, decodes to zero nodes, carries a reference
-this build cannot parse, or is more than an hour older than the newest note
-snapshot or blob beside it.
+full TTL — and never at all if the tree names them again by then. A workspace is
+refused whole, and nothing in it is touched, when its tree snapshot is absent,
+unreadable, decodes to zero nodes, carries a reference this build cannot parse,
+or is more than an hour older than the newest doc snapshot or blob beside it.
+That last one clears on any structural change, a server restart, or every peer
+disconnecting from the workspace; note edits alone do not rewrite the tree.
+
+A move that the filesystem rejects is reported per object and the run carries on;
+the exit status is 1 if anything failed.
 `.trim();
 
 async function main(argv) {
@@ -347,7 +471,7 @@ async function main(argv) {
   const report = await sweep(args);
   if (args.json) {
     console.log(JSON.stringify(report, null, 2));
-    return 0;
+    return report.workspaces.some((w) => w.failed.length > 0) ? 1 : 0;
   }
 
   console.log(
@@ -365,11 +489,24 @@ async function main(argv) {
     );
     for (const sha of ws.attic) console.log(`    -> .attic  ${sha}`);
     for (const sha of ws.unlinked) console.log(`    unlink     ${sha}`);
+    for (const sha of ws.liveInAttic) {
+      console.log(
+        `    WARNING    ${sha} is in .attic, and the tree names it again. An earlier run\n`
+        + '               condemned bytes that are live; this one declined to remove them.\n'
+        + '               They are a 404 for every peer until you move the file back into\n'
+        + `               blobs/${ws.workspace}/${sha.slice(0, 2)}/${sha.slice(2, 4)}/ by hand.`,
+      );
+    }
+    for (const failure of ws.failed) {
+      console.log(`    FAILED ${failure.stage}  ${failure.sha}: ${failure.error}`);
+    }
   }
   if (!args.apply && report.workspaces.some((w) => w.attic.length + w.unlinked.length > 0)) {
     console.log('\nRe-run with --apply to carry this out.');
   }
-  return 0;
+  // A run that could not finish everything it set out to do still exits non-zero,
+  // the way the unhandled rejection used to — but now the report is printed first.
+  return report.workspaces.some((w) => w.failed.length > 0) ? 1 : 0;
 }
 
 // Only when RUN, never when imported by a test.
