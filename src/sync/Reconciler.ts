@@ -1054,7 +1054,7 @@ export class Reconciler {
             await this.cleanReplace(ctx, id, path, ref, st);
             return;
           default:
-            await this.forkAndTake(ctx, id, path, local, ref);
+            await this.forkAndTake(ctx, id, path, local, ref, st);
         }
       });
     }
@@ -1509,7 +1509,7 @@ export class Reconciler {
         this.recordBlobHash(id, ref.sha256, st.bytes, st.mtime);
         return;
       }
-      await this.forkAndTake(ctx, id, path, local, ref);
+      await this.forkAndTake(ctx, id, path, local, ref, st);
     });
   }
 
@@ -1624,12 +1624,37 @@ export class Reconciler {
    *  1. Fetch and verify FIRST, so a fetch that fails leaves the user's file
    *     exactly where it was — not renamed aside with an empty path beside it
    *     because the network blinked.
-   *  2. `vault.rename` the local file. THE RENAME IS THE PRESERVATION: no copy,
+   *  2. RE-CHECK BETWEEN, exactly as `cleanReplace` does and for the same reason
+   *     twice over — see the two clauses below.
+   *  3. `vault.rename` the local file. THE RENAME IS THE PRESERVATION: no copy,
    *     no read, and no instant in which the user's bytes exist only in memory
    *     (I1, I16).
-   *  3. Write the incoming bytes at the canonical path — one write, never a stub.
-   *  4. Tell the user, naming both files, because a file they did not create has
+   *  4. Write the incoming bytes at the canonical path — one write, never a stub.
+   *  5. Tell the user, naming both files, because a file they did not create has
    *     just appeared next to one they did.
+   *
+   * §4.3's pseudocode asks `isOpenInLeaf` once and stops there; §11's statement of
+   * I7 is the normative one and is wider — "re-checked after every await that can
+   * take minutes (the fetch)" — so the re-check belongs here too, and MORE than on
+   * the replace path: `cleanReplace` swaps a file's bytes, while this moves the
+   * file out from under whatever view is showing it.
+   *
+   * The local file is re-`stat`ed as well, for a reason the replace path does not
+   * have. Nothing here would be DESTROYED by a mid-fetch save — the rename
+   * preserves whatever bytes are on disk — but it would preserve them under a name
+   * built from `local`, the hash they had before the save, and §4.3 makes that
+   * name load-bearing: it is the deterministic handle a re-observed divergence
+   * lands on. Worse, the fresh bytes may not be rule 4 at all — a save that landed
+   * on `ref.sha256` is rule 1 and a save whose base still matches is rule 2, a
+   * republish — so forking on the stale verdict moves the user's newest work off
+   * the path they saved it to. Deferring one pass re-derives all three hashes.
+   *
+   * `forkPathFor` stays BEFORE the fetch, deliberately, matching §4.3 line for
+   * line: it is what refuses a file with no shareable name before this device pays
+   * to download anything for it. The half of it that perishes — `uniquify` reading
+   * the disk — fails safe if it does: `vault.rename` refuses an occupied
+   * destination, so a fork path taken during the fetch throws into `guarded` with
+   * both copies still intact and the next pass recomputing the name.
    *
    * NO TREE WRITE happens here. Step 6's `publishUntracked` seam mints and owns
    * the fork's node, which is what keeps this class a pure driver over a snapshot
@@ -1643,6 +1668,7 @@ export class Reconciler {
     path: string,
     local: string,
     ref: BlobRef,
+    seen: { bytes: number; mtime: number },
   ): Promise<void> {
     // I7: renaming a file out from under an open view is precisely what this
     // invariant exists to prevent. One pass of delay costs nothing.
@@ -1666,6 +1692,11 @@ export class Reconciler {
     if (!assertInsideShare(this.shareRoot, forkPath)) {
       throw new Error(`fork: destination is outside the share: ${forkPath}`);
     }
+
+    // Everything below re-reads the world this verdict was based on (I7, §4.3).
+    if (this.deps.vault.isOpenInLeaf(path)) return;
+    const now = await this.deps.vault.stat(path);
+    if (now === null || now.mtime !== seen.mtime || now.bytes !== seen.bytes) return;
 
     this.deps.tickets.arm('rename', path, forkPath);
     await this.deps.vault.rename(path, forkPath);             // I16, and I1: nothing is destroyed

@@ -3329,6 +3329,109 @@ test('a conflicted attachment open in a leaf is not forked', async () => {
   assert.deepEqual(h.notices, []);
 });
 
+/**
+ * The fork path's version of B8/B11's harness: a rule-4 divergence whose `get`
+ * runs `duringFetch` while the bytes are in flight.
+ *
+ * The window it opens is the point. A fetch is bounded by file size, not by an
+ * 8 s doc timeout, so on a 200 MB attachment over a phone link it is minutes
+ * wide — and everything the verdict was based on can change inside it.
+ */
+async function forkWithInterference(
+  h: Harness,
+  id: string,
+  rel: string,
+  mine: Uint8Array,
+  theirs: Uint8Array,
+  duringFetch: (path: string) => void,
+): Promise<string> {
+  const theirsSha = await h.blobs.seed(theirs);
+  const path = await bindBlob(h, id, rel, mine, {
+    sha256: theirsSha, bytes: theirs.length, parent: 'f'.repeat(64),
+  }, { sha256: await hashOfBytes(mine), len: mine.length });
+
+  h.reconciler = new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: blobPortOf(h.blobs, {
+      get: async (sha, n) => {
+        const bytes = await h.blobs.get(sha, n);
+        duringFetch(path);
+        return bytes;
+      },
+    }),
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    displayName: 'Ann',
+    now: () => NOW,
+  });
+  return path;
+}
+
+// ⚠ B11's twin, on the fork path, and the worse half of the pair: `cleanReplace`
+// swaps a file's bytes, while this RENAMES the file out from under whatever view
+// is showing it. `isOpenInLeaf` was false when the verdict was reached and true by
+// the time the bytes arrived (I7).
+test('B11 fork twin: a file opened DURING the fork fetch is not renamed out from under the view',
+  async () => {
+    const h = makeHarness({ displayName: 'Ann' });
+    h.vault.seed(SHARE, 'd');
+    const mine = png(1);
+    const path = await forkWithInterference(
+      h, nid('A'), 'diagram.png', mine, png(2, 96),
+      // The user double-clicks the image while the download is running.
+      (p) => { h.vault.setOpen(p, true); },
+    );
+
+    const r = await h.reconciler.reconcile('sync');
+
+    assert.deepEqual(r.failures, []);
+    assert.equal(h.vault.callsTo('rename').length, 0, 'the open file was not moved');
+    assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'and it still holds its own bytes');
+    assert.equal(h.vault.callsTo('createBinary').length, 0, 'nothing was written over it either');
+    assert.deepEqual(
+      Object.keys(h.vault.binarySnapshot()).filter((p) => p.includes('conflicted copy')), [],
+      'no half-done fork was left behind',
+    );
+    assert.deepEqual(h.notices, [], 'and nobody was told about a fork that did not happen');
+  });
+
+// ⚠ B12's twin, on the fork path. Nothing here is destroyed by a stale verdict —
+// the rename preserves whatever bytes are there — but the NAME it preserves them
+// under carries the hash they had before the user saved, and §4.3 makes that name
+// load-bearing. Worse, the fresh bytes may not be a fork case at all: a save that
+// happened to land on `ref.sha256` is rule 1, and one whose base still matches is
+// rule 2, a republish. Deferring one pass re-derives the verdict from what is
+// actually on disk.
+test('B12 fork twin: bytes that changed during the fork fetch are not forked on the old verdict',
+  async () => {
+    const h = makeHarness({ displayName: 'Ann' });
+    h.vault.seed(SHARE, 'd');
+    const mine = png(1);
+    const edited = png(3, 48);
+    const path = await forkWithInterference(
+      h, nid('A'), 'diagram.png', mine, png(2, 96),
+      // The user saves over it mid-download.
+      (p) => { h.vault.seedBinary(p, edited); },
+    );
+
+    const r = await h.reconciler.reconcile('sync');
+
+    assert.deepEqual(r.failures, []);
+    assert.deepEqual(
+      h.vault.binarySnapshot()[path], edited,
+      'the bytes the user just saved are still at the path they saved them to',
+    );
+    assert.equal(h.vault.callsTo('rename').length, 0, 'nothing was renamed on a stale verdict');
+    assert.deepEqual(
+      Object.keys(h.vault.binarySnapshot()).filter((p) => p.includes('conflicted copy')), [],
+      'and no fork was named after a hash the file no longer has',
+    );
+    assert.deepEqual(h.notices, []);
+  });
+
 // ⚠ B10. Fork idempotence, which is what the missing timestamp buys. The fork
 // file is untracked until step 6 hands it to the publisher, so a pass that runs
 // before the node is minted must not fork a second time — and must offer the same
