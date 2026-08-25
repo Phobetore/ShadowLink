@@ -12,6 +12,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   BLOB_PUBLISH_CONCURRENCY, PUBLISH_BACKOFF_MS, PUBLISH_CONCURRENCY, RECOVERED_DIR,
@@ -1066,6 +1069,10 @@ test('an attachment open in a leaf defers without touching the disk or the ladde
 // recorded, explained once — and the file is left exactly where the user put it.
 // The binding goes with it, because a dead node still bound to a real file is
 // what the deletion pass reads as "rescue this into ShadowLink Recovered/".
+//
+// ⚠ A PIN ON §7.4 AS AMENDED. The `why: 'server'` arm below only exists because
+// the two ceilings are two numbers: folded with `min()` there would be one, and
+// nothing could reach this verdict or say which remedy the user has.
 test('B23: a file over the server limit is retracted, and the file is untouched', async () => {
   const h = makeHarness();
   const bytes = png(1, 4_096);
@@ -1090,6 +1097,11 @@ test('B23: a file over the server limit is retracted, and the file is untouched'
   );
   assert.equal(h.vault.wasTrashed(`${SHARE}/scan.tiff`), false);
   assert.equal(h.blobs.callsTo('put').length, 0, 'and nothing was uploaded');
+  assert.equal(
+    h.blobs.callsTo('limits').length, 1,
+    'the ceiling is asked for ONCE and remembered: it is a policy that moves, and '
+    + 'the publish path is the only consumer that can afford a value which does',
+  );
   assert.equal(h.state.data.publish[id].state, 'done', 'the entry is closed, not retried for ever');
   assert.equal(h.notices.length, 1, 'the user is told exactly once');
   assert.match(h.notices[0], /scan\.tiff/);
@@ -1098,6 +1110,12 @@ test('B23: a file over the server limit is retracted, and the file is untouched'
 // ⚠ B24, the publish arm: the cap is checked BEFORE the bytes are allocated. A
 // cap enforced after `readBinary` is no cap at all on the device it protects —
 // the phone is already out of memory by then.
+//
+// ⚠ AND THE ARCHITECTURAL PIN ON §7.4 AS AMENDED. The store is not asked
+// ANYTHING here — not even `/limits`. That is the machine-checkable form of "the
+// memory cap is a fact about the device, knowable offline": under a folded
+// `min(platformCap, maxFileBytes)` the device cap could not be computed without a
+// network round trip, and this line would have to be deleted.
 test('B24: a file over the device cap is retracted without ever being read', async () => {
   const h = makeHarness({ memoryCapBytes: () => 100 });
   const id = h.addBlob('clip.mov', png(2, 512));
@@ -1107,6 +1125,10 @@ test('B24: a file over the device cap is retracted without ever being read', asy
 
   assert.equal(h.vault.callsTo('readBinary').length, 0, 'never held in memory');
   assert.equal(h.blobs.calls.length, 0, 'and the store was never asked about it');
+  assert.equal(
+    h.blobs.callsTo('limits').length, 0,
+    'the device arm needs no network: a phone learns it cannot hold a file offline',
+  );
   assert.equal(h.state.data.oversized[fold(`${SHARE}/clip.mov`)]?.why, 'device');
   assert.equal(h.tree.get(id)!.x, 1);
 });
@@ -1430,4 +1452,41 @@ test('the seed guard passes ordinary text, including CRLF and non-ASCII', async 
     assert.equal(h.tree.get(id)!.s, 1, `${cases[i][0]} was refused`);
   }
   assert.deepEqual(h.notices, [], 'and nobody was warned about a note that is fine');
+});
+
+// ----------------------------------------------- §7.4: one consumer of /limits
+
+/**
+ * The publish path is the ONLY consumer that gets a value which moves.
+ *
+ * This is the assertion that generalizes to a seventh consumer, which is why it
+ * is written over the source rather than over one harness: a contributor who
+ * folds the server's ceiling into the reconciler, the deletion pass, the vault
+ * watcher or the bootstrap classifier has to call `limits()` from there, and this
+ * trips on the call rather than on whatever it went on to break.
+ *
+ * What it would break is not subtle. `GET /blob/<ws>/<sha>` enforces no size
+ * limit at all — `MAX_FILE_SIZE_MB` is checked only on the PATCH ingress — so the
+ * bytes of an over-limit object are served on request. A device that folded the
+ * ceiling into its memory cap would refuse to hash, bind, prove, resurrect or
+ * download a file it is perfectly able to hold, and every remote tombstone for
+ * one would become a `ShadowLink Recovered/` rescue.
+ */
+test('limits() has exactly one production caller, and it is the publish path (§7.4)', () => {
+  const dir = fileURLToPath(new URL('.', import.meta.url));
+  const callers: string[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.ts') || name.endsWith('.test.ts')) continue;
+    // The port's own declaration and its HTTP implementation are what `limits()`
+    // IS; the question here is who ASKS.
+    if (name === 'BlobPort.ts' || name === 'ObsidianBlobPort.ts') continue;
+    const src = readFileSync(join(dir, name), 'utf8');
+    if (/\bblobs\.limits\s*\(/.test(src)) callers.push(name);
+  }
+  assert.deepEqual(
+    callers, ['PublishQueue.ts'],
+    'The server ceiling is an acceptance policy for uploads. It gates exactly one '
+    + 'decision — whether to offer bytes to the store — and never a read, a hash, '
+    + 'a proof, a resurrect, a fetch, a modal count or a deletion verdict.',
+  );
 });

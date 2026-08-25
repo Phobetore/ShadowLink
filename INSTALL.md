@@ -327,7 +327,15 @@ holds a whole attachment in memory to verify it — on a phone as well as on a
 laptop — so a larger ceiling is a promise the other end cannot keep. The plugin
 has a ceiling of its own for the same reason, 100 MB on a desktop and 32 MB on a
 phone, and that one is compiled into the plugin: no environment variable and no
-setting raises it. Whichever of the two is lower is the one that decides.
+setting raises it. The lower of the two decides what can be *published*.
+
+The two are not interchangeable, and the plugin does not treat them as one
+number. `MAX_FILE_SIZE_MB` is checked when an attachment is uploaded and nowhere
+else — the server will happily serve an object it already holds, however large
+and whatever the limit says today — so lowering it stops new uploads and does not
+make anybody's existing attachments unreadable. The device ceiling is the one
+that applies in both directions, because the whole file has to fit in memory to
+be hashed and verified.
 
 Nothing breaks and nothing is deleted when a file is over a limit or the store is
 full. The file stays exactly where its owner put it, and if it had already been

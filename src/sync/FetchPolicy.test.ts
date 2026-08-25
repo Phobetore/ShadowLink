@@ -8,8 +8,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-import { fetchVerdict, type FetchLimits } from './FetchPolicy.ts';
+import { fetchVerdict, publishVerdict, type FetchLimits } from './FetchPolicy.ts';
 
 const LIMITS: FetchLimits = {
   memoryCapBytes: 1_000,
@@ -77,4 +79,80 @@ test('an unlimited-looking budget still refuses above the cap', () => {
     memoryCapBytes: 10, autofetchMaxBytes: 1e9, sessionBudgetBytes: 1e9,
   };
   assert.equal(fetchVerdict(11, wide, false, 0), 'tooLarge');
+});
+
+// ------------------------------------------------------------ §3.2: publishing
+
+// The OTHER direction, deliberately in this file and immediately below the one
+// above, because the difference between the two signatures IS the design: the
+// server's per-file ceiling is a PARAMETER of `publishVerdict` and structurally
+// absent from `FetchLimits`. Acceptance governs WRITING and is a policy the
+// operator can change at any moment; memory governs BOTH directions and is a
+// fact about the hardware. Folding them types the second as the first.
+
+test('publishVerdict: inside both ceilings, the bytes are offered', () => {
+  assert.equal(publishVerdict(50, 1_000, 500), 'ok');
+});
+
+// A phone must never need the network to learn it cannot hold a file, so the
+// device arm is tested first — and the server ceiling is only awaited when the
+// call actually reaches it.
+test('publishVerdict: the DEVICE arm wins when both ceilings are exceeded', () => {
+  assert.deepEqual(publishVerdict(5_000, 1_000, 100), { refused: 'device', cap: 1_000 });
+});
+
+// §7.5 promises the user a remedy and the two refusals have different ones —
+// "shrink it" against "ask whoever runs the server" — so which ceiling bound it
+// travels with the verdict instead of being re-derived by the caller.
+test('publishVerdict: the server arm refuses only what the device arm allowed', () => {
+  assert.deepEqual(publishVerdict(2_000, 1e9, 1_024), { refused: 'server', cap: 1_024 });
+});
+
+// I2, in the one place it cannot be undone by a later pass: an unknown ceiling is
+// never a small one. Reading "I could not ask" as "no" tombstones a publishable
+// file because the network blinked.
+test('publishVerdict: a null server ceiling never returns a server refusal', () => {
+  assert.equal(publishVerdict(1e9, 2e9, null), 'ok');
+  assert.equal(publishVerdict(0, 0, null), 'ok');
+});
+
+// `>` at both ceilings, matching `fetchVerdict`'s "this much is fine" above.
+test('publishVerdict: both ceilings are inclusive', () => {
+  assert.equal(publishVerdict(1_000, 1_000, 1e9), 'ok', 'exactly the device cap');
+  assert.equal(publishVerdict(1_024, 1e9, 1_024), 'ok', 'exactly the server cap');
+  assert.deepEqual(publishVerdict(1_001, 1_000, 1e9), { refused: 'device', cap: 1_000 });
+  assert.deepEqual(publishVerdict(1_025, 1e9, 1_024), { refused: 'server', cap: 1_024 });
+});
+
+// ---------------------------------------------------------------- §7.4's shape
+
+/**
+ * The cap rule as a SHAPE rather than a sentence, because a sentence is what went
+ * wrong here: §7.4 wrote `memoryCapBytes() = min(platformCap, maxFileBytes)`,
+ * which types an acceptance policy as a memory fact.
+ *
+ * A fourth field on `FetchLimits` is the only way that formula could reach this
+ * module, and the consequence would not be cosmetic: `MAX_FILE_SIZE_MB` floors at
+ * 1 in `server/config.js`, BELOW the 10 MB desktop / 2 MB mobile auto-fetch
+ * ceiling. A folded server value therefore turns every attachment in that gap
+ * from the recorded, remediable `needsApproval` into the unrecorded, unfixable
+ * `tooLarge` — and the cap is tested before an approval is consulted, so nothing
+ * the user presses can lift it.
+ *
+ * Read off the source rather than off a literal, because the test runner strips
+ * types without checking them: a literal would still satisfy a widened interface.
+ */
+test('FetchLimits carries three device numbers and no server value (§7.4)', () => {
+  const src = readFileSync(fileURLToPath(new URL('./FetchPolicy.ts', import.meta.url)), 'utf8');
+  const start = src.indexOf('export interface FetchLimits {');
+  assert.notEqual(start, -1, 'FetchPolicy.ts no longer declares FetchLimits');
+  const block = src.slice(start, src.indexOf('\n}', start));
+  const fields = [...block.matchAll(/^ {2}(\w+)\??:/gm)].map((m) => m[1]).sort();
+  assert.deepEqual(
+    fields,
+    ['autofetchMaxBytes', 'memoryCapBytes', 'sessionBudgetBytes'],
+    'A server ceiling reaching the fetch policy would refuse a DOWNLOAD of bytes '
+    + 'that GET /blob/<ws>/<sha> serves with no size check at all, and would turn '
+    + 'needsApproval into tooLarge for everything between the two numbers.',
+  );
 });

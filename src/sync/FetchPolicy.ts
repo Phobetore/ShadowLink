@@ -1,5 +1,11 @@
 // src/sync/FetchPolicy.ts
-// Which attachments this device downloads, and which it does not (spec §7.2).
+// Which attachments this device downloads, and which it does not (spec §7.2) —
+// and, at the bottom, which it will offer to the store (§3.2).
+//
+// The two live together so the ASYMMETRY between them is visible as two type
+// signatures rather than as prose: the server's acceptance ceiling is a parameter
+// of the publish side and is structurally absent from `FetchLimits`, because
+// acceptance governs writing and memory governs both directions.
 //
 // This is four lines of arithmetic in its own module for one reason: TWO callers
 // have to reach the same answer. `Reconciler.materializeBlob` decides what the
@@ -69,4 +75,50 @@ export function fetchVerdict(
   if (bytes > limits.autofetchMaxBytes) return 'needsApproval';
   if (spentThisSession + bytes > limits.sessionBudgetBytes) return 'sessionBudget';
   return 'yes';
+}
+
+/**
+ * Which ceiling refused a publish, and what that ceiling was.
+ *
+ * The two arms have different remedies (§7.5) — "shrink it" against "ask whoever
+ * runs the server to raise `MAX_FILE_SIZE_MB`" — so the caller is told which one
+ * bound the bytes rather than re-deriving it from a comparison it already made.
+ */
+export type PublishRefusal = { refused: 'device' | 'server'; cap: number };
+
+/**
+ * Spec §3.2's two sequential size checks before a publish, on settled bytes.
+ *
+ * THE ASYMMETRY WITH `fetchVerdict` IS THE POINT, and it is stated here as two
+ * adjacent signatures rather than as a comment somebody has to remember: the
+ * server's per-file ceiling is a PARAMETER of this function and is structurally
+ * absent from `FetchLimits`. Acceptance is a POLICY about writing — the operator
+ * edits `MAX_FILE_SIZE_MB` and restarts, and every client learns the new number
+ * lazily, once, and only if it publishes an attachment — so it may gate exactly
+ * one decision, whether to offer bytes to the store. The memory cap is a FACT
+ * about the device: pure, synchronous, knowable offline, constant for the life of
+ * the process, and it gates every whole-file allocation in BOTH directions.
+ * `min()` of the two types the policy as the fact, and the fact is what decides
+ * whether a downloaded attachment can be bound, proven, resurrected or kept.
+ *
+ * The DEVICE arm is tested first, so a phone never needs the network to learn it
+ * cannot hold a file — and so the caller never has to await a `/limits` round
+ * trip to reach that answer.
+ *
+ * `serverCap === null` skips the server arm entirely. An unknown ceiling is never
+ * a small one (I2): treating "I could not ask" as "no" would tombstone a
+ * publishable file because the network blinked, which is the one place I2 is not
+ * recoverable by a later pass.
+ *
+ * Every comparison is `>`, exactly as in `fetchVerdict`: the ceilings are "this
+ * much is fine", not "strictly less than this".
+ */
+export function publishVerdict(
+  bytes: number,
+  deviceCap: number,
+  serverCap: number | null,
+): 'ok' | PublishRefusal {
+  if (bytes > deviceCap) return { refused: 'device', cap: deviceCap };
+  if (serverCap !== null && bytes > serverCap) return { refused: 'server', cap: serverCap };
+  return 'ok';
 }

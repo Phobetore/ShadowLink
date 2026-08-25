@@ -65,6 +65,7 @@ import type { NodeFields } from '../tree/types.ts';
 import type { BlobPort } from './BlobPort.ts';
 import type { DeviceState, PublishEntry } from './DeviceState.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
+import { publishVerdict } from './FetchPolicy.ts';
 import { RetryLater } from './Reconciler.ts';
 import type { VaultPort } from './VaultPort.ts';
 
@@ -464,14 +465,17 @@ export class PublishQueue {
       // Size is decided HERE, where the bytes have settled, and never at create
       // time. Both caps are checked before `readBinary`, so a file too big to
       // hold in memory is never held in memory (§7.4).
+      //
+      // Asked TWICE, of the same pure function, so the ceiling is only fetched
+      // once the device arm has passed: `publishVerdict` tests the device first
+      // precisely so a phone never needs the network to learn it cannot hold a
+      // file, and an `await` in the argument list would throw that away. A null
+      // ceiling skips the server arm, so the first call is exactly the device arm.
       const deviceCap = this.memoryCapBytes();
-      if (st.bytes > deviceCap) {
-        this.retract(id, f, path, st.bytes, deviceCap, 'device');
-        return;
-      }
-      const serverCap = await this.serverCap();
-      if (serverCap !== null && st.bytes > serverCap) {
-        this.retract(id, f, path, st.bytes, serverCap, 'server');
+      let verdict = publishVerdict(st.bytes, deviceCap, null);
+      if (verdict === 'ok') verdict = publishVerdict(st.bytes, deviceCap, await this.serverCap());
+      if (verdict !== 'ok') {
+        this.retract(id, f, path, st.bytes, verdict.cap, verdict.refused);
         return;
       }
 

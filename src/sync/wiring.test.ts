@@ -188,3 +188,27 @@ test('every platform number is chosen by a mobile test, in main.ts', () => {
     );
   }
 });
+
+// §7.4, from the other side: the memory cap is a fact about the DEVICE, so no
+// accessor for a server number may be wired into anything that reads it.
+//
+// `main.ts` is where the two could be joined, because it is the only file that
+// holds both the platform test and the ports. Four of the five collaborators must
+// never see a server ceiling at all — a reconciler, a deletion pass, a vault
+// watcher or a bootstrap classifier that knew `MAX_FILE_SIZE_MB` would refuse to
+// hash, bind, prove, resurrect or download bytes the store serves happily, since
+// `GET /blob/<ws>/<sha>` enforces no size limit and only the PATCH ingress does.
+// `PublishQueue` is the exception on purpose: acceptance is a policy about
+// writing, and writing is the one decision it may gate.
+test('no server-limit accessor is wired into anything but the publish path (§7.4)', () => {
+  for (const name of ['Reconciler', 'Deletions', 'VaultWatcher', 'Bootstrap']) {
+    const args = constructorArgs(name);
+    for (const banned of ['maxFileBytes', 'serverCap', 'serverMaxBytes', 'limits(']) {
+      assert.ok(
+        !args.includes(banned),
+        `${name} is being handed "${banned}". The memory cap is a property of the `
+        + 'device and must not move when the network does.',
+      );
+    }
+  }
+});
