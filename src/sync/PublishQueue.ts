@@ -62,7 +62,7 @@ import {
 } from '../tree/paths.ts';
 import type { TreeDoc } from '../tree/TreeDoc.ts';
 import type { NodeFields } from '../tree/types.ts';
-import type { BlobPort } from './BlobPort.ts';
+import { BlobQuotaExceeded, BlobTooLarge, type BlobPort } from './BlobPort.ts';
 import type { DeviceState, PublishEntry } from './DeviceState.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
 import { publishVerdict } from './FetchPolicy.ts';
@@ -503,6 +503,21 @@ export class PublishQueue {
         if (!(await this.deps.blobs.put(sha256, bytes))) {
           // A REFUSAL (413 / 507 / 422), not a transport failure — those throw and
           // land in the catch below. The reason is the user's to see.
+          //
+          // §9's endpoint table, `BlobPort.limits` and `ObsidianBlobPort` all
+          // promise the ceiling is "re-fetched after a 413/507", and it never was.
+          // Without this, a self-hoster who LOWERS `MAX_FILE_SIZE_MB` mid-session
+          // leaves every over-limit attachment in an unbounded silent loop: the
+          // remembered ceiling still says the old number so nothing retracts, the
+          // whole file is re-read, re-hashed and re-offered on every rung, and the
+          // user is told nothing — §7.5's Notice lives on the retract path this
+          // never reaches. Only the 413 changes a decision; the 507 is invalidated
+          // too so the documented contract is true rather than half-true, at the
+          // cost of one extra GET per rung of a publish that is failing anyway.
+          const err = this.deps.blobs.lastError;
+          if (err instanceof BlobTooLarge || err instanceof BlobQuotaExceeded) {
+            this.serverMaxBytes = null;
+          }
           this.fail(id, this.deps.blobs.lastError);
           return;
         }
@@ -655,6 +670,13 @@ export class PublishQueue {
    * one place where it is not recoverable by a later pass. Publishing simply
    * proceeds; if the object really is over the ceiling, the server answers 413 and
    * `put` refuses, which is a backoff.
+   *
+   * Asked once and remembered, because this is the only value in the publish path
+   * that moves and a round trip per attachment would be absurd — but the memory is
+   * DROPPED on a 413 or a 507 (§9), where the remembered number has just been
+   * proven wrong or the store's shape has just changed. A memo with no
+   * invalidation is what turned a lowered `MAX_FILE_SIZE_MB` into a silent
+   * infinite re-upload.
    */
   private async serverCap(): Promise<number | null> {
     if (this.serverMaxBytes !== null) return this.serverMaxBytes;

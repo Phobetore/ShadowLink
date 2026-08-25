@@ -23,7 +23,7 @@ import { fold, hashOf, hashOfBytes, isLive, relPath, validateRel } from '../tree
 import { TreeDoc } from '../tree/TreeDoc.ts';
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
-import type { BlobPort } from './BlobPort.ts';
+import { BlobQuotaExceeded, type BlobPort } from './BlobPort.ts';
 import { Deletions } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
@@ -1213,6 +1213,24 @@ test('an oversized replace refuses the new bytes and leaves the published node l
   assert.equal(h.notices.length, 1, 'and not once per pass');
   assert.equal(h.tree.get(id)!.x, undefined);
   assert.equal(h.blobs.callsTo('put').length, 0);
+
+  // ⚠ THE GAP THIS TEST LEFT OPEN. "Not once per pass" was asserted of the
+  // NOTICE, and INSTALL.md promises it of the WORK: "a refused replacement is
+  // retried only when the file changes again". The closed entry carries the
+  // intent, so a requeue for the same bytes must cost nothing at all — no stat,
+  // no read, no upload, and no second question to the server about its ceiling.
+  h.vault.resetCalls();
+  h.blobs.resetCalls();
+  h.queue.requeue(id, bigSha);
+  await h.queue.drain();
+  h.queue.requeue(id, bigSha);
+  await h.queue.drain();
+
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'the file is not re-read');
+  assert.equal(h.vault.callsTo('stat').length, 0, 'not even stat-ed');
+  assert.equal(h.blobs.callsTo('put').length, 0, 'and nothing is offered');
+  assert.equal(h.blobs.callsTo('limits').length, 0, 'and the ceiling is not re-asked');
+  assert.equal(h.notices.length, 1);
 });
 
 test('the device-cap arm refuses a published attachment too, without ever reading it', async () => {
@@ -1489,4 +1507,121 @@ test('limits() has exactly one production caller, and it is the publish path (§
     + 'decision — whether to offer bytes to the store — and never a read, a hash, '
     + 'a proof, a resurrect, a fetch, a modal count or a deletion verdict.',
   );
+});
+
+// ------------------------------------------- §9: the ceiling after a 413 / 507
+
+/**
+ * The natural next paragraph of "a limits() that could not be asked does not
+ * retract anything", and the bug that paragraph's memo introduced.
+ *
+ * `/limits` is asked once per session and remembered, which is right: it is the
+ * one value in the publish path that moves, and asking per file would be a round
+ * trip per attachment. But the memo had no invalidation, while §9's endpoint
+ * table, `BlobPort.limits` and `ObsidianBlobPort` all promise it is "re-fetched
+ * after a 413/507".
+ *
+ * Without that, a self-hoster who LOWERS `MAX_FILE_SIZE_MB` mid-session puts
+ * every over-limit attachment into an unbounded silent loop: the cached ceiling
+ * still says the old number, so nothing retracts; the whole file is re-read and
+ * re-hashed and re-offered on every rung; the server answers 413 every time; and
+ * the user is told nothing, because §7.5's Notice lives on the retract path this
+ * never reaches.
+ */
+test('a 413 re-reads the ceiling, so a lowered limit converges instead of looping', async () => {
+  const h = makeHarness();
+  // Warm the memo the way a real session warms it: one attachment published
+  // successfully, against a ceiling that accepted it.
+  h.blobs.setLimits({ maxFileBytes: 64 * 1024 });
+  const small = png(1, 256);
+  const first = h.addBlob('logo.png', small);
+  h.queue.enqueue(first);
+  await h.queue.drain();
+  assert.equal(h.tree.get(first)!.s, 1, 'the warm-up really did publish');
+  assert.equal(h.blobs.callsTo('limits').length, 1, 'and asked the ceiling exactly once');
+
+  // The operator edits MAX_FILE_SIZE_MB down and restarts the server. Nothing
+  // tells the plugin.
+  h.blobs.setLimits({ maxFileBytes: 1_024 });
+  const big = png(2, 4_096);
+  const id = h.addBlob('scan.tiff', big);
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  // First contact with the new reality is the 413 itself: the stale ceiling let
+  // the publish through, the store refused it, and the rung was charged.
+  assert.equal(h.blobs.callsTo('put').length, 2, 'the warm-up and this one');
+  assert.equal(h.state.data.publish[id].attempts, 1);
+  assert.equal(h.tree.get(id)!.x, undefined, 'nothing was decided on a stale number');
+  assert.deepEqual(h.notices, [], 'and a 413 alone is not something to tell the user');
+
+  // The next rung. This is the whole change: the ceiling is unknown again, so it
+  // is asked again, and the answer is now the number that will actually decide.
+  h.clock.now = h.state.data.publish[id].nextAt;
+  await h.queue.drain();
+
+  assert.equal(h.blobs.callsTo('limits').length, 2, 'the ceiling was re-read after the 413');
+  assert.equal(
+    h.blobs.callsTo('put').length, 2,
+    'and the file was not offered a third time: the verdict now precedes the upload',
+  );
+  assert.deepEqual(h.state.data.oversized[fold(`${SHARE}/scan.tiff`)], {
+    bytes: big.length, cap: 1_024, why: 'server',
+  }, 'refused against the NEW number, not the remembered one');
+  assert.equal(h.state.data.publish[id].state, 'done', 'the entry is closed, not retried for ever');
+  assert.equal(h.state.data.publish[id].attempts, 0);
+  assert.equal(h.notices.length, 1, 'and the user is finally told, exactly once');
+  assert.match(h.notices[0], /scan\.tiff/);
+  assert.match(h.notices[0], /this server accepts/);
+
+  // The memo is NARROWED, not disabled. A publish that is not refused must not
+  // turn into a `/limits` round trip per attachment.
+  const quiet = h.addBlob('note.png', png(3, 128));
+  h.queue.enqueue(quiet);
+  await h.queue.drain();
+  await h.queue.drain();
+  assert.equal(h.tree.get(quiet)!.s, 1);
+  assert.equal(h.blobs.callsTo('limits').length, 2, 'still asked once per known ceiling');
+});
+
+/**
+ * The other half, and the reason to invalidate on 507 rather than only on 413.
+ *
+ * §9, `BlobPort.limits` and `ObsidianBlobPort` all say "413/507". Only the 413
+ * changes a decision — a full store is a RETRY, not a refusal, and the node must
+ * stay live and pending with nothing recorded and nothing said. Invalidating on
+ * quota costs one extra `/limits` GET per rung and changes nothing else, which is
+ * the price of a contract that is true rather than half-true.
+ */
+test('a 507 re-reads the ceiling too, and is still a retry rather than a refusal', async () => {
+  const h = makeHarness();
+  const bytes = png(1, 512);
+  const id = h.addBlob('scan.tiff', bytes);
+  h.blobs.refuseNextPut(new BlobQuotaExceeded('507: the store has no room'));
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.state.data.publish[id].state, 'pending', 'the node is still queued');
+  assert.equal(h.state.data.publish[id].attempts, 1, 'one rung charged, and it retries');
+  assert.equal(h.tree.get(id)!.x, undefined, 'never tombstoned: the store being full is not a size');
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.deepEqual(h.state.data.oversized, {}, 'and no path was poisoned');
+  assert.deepEqual(h.notices, [], 'a full store is not a refusal the user has to act on');
+
+  // Room is made. The retry goes through, and the ceiling was re-read at most
+  // once for the rung that failed.
+  h.clock.now = h.state.data.publish[id].nextAt;
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, 1, 'it goes through on its own once there is room');
+  assert.equal(
+    h.blobs.callsTo('limits').length, 2,
+    'the ceiling was re-read after the 507 as well — one GET per refused rung, and '
+    + 'not one per attempt: this is the assertion that keeps "413/507" in §9, in '
+    + 'BlobPort.limits and in ObsidianBlobPort from being a contract naming two '
+    + 'codes while the client honours one',
+  );
+  assert.deepEqual(h.notices, []);
 });

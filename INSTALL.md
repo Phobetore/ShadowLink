@@ -348,12 +348,21 @@ What happens next differs by cause, and the difference matters:
 - **The file is over a size limit.** It does *not* go through when you raise the
   limit. Raising `MAX_FILE_SIZE_MB` needs the server restarted **and** each
   member's plugin toggled off and on, because the plugin asks the server for its
-  limit once and remembers the answer for as long as it stays loaded. The device
+  limit once and remembers the answer until an upload is refused. The device
   ceiling cannot be raised at all. And the refusal itself is remembered: an
   attachment that was never shared is offered again only once it becomes *smaller*
   than the size that was refused, and a refused replacement is retried only when
   the file changes again. The way an over-limit attachment gets shared is to
   shrink it, not to raise the ceiling.
+
+  **Lowering** `MAX_FILE_SIZE_MB` needs no such dance, and this is worth knowing
+  before you do it. The first upload the server turns away makes the plugin ask
+  for the limit again, and anything now over the new ceiling is refused properly:
+  the owner gets one notice per file, the file stays exactly where it is, and
+  attachments that had already been shared are untouched — the server never
+  refuses to *serve* an object it already holds. Members who were mid-upload when
+  you lowered it will see those notices arrive; that is the refusal becoming
+  visible, not something breaking.
 
 Back up `PERSISTENCE_DIR`. It holds the server's copy of the share and the key
 file. Everyone's vault also holds a full copy of every note, so losing it is
