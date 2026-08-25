@@ -111,6 +111,7 @@ function makeHarness(): Harness {
     tree,
     openNodeId: () => null,
     now,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   const watcher = new VaultWatcher({

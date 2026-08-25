@@ -2154,6 +2154,7 @@ test('an attachment round-trips: published on A, materialized byte-identically o
     openNodeId: () => null,
     now: () => NOW,
     settleMs: 0,
+    ...DESKTOP_MEMORY_CAP,
   });
   queue.enqueue(idA);
   await queue.drain();
@@ -3623,6 +3624,7 @@ function makePeer(name: string, tree: TreeDoc, store: FakeBlobs): Peer {
     displayName: name,
     now: () => NOW,
     settleMs: 0,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   const watcher = new VaultWatcher({

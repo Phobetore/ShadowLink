@@ -52,7 +52,6 @@
 
 import {
   ATTACHMENT_SETTLE_MS,
-  BLOB_MAX_BYTES,
   BLOB_PUBLISH_CONCURRENCY,
   PUBLISH_BACKOFF_MS,
   PUBLISH_CONCURRENCY,
@@ -94,7 +93,7 @@ export interface PublishQueueDeps {
    * The largest attachment this device will hold in memory (§7.4). Injected as a
    * plain number so the engine never has to ask Obsidian what platform it is on.
    */
-  memoryCapBytes?: () => number;
+  memoryCapBytes: () => number;
   /** Injected only by tests, which need the settle window to be deterministic. */
   settleMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -471,7 +470,7 @@ export class PublishQueue {
       // precisely so a phone never needs the network to learn it cannot hold a
       // file, and an `await` in the argument list would throw that away. A null
       // ceiling skips the server arm, so the first call is exactly the device arm.
-      const deviceCap = this.memoryCapBytes();
+      const deviceCap = this.deps.memoryCapBytes();
       let verdict = publishVerdict(st.bytes, deviceCap, null);
       if (verdict === 'ok') verdict = publishVerdict(st.bytes, deviceCap, await this.serverCap());
       if (verdict !== 'ok') {
@@ -655,10 +654,6 @@ export class PublishQueue {
     );
   }
 
-  /** The largest attachment this device will hold in memory (§7.4). */
-  private memoryCapBytes(): number {
-    return this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
-  }
 
   /**
    * The server's per-file ceiling, or null while it is unknown.

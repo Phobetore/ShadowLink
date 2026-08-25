@@ -28,7 +28,7 @@ import { Deletions } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
-import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import { DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { PublishQueue, type PublishQueueDeps } from './PublishQueue.ts';
 import type { DeletionContext, ReconcileFailure } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
@@ -108,6 +108,7 @@ function makeHarness(over: Partial<PublishQueueDeps> = {}): Harness {
     sleep: () => settle.run(),
     displayName: 'Ada',
     notice: (m) => { notices.push(m); },
+    ...DESKTOP_MEMORY_CAP,
     ...over,
   });
 
@@ -323,6 +324,7 @@ test('`s` is written only after the flush has come back', async () => {
     tree: h.tree,
     openNodeId: () => null,
     now: () => h.clock.now,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   q.enqueue(id);
@@ -391,6 +393,7 @@ test('a doc seeded concurrently between the open and the insert is retried, not 
   const q = new PublishQueue({
     docs: racing, vault: h.vault, blobs: h.blobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   q.enqueue(id);
@@ -481,6 +484,7 @@ test('no more than PUBLISH_CONCURRENCY publishes are ever in flight', async () =
   const q = new PublishQueue({
     docs: gated, vault: h.vault, blobs: h.blobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   for (const id of ids) q.enqueue(id);
@@ -517,6 +521,7 @@ test('a lower concurrency is honoured, and a second drain during one is not a se
   const q = new PublishQueue({
     docs: gated, vault: h.vault, blobs: h.blobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now, concurrency: 2,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   for (const id of ids) q.enqueue(id);
@@ -560,6 +565,7 @@ test('one failing publish does not stop the others in the same drain', async () 
   const q = new PublishQueue({
     docs: h.docs, vault: locked, blobs: h.blobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   q.enqueue(bad);
@@ -943,6 +949,7 @@ test('B3: an upload the store will not confirm publishes nothing and retries', a
   const q = new PublishQueue({
     docs: h.docs, vault: h.vault, blobs: unconfirming, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now, settleMs: 0,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   q.enqueue(id);
@@ -1391,6 +1398,7 @@ test('attachments drain in their own lane, and notes keep theirs', async () => {
   const q = new PublishQueue({
     docs: gatedDocs, vault: h.vault, blobs: gatedBlobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now, settleMs: 0,
+    ...DESKTOP_MEMORY_CAP,
   });
 
   for (const id of Object.keys(h.state.data.owned)) q.enqueue(id);
