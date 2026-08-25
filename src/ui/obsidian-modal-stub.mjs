@@ -8,12 +8,19 @@
 // different set of runtime symbols, kept beside the module it serves rather than
 // bolted onto that stub, so neither can break the other.
 //
-// WHAT THIS IS ALLOWED TO PROVE, and nothing wider: that `Modal.close()` runs
-// `onClose`, and that `Setting`'s builders are chainable. Both are documented
-// Obsidian behaviour, and they are the two facts every safe answer in `modals.ts`
-// rests on. It is deliberately NOT a DOM: `createEl` records a tag and a string
-// and stops there, because a fake that tried to be a browser would start proving
-// things about itself instead of about the dialogs.
+// WHAT THIS IS ALLOWED TO PROVE, and nothing wider:
+//
+//  * `Modal.close()` runs `onClose` (for `modals.ts`);
+//  * `Setting`'s builders are chainable (for both callers);
+//  * a text box's `onChange` fires when the USER types and not when
+//    `setValue()` writes into it, and a disabled input fires nothing at all
+//    (for `SettingsTab.ts`).
+//
+// All three are documented Obsidian/DOM behaviour, and they are the facts every
+// answer in `modals.ts` and `SettingsTab.ts` rests on. It is deliberately NOT a
+// DOM: `createEl` records a tag and a string and stops there, because a fake that
+// tried to be a browser would start proving things about itself instead of about
+// the code under test.
 //
 // Not shipped: `.mjs` is outside the plugin build (which starts at `main.ts`) and
 // outside `banned-calls.test.ts`'s `.ts` scan.
@@ -52,6 +59,26 @@ class StubEl {
     this.children.length = 0;
     this.settings.length = 0;
   }
+}
+
+/**
+ * The base every plugin settings pane extends.
+ *
+ * Obsidian builds one of these per plugin, hands it a container it has already
+ * emptied of the previous pane, and calls `display()` each time the user opens
+ * the tab — never in between. That "never in between" is behaviour a test needs
+ * to be able to rely on, so nothing here calls `display()` on its own.
+ */
+export class PluginSettingTab {
+  constructor(app, plugin) {
+    this.app = app;
+    this.plugin = plugin;
+    this.containerEl = new StubEl('div');
+  }
+
+  display() {}
+
+  hide() {}
 }
 
 export class Modal {
@@ -101,6 +128,69 @@ class StubToggle {
   }
 }
 
+/**
+ * One text box.
+ *
+ * The split between `setValue` and `type` is the whole point of this class.
+ * Obsidian's `TextComponent.setValue` writes straight into the input element, so
+ * it does NOT fire `onChange`; only a real edit does. A stub that fired the
+ * handler from `setValue` would make every `display()` look like the user had
+ * just retyped all four share settings, and would hide the exact bug this is here
+ * to catch.
+ */
+class StubText {
+  constructor() {
+    this.value = '';
+    this.placeholder = '';
+    this.handler = null;
+    /**
+     * Obsidian exposes the real `<input>`; `SettingsTab` reaches through to set
+     * `.type = 'password'` on it, because there is no component method for that.
+     */
+    this.inputEl = { type: 'text', disabled: false };
+  }
+
+  get disabled() {
+    return this.inputEl.disabled;
+  }
+
+  setValue(value) {
+    this.value = String(value);
+    return this;
+  }
+
+  setPlaceholder(value) {
+    this.placeholder = String(value);
+    return this;
+  }
+
+  setDisabled(disabled) {
+    this.inputEl.disabled = disabled === true;
+    return this;
+  }
+
+  onChange(handler) {
+    this.handler = handler;
+    return this;
+  }
+
+  /**
+   * Test-side: what typing into the box does.
+   *
+   * Returns the handler's promise, because `SettingsTab`'s handlers are async and
+   * every one of them awaits a save — a test that did not await would assert
+   * against settings that had not been written yet.
+   *
+   * A disabled input fires no input event, so it runs no handler. That is the
+   * browser's rule, not this stub's opinion.
+   */
+  type(value) {
+    if (this.inputEl.disabled) return Promise.resolve();
+    this.value = String(value);
+    return Promise.resolve(this.handler === null ? undefined : this.handler(this.value));
+  }
+}
+
 class StubButton {
   constructor() {
     this.text = '';
@@ -142,6 +232,7 @@ export class Setting {
     this.desc = '';
     this.toggles = [];
     this.buttons = [];
+    this.texts = [];
     containerEl.settings.push(this);
   }
 
@@ -152,6 +243,13 @@ export class Setting {
 
   setDesc(value) {
     this.desc = String(value);
+    return this;
+  }
+
+  addText(build) {
+    const text = new StubText();
+    build(text);
+    this.texts.push(text);
     return this;
   }
 
