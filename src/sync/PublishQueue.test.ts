@@ -1021,3 +1021,66 @@ test('attachments drain in their own lane, and notes keep theirs', async () => {
   assert.equal(peak, BLOB_PUBLISH_CONCURRENCY, 'the attachment lane is capped at its own width');
   assert.equal(q.pendingCount(), 0, 'and everything published');
 });
+
+// ---------------------------------------------------------------- P2 §3.6: the seed guard
+
+// ⚠ B21's other half. A `.md` node whose file is not text is reachable today: a
+// kind-crossing rename mints one, and so does `publishUntracked` for any
+// non-text file somebody named `.md`. `vault.read` decodes it as UTF-8, which is
+// LOSSY — every invalid byte becomes U+FFFD — and seeding that into a `Y.Text` is
+// irreversible, because `s` is never re-offered. Refusing costs one `stat`.
+test('B21: a markdown node whose bytes are not UTF-8 is never seeded', async () => {
+  const h = makeHarness();
+  // A PNG signature and a run of bytes no UTF-8 decoder can round-trip.
+  const notText = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0xc0, 0x80]);
+  const id = h.tree.createNode({ k: 'f', d: '', n: 'notes.md' }, NOW);
+  h.vault.seedBinary(`${SHARE}/notes.md`, notText);
+  h.state.data.owned[id] = true;
+  h.state.data.materialized[id] = `${SHARE}/notes.md`;
+  h.queue.enqueue(id);
+
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined, 'the node is not published');
+  assert.equal(h.docs.text(`n_${id}`), '', 'and the content doc holds nothing at all');
+  assert.deepEqual(
+    h.docs.calls.filter((c) => c.op === 'insertIfEmpty'), [],
+    'the mojibake never reached the document',
+  );
+  assert.equal(h.state.data.contentHash[id], undefined);
+  assert.equal(h.notices.length, 1, 'the user is told, once');
+  assert.ok(h.notices[0].includes('notes.md'), h.notices[0]);
+  // Refusing is not failing: a backoff step would park the entry for minutes
+  // over a file that will never become text on its own.
+  assert.equal(h.state.data.publish[id].attempts, 0, 'no rung of the ladder was charged');
+  assert.equal(h.state.data.publish[id].state, 'pending');
+  assert.ok(h.queue.lastError(id) !== undefined, 'and the reason is available to diagnostics');
+
+  // Repeated drains stay quiet: the Notice is not re-shown on every pass.
+  await h.queue.drain();
+  assert.equal(h.notices.length, 1);
+  assert.equal(h.tree.get(id)!.s, undefined);
+});
+
+// The guard must not refuse ordinary notes. CRLF is the case that would break a
+// naive length check on the NORMALIZED text: `normLF` shortens it by one byte per
+// line, and the file on disk is the length the encoder sees, not the length after
+// normalization.
+test('the seed guard passes ordinary text, including CRLF and non-ASCII', async () => {
+  const h = makeHarness();
+  const cases: Array<[string, string]> = [
+    ['plain.md', 'a plain note'],
+    ['crlf.md', 'line one\r\nline two\r\n'],
+    ['unicode.md', 'Ünïcødé — a note with an em dash and an emoji 🌍'],
+    ['empty.md', ''],
+  ];
+  const ids = cases.map(([name, text]) => h.add(name, text));
+  for (const id of ids) h.queue.enqueue(id);
+
+  await h.queue.drain();
+
+  for (const [i, id] of ids.entries()) {
+    assert.equal(h.tree.get(id)!.s, 1, `${cases[i][0]} was refused`);
+  }
+  assert.deepEqual(h.notices, [], 'and nobody was warned about a note that is fine');
+});

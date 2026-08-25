@@ -296,6 +296,8 @@ export class Client {
         for (const path of paths) await this.watcher.onCreate(path, 'f');
         await this.publishQueue.drain();
       },
+      // §3.5: the modify handler's hint about where to spend the re-hash budget.
+      takeDirtyPaths: () => this.watcher.takeDirtyPaths(),
       notice: (m) => this.notices.push(m),
     });
 
@@ -374,7 +376,7 @@ export class Client {
     else if (ev.op === 'rename') promise = this.watcher.onRename(ev.path, ev.oldPath, ev.kind);
     // A modify is an optimization, never the mechanism: reconciler step 2.5 is a
     // full recompute, so a client that hears nothing converges on the next pass.
-    else if (ev.op === 'modify') promise = Promise.resolve();
+    else if (ev.op === 'modify') promise = this.watcher.onModify(ev.path);
     else { this.watcher.onDelete(ev.path, ev.kind); promise = Promise.resolve(); }
     this._events.push(promise.catch((err) => { this.eventErrors.push(err); }));
   }
@@ -386,6 +388,7 @@ export class Client {
       if (queued.length > 0) await Promise.all(queued);
       await this.watcher.flushDeleteBatch();
       await this.watcher.flushUnshare();
+      await this.watcher.flushModify();
       if (this._events.length === 0) return;
     }
     throw new Error(`${this.name}: vault event handlers never quiesced`);

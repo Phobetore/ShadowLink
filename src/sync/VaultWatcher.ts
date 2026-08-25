@@ -34,6 +34,7 @@
 import {
   DELETE_COALESCE_MS,
   LOCAL_BULK_DELETE_THRESHOLD,
+  MODIFY_COALESCE_MS,
   RECOVERED_DIR,
   RESURRECT_WINDOW_MS,
   STAGING_DIR,
@@ -83,7 +84,8 @@ export interface WatcherDeps {
 type PendingEvent =
   | { op: 'create'; path: string; kind: Kind }
   | { op: 'rename'; path: string; oldPath: string; kind: Kind }
-  | { op: 'delete'; path: string; kind: Kind };
+  | { op: 'delete'; path: string; kind: Kind }
+  | { op: 'modify'; path: string };
 
 /** A path the user removed from the share, resolved to the node that owns it. */
 interface Batched {
@@ -102,6 +104,12 @@ interface WatcherIndex {
   /** fold(derived rel path) -> nodeId: where a live node actually MATERIALIZES. */
   byDerivedFold: Map<string, string>;
 }
+
+/** The three coalesced batches, each with its own timer and its own window. */
+type Batch = 'delete' | 'unshare' | 'modify';
+
+/** Shared empty answer for `takeDirtyPaths`, so the common case allocates nothing. */
+const EMPTY_DIRTY: ReadonlySet<string> = new Set<string>();
 
 function cmp(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
@@ -178,9 +186,19 @@ export class VaultWatcher {
   private readonly unshareBatch = new Map<string, { from: string; to: string }>();
   /** §5.5: nodes awaiting the user's answer. Reconcile must treat these as invalid. */
   private readonly decisionPending = new Set<string>();
+  /**
+   * fold(path) of every attachment the user has saved over since the last pass
+   * took the set (§3.5).
+   *
+   * It is a hint about WHERE to spend the pass's re-hash budget and nothing more:
+   * the pass recomputes every bound attachment either way, so losing this set
+   * costs one slower convergence and never a wrong answer.
+   */
+  private readonly dirtyPaths = new Set<string>();
 
   private deleteTimer: ReturnType<typeof setTimeout> | null = null;
   private unshareTimer: ReturnType<typeof setTimeout> | null = null;
+  private modifyTimer: ReturnType<typeof setTimeout> | null = null;
   private deleteChain: Promise<void> = Promise.resolve();
   private unshareChain: Promise<void> = Promise.resolve();
 
@@ -204,10 +222,26 @@ export class VaultWatcher {
     return this.pending.length;
   }
 
+  /**
+   * §3.5. Paths the modify handler has flagged, handed to the pass that asks for
+   * them — and cleared in the same breath.
+   *
+   * TAKEN rather than read: the pass owns what it is given, so a save that lands
+   * while the pass is running is answered by the NEXT pass instead of being
+   * absorbed by one whose hashing was already decided.
+   */
+  takeDirtyPaths(): ReadonlySet<string> {
+    if (this.dirtyPaths.size === 0) return EMPTY_DIRTY;
+    const taken = new Set(this.dirtyPaths);
+    this.dirtyPaths.clear();
+    return taken;
+  }
+
   /** Drop every pending timer. P1c calls this from `onunload`. */
   dispose(): void {
     this.clearTimer('delete');
     this.clearTimer('unshare');
+    this.clearTimer('modify');
   }
 
   // ---------------------------------------------------------- I14
@@ -329,6 +363,57 @@ export class VaultWatcher {
     }
   }
 
+  // ---------------------------------------------------------- onModify
+
+  /**
+   * Spec §3.5. The user saved over an attachment.
+   *
+   * This handler has NO logic, and that is the design rather than an omission.
+   * Reconciler step 2.5 is already "make the file and the tree agree" — a full
+   * recompute over every bound attachment — so anything decided here would be a
+   * second, weaker copy of that rule, running at the one moment the file is most
+   * likely to be half-written. All it does is remember which path to spend the
+   * pass's re-hash budget on first, and ask for a pass (I8).
+   *
+   * IT RETURNS IMMEDIATELY FOR A NOTE. Markdown modifications flow through the
+   * CRDT and nowhere else: a modify handler that touched a note would fight the
+   * live `yCollab` binding, turning Obsidian's external-change reload into a
+   * whole-document overwrite broadcast to every peer — which is exactly the I7
+   * failure this plugin exists to avoid.
+   *
+   * Same order as every other handler: share-root guard, phase gate, ticket,
+   * scope, then idempotence. The ticket is an optimization only (I9) — without
+   * one the next pass re-hashes the file, finds the tree already agrees, and does
+   * nothing.
+   */
+  async onModify(path: string): Promise<void> {
+    if (this.shareRootGuard(path) === 'handled') return;
+    if (this.deps.phase() !== 'ready') {
+      this.pending.push({ op: 'modify', path });
+      return;
+    }
+    if (this.deps.tickets.claim('modify', path)) return;         // our own write, echoing back
+    const rel = this.toRel(path);
+    if (rel === null) return;
+
+    // A path no live node owns is step 6's business (it offers untracked files to
+    // the publisher), never this handler's: there is no content to compare yet.
+    const id = this.resolveLive(this.index(), rel);
+    if (id === undefined) return;
+    const f = this.deps.tree.get(id);
+    if (f === null || f.k !== 'b') return;                       // I7: notes are the CRDT's
+
+    this.dirtyPaths.add(fold(path));
+    this.scheduleFlush('modify');
+  }
+
+  /** Force the coalesced modify batch to resolve now. Tests call this; so does P1c. */
+  async flushModify(): Promise<void> {
+    this.clearTimer('modify');
+    if (this.dirtyPaths.size === 0) return;
+    this.deps.scheduleReconcile?.('modify');
+  }
+
   // ---------------------------------------------------------- §5.6
 
   /**
@@ -428,7 +513,7 @@ export class VaultWatcher {
     if (!nowInside) { this.queueUnshare(oldPath, path); return; }             // §5.5
 
     const idx = this.index();
-    const id = this.resolveRenamed(idx, oldPath, relOld, relNew!);
+    const id = await this.resolveRenamed(idx, oldPath, relOld, relNew!);
     if (id === undefined) { await this.onCreate(path, kind); return; }
 
     // I8. The tree already places this node exactly where the event says it is —
@@ -443,6 +528,41 @@ export class VaultWatcher {
     if (f === null) { await this.onCreate(path, kind); return; }
     const { d, n } = splitRel(relNew!);
     const tree = this.deps.tree;
+
+    // §3.6, the KIND-CROSSING rename (`notes.md` -> `notes.png`, `scan.png` ->
+    // `scan.md`). `k` is written once and never mutated, so this is not
+    // expressible as a patch — and leaving it unhandled makes the node
+    // permanently INVALID on every peer: no derived path, never materialized,
+    // never deleted, a stale file on every disk behind one diagnostics line.
+    //
+    // So the old node is tombstoned where it was and a new one of the right kind
+    // is minted, in ONE transaction. The history stays with the old name, which
+    // is a real loss and is why the user is told; it is strictly better than a
+    // node nothing can act on.
+    if (nodeKindOf(relNew!, kind) !== f.k) {
+      const newKind = nodeKindOf(relNew!, kind);
+      let minted = '';
+      tree.transactLocal(() => {
+        const patch: NodePatch = { x: f.g, xa: this.nowFn(), xb: this.deps.displayName };
+        // The bytes this device last confirmed, so a peer holding the old file can
+        // still prove what it is holding (§5.3's rescue).
+        const known = this.deps.state.data.contentHash[id];
+        if (known !== undefined) patch.xh = known.sha256;
+        tree.patchNode(id, patch);
+        minted = tree.createNode({ k: newKind, d, n }, this.nowFn());
+      });
+      this.unbind(id);
+      this.bind(minted, path);
+      // I5: this device minted it, so this device publishes it — and nobody else.
+      this.deps.state.data.owned[minted] = true;
+      this.deps.enqueuePublish?.(minted);
+      this.persist();
+      this.deps.notice?.(
+        `"${relOld}" became "${relNew!}". It is now shared as a new file; `
+        + 'its history stays with the old name.',
+      );
+      return;
+    }
 
     // ONE transaction: the node and, for a directory, every descendant's `d`.
     // Nested `transactLocal` calls merge into this one, so observers see a single
@@ -771,6 +891,7 @@ export class VaultWatcher {
     for (const event of queued) {
       if (event.op === 'create') await this.onCreate(event.path, event.kind);
       else if (event.op === 'rename') await this.onRename(event.path, event.oldPath, event.kind);
+      else if (event.op === 'modify') await this.onModify(event.path);
       else this.onDelete(event.path, event.kind);
     }
     await this.flushDeleteBatch();
@@ -813,12 +934,29 @@ export class VaultWatcher {
    * `derivedPath` holds exactly those. A stale binding to a node a peer has since
    * deleted must not turn a local rename into an edit of somebody's tombstone.
    */
-  private resolveRenamed(
+  private async resolveRenamed(
     idx: WatcherIndex,
     oldPath: string,
     relOld: string,
     relNew: string,
-  ): string | undefined {
+  ): Promise<string | undefined> {
+    // §3.6. A rename whose OLD path is occupied again is not a rename of whatever
+    // used to live there. The fork sequence produces exactly that shape —
+    // `rename A -> B`, then `create A` — and once the pass's `clearArmed()` has
+    // dropped the ticket, a late echo would otherwise be trusted and rename the
+    // CANONICAL node to the conflicted-copy name on every peer. Treating it as a
+    // create of the new path is what makes a missing ticket harmless (I9).
+    //
+    // Only a definite `true` blocks: `exists` throwing is "I could not look", and
+    // I2 says that is never evidence — here, evidence that the old path came back.
+    let backOnDisk = false;
+    try {
+      backOnDisk = await this.deps.vault.exists(oldPath);
+    } catch (err) {
+      this.lastFailure = err;
+    }
+    if (backOnDisk) return this.resolveLive(idx, relNew);
+
     const bound = this.boundId(oldPath);
     if (bound !== undefined && idx.tree.derivedPath.has(bound)) return bound;
     return this.resolveLive(idx, relOld) ?? this.resolveLive(idx, relNew);
@@ -913,29 +1051,44 @@ export class VaultWatcher {
 
   // ---------------------------------------------------------- timers
 
-  private scheduleFlush(which: 'delete' | 'unshare'): void {
-    if (which === 'delete' ? this.deleteTimer !== null : this.unshareTimer !== null) return;
+  private scheduleFlush(which: Batch): void {
+    if (this.timerFor(which) !== null) return;
+    // A modify window is longer than a delete window on purpose: an editor that
+    // saves in three steps fires three events, and the file is still being
+    // written through all of them (§3.5).
+    const delay = which === 'modify' ? MODIFY_COALESCE_MS : DELETE_COALESCE_MS;
     const handle = setTimeout(() => {
       if (which === 'delete') {
         this.deleteTimer = null;
         void this.flushDeleteBatch();
-      } else {
+      } else if (which === 'unshare') {
         this.unshareTimer = null;
         void this.flushUnshare();
+      } else {
+        this.modifyTimer = null;
+        void this.flushModify();
       }
-    }, DELETE_COALESCE_MS);
+    }, delay);
     // Node keeps the process alive for a pending timer; Obsidian's setTimeout
     // returns a plain number with no `unref`. Optional-call both ways.
     (handle as unknown as { unref?: () => void }).unref?.();
     if (which === 'delete') this.deleteTimer = handle;
-    else this.unshareTimer = handle;
+    else if (which === 'unshare') this.unshareTimer = handle;
+    else this.modifyTimer = handle;
   }
 
-  private clearTimer(which: 'delete' | 'unshare'): void {
-    const handle = which === 'delete' ? this.deleteTimer : this.unshareTimer;
+  private timerFor(which: Batch): ReturnType<typeof setTimeout> | null {
+    if (which === 'delete') return this.deleteTimer;
+    if (which === 'unshare') return this.unshareTimer;
+    return this.modifyTimer;
+  }
+
+  private clearTimer(which: Batch): void {
+    const handle = this.timerFor(which);
     if (handle !== null) clearTimeout(handle);
     if (which === 'delete') this.deleteTimer = null;
-    else this.unshareTimer = null;
+    else if (which === 'unshare') this.unshareTimer = null;
+    else this.modifyTimer = null;
   }
 }
 

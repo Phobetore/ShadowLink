@@ -112,6 +112,13 @@ export class PublishQueue {
   private readonly errors = new Map<string, unknown>();
 
   /**
+   * Nodes whose file turned out not to be text (§3.6), so the Notice is shown
+   * once rather than on every drain. The refusal itself is recomputed every time:
+   * this set only governs how loud it is.
+   */
+  private readonly seedRefused = new Set<string>();
+
+  /**
    * The server's per-file ceiling, once this session has managed to ask for it.
    *
    * Cached rather than re-fetched per item, and NOT cached as a failure: `limits()`
@@ -315,7 +322,9 @@ export class PublishQueue {
 
     let handle: DocHandle | null = null;
     try {
-      const text = normLF(await this.deps.vault.read(path));
+      const raw = await this.deps.vault.read(path);
+      if (!(await this.roundTrips(id, path, raw))) return;
+      const text = normLF(raw);
       const opened = await this.deps.docs.openHeadless(`n_${id}`);
       handle = opened.handle;
 
@@ -350,6 +359,50 @@ export class PublishQueue {
     } finally {
       if (handle !== null) this.deps.docs.close(handle);
     }
+  }
+
+  /**
+   * §3.6. Did the text we just read actually come from this file, or is it what a
+   * UTF-8 decoder made of bytes that are not text?
+   *
+   * `vault.read` decodes as UTF-8 and every invalid byte becomes U+FFFD, so a
+   * `'f'` node over a PNG yields mojibake that is a perfectly ordinary string —
+   * and seeding THAT into a `Y.Text` is irreversible, because `s` is never
+   * re-offered and no later pass may touch a seeded doc. The check is one `stat`:
+   * re-encode what was read and compare its length with the file's real size.
+   *
+   * It is reachable today rather than hypothetical: `publishUntracked` offers any
+   * file named `.md` regardless of what is in it, and a kind-crossing rename
+   * (§3.6) mints an `'f'` node over the bytes of a `.png` on purpose.
+   *
+   * REFUSING IS NOT FAILING — no rung of the backoff ladder is charged, because a
+   * file that is not text will not become text by waiting; the entry stays
+   * pending, the reason reaches diagnostics, and the user is told exactly once.
+   *
+   * A `stat` that cannot answer is a retry (I2): "I could not look" must not
+   * become "seed it anyway".
+   */
+  private async roundTrips(id: string, path: string, raw: string): Promise<boolean> {
+    const st = await this.deps.vault.stat(path);
+    if (st === null) throw new RetryLater(`${path} is not on disk`);
+    const encoded = new TextEncoder().encode(raw).length;
+    // The BOM allowance: a UTF-8 decoder strips a leading byte-order mark, so a
+    // perfectly good note that carries one re-encodes exactly three bytes short.
+    // A lossy decode fails the check in the other direction — U+FFFD is three
+    // bytes for every invalid one — so this cannot let mojibake through.
+    if (encoded === st.bytes || encoded + BOM_BYTES === st.bytes) return true;
+
+    this.errors.set(id, new Error(
+      `${path} is ${st.bytes} bytes on disk but decodes to ${encoded}: not UTF-8 text`,
+    ));
+    if (!this.seedRefused.has(id)) {
+      this.seedRefused.add(id);
+      this.deps.notice?.(
+        `"${baseOf(path)}" is not a text file, so it is not being shared as a note. `
+        + 'Rename it back to its original extension to share it as an attachment.',
+      );
+    }
+    return false;
   }
 
   // ============================================================ attachments (§3.2)
@@ -595,6 +648,9 @@ function mb(bytes: number): string {
   const value = bytes / (1024 * 1024);
   return value >= 10 ? String(Math.round(value)) : value.toFixed(1);
 }
+
+/** A UTF-8 byte-order mark, which a decoder strips and an encoder does not put back. */
+const BOM_BYTES = 3;
 
 /** I18: compare and hash on normalized line endings; never write the result to disk. */
 function normLF(text: string): string {

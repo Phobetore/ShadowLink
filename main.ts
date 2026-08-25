@@ -323,6 +323,10 @@ class SyncRuntime {
       // so the pass stays a driver over a tree snapshot; the entry it writes is
       // drained by step 7 below, in this same pass.
       requeuePublish: (nodeId, intent) => { this.queue.requeue(nodeId, intent); },
+      // §3.5: the files the user has just saved go to the front of the re-hash
+      // budget. The pass TAKES the set, so a save landing mid-pass is answered by
+      // the next one rather than absorbed by this one.
+      takeDirtyPaths: () => this.watcher.takeDirtyPaths(),
       // §5.5: a pass firing while the unshare modal is open must not put back the
       // very file the user just dragged out.
       pendingDecision: () => this.watcher.pendingDecision,
@@ -522,6 +526,13 @@ class SyncRuntime {
     }));
     plugin.registerEvent(vault.on('delete', (file) => {
       this.watcher.onDelete(file.path, kindOf(file));
+    }));
+    // §3.5. Registered for the first time in P2, and it is only ever about
+    // attachments: the handler returns immediately for a note, because markdown
+    // modifications flow through the CRDT and a second writer under a live
+    // yCollab binding is the I7 failure this plugin exists to avoid.
+    plugin.registerEvent(vault.on('modify', (file) => {
+      void this.guard(this.watcher.onModify(file.path));
     }));
 
     plugin.registerEvent(plugin.app.workspace.on('file-open', (file) => {

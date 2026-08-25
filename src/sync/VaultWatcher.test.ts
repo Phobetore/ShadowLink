@@ -420,6 +420,11 @@ test('48: create-then-rename with no reconcile in between does not fork the node
   h.vault.seed(`${SHARE}/Untitled.md`, 'f', '');
 
   await h.watcher.onCreate(`${SHARE}/Untitled.md`, 'f');
+  // Obsidian moves the file and THEN fires the event, so the old path is gone by
+  // the time the handler runs — and the fixture now says so, because §3.6's guard
+  // reads a rename whose OLD path is occupied again as the fork sequence
+  // (`rename A -> B`, then `create A`) rather than as a rename of that node.
+  await h.vault.rename(`${SHARE}/Untitled.md`, `${SHARE}/Roadmap.md`);
   await h.watcher.onRename(`${SHARE}/Roadmap.md`, `${SHARE}/Untitled.md`, 'f');
 
   assert.equal(h.tree.size(), 1, 'exactly ONE node');
@@ -1557,4 +1562,290 @@ test('the watcher never names an irreversible vault call (I1)', () => {
     assert.ok(!source.includes(needle), `VaultWatcher.ts must not contain ${JSON.stringify(needle)}`);
   }
   assert.ok(!/from ['"]obsidian['"]/.test(source), 'no obsidian import');
+});
+
+// ---------------------------------------------------------------- P2 §3.5: onModify
+
+/** A published attachment node bound to a file, as a materialized device holds it. */
+function boundBlob(h: Harness, rel: string, bytes: Uint8Array): string {
+  const cut = rel.lastIndexOf('/');
+  const d = cut === -1 ? '' : rel.slice(0, cut);
+  const n = rel.slice(cut + 1);
+  const path = `${SHARE}/${rel}`;
+  h.vault.seedBinary(path, bytes);
+  const id = mint(h.tree, { k: 'b', d, n, s: 1, b: `${'a'.repeat(64)}:${bytes.length}:-` });
+  h.state.data.materialized[id] = path;
+  return id;
+}
+
+// The handler has NO logic, deliberately: it records a path and asks for a
+// reconcile. Step 2.5 is already "make the file and the tree agree", so anything
+// decided here would be a second, weaker copy of that rule — and one that runs
+// while the file is still being written.
+test('onModify records the attachment as dirty, schedules a reconcile and writes nothing', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = boundBlob(h, 'img/diagram.png', new Uint8Array([1, 2, 3, 4]));
+  h.resetCounts();
+
+  await h.watcher.onModify(`${SHARE}/img/diagram.png`);
+  await h.watcher.flushModify();
+
+  assert.equal(h.counts.txns, 0, 'not one tree write');
+  assert.deepEqual(h.reconciles, ['modify'], 'a pass is asked for');
+  assert.deepEqual([...h.watcher.takeDirtyPaths()], [fold(`${SHARE}/img/diagram.png`)]);
+  assert.equal(h.vault.calls.length, 0, 'and the file itself is not touched, not even read');
+  assert.equal(isLive(h.tree.get(id)!), true);
+});
+
+// ⚠ I7. A modify handler that touched a NOTE would fight the yCollab binding —
+// Obsidian's external-change reload becomes a whole-document overwrite,
+// broadcast to every peer. Markdown modifications flow through the CRDT and
+// nowhere else, so this handler returns before it has done anything at all.
+test('onModify ignores a markdown node entirely', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+  const id = mint(h.tree, { k: 'f', d: '', n: 'todo.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/todo.md`;
+  h.resetCounts();
+
+  await h.watcher.onModify(`${SHARE}/todo.md`);
+  await h.watcher.flushModify();
+
+  assert.equal(h.counts.txns, 0);
+  assert.deepEqual(h.reconciles, [], 'a note being edited is not a reason to reconcile');
+  assert.deepEqual([...h.watcher.takeDirtyPaths()], [], 'and nothing was flagged for re-hashing');
+});
+
+test('onModify ignores a path no node owns, and one outside the share', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/loose.png`, new Uint8Array([1, 2]));
+  h.vault.seedBinary('Elsewhere/other.png', new Uint8Array([3, 4]));
+  h.resetCounts();
+
+  await h.watcher.onModify(`${SHARE}/loose.png`);
+  await h.watcher.onModify('Elsewhere/other.png');
+  await h.watcher.flushModify();
+
+  assert.equal(h.counts.txns, 0);
+  assert.deepEqual(h.reconciles, [], 'an untracked file is step 6’s business, not this handler’s');
+  assert.deepEqual([...h.watcher.takeDirtyPaths()], []);
+});
+
+// The echo of our own write. A ticket is an OPTIMIZATION (I9): without one the
+// handler would flag the path, the next pass would re-hash it and land on rule 1,
+// and nothing would happen — this only saves the hash.
+test('onModify claims the ticket armed by our own binary write', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  boundBlob(h, 'diagram.png', new Uint8Array([1, 2, 3, 4]));
+  h.tickets.arm('modify', `${SHARE}/diagram.png`);
+
+  await h.watcher.onModify(`${SHARE}/diagram.png`);
+  await h.watcher.flushModify();
+
+  assert.deepEqual([...h.watcher.takeDirtyPaths()], [], 'the echo was recognised');
+  assert.deepEqual(h.reconciles, []);
+});
+
+// I9: a handler never mutes. An event that arrives before the plugin is ready is
+// QUEUED and replayed, never dropped.
+test('a modify arriving before ready is queued and applied on replay', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  boundBlob(h, 'diagram.png', new Uint8Array([1, 2, 3, 4]));
+  h.setPhase('boot');
+
+  await h.watcher.onModify(`${SHARE}/diagram.png`);
+  assert.equal(h.watcher.pendingEventCount, 1);
+  assert.deepEqual([...h.watcher.takeDirtyPaths()], [], 'nothing decided while booting');
+
+  h.setPhase('ready');
+  await h.watcher.flushPending();
+  await h.watcher.flushModify();
+
+  assert.deepEqual([...h.watcher.takeDirtyPaths()], [fold(`${SHARE}/diagram.png`)]);
+  assert.deepEqual(h.reconciles, ['modify']);
+});
+
+// I14 runs first in every handler: the shared folder is never a node.
+test('onModify on the share root is handled by the share-root guard', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.resetCounts();
+
+  await h.watcher.onModify(SHARE);
+  await h.watcher.flushModify();
+
+  assert.equal(h.counts.txns, 0);
+  assert.deepEqual([...h.watcher.takeDirtyPaths()], []);
+});
+
+// The set is TAKEN, not read: the pass that asks for it owns it, so a save that
+// lands while that pass is running is answered by the next one rather than
+// silently absorbed by a pass whose hashing was already decided.
+test('the dirty set is drained by the pass that takes it, and coalesces until then', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  boundBlob(h, 'a.png', new Uint8Array([1, 2, 3, 4]));
+  boundBlob(h, 'b.png', new Uint8Array([5, 6, 7, 8]));
+
+  await h.watcher.onModify(`${SHARE}/a.png`);
+  await h.watcher.onModify(`${SHARE}/a.png`);
+  await h.watcher.onModify(`${SHARE}/b.png`);
+  await h.watcher.flushModify();
+
+  assert.deepEqual(
+    [...h.watcher.takeDirtyPaths()].sort(),
+    [fold(`${SHARE}/a.png`), fold(`${SHARE}/b.png`)],
+    'one entry per path, however many events arrived',
+  );
+  assert.deepEqual([...h.watcher.takeDirtyPaths()], [], 'and the second take is empty');
+  assert.deepEqual(h.reconciles, ['modify'], 'three events, one coalesced request');
+});
+
+// ---------------------------------------------------------------- P2 §3.6: rename fixes
+
+// ⚠ B22. The fork sequence is `rename A -> B` followed by `create A`, and the
+// reconciler clears its whole ticket book at the end of the pass. A rename echo
+// that arrives after that finds the binding still pointing at A — and, trusted,
+// it would rename the CANONICAL node to the conflicted-copy name on every peer.
+// Confirming the old path is really gone is what makes a missing ticket harmless.
+test('B22: a late rename echo whose old path is back on disk does not rewrite the node', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const canonical = `${SHARE}/diagram.png`;
+  const fork = `${SHARE}/diagram (conflicted copy — Ann, a71c4013).png`;
+  const id = boundBlob(h, 'diagram.png', new Uint8Array([1, 2, 3, 4]));
+  // The state after a fork: both files exist, and the binding still names the
+  // canonical path because the reconciler re-bound it there.
+  h.vault.seedBinary(fork, new Uint8Array([9, 9, 9, 9]));
+  h.resetCounts();
+
+  await h.watcher.onRename(fork, canonical, 'f');
+
+  assert.equal(relPath(h.tree.get(id)!), 'diagram.png', 'the canonical node keeps its name');
+  assert.equal(h.state.data.materialized[id], canonical, 'and its binding');
+  const forked = fieldsOf(h.tree).filter((n) => n.rel.includes('conflicted copy'));
+  assert.equal(forked.length, 1, 'the fork became a node of its own');
+  assert.equal(forked[0].k, 'b');
+  assert.deepEqual(h.published, [forked[0].id], 'and it is offered for publication');
+});
+
+// The ordinary rename is unchanged: the old path really is gone, so the binding
+// is trusted and one node is rewritten.
+test('an ordinary rename still rewrites the node it is bound to', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = boundBlob(h, 'diagram.png', new Uint8Array([1, 2, 3, 4]));
+  await h.vault.rename(`${SHARE}/diagram.png`, `${SHARE}/plan.png`);
+  h.resetCounts();
+
+  await h.watcher.onRename(`${SHARE}/plan.png`, `${SHARE}/diagram.png`, 'f');
+
+  assert.equal(relPath(h.tree.get(id)!), 'plan.png');
+  assert.equal(h.tree.size(), 1, 'and no second node was minted');
+  assert.equal(h.state.data.materialized[id], `${SHARE}/plan.png`);
+});
+
+// I2, applied to the guard itself: "I could not look" is not evidence that the
+// old path came back, so an `exists` that throws leaves the ordinary behaviour
+// exactly as it was.
+test('an exists that throws does not turn an ordinary rename into a new node', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = boundBlob(h, 'diagram.png', new Uint8Array([1, 2, 3, 4]));
+  await h.vault.rename(`${SHARE}/diagram.png`, `${SHARE}/plan.png`);
+  h.vault.failNext('exists', new Error('EIO: the volume is unreadable'));
+
+  await h.watcher.onRename(`${SHARE}/plan.png`, `${SHARE}/diagram.png`, 'f');
+
+  assert.equal(relPath(h.tree.get(id)!), 'plan.png');
+  assert.equal(h.tree.size(), 1);
+});
+
+// ⚠ B21. `k` is write-once, so a rename that crosses kinds is not expressible as
+// a patch. Left unhandled it makes the node permanently invalid on every peer:
+// no derived path, never materialized, never deleted — a stale file on every disk
+// behind one line of diagnostics.
+test('B21: renaming an attachment to .md tombstones the node and mints a note', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = boundBlob(h, 'diagram.png', new Uint8Array([1, 2, 3, 4]));
+  h.state.data.contentHash[id] = { sha256: 'c'.repeat(64), len: 4 };
+  await h.vault.rename(`${SHARE}/diagram.png`, `${SHARE}/notes.md`);
+  h.resetCounts();
+
+  await h.watcher.onRename(`${SHARE}/notes.md`, `${SHARE}/diagram.png`, 'f');
+
+  assert.equal(h.counts.txns, 1, 'the tombstone and the new node land in ONE transaction');
+  const old = h.tree.get(id)!;
+  assert.equal(isLive(old), false, 'the attachment node is dead');
+  assert.equal(old.xh, 'c'.repeat(64), 'with the bytes it last held, so a peer can rescue them');
+  assert.equal(old.xb, 'Ada');
+  assert.equal(relPath(old), 'diagram.png', 'and it still names the path it used to hold');
+
+  const minted = fieldsOf(h.tree).filter((n) => n.id !== id);
+  assert.equal(minted.length, 1);
+  assert.equal(minted[0].k, 'f', 'the new node is a note, because the new name is a note’s');
+  assert.equal(minted[0].rel, 'notes.md');
+  assert.equal(h.state.data.owned[minted[0].id], true, 'this device owns what it minted (I5)');
+  assert.deepEqual(h.published, [minted[0].id]);
+  assert.equal(h.state.data.materialized[minted[0].id], `${SHARE}/notes.md`);
+  assert.equal(h.state.data.materialized[id], undefined, 'and the old binding is gone');
+  assert.equal(h.notices.length, 1, 'the user is told once that the history stayed behind');
+  assert.ok(h.notices[0].includes('notes.md'), h.notices[0]);
+});
+
+test('renaming a note to an attachment crosses the other way, with the same shape', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/scan.md`, 'f', 'body');
+  const id = mint(h.tree, { k: 'f', d: '', n: 'scan.md', s: 1 });
+  h.state.data.materialized[id] = `${SHARE}/scan.md`;
+  await h.vault.rename(`${SHARE}/scan.md`, `${SHARE}/scan.png`);
+  h.resetCounts();
+
+  await h.watcher.onRename(`${SHARE}/scan.png`, `${SHARE}/scan.md`, 'f');
+
+  assert.equal(isLive(h.tree.get(id)!), false);
+  const minted = fieldsOf(h.tree).filter((n) => n.id !== id);
+  assert.equal(minted.length, 1);
+  assert.equal(minted[0].k, 'b');
+  assert.equal(minted[0].rel, 'scan.png');
+  assert.equal(h.counts.txns, 1);
+});
+
+// A rename that crosses into a name NEITHER kind may hold is a drag-out of the
+// share in everything but direction: the node cannot follow the file there.
+test('renaming an attachment to a refused extension is not a kind crossing', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = boundBlob(h, 'diagram.png', new Uint8Array([1, 2, 3, 4]));
+  await h.vault.rename(`${SHARE}/diagram.png`, `${SHARE}/setup.exe`);
+
+  await h.watcher.onRename(`${SHARE}/setup.exe`, `${SHARE}/diagram.png`, 'f');
+  await h.watcher.flushUnshare();
+
+  assert.equal(h.tree.size(), 1, 'no second node was minted for a path nothing may claim');
+  assert.equal(isLive(h.tree.get(id)!), false, 'and the node followed the user’s intent');
+});
+
+// A folder rename cannot cross kinds — `nodeKindOf` reads the DISK kind for that
+// — so `Album` -> `Album.md` is still one directory node, renamed.
+test('a folder renamed to a markdown-looking name stays a folder node', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/Album`, 'd');
+  const id = mint(h.tree, { k: 'd', d: '', n: 'Album' });
+  h.state.data.materialized[id] = `${SHARE}/Album`;
+  await h.vault.rename(`${SHARE}/Album`, `${SHARE}/Album.md`);
+
+  await h.watcher.onRename(`${SHARE}/Album.md`, `${SHARE}/Album`, 'd');
+
+  assert.equal(h.tree.size(), 1);
+  assert.equal(h.tree.get(id)!.k, 'd');
+  assert.equal(relPath(h.tree.get(id)!), 'Album.md');
 });
