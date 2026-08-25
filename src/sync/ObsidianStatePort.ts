@@ -16,10 +16,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // WHAT THIS PORT CAN AND CANNOT PROMISE. Read this before "restoring" atomicity.
 //
-// Spec §2.5 and §2.6 both say these files are written "atomically (write `.tmp`,
-// then `adapter.rename`)". That prescription DOES NOT WORK, and the spec has been
-// amended to match this file rather than the other way round. `vault.adapter` is
-// not `node:fs`:
+// Spec §2.5 and §2.6 both USED to say these files are written "atomically (write
+// `.tmp`, then `adapter.rename`)". That prescription DOES NOT WORK; §2.5.1 is the
+// amendment, and it was written from this file rather than the other way round.
+// `vault.adapter` is not `node:fs`:
 //
 //   * `FileSystemAdapter.prototype.rename` tests the destination itself and
 //     throws BEFORE it reaches `fsPromises.rename` —
@@ -187,15 +187,15 @@ export class ObsidianStatePort implements StatePort {
    * about to be overwritten non-atomically, the fallback the read path would
    * reach for already holds the NEW bytes rather than the previous revision.
    *
-   * @param put Writes the given bytes at whatever path it is handed — the text
-   *            and binary arms differ in nothing else.
+   * @param writeAt Writes the caller's bytes at whatever path it is handed — the
+   *                text and binary arms differ in nothing else.
    */
-  private async put(target: string, put: (path: string) => Promise<void>): Promise<void> {
+  private async put(target: string, writeAt: (path: string) => Promise<void>): Promise<void> {
     const tmp = `${target}.tmp`;
     await this.ensureDir();
-    await put(tmp);
+    await writeAt(tmp);
     if (await this.link(tmp, target)) return;
-    await put(target);
+    await writeAt(target);
   }
 
   /**
@@ -239,10 +239,27 @@ export class ObsidianStatePort implements StatePort {
         await this.adapter.rename(tmp, target);
         return true;
       } catch (err) {
-        if (await this.adapter.exists(target)) return false;
+        if (await this.occupied(target)) return false;
         if (attempt >= this.renameAttempts) throw err;
         await sleep(this.renameDelayMs * attempt);
       }
+    }
+  }
+
+  /**
+   * Why the rename above failed: because something is already at `target`, or
+   * for some other reason.
+   *
+   * An `exists` that throws answers neither, and must not become the error the
+   * caller sees — the rename failure is the interesting one. Reporting "not
+   * occupied" hands the decision back to the retry budget, which either clears
+   * the problem or rethrows the original.
+   */
+  private async occupied(target: string): Promise<boolean> {
+    try {
+      return await this.adapter.exists(target);
+    } catch {
+      return false;
     }
   }
 }
