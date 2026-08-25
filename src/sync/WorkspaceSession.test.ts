@@ -42,6 +42,7 @@ import type { Kind, VaultPort } from './VaultPort.ts';
 import {
   CodeMirrorBinding,
   WorkspaceSession,
+  type MountResult,
   type ProviderPort,
   type SessionAwareness,
   type SessionProvider,
@@ -209,6 +210,37 @@ class GatedVault implements VaultPort {
     await this.gate('create');
     return this.inner.create(path, data);
   }
+  readBinary(path: string): Promise<Uint8Array> { return this.inner.readBinary(path); }
+  createBinary(path: string, data: Uint8Array): Promise<void> {
+    return this.inner.createBinary(path, data);
+  }
+  stat(path: string): ReturnType<VaultPort['stat']> { return this.inner.stat(path); }
+  createFolder(path: string): Promise<void> { return this.inner.createFolder(path); }
+  rename(from: string, to: string): Promise<void> { return this.inner.rename(from, to); }
+  trashLocal(path: string): Promise<void> { return this.inner.trashLocal(path); }
+  isOpenInLeaf(path: string): boolean { return this.inner.isOpenInLeaf(path); }
+}
+
+/**
+ * A vault in which every candidate name under `ShadowLink Recovered/` is taken,
+ * so `uniquify` exhausts its 1000 tries and throws.
+ *
+ * Reachable for real: the stash name is derived from the note's basename and a
+ * timestamp, so a note that is opened repeatedly inside one second competes with
+ * its own earlier copies for the same names.
+ */
+class CrowdedRecovered implements VaultPort {
+  constructor(private readonly inner: FakeVault) {}
+
+  exists(path: string): Promise<boolean> {
+    if (path.startsWith(`${RECOVERED_DIR}/`)) return Promise.resolve(true);
+    return this.inner.exists(path);
+  }
+
+  list(): Array<{ path: string; kind: Kind }> { return this.inner.list(); }
+  listDir(path: string): Promise<string[]> { return this.inner.listDir(path); }
+  read(path: string): Promise<string> { return this.inner.read(path); }
+  create(path: string, data: string): Promise<void> { return this.inner.create(path, data); }
   readBinary(path: string): Promise<Uint8Array> { return this.inner.readBinary(path); }
   createBinary(path: string, data: Uint8Array): Promise<void> {
     return this.inner.createBinary(path, data);
@@ -685,6 +717,126 @@ test('a local copy matching the shared document is not stashed', async () => {
   assert.equal(h.editor.current?.notePath, `${SHARE}/a.md`);
 });
 
+// ================================================================ the typing window
+//
+// Everything above reasons about two strings — the file's bytes and the shared
+// document — and treats the editor as showing the first of them. Between the
+// `vault.read` that starts an open and the `mount` that ends it there is a third
+// string, and it is the newest: the buffer the user is typing into. That window
+// is the provider's connect-and-sync round trip, i.e. the first second after
+// opening a note, i.e. when people type.
+//
+// `mount` replaces the whole document to establish the equality
+// `y-codemirror.next` requires, so whatever is in that buffer is what an open
+// destroys — and the file read seconds earlier is not it.
+
+test('keystrokes typed while a healthy note is opening are preserved, not destroyed', async () => {
+  // Nothing is wrong with this note. The file and the shared document agree, so
+  // the open has no divergence to resolve and takes no stash branch at all — and
+  // the mount still throws the user's characters away, because the buffer stopped
+  // being the file's bytes the moment they typed.
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('a.md', 'shared body', { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: 'shared body' });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.type(path, ' plus what I just typed');
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  assert.equal(h.editor.document(path), 'shared body', 'the shared document wins on screen');
+  assert.deepEqual(
+    h.stashes().map(([, text]) => text),
+    ['shared body plus what I just typed'],
+    'and what it replaced is on disk somewhere, not gone',
+  );
+  assert.ok(h.notices.some((n) => n.includes(RECOVERED_DIR)), h.notices.join(' | '));
+});
+
+test('a divergent open preserves what was on screen, not the revision read off disk', async () => {
+  // I1's rule applied to the right string. The stash used to hold `localText` —
+  // the bytes read before the round trip — so a user who typed into a stale note
+  // while it opened had a revision they had already moved past carefully
+  // preserved for them, and the paragraph they had just written destroyed.
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  const path = `${SHARE}/Sans titre.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: SHARED });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.type(path, '\n\nA paragraph I wrote while it was opening.');
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  assert.equal(h.editor.document(path), SHARED, 'the shared document still wins');
+  assert.deepEqual(
+    h.stashes().map(([, text]) => text),
+    [`${STALE}\n\nA paragraph I wrote while it was opening.`],
+    'the stash holds what the mount destroyed, superseding the disk revision',
+  );
+});
+
+test('a mount that refuses AFTER replacing the buffer still preserves what it replaced', async () => {
+  // `CodeMirrorBinding.mount`'s belt-and-braces arm: the replacement went in, the
+  // bind did not take, and the buffer is deliberately left holding the shared
+  // text rather than re-dirtied with bytes the workspace has moved past. The
+  // displaced characters are gone from the editor either way, so a refusal owes
+  // the same copy a success does.
+  const h = makeHarness();
+  const id = h.add('a.md', STALE, { s: 1 });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  h.editor.mount = () => ({ ok: false, replaced: `${STALE} and what I typed` });
+
+  await h.session.open(path);
+
+  assert.equal(h.session.openNodeId(), null, 'nothing claims to be bound');
+  assert.equal(h.providers.created[0].destroyed, true, 'and the provider was released');
+  assert.deepEqual(h.stashes().map(([, text]) => text), [`${STALE} and what I typed`]);
+});
+
+test('a mount that replaced nothing and found no divergence stashes nothing', async () => {
+  // The other direction, and the reason `replaced` is optional rather than
+  // "whatever the editor held": a stash of bytes nothing replaced preserves
+  // nothing, and that is what nine near-identical files in three minutes was.
+  const h = makeHarness();
+  const id = h.add('a.md', 'shared body', { s: 1, owned: true });
+  h.providers.configure(`n_${id}`, { remote: 'shared body' });
+
+  await h.session.open(`${SHARE}/a.md`);
+
+  assert.deepEqual(h.stashes(), []);
+  assert.equal(mutations(h.vault), 0);
+});
+
+test('a stash that can find no free name is a notice, not an open that gives up', async () => {
+  // `uniquify` throws after 1000 collisions, and it used to throw OUTSIDE
+  // `stashLocalCopy`'s try — so it propagated out of `doOpen`, past the watermark
+  // step, to `open`'s catch-all, which says "ShadowLink: <message>" about bytes
+  // nothing preserved. The document had already been replaced by then.
+  const h = makeHarness({}, { wrapVault: (inner) => new CrowdedRecovered(inner) });
+  const id = h.add('a.md', STALE, { s: 1 });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+
+  await h.session.open(path);
+
+  assert.ok(
+    h.notices.some((n) => n.startsWith(`Could not save a local copy of "a.md"`)),
+    h.notices.join(' | '),
+  );
+  assert.equal(
+    h.notices.some((n) => n.startsWith('ShadowLink: ')),
+    false,
+    'and not the generic catch-all, which names neither the file nor the reason',
+  );
+  assert.equal(h.session.openNodeId(), id, 'the open finished: the note is bound');
+  assert.equal(h.editor.document(path), SHARED);
+});
+
 // ================================================================ I17 — the watermark
 
 test('a divergent open records no watermark, and removes the one it finds (I17)', async () => {
@@ -1030,13 +1182,13 @@ test('a session superseded by its own mount records no content watermark (I17)',
   const editor = h.editor;
   const mount = editor.mount.bind(editor);
   let follow: Promise<void> | null = null;
-  editor.mount = (path, text, awareness): boolean => {
-    const ok = mount(path, text, awareness);
+  editor.mount = (path, text, awareness): MountResult => {
+    const result = mount(path, text, awareness);
     if (follow === null) {
       h.active.path = `${SHARE}/b.md`;
       follow = h.session.open(`${SHARE}/b.md`);
     }
-    return ok;
+    return result;
   };
 
   h.active.path = `${SHARE}/a.md`;
@@ -1127,8 +1279,9 @@ test('mount makes the editor hold the shared document before it binds anything',
   const binding = new CodeMirrorBinding(() => leaf.view);
   const leaf = leafOf(STALE, binding.editorExtension());
 
-  assert.equal(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), true);
+  const result = binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
 
+  assert.equal(result.ok, true);
   assert.equal(leaf.doc(), SHARED, 'the editor holds the workspace\'s text');
   assert.equal(leaf.transactions.length, 2, 'the replacement and the bind are separate dispatches');
   assert.equal(leaf.transactions[0].docChanged, true, 'the replacement goes first…');
@@ -1147,12 +1300,52 @@ test('the replacement is kept out of the undo history', () => {
   assert.equal(leaf.transactions[0].annotation(Transaction.addToHistory), false);
 });
 
+test('mount reports the text it replaced, so the caller can preserve it', () => {
+  // A boolean cannot say what the editor was holding, and the editor is the only
+  // place the user's most recent characters exist. The caller stashes THIS, not
+  // the file it read before the round trip.
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf(`${STALE} and what I typed`, binding.editorExtension());
+
+  const result = binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+
+  assert.deepEqual(result, { ok: true, replaced: `${STALE} and what I typed` });
+});
+
+test('mount reports what it replaced even when it then refuses', () => {
+  // Obsidian rebuilt the editor's state between the two dispatches, so the
+  // replacement landed and the reconfigure did not. The buffer is left holding
+  // the shared text either way, so the displaced characters are just as gone as
+  // they are after a success — and just as owed a copy.
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf(STALE, binding.editorExtension());
+  const rebuildOnNextDispatch = (): void => {
+    const original = leaf.view.dispatch.bind(leaf.view);
+    (leaf.view as { dispatch: (spec: TransactionSpec) => void }).dispatch = (spec) => {
+      original(spec);
+      // Obsidian's own rebuild: a fresh state, without the plugin's compartment.
+      (leaf.view as { state: EditorState }).state = EditorState.create({
+        doc: leaf.view.state.doc.toString(),
+      });
+    };
+  };
+  rebuildOnNextDispatch();
+
+  const result = binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+
+  assert.equal(result.ok, false, 'no binding was installed');
+  assert.equal(result.replaced, STALE, 'and it says what it cost to find that out');
+  assert.equal(leaf.doc(), SHARED, 'the buffer is not re-dirtied with the stale revision');
+});
+
 test('mount leaves a document that already matches completely alone', () => {
   const binding = new CodeMirrorBinding(() => leaf.view);
   const leaf = leafOf(SHARED, binding.editorExtension());
 
-  assert.equal(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), true);
+  const result = binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
 
+  assert.equal(result.ok, true);
+  assert.equal(result.replaced, undefined, 'nothing was replaced, so nothing is reported');
   assert.deepEqual(leaf.transactions.map((tr) => tr.docChanged), [false], 'one dispatch, no change');
 });
 
@@ -1164,7 +1357,11 @@ test('mount into a state without the compartment is refused, and writes nothing'
   const binding = new CodeMirrorBinding(() => leaf.view);
   const leaf = leafOf(STALE, null);
 
-  assert.equal(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), false);
+  assert.deepEqual(
+    binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()),
+    { ok: false },
+    'refused, and with nothing to preserve: the buffer was never touched',
+  );
 
   assert.equal(leaf.doc(), STALE, 'the user\'s document is exactly as it was found');
   assert.deepEqual(leaf.transactions, [], 'and nothing was dispatched at it');
@@ -1172,7 +1369,7 @@ test('mount into a state without the compartment is refused, and writes nothing'
 
 test('mount with no view for the path is refused', () => {
   const binding = new CodeMirrorBinding(() => null);
-  assert.equal(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), false);
+  assert.deepEqual(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), { ok: false });
 });
 
 test('unmount removes the binding and leaves the document where it is', () => {

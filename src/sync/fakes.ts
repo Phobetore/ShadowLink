@@ -56,7 +56,7 @@ import {
 import type { DocHandle, DocPort } from './DocPort.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 import { CodeMirrorBinding } from './WorkspaceSession.ts';
-import type { EditorBinding, SessionAwareness } from './WorkspaceSession.ts';
+import type { EditorBinding, MountResult, SessionAwareness } from './WorkspaceSession.ts';
 
 export type { BlobLimits } from './BlobPort.ts';
 
@@ -651,6 +651,25 @@ export class FakeEditorBinding implements EditorBinding {
     return this.leaves.get(notePath)?.doc;
   }
 
+  /**
+   * The user typing into the open note.
+   *
+   * Modelled because the interesting moment is BETWEEN the session's
+   * `vault.read` and its `mount` — the provider's connect-and-sync round trip,
+   * which is the first second after opening a note and therefore exactly when
+   * people type. From that point the editor's buffer, not the file, is the
+   * newest copy of the note, and it is the thing a mount replaces.
+   *
+   * Appended at the end rather than at a caret, because where the characters
+   * went is not what any of this turns on; that they were there is.
+   */
+  type(notePath: string, text: string): void {
+    const leaf = this.leaves.get(notePath);
+    if (leaf === undefined) throw new Error(`no leaf is open for ${notePath}`);
+    const at = leaf.state.doc.length;
+    leaf.dispatch({ changes: { from: at, to: at, insert: text } });
+  }
+
   /** Every transaction that reached this leaf, in order. */
   transactions(notePath: string): readonly Transaction[] {
     return this.leaves.get(notePath)?.transactions ?? [];
@@ -681,14 +700,19 @@ export class FakeEditorBinding implements EditorBinding {
 
   // ---------------------------------------------------------- EditorBinding
 
-  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): boolean {
-    if (!this.binding.mount(notePath, text, awareness)) {
+  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): MountResult {
+    // The shipped binding's result is passed through UNTOUCHED, `replaced`
+    // included: what a mount displaced is the one thing the session cannot find
+    // out for itself afterwards, so a fake that summarised it away would hide
+    // exactly the defect this class exists to expose.
+    const result = this.binding.mount(notePath, text, awareness);
+    if (!result.ok) {
       this.refused.push(notePath);
-      return false;
+      return result;
     }
     this.mounts.push({ notePath, text });
     this.observe(notePath, text);
-    return true;
+    return result;
   }
 
   unmount(): void {

@@ -824,7 +824,11 @@ test('a mount makes the editor equal the Y.Text it binds', () => {
   editor.openLeaf('Shared/a.md', 'the stale local revision');
   const text = ytext('the workspace revision');
 
-  assert.equal(editor.mount('Shared/a.md', text, new TestAwareness()), true);
+  assert.deepEqual(
+    editor.mount('Shared/a.md', text, new TestAwareness()),
+    { ok: true, replaced: 'the stale local revision' },
+    'and says what it displaced, which is the only copy of it there was',
+  );
   assert.equal(editor.document('Shared/a.md'), 'the workspace revision');
 });
 
@@ -878,7 +882,7 @@ test('a mount into a leaf whose state has no compartment is refused', () => {
   const editor = new FakeEditorBinding();
   editor.openLeaf('Shared/a.md', 'body', { initialized: false });
 
-  assert.equal(editor.mount('Shared/a.md', ytext('shared'), new TestAwareness()), false);
+  assert.deepEqual(editor.mount('Shared/a.md', ytext('shared'), new TestAwareness()), { ok: false });
   assert.deepEqual(editor.refused, ['Shared/a.md']);
   assert.equal(editor.document('Shared/a.md'), 'body', 'and it wrote nothing');
 });
@@ -888,8 +892,11 @@ test('a mount for a path with no leaf, or a missing one, is refused', () => {
   editor.openLeaf('Shared/a.md', 'body');
   editor.missing.add('Shared/a.md');
 
-  assert.equal(editor.mount('Shared/a.md', ytext('shared'), new TestAwareness()), false);
-  assert.equal(editor.mount('Shared/never-opened.md', ytext('shared'), new TestAwareness()), false);
+  assert.deepEqual(editor.mount('Shared/a.md', ytext('shared'), new TestAwareness()), { ok: false });
+  assert.deepEqual(
+    editor.mount('Shared/never-opened.md', ytext('shared'), new TestAwareness()),
+    { ok: false },
+  );
   assert.equal(editor.mounts.length, 0);
 });
 

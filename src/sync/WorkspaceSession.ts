@@ -110,6 +110,36 @@ export interface ProviderPort {
  * none, so the session can release the document instead of holding a session
  * nothing is looking at.
  */
+/**
+ * What a mount did, which is two facts and not one.
+ *
+ * It used to be a boolean, and the missing half cost the user their keystrokes:
+ * a mount that establishes an equality by REPLACING a document has destroyed
+ * whatever that document held, and only the mount knows what that was. The
+ * caller reads the file, not the editor, so it cannot find out afterwards —
+ * by then the buffer holds the shared text.
+ */
+export interface MountResult {
+  /** Whether a binding is installed AND the editor holds the shared text. */
+  readonly ok: boolean;
+  /**
+   * The text the mount removed from the editor, present only when it removed
+   * any.
+   *
+   * This is the newest copy of the note in existence at that instant: newer
+   * than the file, because Obsidian's save of a dirty buffer is asynchronous
+   * and the user has been typing into it since the open began. Preserving it is
+   * the caller's job (I1), and preserving the FILE instead — which is what the
+   * caller could see on its own — preserves a revision the user has already
+   * moved past while destroying the paragraph they just wrote.
+   *
+   * Reported on a refusal too. The buffer is deliberately left holding the
+   * shared text when a bind does not take, so the characters are just as gone
+   * as they are after a success.
+   */
+  readonly replaced?: string;
+}
+
 export interface EditorBinding {
   /**
    * Make the editor showing `notePath` HOLD `text`, then bind it.
@@ -124,14 +154,15 @@ export interface EditorBinding {
    * `RangeError: Invalid change range 15 to 16 (in doc of length 0)`, and a note
    * whose content never appears and whose file is never rewritten.
    *
-   * So a `true` return is a claim about what the editor now CONTAINS, not about
-   * a dispatch having been issued. Callers rely on it: for an open note the
-   * editor is the only writer of the file's bytes (I7), so "the shared document
-   * wins on disk" is delivered by this method or not at all.
+   * So `ok` is a claim about what the editor now CONTAINS, not about a dispatch
+   * having been issued. Callers rely on it: for an open note the editor is the
+   * only writer of the file's bytes (I7), so "the shared document wins on disk"
+   * is delivered by this method or not at all.
    *
-   * False means no binding was installed.
+   * `ok: false` means no binding was installed. `replaced` says what the attempt
+   * cost regardless — see `MountResult`.
    */
-  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): boolean;
+  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): MountResult;
   /** Remove any binding. Idempotent, and safe once the view is gone. */
   unmount(): void;
 }
@@ -353,21 +384,37 @@ export class WorkspaceSession {
     // await and here the user may have switched notes without a newer `open()`
     // having reached us yet.
     if (this.deps.activePath() !== notePath) { release(provider, doc); return; }
-    if (!this.deps.editor.mount(notePath, text, provider.awareness)) {
-      release(provider, doc);
-      return;
-    }
-    this.active = { nodeId, notePath, doc, provider };
+    const mounted = this.deps.editor.mount(notePath, text, provider.awareness);
+    if (mounted.ok) this.active = { nodeId, notePath, doc, provider };
+    else release(provider, doc);
 
-    if (diverged) {
-      // Only now. `mount` returning true is the promise that the editor holds
-      // the shared text, so this is the first moment at which the local bytes
-      // are genuinely being replaced — and the only moment at which preserving
-      // them preserves anything. A failed mount leaves the file exactly as it
-      // was and leaves no stash behind to explain a replacement that never
-      // happened.
-      await this.stashLocalCopy(nodeId, notePath, localText);
-    }
+    // WHAT THIS OPEN DESTROYED, which is the only thing worth preserving (I1)
+    // and is NOT `localText`.
+    //
+    // `localText` is what `vault.read` returned near the top of this method, and
+    // between there and here sits the provider's connect-and-sync round trip —
+    // up to eight seconds, and precisely the first seconds after a note opens,
+    // which is when people type. Obsidian's save of a dirty buffer is
+    // asynchronous and the plugin cannot make it happen, so from the user's first
+    // keystroke the EDITOR holds the newest copy of this note and the file does
+    // not. `mount` replaces the editor's whole document, so that copy is what an
+    // open costs, and `mount` is the only thing that ever sees it.
+    //
+    // Stashing `localText` instead is not a smaller version of preserving it: on
+    // a healthy note — file and shared document in agreement, no divergence, no
+    // stash branch taken at all — it preserved NOTHING while the paragraph the
+    // user had just written was thrown away in silence. On a divergent one it
+    // carefully preserved a revision they had already moved past, and threw the
+    // same paragraph away.
+    //
+    // The fallback covers the one case `replaced` cannot: the mount replaced
+    // nothing because the buffer already held the shared text, yet the file still
+    // disagrees with it, and Obsidian's next save is about to overwrite that file
+    // with the buffer. Those disk bytes go too, so they are preserved too.
+    const lost = mounted.replaced ?? (mounted.ok && diverged ? localText : undefined);
+    if (lost !== undefined) await this.stashLocalCopy(nodeId, notePath, lost);
+
+    if (!mounted.ok) return;
 
     // I17. A watermark names bytes that are simultaneously in the workspace and
     // on THIS disk, and it may advance only once a write has returned. This
@@ -527,31 +574,40 @@ export class WorkspaceSession {
    * at the vault root and outside the share by construction — so the watcher
    * ignores it and no node is ever minted for a stashed copy.
    *
-   * Called only after a successful mount, i.e. only once the editor genuinely
-   * holds the shared text and the local revision is on its way out. The file at
-   * the canonical path is not removed: Obsidian is about to write the editor's
-   * buffer over it, and a stash that deleted it first would leave the user
-   * staring at a missing note for as long as that save took.
+   * Called only once a mount has genuinely displaced something, and handed the
+   * string that was displaced — normally the editor's buffer, which is newer
+   * than the file. The file at the canonical path is not removed: Obsidian is
+   * about to write the editor's buffer over it, and a stash that deleted it
+   * first would leave the user staring at a missing note for as long as that
+   * save took.
    *
    * Two things are deliberately not stashed, because a copy of them preserves
    * nothing and the notice that goes with it is not true:
    *  - bytes already preserved for this node in this session (see `stashed`);
-   *  - an empty file. Nine 0-byte "local copies" is what the incident looked
+   *  - an empty document. Nine 0-byte "local copies" is what the incident looked
    *    like from the user's side, and not one of them held anything.
+   *
+   * EVERY step is inside the try, including finding a free name. `uniquify`
+   * throws after 1000 collisions, and while it sat outside, that throw left
+   * `doOpen` through `open`'s catch-all — after the document had already been
+   * replaced — as a bare "ShadowLink: could not find a free name for …", naming
+   * neither the note nor the fact that its bytes are now nowhere. I15's rule is
+   * that a failed stash must not abort the open and must not be silent; a rule
+   * that only holds for the failures someone happened to wrap is neither.
    */
   private async stashLocalCopy(
     nodeId: string,
     notePath: string,
-    localText: string,
+    replaced: string,
   ): Promise<void> {
-    if (localText.length === 0) return;
-    const digest = await hashOf(localText);
-    if (this.stashed.get(nodeId) === digest) return;
-    const dest = await this.uniquify(`${RECOVERED_DIR}/${stashName(notePath, this.now())}`);
-    if (!assertInsideShare(this.deps.shareRoot(), dest, true)) return;
+    if (replaced.length === 0) return;
     try {
+      const digest = await hashOf(replaced);
+      if (this.stashed.get(nodeId) === digest) return;
+      const dest = await this.uniquify(`${RECOVERED_DIR}/${stashName(notePath, this.now())}`);
+      if (!assertInsideShare(this.deps.shareRoot(), dest, true)) return;
       if (!(await this.exists(RECOVERED_DIR))) await this.deps.vault.createFolder(RECOVERED_DIR);
-      await this.deps.vault.create(dest, localText);
+      await this.deps.vault.create(dest, replaced);
       // Recorded only once the bytes are genuinely on disk somewhere else. A
       // stash that failed has preserved nothing and must be attempted again.
       this.stashed.set(nodeId, digest);
@@ -560,8 +616,9 @@ export class WorkspaceSession {
         + `A copy was saved to ${RECOVERED_DIR}/.`,
       );
     } catch (err) {
-      // I15: a stash that failed must not abort the open, and must not be
-      // silent either — the shared copy is about to become what is on screen.
+      // I15: a stash that failed must not abort the open, and must not be silent
+      // either — the shared copy IS what is on screen by now, and these are the
+      // only bytes the user had that nothing else holds.
       this.deps.notice(`Could not save a local copy of "${baseOf(notePath)}": ${messageOf(err)}`);
     }
   }
@@ -612,9 +669,9 @@ export class CodeMirrorBinding implements EditorBinding {
     return this.compartment.of([]);
   }
 
-  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): boolean {
+  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): MountResult {
     const view = this.viewFor(notePath);
-    if (view === null) return false;
+    if (view === null) return { ok: false };
 
     // LIVENESS FIRST, before anything is written. `Compartment.reconfigure`
     // aimed at a state that does not contain the compartment is inert and
@@ -623,7 +680,7 @@ export class CodeMirrorBinding implements EditorBinding {
     // true having bound nothing at all, and the session then behaves as though
     // the user were editing collaboratively. Checking BEFORE the replacement
     // also means a mount that cannot bind has not thrown the user's buffer away.
-    if (this.compartment.get(view.state) === undefined) return false;
+    if (this.compartment.get(view.state) === undefined) return { ok: false };
 
     // I18: compare on normalized line endings, in BOTH directions. A peer on
     // Windows can seed a document holding CRLF, and CodeMirror normalizes line
@@ -636,7 +693,17 @@ export class CodeMirrorBinding implements EditorBinding {
     // see — but it is worth knowing that this comparison hides it rather than
     // solving it.)
     const shared = text.toString();
-    if (normLF(view.state.doc.toString()) !== normLF(shared)) {
+
+    // WHAT WAS ON SCREEN, captured before anything can change it. It is not
+    // necessarily the file's bytes: Obsidian's save of a dirty buffer is
+    // asynchronous, so from the user's first keystroke after the open began this
+    // is the newest copy of the note anywhere — and the replacement below is
+    // about to be the only thing that has ever held it.
+    const before = view.state.doc.toString();
+
+    let replaced: string | undefined;
+    if (normLF(before) !== normLF(shared)) {
+      replaced = before;
       // WHAT THIS COSTS, deliberately. Replacing the whole document is the
       // bluntest possible convergence: the user's selection is remapped through
       // a change that touches every character, so a cursor mid-note lands at the
@@ -676,22 +743,26 @@ export class CodeMirrorBinding implements EditorBinding {
       this.compartment.get(view.state) === undefined
       || normLF(view.state.doc.toString()) !== normLF(shared)
     ) {
-      // Belt and braces: the two claims `true` makes are that the binding is
+      // Belt and braces: the two claims `ok` makes are that the binding is
       // installed and that the editor holds the shared text. If either is false
       // after the dispatches, say so rather than let the session record a
       // watermark and defer repairs for a note nothing is bound to. The buffer
       // is left holding the shared text — restoring the stale revision would
       // only re-dirty it with bytes the workspace has already moved past.
+      //
+      // `replaced` is reported all the same, and this is the whole reason it is
+      // on the failure arm too: the displaced characters are exactly as gone as
+      // they would be after a success, so the caller owes them the same copy.
       try {
         view.dispatch({ effects: this.compartment.reconfigure([]) });
       } catch {
         /* the view was destroyed with its leaf */
       }
-      return false;
+      return { ok: false, replaced };
     }
 
     this.mounted = view;
-    return true;
+    return { ok: true, replaced };
   }
 
   unmount(): void {
