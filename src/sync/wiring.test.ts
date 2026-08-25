@@ -88,6 +88,51 @@ test('the publish queue and the watcher are given the memory cap (§7.4)', () =>
   assertPasses('VaultWatcher', ['memoryCapBytes']);
 });
 
+// §7.3. Three commands, and a markdown post-processor, all of them reachable only
+// through Obsidian's own registries. A command that is never registered is a
+// feature nobody can find, and the whole point of the deferral policy is that the
+// user has a way to say "yes, fetch that one".
+test('the three download commands and the embed post-processor are registered', () => {
+  for (const id of [
+    'download-attachments-in-note', 'download-all-attachments', 'download-attachments',
+  ]) {
+    assert.ok(
+      MAIN.includes(`id: '${id}'`),
+      `main.ts must register the "${id}" command; a deferral the user cannot lift is a `
+      + 'file they simply do not have.',
+    );
+  }
+  assert.ok(
+    /registerMarkdownPostProcessor\(\s*deferredEmbedProcessor\(/.test(MAIN),
+    'main.ts must register the deferred-embed post-processor',
+  );
+});
+
+// §7.3. Every one of those four paths must go through the SAME mechanism —
+// approve, persist, then run a pass — because the pass owns every rule about what
+// may be written where. A command that fetched bytes itself would be a second
+// writer with none of them.
+test('downloading an attachment approves it, persists that, and then runs a pass', () => {
+  const start = MAIN.indexOf('async downloadAttachments(');
+  assert.notEqual(start, -1, 'main.ts no longer has the shared download path');
+  const body = MAIN.slice(start, MAIN.indexOf('\n  }', start));
+
+  const approve = body.indexOf('fetchApproved[id] = true');
+  const persist = body.indexOf('state.flush()');
+  const pass = body.indexOf('reconcile(');
+  assert.ok(approve !== -1, 'the approval is what lifts the policy (§7.2)');
+  assert.ok(
+    persist > approve,
+    'the approval is persisted BEFORE the pass: a fetch that fails must not make the '
+    + 'user press the button again',
+  );
+  assert.ok(pass > persist, 'and only then is a pass asked for');
+  assert.equal(
+    /blobs\.get\(/.test(body), false,
+    'a command must never fetch bytes itself — the pass owns every rule about writing them',
+  );
+});
+
 // §7.4: platform detection lives in `main.ts` and reaches the engine as plain
 // numbers. A helper that stopped branching would hand a phone the desktop
 // ceilings without a single test noticing.

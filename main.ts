@@ -44,12 +44,15 @@ import { WebsocketProvider } from 'y-websocket';
 
 import { SettingsTab } from './src/ui/SettingsTab';
 import {
+  chooseAttachments,
   chooseKeptFiles,
   confirmBulkDelete,
   confirmFirstSync,
   confirmLocalBulkDelete,
   confirmUnshare,
 } from './src/ui/modals';
+import { deferredEmbedProcessor, matchDeferred } from './src/ui/DeferredEmbeds';
+import { formatBytes, syncedStatus } from './src/ui/format';
 import { DEFAULT_SETTINGS, ShadowLinkSettings } from './src/types';
 
 import {
@@ -75,7 +78,7 @@ import { ObsidianStatePort, treeSnapshotKey } from './src/sync/ObsidianStatePort
 import { ObsidianVaultPort } from './src/sync/ObsidianVaultPort';
 import { PublishQueue } from './src/sync/PublishQueue';
 import { Reconciler } from './src/sync/Reconciler';
-import type { ReconcileCause } from './src/sync/Reconciler';
+import type { DeferredAttachment, ReconcileCause } from './src/sync/Reconciler';
 import { Tickets } from './src/sync/Tickets';
 import { VaultWatcher } from './src/sync/VaultWatcher';
 import type { Kind } from './src/sync/VaultPort';
@@ -623,7 +626,81 @@ class SyncRuntime {
         tooltip: pending > 0 ? `${pending} file(s) waiting to upload` : 'Reconciling the vault',
       };
     }
-    return { text: 'ShadowLink: synced', tooltip: `Sharing ${this.shareRoot}` };
+    // §7.3. The wording is in `syncedStatus` rather than inline here because it is
+    // the one string in this plugin that is load-bearing: the tree can agree on
+    // every peer that a path holds hash H while exactly one peer has the bytes, so
+    // a bare "synced" beside twelve undownloaded attachments is false — and false
+    // in the direction that stops the user looking for the file.
+    return syncedStatus(this.shareRoot, this.reconciler.deferredAttachments);
+  }
+
+  // ---------------------------------------------------------- §7.3 downloads
+
+  /** Every attachment the last pass decided not to fetch, for the commands and the UI. */
+  get deferredAttachments(): readonly DeferredAttachment[] {
+    return this.reconciler.deferredAttachments;
+  }
+
+  /**
+   * §7.3's one mechanism, behind all three commands and the embed button:
+   * `fetchApproved[id] = true`, then a pass.
+   *
+   * Approval is PERSISTED before the pass runs, deliberately. It survives a
+   * reconciler that refuses this pass, a network that is down right now and a
+   * restart in between — "I want this file" is a decision the user made once, and
+   * making them make it again because a fetch failed is how a download button
+   * becomes something people press five times.
+   *
+   * Nothing here fetches anything itself. The pass owns every rule about what may
+   * be written where, and a command that reached around it would be a second
+   * writer with none of them.
+   */
+  async downloadAttachments(ids: readonly string[]): Promise<void> {
+    if (ids.length === 0) {
+      new Notice('ShadowLink: nothing to download — every attachment here is up to date.');
+      return;
+    }
+    for (const id of ids) this.state.data.fetchApproved[id] = true;
+    await this.state.flush();
+    await this.reconciler.reconcile('sync');
+
+    // Report against what is STILL deferred rather than against what was asked
+    // for: the memory cap outranks an approval (§7.4), so "download" and "arrived"
+    // are genuinely different numbers on a phone, and claiming otherwise would be
+    // the same lie the status bar just stopped telling.
+    const stuck = new Set(this.reconciler.deferredAttachments.map((d) => d.id));
+    const done = ids.filter((id) => !stuck.has(id)).length;
+    new Notice(
+      done === ids.length
+        ? `ShadowLink downloaded ${done} attachment(s).`
+        : `ShadowLink downloaded ${done} of ${ids.length} attachment(s); the rest could not `
+          + 'be fetched yet. See the status bar for what is still outstanding.',
+    );
+  }
+
+  /**
+   * §7.3's "download attachments in this note".
+   *
+   * The links come from Obsidian's own metadata cache, which lists an embed whether
+   * or not it resolves — and for a deferred attachment it never resolves, because
+   * there is deliberately nothing on disk to resolve to. That is why the match runs
+   * against the reconciler's list of paths rather than against a `TFile`.
+   */
+  deferredInNote(path: string): DeferredAttachment[] {
+    const file = this.plugin.app.vault.getFileByPath(path);
+    if (file === null) return [];
+    const cache = this.plugin.app.metadataCache.getFileCache(file);
+    const entries = this.reconciler.deferredAttachments;
+    const out = new Map<string, DeferredAttachment>();
+    for (const embed of cache?.embeds ?? []) {
+      const hit = matchDeferred(embed.link, path, entries);
+      if (hit !== null) out.set(hit.id, hit);
+    }
+    for (const link of cache?.links ?? []) {
+      const hit = matchDeferred(link.link, path, entries);
+      if (hit !== null) out.set(hit.id, hit);
+    }
+    return [...out.values()];
   }
 
   // ---------------------------------------------------------- reconcile driver
@@ -786,6 +863,36 @@ export default class ShadowLinkPlugin extends Plugin {
       callback: () => { void this.resolveKeptFiles(); },
     });
 
+    // §7.3's three ways to ask for a deferred attachment. All three are the same
+    // mechanism — `fetchApproved[id] = true`, then a pass — and they exist as
+    // three because "the picture in front of me", "everything" and "these ones"
+    // are three genuinely different questions, and only offering the middle one
+    // makes the answer to the first "download 3 GB".
+    this.addCommand({
+      id: 'download-attachments-in-note',
+      name: 'Download attachments in this note',
+      callback: () => { void this.downloadInActiveNote(); },
+    });
+    this.addCommand({
+      id: 'download-all-attachments',
+      name: 'Download all attachments',
+      callback: () => { void this.downloadAllAttachments(); },
+    });
+    this.addCommand({
+      id: 'download-attachments',
+      name: 'Download attachments',
+      callback: () => { void this.chooseAttachmentsToDownload(); },
+    });
+
+    // §7.3's embed button. Registered ONCE, in `onload`, for the same reason the
+    // editor extension is: it has to outlive any single runtime, and it reads the
+    // runtime through a closure so a share that starts later still gets it. With
+    // no runtime it finds nothing deferred and does nothing at all.
+    this.registerMarkdownPostProcessor(deferredEmbedProcessor({
+      deferred: () => this.runtime?.deferredAttachments ?? [],
+      download: (id) => { void this.downloadAttachments([id]); },
+    }));
+
     this.statusEl = this.addStatusBarItem();
     this.setStatus('ShadowLink: starting…', 'ShadowLink is waiting for the workspace to load.');
 
@@ -873,6 +980,75 @@ export default class ShadowLinkPlugin extends Plugin {
       console.error('[ShadowLink] resolving kept files failed', err);
       new Notice('ShadowLink could not finish sharing those files. See the console.');
     }
+  }
+
+  // ---------------------------------------------------------- §7.3
+
+  /** The active note's unresolved attachment embeds — the picture in front of you. */
+  private async downloadInActiveNote(): Promise<void> {
+    const runtime = this.runtime;
+    if (runtime === null) return this.notRunning();
+    const file = this.app.workspace.getActiveFile();
+    if (file === null) {
+      new Notice('ShadowLink: open a note first.');
+      return;
+    }
+    const wanted = runtime.deferredInNote(file.path);
+    if (wanted.length === 0) {
+      new Notice('ShadowLink: every attachment in this note is already downloaded.');
+      return;
+    }
+    await this.downloadAttachments(wanted.map((d) => d.id));
+  }
+
+  /**
+   * Everything, sizes and all.
+   *
+   * The total goes in the Notice rather than in a confirmation dialog: this command
+   * only exists because the user went looking for it, and asking "are you sure" after
+   * somebody typed the words "download all attachments" is a dialog that teaches
+   * people to dismiss dialogs.
+   */
+  private async downloadAllAttachments(): Promise<void> {
+    const runtime = this.runtime;
+    if (runtime === null) return this.notRunning();
+    const entries = runtime.deferredAttachments;
+    if (entries.length === 0) {
+      new Notice('ShadowLink: every attachment in this workspace is already downloaded.');
+      return;
+    }
+    const bytes = entries.reduce((sum, d) => sum + d.bytes, 0);
+    new Notice(`ShadowLink is downloading ${entries.length} attachment(s) (${formatBytes(bytes)})…`);
+    await this.downloadAttachments(entries.map((d) => d.id));
+  }
+
+  /** The per-item list: names, sizes, and a toggle each. */
+  private async chooseAttachmentsToDownload(): Promise<void> {
+    const runtime = this.runtime;
+    if (runtime === null) return this.notRunning();
+    const entries = runtime.deferredAttachments;
+    if (entries.length === 0) {
+      new Notice('ShadowLink: every attachment in this workspace is already downloaded.');
+      return;
+    }
+    const chosen = await chooseAttachments(this.app, entries);
+    if (chosen.length === 0) return;                       // dismissing downloads nothing
+    await this.downloadAttachments(chosen);
+  }
+
+  private async downloadAttachments(ids: readonly string[]): Promise<void> {
+    const runtime = this.runtime;
+    if (runtime === null) return this.notRunning();
+    try {
+      await runtime.downloadAttachments(ids);
+    } catch (err) {
+      console.error('[ShadowLink] downloading attachments failed', err);
+      new Notice('ShadowLink could not download those attachments. See the console.');
+    }
+  }
+
+  private notRunning(): void {
+    new Notice('ShadowLink is not running in this vault. Check its settings and reload it.');
   }
 
   // ---------------------------------------------------------- status bar

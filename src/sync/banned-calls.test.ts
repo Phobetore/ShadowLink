@@ -266,6 +266,9 @@ const VAULT_SHAPED = new Set(['vault', 'vaults', 'adapter', 'dataadapter', 'v', 
  *   this.open, this.liveHandles, this.listeners, this.waiters,
  *   this.subscribers, this.decisionPending, this.selected   Sets
  *   this.objects        FakeBlobs' in-memory content-addressed store
+ *   node.classList      a DOMTokenList on a rendered markdown element — the
+ *                       post-processor's own output, which exists only in a
+ *                       preview pane and has no path, no file and no disk
  */
 const IN_MEMORY: Record<string, string[]> = {
   'src/sync/Deletions.ts': ['ctx.disk'],
@@ -280,6 +283,7 @@ const IN_MEMORY: Record<string, string[]> = {
   'src/sync/fakes.ts': ['this.open', 'this.entries', 'this.byFold', 'this.liveHandles', 'this.objects'],
   'src/tree/TreeDoc.ts': ['m', 'this.subscribers'],
   'src/tree/TreeIndex.ts': ['derivedPath'],
+  'src/ui/DeferredEmbeds.ts': ['node.classList'],
   'src/ui/modals.ts': ['this.selected'],
 };
 

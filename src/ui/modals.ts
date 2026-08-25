@@ -26,24 +26,11 @@ import { App, Modal, Setting } from 'obsidian';
 import type { BootstrapConfirmation, BootstrapDecision } from '../sync/Bootstrap.ts';
 import type { BulkChoice, BulkSummary } from '../sync/Deletions.ts';
 import type { KeptEntry } from '../sync/KeptFiles.ts';
+import type { DeferredAttachment } from '../sync/Reconciler.ts';
+import { formatBytes as sizeOf } from './format.ts';
 
 /** Longest list any of these dialogs renders inline before it summarizes. */
 const MAX_LISTED = 8;
-
-/**
- * Bytes as a size a human reads, for the dialogs that have to make "a lot"
- * concrete.
- *
- * "3 files" and "3 files (218 MB)" are different questions, and only the second
- * one can actually be answered.
- */
-function sizeOf(bytes: number): string {
-  const mb = bytes / (1024 * 1024);
-  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
-  if (mb >= 10) return `${Math.round(mb)} MB`;
-  if (mb >= 0.1) return `${mb.toFixed(1)} MB`;
-  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-}
 
 abstract class DecisionModal<T> extends Modal {
   /** Resolves exactly once, with the safe answer if the user never chose. */
@@ -389,4 +376,65 @@ export function chooseKeptFiles(
   entries: readonly KeptEntry[],
 ): Promise<KeptEntry[]> {
   return new KeptFilesModal(app, entries).ask();
+}
+
+// ============================================================ §7.3
+
+/**
+ * Everything this device decided not to download, with a Download for each.
+ *
+ * The sixth dialog, and the second that is not a refusal to act. Its safe answer
+ * is DOWNLOAD NOTHING, for the ordinary reason: the state it is showing — a file
+ * in the workspace that is not on this disk — costs the user nothing to stay in,
+ * and every entry in it is a size somebody may not want to spend.
+ *
+ * The sizes are the whole point of listing them at all. "12 attachments are not
+ * downloaded" is a fact; "12 attachments, 340 MB, here they are" is a decision.
+ */
+class DeferredAttachmentsModal extends DecisionModal<string[]> {
+  private readonly selected = new Set<string>();
+
+  constructor(app: App, private readonly entries: readonly DeferredAttachment[]) {
+    super(app, []);
+  }
+
+  override onOpen(): void {
+    const { contentEl, titleEl, entries } = this;
+    titleEl.setText('ShadowLink — attachments not downloaded');
+
+    const total = entries.reduce((sum, e) => sum + e.bytes, 0);
+    contentEl.createEl('p', {
+      text: `${entries.length} attachment(s) (${sizeOf(total)}) are in this workspace but not `
+        + 'on this device. They still belong to the shared folder — nothing is missing '
+        + 'for anybody else, and nothing has been deleted.',
+    });
+
+    for (const entry of entries) {
+      new Setting(contentEl)
+        .setName(entry.path)
+        .setDesc(sizeOf(entry.bytes))
+        .addToggle((t) => t
+          .setValue(false)
+          .onChange((v) => {
+            if (v) this.selected.add(entry.id);
+            else this.selected.delete(entry.id);
+          }));
+    }
+
+    new Setting(contentEl)
+      .addButton((b) => b
+        .setButtonText('Not now')
+        .setCta()
+        .onClick(() => { this.choose([]); }))
+      .addButton((b) => b
+        .setButtonText('Download selected')
+        .onClick(() => { this.choose([...this.selected]); }));
+  }
+}
+
+export function chooseAttachments(
+  app: App,
+  entries: readonly DeferredAttachment[],
+): Promise<string[]> {
+  return new DeferredAttachmentsModal(app, entries).ask();
 }
