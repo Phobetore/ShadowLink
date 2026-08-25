@@ -22,6 +22,15 @@
 // round trip, because a node whose `s` is set is never offered for publication
 // again by anybody — a premature `s` is permanent content loss, not a retry.
 //
+// I6 — AN EMPTY DOCUMENT IS NOT CONTENT. A flush of an empty doc round-trips
+// perfectly and confirms nothing, and `s` is the whole definition of "published"
+// for a note, so setting it there makes every peer materialize a 0-BYTE FILE on
+// the canonical path — which looks correct, gets deleted by hand, and the hand
+// deletion is a tombstone that propagates. Obsidian's "New note" is a 0-byte file,
+// so this is the ordinary state of every note until its author types. Refusing to
+// publish it is not refusing to have it: the node stays, peers list it as pending,
+// and the entry stays queued for the drain after its first byte lands.
+//
 // P2 adds a second arm, `publishBlobOne` (spec §3.2), which publishes an
 // ATTACHMENT's bytes into the content-addressed store instead of a note's text
 // into a content doc. The same three invariants govern it, in a different shape:
@@ -349,11 +358,31 @@ export class PublishQueue {
         throw new RetryLater(`content doc n_${id} was not confirmed`);
       }
 
-      this.deps.tree.patchNode(id, { s: 1 });
       // Whatever is actually in the document is what this device has confirmed —
       // the local text when we seeded it, the remote text when a peer had already
       // published. Never the local copy in the second case.
       const published = remote.length === 0 ? text : remote;
+
+      // I6, and the same refusal the attachment arm already makes for a zero-byte
+      // file. A confirmed flush of an EMPTY document confirms nothing: `s` is the
+      // whole definition of "published" for a note, so setting it here tells every
+      // peer to materialize content that does not exist, and `Reconciler` obliges
+      // by writing a 0-byte file on the canonical path — the thing its own comment
+      // calls worse than no file, because it looks correct and gets deleted by
+      // hand. That hand deletion is a tombstone, and it propagates to everybody,
+      // the author included.
+      //
+      // Obsidian's "New note" IS a 0-byte file, so an empty note is the ordinary
+      // state of every note for as long as it takes its author to start typing.
+      // This refuses to PUBLISH one, not to have one: the node stays in the tree
+      // under its own name, peers list it as pending, and the entry left `pending`
+      // here publishes it on the next drain after its first byte lands. Refusing
+      // is not failing, so no rung of the ladder is charged and nothing is said to
+      // the user about a note they are still writing.
+      if (published.length === 0) return;
+
+      this.deps.tree.patchNode(id, { s: 1 });
+
       data.contentHash[id] = { sha256: await hashOf(published), len: published.length };
       data.publish[id] = { state: 'done', attempts: 0, nextAt: 0 };
       this.errors.delete(id);
