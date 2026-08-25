@@ -455,6 +455,37 @@ export class Reconciler {
    */
   private sessionFetchedBytes = 0;
   /**
+   * §3.5: a local hash is computed once per CHANGE, not once per PASS.
+   *
+   * `contentHash` cannot be this record. It is I17's BASE — what this device
+   * confirmed is simultaneously on disk AND named by the tree — and it must not
+   * advance until a publish confirms. One record doing both jobs would flip
+   * `replaceVerdict` from `republish` to `fork` and rename the user's file.
+   *
+   * So a second, weaker record: what this SESSION last computed for a file,
+   * trusted on the same two-clause `(len, mtime)` oracle the staleness check
+   * already uses. Without it, any node that cannot converge — for any reason at
+   * all — re-reads and re-hashes its whole file on every pass, for as long as the
+   * condition lasts. Four entrances, all measured, none of them an error: a
+   * publish refused by the server's ceiling, a publish waiting out a backoff rung,
+   * a publish deferred by I7's open-leaf check, and an `adoptBlob` whose incoming
+   * version is merely over the auto-fetch ceiling.
+   *
+   * IN MEMORY ONLY, never persisted and never exported. A restart re-derives
+   * everything from the disk and the tree, which is what keeps I8 literally true
+   * and what stops this cache from rotting: its window is strictly shorter than
+   * the one `contentHash` already trusts.
+   *
+   * IT SUBSTITUTES FOR THE HASH AND NEVER FOR THE VERDICT. Every caller runs the
+   * identical code path with an identical `local`; no caller branches on where
+   * the hash came from and nothing returns early on a hit.
+   * `replaceVerdict(local, ref, base)` takes the INCOMING reference as an input,
+   * so a hit that skipped the switch would strand this device on its own version
+   * for ever — the thing that changed is not the thing this remembers. It may
+   * change what a pass COSTS; it may never change what a pass WRITES.
+   */
+  private localHashes = new Map<string, { len: number; mtime: number; sha256: string }>();
+  /**
    * What the last completed pass decided not to fetch (§7.3).
    *
    * The status bar, the download commands and the markdown post-processor all
@@ -1061,6 +1092,14 @@ export class Reconciler {
    * same derivation as `desired`), so this loop never re-asks what a node is.
    */
   private async reconcileBlobBytes(ctx: PassContext): Promise<void> {
+    // §3.5's memo, swept once per pass so it cannot grow without bound over a long
+    // session. Pruned to `blobRefs` and NEVER to `have`: `have` excludes every
+    // unbound node, which is precisely the `adoptBlob` entrance the memo exists to
+    // close, and pruning to it would evict the entry on the pass that wrote it.
+    for (const id of this.localHashes.keys()) {
+      if (!ctx.blobRefs.has(id)) this.localHashes.delete(id);
+    }
+
     const budget: RehashBudget = { remaining: this.rehashBudgetBytes(), spent: 0 };
 
     for (const id of [...ctx.blobRefs.keys()].sort(cmp)) {
@@ -1089,7 +1128,7 @@ export class Reconciler {
           && base.len === st.bytes;
         const local = fresh
           ? base.sha256
-          : await this.hashWithBudget(ctx, id, path, st.bytes, budget);
+          : await this.hashWithBudget(ctx, id, path, st, budget);
         // Refused by the cap or the budget. NEVER "assume converged": the whole
         // point of refusing is that this device does not know what is on disk.
         if (local === null) return;
@@ -1131,15 +1170,23 @@ export class Reconciler {
    * user just saved that file, and answering "not this pass" for the one change
    * they made is the wrong trade. The charge is still taken, so one huge save
    * cannot also drag the rest of the share through the same pass.
+   *
+   * MEMO, THEN CAP, THEN BUDGET, THEN READ. The memo is consulted first because a
+   * hit allocates nothing at all, so neither ceiling has anything left to refuse:
+   * both of them exist to stop this device holding a whole file in memory, and a
+   * remembered hash never does. A miss falls through to exactly the code that was
+   * here before, and the read that follows it feeds the memo.
    */
   private async hashWithBudget(
     ctx: PassContext,
     id: string,
     path: string,
-    bytes: number,
+    st: { bytes: number; mtime: number },
     budget: RehashBudget,
   ): Promise<string | null> {
-    if (bytes > this.memoryCapBytes()) {
+    const memo = this.memoHit(id, st);
+    if (memo !== null) return memo;
+    if (st.bytes > this.memoryCapBytes()) {
       ctx.diagnostics.tooLarge.push(id);
       return null;
     }
@@ -1147,18 +1194,38 @@ export class Reconciler {
     // `spent > 0` keeps the first hash of every pass permitted however large it
     // is, so a share whose smallest attachment exceeds the budget still converges
     // instead of deferring the same node for ever.
-    if (!urgent && budget.spent > 0 && bytes > budget.remaining) {
+    if (!urgent && budget.spent > 0 && st.bytes > budget.remaining) {
       ctx.diagnostics.rehashDeferred.push(id);
       return null;
     }
-    budget.spent += bytes;
-    budget.remaining -= bytes;
-    return await hashOfBytes(await this.deps.vault.readBinary(path));
+    budget.spent += st.bytes;
+    budget.remaining -= st.bytes;
+    const sha256 = await hashOfBytes(await this.deps.vault.readBinary(path));
+    this.memoPut(id, st, sha256);
+    return sha256;
   }
 
   /** How many bytes this pass may re-hash before it starts deferring (§3.5). */
   private rehashBudgetBytes(): number {
     return this.deps.rehashBudgetBytes?.() ?? REHASH_BUDGET_BYTES;
+  }
+
+  /**
+   * What this session already computed for this node's file, or null.
+   *
+   * The oracle is the staleness check's, both clauses included: size alone misses
+   * every same-size edit, and a length alone would be trusted for ever. A miss is
+   * "I do not know", never "it is unchanged" — the only thing a hit is allowed to
+   * skip is the read and the digest.
+   */
+  private memoHit(id: string, st: { bytes: number; mtime: number }): string | null {
+    const m = this.localHashes.get(id);
+    return m !== undefined && m.len === st.bytes && m.mtime === st.mtime ? m.sha256 : null;
+  }
+
+  /** Remember a hash this session computed, against the file it was computed from. */
+  private memoPut(id: string, st: { bytes: number; mtime: number }, sha256: string): void {
+    this.localHashes.set(id, { len: st.bytes, mtime: st.mtime, sha256 });
   }
 
   // ---------------------------------------------------------- step 3
@@ -1576,15 +1643,27 @@ export class Reconciler {
       const st = await this.deps.vault.stat(path);
       if (st === null) return;
 
-      // §7.4. Hashing needs the whole file in memory. A file this device cannot
-      // hash is one it cannot decide anything about, so it decides nothing: no
-      // binding (which would claim bytes we never compared), and no fork.
-      if (st.bytes > this.memoryCapBytes()) {
-        ctx.diagnostics.tooLarge.push(id);
-        return;
+      // §3.5's memo, and this is the entrance it exists for. An incoming version
+      // merely over the auto-fetch ceiling leaves this node unbound for as long as
+      // the ceiling stands, and `adoptBlob` re-reads and re-hashes the whole local
+      // file on every pass to reach the same "not yet". It has its own cap check
+      // and its own read rather than going through `hashWithBudget`, so a memo
+      // wired only into that would miss the widest churn entrance in the pass.
+      //
+      // A hit skips the read and the digest and NOTHING ELSE: everything from the
+      // comparison below runs exactly as it did, against exactly the same `local`.
+      let local = this.memoHit(id, st);
+      if (local === null) {
+        // §7.4. Hashing needs the whole file in memory. A file this device cannot
+        // hash is one it cannot decide anything about, so it decides nothing: no
+        // binding (which would claim bytes we never compared), and no fork.
+        if (st.bytes > this.memoryCapBytes()) {
+          ctx.diagnostics.tooLarge.push(id);
+          return;
+        }
+        local = await hashOfBytes(await this.deps.vault.readBinary(path));
+        this.memoPut(id, st, local);
       }
-
-      const local = await hashOfBytes(await this.deps.vault.readBinary(path));
       if (local === ref.sha256) {
         // Converged before the pass even started: the file the user has IS the
         // file the workspace names. Binding is the entire job.

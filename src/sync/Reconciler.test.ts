@@ -3847,3 +3847,348 @@ test('B33: the concurrent case converges identically whichever peer reconciles f
   assert.deepEqual(shareBytes(first.ann.vault), shareBytes(first.bob.vault));
   assert.deepEqual(shareBytes(second.ann.vault), shareBytes(second.bob.vault));
 });
+
+// ------------------------------------------- P2 §3.5: the per-session hash memo
+//
+// A local hash is computed once per CHANGE, not once per PASS. Everything below
+// is about the gap between those two sentences, which is where the plugin spent
+// a whole file read and a whole SHA-256 per attachment per pass, for as long as
+// anything failed to converge — and four ordinary situations fail to converge
+// indefinitely with no error anywhere.
+//
+// The memo's contract, which every test here is a reading of:
+//
+//   IT SUBSTITUTES FOR THE HASH AND FOR NOTHING ELSE. No caller branches on
+//   whether the hash came from the memo, and nothing returns early on a hit. It
+//   may change what a pass COSTS; it may never change what a pass WRITES.
+
+/** The four measured churn entrances, minus the two that need an injected fault. */
+interface ChurnWorld {
+  /** Bound and published, edited locally, requeued for ever because nothing publishes. */
+  churn: string;
+  /** Published, UNBOUND, local bytes differ, incoming version over the fetch ceiling. */
+  adopt: string;
+  /** Converged and confirmed: the control that must stay one stat and no read. */
+  quiet: string;
+  churnPath: string;
+  adoptPath: string;
+  edited: Uint8Array;
+  editedSha: string;
+  baseSha: string;
+  /** What a collaborator publishes partway through: new, smaller, fetchable. */
+  peer: Uint8Array;
+  peerSha: string;
+}
+
+/**
+ * One vault holding three attachments in three states, none of them an error.
+ *
+ * Default constants, default server limits, no injected failure and no network
+ * fault anywhere: the churn below is what a perfectly healthy share does.
+ */
+async function seedChurnWorld(h: Harness): Promise<ChurnWorld> {
+  h.vault.seed(SHARE, 'd');
+
+  // ENTRANCE A. The user edited a published attachment. §3.5 rule 2 requeues the
+  // publish on every pass, and the base deliberately does not advance until the
+  // publish confirms (I17) — so while the publish is refused, on a backoff rung,
+  // or deferred by I7's open-leaf check, this node re-hashes for ever.
+  const original = png(1, 64);
+  const baseSha = await h.blobs.seed(original);
+  const churn = nid('A');
+  const churnPath = await bindBlob(h, churn, 'churn.png', original, {
+    sha256: baseSha, bytes: original.length, parent: null,
+  }, { sha256: baseSha, len: original.length });
+  const edited = png(2, 96);
+  h.vault.seedBinary(churnPath, edited);
+
+  // ENTRANCE D, and the widest one. Nothing is bound here, so `ctx.have` does not
+  // know this node — which is why a memo pruned to `ctx.have` would close every
+  // entrance except this one. The incoming version is merely over the auto-fetch
+  // ceiling; `adoptBlob` hashes the local file, cannot fork without fetching, and
+  // decides nothing. Next pass, same again.
+  const theirs = png(3, 512);
+  const theirsSha = await h.blobs.seed(theirs);
+  const adopt = nid('B');
+  const adoptPath = `${SHARE}/adopt.png`;
+  h.nodes.set(adopt, blob('', 'adopt.png', `${theirsSha}:${theirs.length}:-`));
+  h.vault.seedBinary(adoptPath, png(4, 200));
+
+  // The control. Converged and confirmed, so the `(len, mtime)` oracle already
+  // answers it and the memo must not change its cost either way.
+  const still = png(5, 64);
+  const stillSha = await h.blobs.seed(still);
+  const quiet = nid('C');
+  await bindBlob(h, quiet, 'quiet.png', still, {
+    sha256: stillSha, bytes: still.length, parent: null,
+  }, { sha256: stillSha, len: still.length });
+
+  const peer = png(6, 64);
+  const peerSha = await h.blobs.seed(peer);
+  return {
+    churn, adopt, quiet, churnPath, adoptPath,
+    edited, editedSha: await hashOfBytes(edited), baseSha, peer, peerSha,
+  };
+}
+
+/** A harness wired the way every test in this section wants it. */
+function churnHarness(requeued: Requeued[]): Harness {
+  return makeHarness({
+    // Low enough that the unbound node's 512-byte incoming version is held back,
+    // high enough that the 64-byte one a collaborator publishes later is fetched.
+    autofetchMaxBytes: () => 100,
+    // A spy, so the requeue is observed and the publish never confirms — which is
+    // exactly the state a refused publish, a backoff rung and an open leaf leave.
+    requeuePublish: (id, intent) => { requeued.push({ id, intent }); },
+  });
+}
+
+/**
+ * ⚠ TEST 0, and the strongest guard on the memo: it changes what a pass COSTS and
+ * never what a pass WRITES.
+ *
+ * Two identical worlds, five identical passes, and the same external events at
+ * the same pass index. `warm` keeps one reconciler, so the memo survives between
+ * passes; `cold` builds a new one before each pass, so every hash is computed
+ * from the file. If the two ever disagree about device state or about the bytes
+ * on disk, the memo has started substituting for a VERDICT rather than for a
+ * hash — and the verdict it would be substituting for is `replaceVerdict`, whose
+ * `fork` arm renames the user's file.
+ *
+ * This is also why the memo may not be keyed on, or short-circuit around, the
+ * incoming reference: pass 3 changes it under both worlds.
+ */
+test('the hash memo changes what a pass costs and never what it writes', async () => {
+  const warmRequeued: Requeued[] = [];
+  const coldRequeued: Requeued[] = [];
+  const warm = churnHarness(warmRequeued);
+  const cold = churnHarness(coldRequeued);
+  const wa = await seedChurnWorld(warm);
+  const wb = await seedChurnWorld(cold);
+
+  let warmReads = 0;
+  let coldReads = 0;
+  for (let pass = 0; pass < 5; pass++) {
+    // The same collaborator publish, at the same moment, in both worlds.
+    if (pass === 2) {
+      warm.nodes.set(wa.churn, blob('', 'churn.png', `${wa.peerSha}:${wa.peer.length}:${wa.baseSha}`));
+      cold.nodes.set(wb.churn, blob('', 'churn.png', `${wb.peerSha}:${wb.peer.length}:${wb.baseSha}`));
+    }
+    warm.vault.resetCalls();
+    cold.vault.resetCalls();
+    const ra = await warm.reconciler.reconcile('sync');
+    const rb = await freshSession(cold, {
+      autofetchMaxBytes: () => 100,
+      requeuePublish: (id, intent) => { coldRequeued.push({ id, intent }); },
+    }).reconcile('sync');
+    // Trap: a pass that REFUSED reports zero of everything, which is
+    // indistinguishable from "no churn" if nobody looks.
+    assert.equal(ra.ran, true, `warm pass ${pass} did not run: ${ra.refusedReason}`);
+    assert.equal(rb.ran, true, `cold pass ${pass} did not run: ${rb.refusedReason}`);
+    assert.deepEqual(ra.failures, [], `warm pass ${pass}`);
+    assert.deepEqual(rb.failures, [], `cold pass ${pass}`);
+    warmReads += warm.vault.callsTo('readBinary').length;
+    coldReads += cold.vault.callsTo('readBinary').length;
+  }
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(warm.state.data)),
+    JSON.parse(JSON.stringify(cold.state.data)),
+    'the memo changed what the pass RECORDED, which is a bug that renames files',
+  );
+  assert.deepEqual(
+    warm.vault.binarySnapshot(), cold.vault.binarySnapshot(),
+    'and the bytes on disk must be identical, forks and all',
+  );
+  assert.deepEqual(warmRequeued, coldRequeued, 'and the same publishes were asked for');
+  assert.deepEqual(warm.notices, cold.notices);
+  assert.ok(
+    warmReads < coldReads,
+    `the memo saved nothing: ${warmReads} reads warm against ${coldReads} cold`,
+  );
+});
+
+/**
+ * ⚠ TEST 1 — churn entrance A, alone and counted: the republish that never
+ * confirms.
+ *
+ * The memo is a CACHE, not a suppressor. The requeue must still happen on every
+ * pass — §3.5 rule 2 says so, and the publish ladder relies on it — and the base
+ * must NOT advance, because `contentHash` is I17's base and advancing it to a
+ * local hash flips `replaceVerdict` from `republish` to `fork`.
+ */
+test('a publish that never confirms hashes its file once, not once per pass', async () => {
+  const requeued: Requeued[] = [];
+  const h = churnHarness(requeued);
+  const w = await seedChurnWorld(h);
+
+  const reads: number[] = [];
+  for (let pass = 0; pass < 5; pass++) {
+    h.vault.resetCalls();
+    const r = await h.reconciler.reconcile('sync');
+    assert.equal(r.ran, true, `pass ${pass} did not run: ${r.refusedReason}`);
+    assert.deepEqual(r.failures, [], `pass ${pass}`);
+    reads.push(h.vault.callsTo('readBinary').length);
+  }
+
+  assert.deepEqual(
+    reads.map((n) => n > 0), [true, false, false, false, false],
+    'the file is read on the pass that first sees the change, and never again',
+  );
+  assert.deepEqual(
+    requeued.filter((q) => q.id === w.churn),
+    Array.from({ length: 5 }, () => ({ id: w.churn, intent: w.editedSha })),
+    'and the requeue still happens every pass: this is a cache, not a suppressor',
+  );
+  assert.deepEqual(
+    h.state.data.contentHash[w.churn],
+    { sha256: w.baseSha, len: 64, mtime: h.state.data.contentHash[w.churn]!.mtime },
+    'the base still names what is simultaneously on disk and in the tree (I17)',
+  );
+  assert.deepEqual(
+    h.vault.binarySnapshot()[w.churnPath], w.edited,
+    'and the file the user edited is exactly as they left it',
+  );
+});
+
+/**
+ * ⚠ TEST 2 — churn entrance D: the `adoptBlob` that never binds.
+ *
+ * The widest entrance, and the one a memo wired only into `hashWithBudget` misses
+ * entirely: `adoptBlob` has its own cap check and its own inline read. It is also
+ * the reason the memo is pruned to `ctx.blobRefs` and never to `ctx.have` — this
+ * node is not in `ctx.have`, because nothing is bound to it.
+ *
+ * Default memory cap, default server limits, no `setLimits`, no publish, no
+ * injected failure. Nothing here is broken; this is what a healthy share does.
+ */
+test('an adopt that cannot fork hashes its file once, not once per pass', async () => {
+  const requeued: Requeued[] = [];
+  const h = churnHarness(requeued);
+  const w = await seedChurnWorld(h);
+
+  const reads: number[] = [];
+  for (let pass = 0; pass < 5; pass++) {
+    h.vault.resetCalls();
+    const r = await h.reconciler.reconcile('sync');
+    assert.equal(r.ran, true, `pass ${pass} did not run: ${r.refusedReason}`);
+    assert.deepEqual(r.failures, [], `pass ${pass}`);
+    reads.push(h.vault.callsTo('readBinary').length);
+    assert.ok(
+      r.diagnostics.deferred.includes(w.adopt),
+      `pass ${pass} forgot the outstanding download — the memo must not silence the status bar`,
+    );
+  }
+
+  assert.deepEqual(
+    reads, [2, 0, 0, 0, 0],
+    'two files read on the first pass — the edited one and this one — and nothing after',
+  );
+  assert.equal(h.state.data.materialized[w.adopt], undefined, 'still unbound: nothing was claimed');
+  assert.equal(h.state.data.contentHash[w.adopt], undefined, 'and no base was invented');
+  assert.equal(mutations(h.vault), 0, 'and adopting decided nothing, so it wrote nothing');
+});
+
+/**
+ * ⚠ TEST 3 — the memo never skips a verdict. Write this one first.
+ *
+ * `replaceVerdict(local, ref, base)` takes the INCOMING reference as an input. A
+ * record keyed on the local file that returned early on a hit would strand this
+ * device on its own version for ever, because the thing that changed is not the
+ * thing the memo remembers.
+ */
+test('a warm memo still reaches the verdict when the collaborator publishes', async () => {
+  const requeued: Requeued[] = [];
+  const h = churnHarness(requeued);
+  const w = await seedChurnWorld(h);
+
+  // Warm: two quiet passes with the file untouched.
+  await h.reconciler.reconcile('sync');
+  h.vault.resetCalls();
+  await h.reconciler.reconcile('sync');
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'the memo really is warm');
+
+  // A collaborator replaces it with a new, smaller, fetchable version. The local
+  // file does not change at all, so nothing the memo remembers is any different.
+  h.nodes.set(w.churn, blob('', 'churn.png', `${w.peerSha}:${w.peer.length}:${w.baseSha}`));
+  h.vault.resetCalls();
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(r.failures, []);
+  const disk = h.vault.binarySnapshot();
+  assert.deepEqual(disk[w.churnPath], w.peer, "the collaborator's version is at the canonical path");
+  const forked = Object.keys(disk).filter(
+    (p) => p.startsWith(`${SHARE}/`) && p.includes('churn') && p !== w.churnPath,
+  );
+  assert.equal(forked.length, 1, 'and the user\'s bytes survive under a fork name');
+  assert.deepEqual(disk[forked[0]], w.edited);
+  assert.deepEqual(stashed(h.vault), {}, 'nothing was exiled to ShadowLink Recovered/');
+  assert.equal(h.state.data.contentHash[w.churn]?.sha256, w.peerSha, 'the base advanced (I17)');
+});
+
+/**
+ * ⚠ TEST 4 — the memo dies on a change.
+ *
+ * Its trust is the same two-clause `(len, mtime)` oracle the staleness check
+ * already uses, over a strictly shorter window: it lives in memory only, so a
+ * restart re-derives everything from the disk and the tree.
+ */
+test('a warm memo is dropped the moment the file changes, and the new bytes are hashed', async () => {
+  const requeued: Requeued[] = [];
+  const h = churnHarness(requeued);
+  const w = await seedChurnWorld(h);
+
+  await h.reconciler.reconcile('sync');
+  h.vault.resetCalls();
+  await h.reconciler.reconcile('sync');
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'the memo really is warm');
+
+  const again = png(7, 128);
+  h.vault.seedBinary(w.churnPath, again);
+  requeued.length = 0;
+  h.vault.resetCalls();
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.equal(r.ran, true);
+  assert.deepEqual(r.failures, []);
+  assert.equal(h.vault.callsTo('readBinary').length, 1, 'exactly one file was re-read');
+  assert.deepEqual(
+    requeued.filter((q) => q.id === w.churn),
+    [{ id: w.churn, intent: await hashOfBytes(again) }],
+    'and the verdict was reached against the bytes that are actually there',
+  );
+});
+
+/**
+ * The memo is per-session, and this is what keeps it from rotting: a restart
+ * re-derives everything from the disk and the tree, which is what makes I8
+ * literally true. Nothing about it is persisted, so `DeviceState` cannot carry a
+ * hash nobody confirmed across a crash.
+ */
+test('the hash memo does not survive a restart, and no part of it is persisted', async () => {
+  const requeued: Requeued[] = [];
+  const h = churnHarness(requeued);
+  const w = await seedChurnWorld(h);
+
+  await h.reconciler.reconcile('sync');
+  h.vault.resetCalls();
+  await h.reconciler.reconcile('sync');
+  assert.equal(h.vault.callsTo('readBinary').length, 0);
+
+  const serialized = JSON.stringify(h.state.data);
+  assert.ok(!serialized.includes(w.editedSha), 'an unconfirmed local hash was persisted');
+
+  // A new session over the same vault, store, state and tree.
+  h.vault.resetCalls();
+  const restarted = await freshSession(h, {
+    autofetchMaxBytes: () => 100,
+    requeuePublish: (id, intent) => { requeued.push({ id, intent }); },
+  }).reconcile('sync');
+
+  assert.equal(restarted.ran, true);
+  assert.equal(
+    h.vault.callsTo('readBinary').length, 2,
+    'a restart looks at the files again rather than trusting a cache it cannot check',
+  );
+});

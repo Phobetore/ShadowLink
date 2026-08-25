@@ -288,6 +288,8 @@ const VAULT_SHAPED = new Set(['vault', 'vaults', 'adapter', 'dataadapter', 'v', 
  *   m / derivedPath     Y.Map and a derived Map
  *   this.open, this.liveHandles, this.listeners, this.waiters,
  *   this.subscribers, this.decisionPending, this.selected   Sets
+ *   this.localHashes    Map — the reconciler's per-session local-hash memo,
+ *                       swept once per pass to the ids the tree still names
  *   this.objects        FakeBlobs' in-memory content-addressed store
  *   node.classList      a DOMTokenList on a rendered markdown element — the
  *                       post-processor's own output, which exists only in a
@@ -299,7 +301,7 @@ const IN_MEMORY: Record<string, string[]> = {
   'src/sync/ObsidianDocPort.ts': ['this.live', 'this.rooms'],
   'src/sync/ProviderAck.ts': ['this.listeners'],
   'src/sync/PublishQueue.ts': ['this.errors'],
-  'src/sync/Reconciler.ts': ['ctx.disk', 'ctx.boundAtFold', 'ctx.have'],
+  'src/sync/Reconciler.ts': ['ctx.disk', 'ctx.boundAtFold', 'ctx.have', 'this.localHashes'],
   'src/sync/Tickets.ts': ['this.store'],
   'src/sync/VaultWatcher.ts': ['this.decisionPending'],
   'src/sync/WorkspaceSession.ts': ['this.waiters'],
