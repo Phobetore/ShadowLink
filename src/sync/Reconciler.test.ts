@@ -24,7 +24,9 @@ import { TreeDoc } from '../tree/TreeDoc.ts';
 import { Deletions, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import type { BlobPort } from './BlobPort.ts';
-import { DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import {
+  DESKTOP_MEMORY_CAP, DESKTOP_PASS_LIMITS, FakeBlobs, FakeDocs, FakeVault,
+} from './fakes.ts';
 import { PublishQueue } from './PublishQueue.ts';
 import { Reconciler, RetryLater, type ReconcilerDeps, type DeletionContext } from './Reconciler.ts';
 import { Tickets, type TicketOp } from './Tickets.ts';
@@ -154,6 +156,7 @@ function makeHarness(over: Partial<ReconcilerDeps> & { vaultPort?: VaultPort } =
   const notices: string[] = [];
 
   const reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: over.vaultPort ?? vault,
     docs,
     blobs,
@@ -423,6 +426,7 @@ test('27: a crash between stageOut and unstageAll loses nothing', async () => {
   const nodes = new Map<string, NodeFields>();
   const docs = new FakeDocs();
   const crashed = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: crashing, docs, blobs: new FakeBlobs(), state, tickets: new Tickets(() => NOW),
     shareRoot: SHARE, entries: () => [...nodes], now: () => NOW,
   });
@@ -450,6 +454,7 @@ test('27: a crash between stageOut and unstageAll loses nothing', async () => {
   assert.ok(restarted.data.staging[a], 'the replayable journal survived the restart');
 
   const recovered = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: inner, docs, blobs: new FakeBlobs(), state: restarted, tickets: new Tickets(() => NOW),
     shareRoot: SHARE, entries: () => [...nodes], now: () => NOW,
   });
@@ -1760,6 +1765,7 @@ test('bytes that arrive unverified are refused by the second check, and nothing 
   h.nodes.set(id, fields);
   const other = png(9);                                       // same length, other bytes
   h.reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: blobPortOf(h.blobs, { get: async () => other }),   // a port that verified nothing
@@ -1911,6 +1917,7 @@ test('the oversized and unavailable lists clear the moment they stop being true'
 
   // A bigger device, or the same one after the file shrank.
   h.reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: h.blobs,
@@ -2169,6 +2176,7 @@ test('an attachment round-trips: published on A, materialized byte-identically o
   vaultB.seed(SHARE, 'd');
   const stateB = new DeviceState(new MemoryStatePort(), 'device-B', 'ws-1', () => NOW, 0);
   const reconcilerB = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: vaultB,
     docs: new FakeDocs(),
     blobs: store,
@@ -2332,6 +2340,7 @@ test('B28: a cold start hashes at most the budget per pass and converges over se
 /** A reconciler over the SAME vault, store, state and tree: a restarted session. */
 function freshSession(h: Harness, over: Partial<ReconcilerDeps> = {}): Reconciler {
   return new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: h.blobs,
@@ -2933,6 +2942,7 @@ test('B11: a file opened DURING the fetch is not replaced', async () => {
   const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
 
   h.reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: blobPortOf(h.blobs, {
@@ -2988,6 +2998,7 @@ test('B12: bytes that changed during the fetch are not overwritten', async () =>
   const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
 
   h.reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: blobPortOf(h.blobs, {
@@ -3025,6 +3036,7 @@ test('B12: a same-size rewrite during the fetch is still not overwritten', async
   const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
 
   h.reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: blobPortOf(h.blobs, {
@@ -3112,6 +3124,7 @@ test('replacement bytes that arrive unverified are refused and nothing is swappe
   const other = png(9, 96);                        // same length, other bytes
 
   h.reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: blobPortOf(h.blobs, { get: async () => other }),
@@ -3389,6 +3402,7 @@ test('fork bytes that arrive unverified are refused and nothing moves', async ()
   }, { sha256: await hashOfBytes(mine), len: mine.length });
 
   h.reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: blobPortOf(h.blobs, { get: async () => png(9, 96) }),   // a port that verified nothing
@@ -3453,6 +3467,7 @@ async function forkWithInterference(
   }, { sha256: await hashOfBytes(mine), len: mine.length });
 
   h.reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: h.docs,
     blobs: blobPortOf(h.blobs, {
@@ -3645,6 +3660,7 @@ function makePeer(name: string, tree: TreeDoc, store: FakeBlobs): Peer {
   });
 
   const reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault,
     docs,
     blobs: store,

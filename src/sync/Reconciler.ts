@@ -24,8 +24,7 @@
 // No `obsidian` import, no node builtins.
 
 import {
-  AUTOFETCH_MAX_BYTES, AUTOFETCH_SESSION_BUDGET, BLOB_MAX_BYTES, RECOVERED_DIR,
-  REHASH_BUDGET_BYTES, STAGING_DIR,
+  RECOVERED_DIR, STAGING_DIR,
 } from '../tree/constants.ts';
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
@@ -249,23 +248,23 @@ export interface ReconcilerDeps {
    * The largest attachment this device will hold in memory (§7.4). Injected as a
    * plain number so nothing here has to know what platform it is running on.
    */
-  memoryCapBytes?: () => number;
+  memoryCapBytes: () => number;
   /**
    * How many bytes step 2.5 may re-hash in one pass (§3.5). Injected for the same
    * reason as the memory cap: the number is a platform fact, not an engine one.
    */
-  rehashBudgetBytes?: () => number;
+  rehashBudgetBytes: () => number;
   /**
    * §7.2's per-file auto-fetch ceiling. Above it an attachment is DEFERRED and
    * the deferral is persisted, so the user can ask for the file later.
    */
-  autofetchMaxBytes?: () => number;
+  autofetchMaxBytes: () => number;
   /**
    * §7.2's second gate: how many bytes this session fetches unattended, across
    * every attachment. A per-file ceiling alone is not enough — 4,000 files of one
    * megabyte each pass every per-file check and still eat a data plan.
    */
-  sessionBudgetBytes?: () => number;
+  sessionBudgetBytes: () => number;
   /**
    * Paths the modify handler has flagged since the last pass, folded, and TAKEN
    * (not copied): the pass owns the set it is given.
@@ -1142,7 +1141,7 @@ export class Reconciler {
       if (!ctx.blobRefs.has(id)) this.localHashes.delete(id);
     }
 
-    const budget: RehashBudget = { remaining: this.rehashBudgetBytes(), spent: 0 };
+    const budget: RehashBudget = { remaining: this.deps.rehashBudgetBytes(), spent: 0 };
 
     for (const id of [...ctx.blobRefs.keys()].sort(cmp)) {
       const ref = ctx.blobRefs.get(id)!;
@@ -1228,7 +1227,7 @@ export class Reconciler {
   ): Promise<string | null> {
     const memo = this.memoHit(id, st);
     if (memo !== null) return memo;
-    if (st.bytes > this.memoryCapBytes()) {
+    if (st.bytes > this.deps.memoryCapBytes()) {
       ctx.diagnostics.tooLarge.push(id);
       // ...and again in the channel that means "the file IS here". The old push
       // stays exactly as it was, so nothing reading it changes.
@@ -1250,10 +1249,6 @@ export class Reconciler {
     return sha256;
   }
 
-  /** How many bytes this pass may re-hash before it starts deferring (§3.5). */
-  private rehashBudgetBytes(): number {
-    return this.deps.rehashBudgetBytes?.() ?? REHASH_BUDGET_BYTES;
-  }
 
   /**
    * What this session already computed for this node's file, or null.
@@ -1580,16 +1575,12 @@ export class Reconciler {
   /** The three ceilings §7.2 decides against, as one value. */
   private fetchLimits(): FetchLimits {
     return {
-      memoryCapBytes: this.memoryCapBytes(),
-      autofetchMaxBytes: this.deps.autofetchMaxBytes?.() ?? AUTOFETCH_MAX_BYTES,
-      sessionBudgetBytes: this.deps.sessionBudgetBytes?.() ?? AUTOFETCH_SESSION_BUDGET,
+      memoryCapBytes: this.deps.memoryCapBytes(),
+      autofetchMaxBytes: this.deps.autofetchMaxBytes(),
+      sessionBudgetBytes: this.deps.sessionBudgetBytes(),
     };
   }
 
-  /** The largest attachment this device will hold in memory (§7.4). */
-  private memoryCapBytes(): number {
-    return this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
-  }
 
   /**
    * The base for a `'b'` node: what this device confirmed is simultaneously on
@@ -1717,7 +1708,7 @@ export class Reconciler {
         // §7.4. Hashing needs the whole file in memory. A file this device cannot
         // hash is one it cannot decide anything about, so it decides nothing: no
         // binding (which would claim bytes we never compared), and no fork.
-        if (st.bytes > this.memoryCapBytes()) {
+        if (st.bytes > this.deps.memoryCapBytes()) {
           ctx.diagnostics.tooLarge.push(id);
           ctx.diagnostics.localTooLarge.push({ id, bytes: st.bytes });
           return;

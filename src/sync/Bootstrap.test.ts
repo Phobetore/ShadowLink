@@ -28,7 +28,9 @@ import {
   type BootstrapDeps,
 } from './Bootstrap.ts';
 import { DeviceState, deviceStateKey, type StatePort } from './DeviceState.ts';
-import { DESKTOP_FETCH_LIMITS, FakeBlobs, FakeVault } from './fakes.ts';
+import {
+  DESKTOP_FETCH_LIMITS, DESKTOP_PASS_LIMITS, FakeBlobs, FakeVault,
+} from './fakes.ts';
 import { Reconciler } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
 
@@ -271,6 +273,7 @@ test('B25: the download split is the predicate the pass will actually apply', as
     },
   });
   reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs: { openHeadless: async () => { throw new Error('no note is involved'); } } as never,
     blobs,

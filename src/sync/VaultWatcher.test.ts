@@ -21,7 +21,9 @@ import { TreeDoc } from '../tree/TreeDoc.ts';
 import type { NodeFields, NodeKind } from '../tree/types.ts';
 import { Deletions } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
-import { DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import {
+  DESKTOP_MEMORY_CAP, DESKTOP_PASS_LIMITS, FakeBlobs, FakeDocs, FakeVault,
+} from './fakes.ts';
 import { Reconciler } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
 import type { Kind } from './VaultPort.ts';
@@ -989,6 +991,7 @@ test('44: replaying every reconciler mutation with no tickets writes nothing to 
     ...DESKTOP_MEMORY_CAP,
   });
   const reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
     vault: h.vault,
     docs,
     blobs: new FakeBlobs(),
