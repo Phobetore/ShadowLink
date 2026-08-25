@@ -57,7 +57,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -89,6 +89,29 @@ function relative(file: string): string {
 
 function read(file: string): string {
   return readFileSync(file, 'utf8');
+}
+
+/**
+ * Every module specifier a file names, in all four spellings TypeScript accepts.
+ *
+ * A substring scan for the target folder would be both too loose (this file
+ * mentions `src/ui/` several times in prose and in an allowlist) and too tight
+ * (`'../ui/format'` does not contain it at all). Specifiers are resolved against
+ * the importing file instead, so what is compared is the file that would actually
+ * be loaded.
+ */
+function importSpecifiers(source: string): string[] {
+  const out: string[] = [];
+  const patterns = [
+    /\bfrom\s*['"]([^'"]+)['"]/g,             // import … from '…' / export … from '…'
+    /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // dynamic import
+    /\bimport\s+['"]([^'"]+)['"]/g,           // side-effect import
+    /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) out.push(match[1]);
+  }
+  return out;
 }
 
 const SOURCES = shippedSources();
@@ -405,6 +428,42 @@ test('only the entry point, the UI and the three adapters import obsidian', () =
       `${rel} must stay headless — no obsidian import`,
     );
   }
+});
+
+test('nothing outside the UI imports the UI — the other direction of the same rule', () => {
+  // ⚠ The hole the test above leaves open. That guard asks "does THIS file import
+  // `obsidian`?" and exempts all of `src/ui/`, so it is satisfied by an engine
+  // module that imports `obsidian` at one remove: the day a helper moves into
+  // `src/ui/` and the reconciler imports it, the reconciler pulls `obsidian` into
+  // the module graph and BOTH guards still pass.
+  //
+  // What breaks then is not subtle but it is badly attributed. Group A and Group B
+  // run under plain `node --test` with no Obsidian in the process, so the failure
+  // arrives as a module-load crash in whichever suite happens to import the engine
+  // first — a stack trace pointing at a file nobody touched. The dependency only
+  // ever goes one way: the UI may import the engine, and `main.ts` wires the two.
+  const allowed = (rel: string): boolean => rel === 'main.ts' || rel.startsWith('src/ui/');
+  let crossings = 0;
+
+  for (const file of SOURCES) {
+    const rel = relative(file);
+    for (const spec of importSpecifiers(read(file))) {
+      if (!spec.startsWith('.')) continue;         // 'obsidian', 'yjs', node builtins
+      if (!relative(resolve(dirname(file), spec)).startsWith('src/ui/')) continue;
+      crossings += 1;
+      assert.ok(
+        allowed(rel),
+        `${rel} imports ${spec}, which drags the UI — and through it obsidian — into `
+        + 'the headless engine. Move the helper out of src/ui/, or invert the '
+        + 'dependency so the UI imports the engine.',
+      );
+    }
+  }
+
+  // A scan that resolved nothing would pass the loop above without looking at
+  // anything. `main.ts` legitimately imports the UI several times over, so this
+  // is the proof that such an import is visible to the scan at all.
+  assert.ok(crossings >= 4, `the specifier scan resolved ${crossings} imports of src/ui`);
 });
 
 test('the scan actually reaches the modules it is guarding', () => {
