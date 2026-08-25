@@ -33,7 +33,7 @@ decide later what my notes are worth. This one asks for a folder.
 
 > **Status: early.** The sync engine is finished and heavily tested — over 850
 > automated tests, including three simulated clients performing 200 random
-> operations each across network partitions; `npm test` and
+> operations across network partitions; `npm test` and
 > `npm run test:e2e:structural` print the exact counts. What has *not* had heavy
 > real-world use is the plugin inside Obsidian itself. Treat this as a beta, keep
 > backups, and please
@@ -177,7 +177,7 @@ release, not hypothetical ones.
   so is anything past a per-session download budget of 512 MB, or 20 MB on a phone.
   Nothing is missing and nothing is broken: the file stays in the shared folder for
   everybody, the status bar counts how many are waiting and its tooltip gives the
-  sizes, and a **Download** button appears where the embed would be. The
+  total, and a **Download** button appears where the embed would be. The
   *ShadowLink: Download attachments* command lists them with their sizes.
 - **Past a hard ceiling, an attachment is not shared at all.** 100 MB on a desktop,
   and **32 MB on a phone** — a screen recording made on that phone is over it
@@ -295,7 +295,7 @@ A short tour of how it fits together:
   `limits` probe, behind a bearer check (`httpAuth.js`), and `blobStore.js` is the
   content-addressed store underneath — write-once objects at a fanned-out path,
   resumable partial uploads, a re-hash of what was assembled before anything is
-  published, and per-workspace quota accounting. `server/tools/sweep-blobs.mjs` is
+  published, and usage accounting against a whole-store quota. `server/tools/sweep-blobs.mjs` is
   the offline sweeper; the server itself has no delete route and never removes an
   attachment on its own.
 

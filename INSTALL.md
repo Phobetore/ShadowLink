@@ -193,9 +193,11 @@ Turn it off to keep those files on this device, and share them later with the
 Press **Start syncing**. Pressing Escape or Cancel does nothing at all — the safe
 answer is always the default.
 
-If your copy of a file differs from the workspace's, the workspace version wins on
-disk and *your* version is saved into `ShadowLink Recovered/`. Nothing is thrown
-away without a copy.
+If your copy of a note differs from the workspace's, the workspace version wins on
+disk and *your* version is saved into `ShadowLink Recovered/`. An attachment is
+kept differently: your copy is renamed where it stands, to `<name> (conflicted
+copy — <who>, <8 characters of its hash>)`, and both versions end up in the shared
+folder for everybody. Nothing is thrown away without a copy.
 
 ---
 
@@ -215,7 +217,7 @@ The status bar at the bottom of Obsidian shows the current state. `paused` with 
 reason means sync has stopped on purpose; hover for why. `synced` on its own means
 everything is here; `synced · 12 attachment(s) available` means the notes are all
 here and twelve attachments have deliberately not been downloaded — hover for
-their sizes and what to do about them.
+the total and what to do about them.
 
 ---
 
@@ -251,7 +253,7 @@ Three ordinary causes, and none of them is a fault.
 
 It may be an attachment this device chose not to download: anything over about
 10 MB — 2 MB on a phone — waits to be asked for. The status bar counts them and
-its tooltip gives the sizes, a **Download** button appears where the embed would
+its tooltip gives the total, a **Download** button appears where the embed would
 be, and the *ShadowLink: Download attachments* command lists them.
 
 Or it was never shared, because Obsidian saved it outside the shared folder.
@@ -372,7 +374,7 @@ as JSON instead of prose.
 surprises people. Moving an object into `.attic/` frees nothing at all — the bytes
 are still on the volume, under a different name, for another full TTL. What it
 frees immediately is *quota*: the store's accounting counts objects and in-flight
-uploads and deliberately does not count `.attic/`, so a workspace that was against
+uploads and deliberately does not count `.attic/`, so a store that was against
 `MAX_TOTAL_STORAGE_GB` can accept uploads again while the disk it sits on is no
 emptier than before. The report says how many objects moved and how many were
 unlinked, and only the unlinked line is space you have actually recovered. If you
