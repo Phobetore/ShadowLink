@@ -596,13 +596,30 @@ export class Deletions {
     }
   }
 
-  /** Adapter-level existence. An unreadable answer is not evidence of absence. */
+  /**
+   * Adapter-level existence, and an unreadable answer is not evidence of absence
+   * (I2). The error PROPAGATES: `rescue` runs inside `guarded`, so it becomes one
+   * contained failure with the file still on disk and still bound, and the next
+   * pass retries it once the adapter can answer again (I15, I17).
+   *
+   * Swallowing it to `false` would be a guess, and both callers guess in the same
+   * direction — the one that lets the rename proceed. `uniquify` would report an
+   * occupied destination as free and hand `vault.rename` a path that already
+   * holds an EARLIER rescue; the adapter's `rename`, unlike its `create` /
+   * `createBinary` / `createFolder` siblings, performs no occupancy check, so one
+   * rescued file would land on top of another inside the single folder whose
+   * whole purpose is that nothing in it is ever lost. `ensureRecoveredDir` would
+   * invent a folder it could not see.
+   *
+   * Guessing "occupied" instead is no better: `uniquify` would probe 998 further
+   * candidates that throw just as hard and end in a misleading "could not find a
+   * free name", and `ensureRecoveredDir` would skip a creation that may be needed.
+   * Propagation is also what this module already does with every other unreadable
+   * answer — `vault.stat` rejects rather than reporting null, and `blobs.has`
+   * throws rather than reporting absent.
+   */
   private async exists(env: Env, path: string): Promise<boolean> {
-    try {
-      return await env.vault.exists(path);
-    } catch {
-      return false;
-    }
+    return await env.vault.exists(path);
   }
 
   private async ensureRecoveredDir(env: Env): Promise<void> {

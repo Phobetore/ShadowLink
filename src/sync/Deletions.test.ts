@@ -864,6 +864,120 @@ test('43: one failing item does not abort the batch (I15)', async () => {
   assert.equal(h.vault.callsTo('trashLocal').length, 0, 'and nothing was trashed on the way');
 });
 
+// --------------------------------- 43a-43c: the existence check behind every rescue
+
+/**
+ * A vault whose `exists` throws for exactly the paths in `unreadable`, and
+ * answers normally for everything else.
+ *
+ * Selective on purpose: `rescue` asks the question twice, about two different
+ * paths and for two different reasons, and a port that failed both at once could
+ * never show which of the two answers a pass actually acted on.
+ */
+function blindTo(inner: FakeVault, ...unreadable: string[]): VaultPort {
+  const keys = new Set(unreadable.map(fold));
+  return wrapVault(inner, {
+    exists: async (p) => {
+      if (keys.has(fold(p))) throw new Error('EIO: the adapter could not answer');
+      return inner.exists(p);
+    },
+  });
+}
+
+test('43a: a rescue whose destination is taken is renamed beside it, never onto it', async () => {
+  // The positive control for 43b, and the reason that test matters. `uniquify` is
+  // the ONLY thing standing between a second rescue and the first one, because
+  // `ObsidianVaultPort.rename` — unlike its create/createBinary/createFolder
+  // siblings — performs no occupancy check of its own.
+  const h = makeHarness();
+  const id = nid('A');
+  const node = dead(file('', 'a.md'));                     // no hash => rescue, not trash
+  h.nodes.set(id, node);
+  h.vault.seed(SHARE, 'd');
+  const taken = `${RECOVERED}/${rescueName('Shared/a.md', node, NOW)}`;
+  h.vault.seed(taken, 'f', 'an earlier rescue');
+  await place(h, id, 'Shared/a.md', 'the local bytes', { hash: false });
+
+  await h.deletions.apply(h.ctx());
+
+  const free = taken.replace(/\.md$/, ' (2).md');
+  assert.deepEqual(rescuedInto(h.vault), [free, taken].sort(), 'both rescues survive');
+  assert.equal(h.vault.snapshot()[taken], 'an earlier rescue', 'the first one is untouched');
+  assert.equal(h.vault.snapshot()[free], 'the local bytes', 'the second landed beside it');
+});
+
+test('43b: an unreadable existence answer is never read as a free rescue destination (I2)', async () => {
+  // The destination already holds an EARLIER rescue, and `exists` cannot answer
+  // for it. An `exists` that swallowed its error and reported "free" would not
+  // merely misname the new file: it would hand `rename` a destination that is
+  // occupied, inside the single folder whose whole purpose is that nothing in it
+  // is ever lost.
+  //
+  // `FakeVault.rename` DOES refuse an occupied destination, so here the damage
+  // would surface as a thrown rename rather than as the silent overwrite the real
+  // adapter performs. That is why this test asserts the rename was never
+  // ATTEMPTED — the one claim that is true on both vaults.
+  const id = nid('A');
+  const node = dead(file('', 'a.md'));
+  const dest = `${RECOVERED}/${rescueName('Shared/a.md', node, NOW)}`;
+
+  const h = makeHarness({ vaultPort: (inner) => blindTo(inner, dest) });
+  h.nodes.set(id, node);
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(dest, 'f', 'an earlier rescue');
+  await place(h, id, 'Shared/a.md', 'the local bytes', { hash: false });
+  h.vault.resetCalls();
+
+  const ctx = h.ctx();
+  await h.deletions.apply(ctx);
+
+  assert.equal(h.vault.callsTo('rename').length, 0, 'no move was even attempted');
+  assert.equal(h.vault.snapshot()[dest], 'an earlier rescue', 'the earlier rescue is intact');
+
+  // Containment, not a crash: the item is a contained failure, so the next pass
+  // retries it once the adapter can answer again (I15, I17).
+  assert.equal(ctx.failures.length, 1, 'exactly one contained failure');
+  assert.equal(ctx.failures[0].key, `delete:${id}`);
+  assert.match(String((ctx.failures[0].err as Error).message), /EIO/, 'and for the right reason');
+
+  // Nothing was decided on a guess: the file is still there, still bound, still
+  // undeclined, and the rate window never counted a deletion that did not happen.
+  assert.equal(h.vault.snapshot()['Shared/a.md'], 'the local bytes');
+  assert.equal(h.state.data.materialized[id], 'Shared/a.md', 'still bound, so it retries');
+  assert.deepEqual(h.state.data.declinedNodes, [], 'and the decision was not recorded');
+  assert.equal(h.state.data.deleteBudget.length, 0);
+  assert.equal(ctx.removedThisPass.size, 0);
+  assert.equal(h.vault.callsTo('trashLocal').length, 0);
+});
+
+test('43c: nor is it read as a missing recovery folder (I2)', async () => {
+  // The same question, asked about `ShadowLink Recovered/` itself. "Cannot read"
+  // is not "absent" here either, and the guess has a direction: answering "absent"
+  // creates the folder and lets the rename proceed, while answering "present"
+  // skips the creation and lets the rename proceed into a folder that may not be
+  // there. Neither is knowledge, so neither is acted on.
+  const h = makeHarness({ vaultPort: (inner) => blindTo(inner, RECOVERED) });
+  const id = nid('A');
+  h.nodes.set(id, dead(file('', 'a.md')));
+  h.vault.seed(SHARE, 'd');
+  await place(h, id, 'Shared/a.md', 'the local bytes', { hash: false });
+  h.vault.resetCalls();
+
+  const ctx = h.ctx();
+  await h.deletions.apply(ctx);
+
+  assert.equal(h.vault.callsTo('createFolder').length, 0, 'nothing was created on a guess');
+  assert.equal(h.vault.callsTo('rename').length, 0, 'and nothing was moved into it');
+  assert.equal(ctx.failures.length, 1, 'one contained failure');
+  assert.match(String((ctx.failures[0].err as Error).message), /EIO/);
+
+  assert.equal(h.vault.snapshot()['Shared/a.md'], 'the local bytes');
+  assert.equal(h.state.data.materialized[id], 'Shared/a.md', 'still bound, so it retries');
+  assert.deepEqual(h.state.data.declinedNodes, []);
+  assert.equal(h.state.data.deleteBudget.length, 0);
+  assert.equal(ctx.removedThisPass.size, 0);
+});
+
 // ------------------------------------------------------- B14-B15: proving a binary
 
 test('B14: an attachment the store still holds is trashed, and the trash keeps its bytes', async () => {
