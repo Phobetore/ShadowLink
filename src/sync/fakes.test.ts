@@ -8,7 +8,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
-import type { BlobPort } from './BlobPort.ts';
+import {
+  BlobDigestMismatch,
+  BlobTooLarge,
+  BlobTransport,
+  BlobUnavailable,
+  type BlobPort,
+} from './BlobPort.ts';
 import { hashOfBytes } from '../tree/paths.ts';
 
 // ---------------------------------------------------------------- case folding
@@ -635,7 +641,7 @@ test('setAbsent models a blob the server no longer holds', async () => {
 // I2. `has` answering false for a network failure would turn "I could not ask"
 // into "the bytes are gone", which at delete time is the difference between a
 // rescue and a removal.
-test('a transport failure throws from has, put and get rather than answering', async () => {
+test('a transport failure throws from has, put and limits rather than answering', async () => {
   const blobs = new FakeBlobs();
   const sha = await blobs.seed(PNG);
   const down = new Error('ECONNRESET');
@@ -646,11 +652,85 @@ test('a transport failure throws from has, put and get rather than answering', a
   blobs.failNext('put', down);
   await assert.rejects(() => blobs.put(sha, PNG), (e) => e === down);
 
-  blobs.failNext('get', down);
-  await assert.rejects(() => blobs.get(sha, PNG.length), (e) => e === down);
+  blobs.failNext('limits', down);
+  await assert.rejects(() => blobs.limits(), (e) => e === down);
 
   // ...and exactly one call each was affected.
   assert.deepEqual(await blobs.has(sha), { present: true, bytes: PNG.length });
+});
+
+// ⚠ `get` is the one that does NOT join that list, and the difference is the
+// whole contract. `ObsidianBlobPort.get` catches everything and answers null —
+// its header says so — and the reconciler is written against exactly that: it
+// branches on the null and then on `lastError`, never on a catch. A fake that
+// threw from `get` would let a test drive a failure shape production cannot
+// produce, and pass on a code path the real port never reaches.
+test('an injected get failure answers null, the one way the real port can fail', async () => {
+  const blobs = new FakeBlobs();
+  const sha = await blobs.seed(PNG);
+  const down = new BlobTransport('socket hang up');
+
+  blobs.failNext('get', down);
+  assert.equal(await blobs.get(sha, PNG.length), null, 'null, never a throw');
+  assert.equal(blobs.lastError, down, 'and the reason is what the caller branches on');
+
+  // ...and exactly one call was affected.
+  assert.deepEqual(await blobs.get(sha, PNG.length), PNG);
+});
+
+// ⚠ Nothing exercises this today: the publish settle check refuses a 0-byte file
+// upstream, so no caller ever offers one. That is precisely the condition under
+// which a fake drifts from the port it stands in for — the divergence is real,
+// and nothing trips over it to say so. `ObsidianBlobPort.put` turns a zero-length
+// object away before any request, because `bytes a-b/total` has no spelling for
+// one and the routes therefore cannot express it.
+test('put refuses a zero-length object, exactly as the real port does', async () => {
+  const blobs = new FakeBlobs();
+  const empty = new Uint8Array(0);
+  const sha = await hashOfBytes(empty);
+
+  assert.equal(await blobs.put(sha, empty), false);
+  assert.ok(blobs.lastError instanceof BlobDigestMismatch, `got ${String(blobs.lastError)}`);
+  assert.equal(blobs.objectCount(), 0, 'nothing at all is stored');
+
+  // A queued refusal does not get in ahead of it: the object never reaches a
+  // server, so no server answer can be the thing that turned it away.
+  const quota = new Error('507 insufficient storage');
+  blobs.refuseNextPut(quota);
+  assert.equal(await blobs.put(sha, empty), false);
+  assert.ok(blobs.lastError instanceof BlobDigestMismatch, 'the zero-length refusal, not the 507');
+  assert.equal(await blobs.put(await hashOfBytes(PNG), PNG), false, 'the 507 is still queued');
+  assert.equal(blobs.lastError, quota);
+});
+
+// The typed errors are the port's contract rather than decoration: `Reconciler`
+// reads `lastError instanceof BlobUnavailable` to tell "the store does not hold
+// these bytes" from "the network did not answer", and reports only the first to
+// the user. A fake that answered plain Errors would make that check — and every
+// future sibling of it — untestable through the fakes.
+test('every refusal carries the type the real port would carry', async () => {
+  const blobs = new FakeBlobs();
+  const sha = await hashOfBytes(PNG);
+
+  blobs.setLimits({ maxFileBytes: 4 });
+  assert.equal(await blobs.put(sha, PNG), false);
+  assert.ok(blobs.lastError instanceof BlobTooLarge, `got ${String(blobs.lastError)}`);
+
+  blobs.setLimits({ maxFileBytes: 1024 });
+  assert.equal(await blobs.put('a'.repeat(64), PNG), false);
+  assert.ok(blobs.lastError instanceof BlobDigestMismatch, `got ${String(blobs.lastError)}`);
+
+  assert.equal(await blobs.get('b'.repeat(64), PNG.length), null);
+  assert.ok(blobs.lastError instanceof BlobUnavailable, `got ${String(blobs.lastError)}`);
+
+  assert.equal(await blobs.put(sha, PNG), true);
+  assert.equal(await blobs.get(sha, PNG.length + 1), null);
+  assert.ok(blobs.lastError instanceof BlobDigestMismatch, `got ${String(blobs.lastError)}`);
+
+  const controller = new AbortController();
+  controller.abort();
+  assert.equal(await blobs.get(sha, PNG.length, controller.signal), null);
+  assert.ok(blobs.lastError instanceof BlobTransport, `got ${String(blobs.lastError)}`);
 });
 
 test('the same bytes stored twice are one object', async () => {

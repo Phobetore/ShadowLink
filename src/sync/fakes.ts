@@ -25,7 +25,15 @@
 // No `obsidian` import, no node builtins.
 
 import { extOf, fold, hashOfBytes } from '../tree/paths.ts';
-import { BlobUnavailable, type BlobLimits, type BlobPort, type BlobPresence } from './BlobPort.ts';
+import {
+  BlobDigestMismatch,
+  BlobTooLarge,
+  BlobTransport,
+  BlobUnavailable,
+  type BlobLimits,
+  type BlobPort,
+  type BlobPresence,
+} from './BlobPort.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 
@@ -717,7 +725,17 @@ export class FakeBlobs implements BlobPort {
     this.limitsValue = { ...this.limitsValue, ...limits };
   }
 
-  /** Make exactly the next call of `op` throw — transport, not refusal. */
+  /**
+   * Fail exactly the next call of `op`, IN THE SHAPE THAT `op` FAILS IN (§8.3).
+   * `has`, `put` and `limits` THROW the error; `get` answers NULL with the error
+   * in `lastError`. Queues, so it can be called twice.
+   *
+   * `get` has no way to throw here, deliberately. `ObsidianBlobPort.get` catches
+   * everything and answers null for every failure there is — its header says so,
+   * and the reconciler is written against exactly that. A fake that threw from
+   * `get` would let a test drive a shape production cannot produce and "prove"
+   * that a caller handles an exception it will never be handed.
+   */
   failNext(op: BlobOp, error: Error): void {
     const queue = this.failures.get(op);
     if (queue) queue.push(error);
@@ -773,16 +791,34 @@ export class FakeBlobs implements BlobPort {
     this.record('put', [sha256, data.length]);
     this.maybeFail('put');
 
+    // `ObsidianBlobPort.put` refuses a zero-length object before it makes any
+    // request at all: `bytes a-b/total` has no spelling for one, so the routes
+    // cannot express it. Nothing offers one today — the publish settle check
+    // refuses a 0-byte file upstream — which is precisely why the fake and the
+    // port would drift here without anybody noticing.
+    //
+    // Checked BEFORE `putRefusals`, because those model server answers (413, 507,
+    // 422) and an object that is never sent cannot receive one.
+    if (data.length === 0) {
+      this.lastError = new BlobDigestMismatch(`put(${sha256}): refusing a zero-length object`);
+      return false;
+    }
     if (this.putRefusals.length > 0) {
       this.lastError = this.putRefusals.shift();
       return false;
     }
+    // The TYPES are the real port's, not plain Errors. `lastError` is what the
+    // publish queue keeps for diagnostics and what the reconciler reads to tell a
+    // 404 from a hiccup; a fake that flattened the family to `Error` would make
+    // any future check on one of them untestable through the fakes.
     if (data.length > this.limitsValue.maxFileBytes) {
-      this.lastError = new Error(`too large: ${data.length} > ${this.limitsValue.maxFileBytes}`);
+      this.lastError = new BlobTooLarge(
+        `too large: ${data.length} > ${this.limitsValue.maxFileBytes}`,
+      );
       return false;
     }
     if (await hashOfBytes(data) !== sha256) {
-      this.lastError = new Error(`digest mismatch for ${sha256}`);
+      this.lastError = new BlobDigestMismatch(`digest mismatch for ${sha256}`);
       return false;
     }
 
@@ -804,10 +840,13 @@ export class FakeBlobs implements BlobPort {
     onProgress?: (received: number, total: number) => void,
   ): Promise<Uint8Array | null> {
     this.record('get', [sha256, expectBytes]);
-    this.maybeFail('get');
+    // An injected failure answers NULL here, never a throw: `ObsidianBlobPort.get`
+    // catches every failure there is and returns null, so a thrown `get` is a
+    // world production cannot produce. See `failNext`.
+    if (this.nextFailure('get') !== undefined) return null;
 
     if (signal?.aborted === true) {
-      this.lastError = new Error('aborted');
+      this.lastError = new BlobTransport(`get(${sha256}): aborted`);
       return null;
     }
     const stored = this.objects.get(sha256);
@@ -824,11 +863,13 @@ export class FakeBlobs implements BlobPort {
       return null;
     }
     if (stored.length !== expectBytes) {
-      this.lastError = new Error(`length mismatch: ${stored.length} != ${expectBytes}`);
+      this.lastError = new BlobDigestMismatch(
+        `length mismatch: ${stored.length} != ${expectBytes}`,
+      );
       return null;
     }
     if (await hashOfBytes(stored) !== sha256) {
-      this.lastError = new Error(`digest mismatch for ${sha256}`);
+      this.lastError = new BlobDigestMismatch(`digest mismatch for ${sha256}`);
       return null;
     }
 
@@ -849,11 +890,22 @@ export class FakeBlobs implements BlobPort {
     this.calls.push({ op, args });
   }
 
-  private maybeFail(op: BlobOp): void {
+  /**
+   * Pop the injected failure for `op` and record it as the reason, or undefined
+   * when none is queued. WHETHER it throws is the caller's business: the four
+   * methods fail in three different shapes and this must not flatten them.
+   */
+  private nextFailure(op: BlobOp): unknown {
     const queue = this.failures.get(op);
-    if (!queue || queue.length === 0) return;
+    if (!queue || queue.length === 0) return undefined;
     const error = queue.shift()!;
     this.lastError = error;
-    throw error;
+    return error;
+  }
+
+  /** For the three methods that THROW on a transport failure: has, put, limits. */
+  private maybeFail(op: BlobOp): void {
+    const error = this.nextFailure(op);
+    if (error !== undefined) throw error;
   }
 }
