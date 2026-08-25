@@ -309,7 +309,11 @@ test('a throwing call is still recorded, and seed writes nothing to the log', as
   v.seed('Shared/a.md', 'f', 'A');
   assert.deepEqual(v.calls, [], 'seed is test setup, not a port call');
 
-  await assert.rejects(() => v.create('Shared/a.md', ''));
+  // The subject here is the call LOG, but the rejection is still pinned: an
+  // unmatched one would let this pass on a `create` that refused for some reason
+  // other than the occupied path, and the log assertion below would look like
+  // proof that the occupancy check ran.
+  await assert.rejects(() => v.create('Shared/a.md', ''), /exists/i);
   assert.deepEqual(v.calls, [{ op: 'create', args: ['Shared/a.md', ''] }]);
 
   v.resetCalls();
@@ -408,7 +412,11 @@ test('listDir enumerates children for a case-variant request', async () => {
 test('listDir still throws for a genuinely missing folder', async () => {
   const v = new FakeVault();
   v.seed('Shared/Archive', 'd');
-  await assert.rejects(() => v.listDir('Shared/Nope'));
+  // MATCHED on "not found", which is the whole claim in the name. `listDir` has two
+  // rejections and the reconciler's empty-folder sweep reads them differently; an
+  // unmatched `rejects` here would be satisfied by the "not a folder" one, or by a
+  // TypeError from a signature that no longer takes a path at all.
+  await assert.rejects(() => v.listDir('Shared/Nope'), /not found/i);
 });
 
 // Real vault.rename refuses to move a folder inside itself.
