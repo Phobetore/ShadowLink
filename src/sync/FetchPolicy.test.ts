@@ -70,6 +70,10 @@ test('approval lifts the per-file ceiling and the session budget', () => {
 // download it — it dies holding half of it, which is the one outcome the cap
 // exists to make impossible. So the cap is tested BEFORE the approval, which is
 // the one place this deviates from §7.2's pseudocode order.
+//
+// That deviation is defensible only while the cap is a fact about the hardware.
+// §7.4 as amended says so — `memoryCapBytes()` = `platformCap`, folded with
+// nothing — which is what makes the paragraph above true rather than roughly true.
 test('approval does NOT lift the memory cap', () => {
   assert.equal(fetchVerdict(1_001, LIMITS, true, 0), 'tooLarge');
 });

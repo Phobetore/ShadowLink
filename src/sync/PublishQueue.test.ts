@@ -1152,6 +1152,10 @@ test('B24: a file over the device cap is retracted without ever being read', asy
 // A size refusal must therefore refuse the BYTES, never the node. §7.5 promises
 // the user "the file untouched and simply not shared. Nothing is moved, nothing
 // is deleted", and for a replace that promise is about the previous version too.
+//
+// ⚠ A PIN ON §7.4 AS AMENDED: the server ceiling is a policy about writing and
+// is folded into nothing. This test is the server arm; the device cap is nowhere
+// near it, and the two are only independently reachable while they stay apart.
 
 test('an oversized replace refuses the new bytes and leaves the published node live', async () => {
   const h = makeHarness();
@@ -1233,6 +1237,9 @@ test('an oversized replace refuses the new bytes and leaves the published node l
   assert.equal(h.notices.length, 1);
 });
 
+// ⚠ The other half of that pin (§7.4 as amended): the device arm, reached with no
+// lowered server ceiling anywhere. Two arms, independently reachable, which is
+// only a meaningful sentence while the two numbers stay two numbers.
 test('the device-cap arm refuses a published attachment too, without ever reading it', async () => {
   const h = makeHarness({ memoryCapBytes: () => 100 });
   const old = png(1, 64);
@@ -1260,6 +1267,9 @@ test('the device-cap arm refuses a published attachment too, without ever readin
   assert.match(h.notices[0], /previous version/);
 });
 
+// ⚠ The pin on §7.4 as amended that measures the actual COST of getting it wrong,
+// rather than the shape of the answer. Nothing below is added to or reworded.
+//
 // The user-visible half, and the only assertion that measures the actual harm:
 // what the OTHER device does with the tree the queue just produced. Ben's pass
 // is the real `Deletions`, over a context assembled the way the reconciler
@@ -1291,7 +1301,8 @@ test('a peer holding the published attachment does not lose it to an oversized r
 });
 
 // I2, in the one place where it cannot be undone by a later pass: an unknown
-// ceiling must never be read as a small one.
+// ceiling must never be read as a small one. §7.4 as amended states this as
+// "the publish proceeds"; the test below is what makes that literal.
 test('a limits() that could not be asked does not retract anything', async () => {
   const h = makeHarness();
   const bytes = png();
