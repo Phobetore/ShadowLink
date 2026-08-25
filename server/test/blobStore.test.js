@@ -518,6 +518,112 @@ test('a rescan ignores files that are not objects at their fanned-out path', asy
   });
 });
 
+/** A tree big enough that its walk is unmistakably still in flight — measured at
+ *  ~190ms for 1024 objects, against the few ms a usage delta takes to land. */
+function seedObjects(root, perBucket = 4) {
+  for (let a = 0; a < 256; a++) {
+    const aa = a.toString(16).padStart(2, '0');
+    for (let b = 0; b < perBucket; b++) {
+      const bb = b.toString(16).padStart(2, '0');
+      mkdirSync(join(root, aa, bb), { recursive: true });
+      writeFileSync(join(root, aa, bb, aa + bb + '0'.repeat(60)), Buffer.alloc(64));
+    }
+  }
+  return { bytes: 256 * perBucket * 64, files: 256 * perBucket };
+}
+
+test('a rescan racing a finalisation must not erase its delta', async () => {
+  // `rescan` walks the tree OUTSIDE the per-workspace usage chain and then writes
+  // an ABSOLUTE total. An upload that finalises mid-walk is therefore counted by
+  // nobody: the walk had already passed its bucket, and the absolute write lands
+  // last on the chain and overwrites the delta — in memory and in usage.json,
+  // which every later delta then reads back as its base. Boot is safe because
+  // `start()` completes before `listen`, but the 6-hour maintenance timer runs
+  // while the server is serving uploads.
+  await withStore({}, async (store, dir) => {
+    const root = join(dir, 'blobs', WS);
+    const seeded = seedObjects(root);
+    await store.rescan(WS);
+    await store.settled();
+    assert.deepEqual(store.usage(WS), seeded, 'baseline');
+
+    const walking = store.rescan(WS);   // parked on its first readdir
+    await null;
+    await store._addUsage(WS, 4096, 1); // a finalisation lands mid-walk
+    await walking;
+    await store.settled();
+
+    const expected = { bytes: seeded.bytes + 4096, files: seeded.files + 1 };
+    assert.deepEqual(store.usage(WS), expected, 'the in-memory total must not lose the delta');
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(root, 'usage.json'), 'utf8')),
+      expected,
+      'and neither must the persisted one',
+    );
+  });
+});
+
+test('a real upload that finalises during a rescan is still counted exactly once', async () => {
+  // The same race driven end to end rather than through `_addUsage`, and the
+  // reason the guard has to abandon the walk rather than merge with it: whether
+  // the walk happened to reach the new object's bucket before or after the
+  // rename is a coin toss, so the only safe reading is "this count is stale".
+  // Counting it once — never zero times, never twice — is the whole assertion.
+  await withStore({}, async (store, dir) => {
+    const root = join(dir, 'blobs', WS);
+    const seeded = seedObjects(root);
+    await store.rescan(WS);
+    await store.settled();
+
+    const buf = bytes(4096, 77);
+    const hash = sha256(buf);
+
+    const walking = store.rescan(WS);
+    await null;
+    const result = await upload(store, WS, hash, buf);
+    assert.equal(result.ok, true);
+    await walking;
+    await store.settled();
+
+    const expected = { bytes: seeded.bytes + 4096, files: seeded.files + 1 };
+    assert.deepEqual(store.usage(WS), expected);
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(root, 'usage.json'), 'utf8')),
+      expected,
+      'and the persisted total agrees',
+    );
+  });
+});
+
+test('a rescan with nothing in flight still repairs a drifted total', async () => {
+  // The other half of the guard: abandoning is only acceptable because a QUIET
+  // rescan still does its job. This is the repair path for a total that drifted
+  // from the objects — the offline sweeper moving bytes to `.attic`, or an
+  // operator clearing objects by hand — so a guard that abandoned
+  // unconditionally, or one left armed by a delta that has already landed, would
+  // be a silent regression here. Note the drift has to be real on disk: `rescan`
+  // deliberately skips the write when its walk agrees with the in-memory copy.
+  await withStore({}, async (store, dir) => {
+    const a = bytes(1500);
+    const b = bytes(2500, 31);
+    await upload(store, WS, sha256(a), a);
+    await upload(store, WS, sha256(b), b);
+    await store.settled();
+    assert.deepEqual(store.usage(WS), { bytes: 4000, files: 2 });
+
+    rmSync(store.finalPath(WS, sha256(b)));   // the sweeper, or a human with rm
+    await store.rescan(WS);
+    await store.settled();
+
+    assert.deepEqual(store.usage(WS), { bytes: 1500, files: 1 });
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(dir, 'blobs', WS, 'usage.json'), 'utf8')),
+      { bytes: 1500, files: 1 },
+      'a quiet rescan must still write the corrected total through',
+    );
+  });
+});
+
 // ------------------------------------------------------------ .part sweep
 
 test('.part files older than the TTL are swept, and stop counting against the quota', async () => {

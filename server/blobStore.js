@@ -141,6 +141,13 @@ export class BlobStore {
     this._incoming = new Map();
     /** ws -> Promise. usage.json's read-modify-write is serialized per workspace. */
     this._usageChain = new Map();
+    /**
+     * ws -> a count that moves whenever a delta is on its way. `rescan` walks the
+     * tree OUTSIDE the chain and then writes an ABSOLUTE total, so it is the one
+     * writer that can overwrite a delta it never saw; comparing this before and
+     * after the walk is how it tells that its count went stale mid-flight.
+     */
+    this._usageDeltas = new Map();
     /** `${ws}/${sha}` -> Promise. Appends to one partial are serialized. */
     this._partChain = new Map();
     /** Last usage-write error per workspace, for diagnostics. Never thrown at a caller. */
@@ -406,6 +413,14 @@ export class BlobStore {
 
     const final = this.finalPath(ws, sha256);
     await mkdir(dirname(final), { recursive: true });
+    // Mark the workspace dirty BEFORE the object can appear at its address, not
+    // after. A rescan's walk can only see this object once the rename lands, so a
+    // mark taken from here on is guaranteed to be visible to any walk that could
+    // have counted it — which is what stops the count below being added twice.
+    // Doing it after `renameWithRetry` would be a microtask before `_addUsage`
+    // marks it anyway, and would leave the whole rename, including its Windows
+    // EPERM retries, unmarked.
+    this._usageDeltas.set(ws, (this._usageDeltas.get(ws) ?? 0) + 1);
     await renameWithRetry(part, final, {
       rename: (from, to) => this._rename(from, to),
       attempts: this.renameAttempts,
@@ -503,6 +518,7 @@ export class BlobStore {
    */
   async rescan(ws) {
     const root = join(this.baseDir, ws);
+    const mark = this._usageDeltas.get(ws) ?? 0;
     let bytes = 0;
     let files = 0;
     for (const first of await readdirOrEmpty(root)) {
@@ -520,6 +536,25 @@ export class BlobStore {
       }
     }
     const next = { bytes, files };
+    // A DELTA LANDED WHILE WE WERE WALKING, so this count is already history and
+    // writing it would silently erase that delta from memory and from usage.json —
+    // which every later delta then reads back as its base. The walk cannot be
+    // merged with the delta instead: whether it happened to reach the new object's
+    // bucket before or after the rename is unknowable from here, so adding the
+    // delta on top would double-count exactly as often as it would repair.
+    // Abandoning is the only safe reading, and it is affordable because the delta
+    // path is exact — a store whose usage writes all succeed never needs this walk.
+    //
+    // ACCEPTED COST: on a store busy enough for the walk to take seconds, every
+    // periodic rescan can abandon indefinitely, and rescan is also the repair path
+    // for drift after a failed usage write or an operator sweep against a live
+    // server. That repair is then deferred to the next quiet cycle or to boot,
+    // where `start()` runs before `listen` and cannot race. Deliberately not
+    // re-armed on a timer: a retry that walks a large tree again is the same cost
+    // as the next cycle, and `lastUsageError` already records the drift's cause.
+    if ((this._usageDeltas.get(ws) ?? 0) !== mark) {
+      return { ...(this._usage.get(ws) ?? next) };
+    }
     const current = this._usage.get(ws);
     this._usage.set(ws, next);
     if (current === undefined || current.bytes !== bytes || current.files !== files) {
@@ -539,6 +574,10 @@ export class BlobStore {
    * the store forgets the smaller of the pair for ever.
    */
   _addUsage(ws, deltaBytes, deltaFiles) {
+    // Synchronously, before the task is even queued: a rescan that samples the
+    // mark after this point must see the change, whether or not the walk saw the
+    // object the delta is for.
+    this._usageDeltas.set(ws, (this._usageDeltas.get(ws) ?? 0) + 1);
     return this._enqueueUsage(ws, async () => {
       const current = await this._readUsage(ws);
       const next = {
