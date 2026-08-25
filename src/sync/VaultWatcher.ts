@@ -32,7 +32,6 @@
 // No `obsidian` import, no node builtins.
 
 import {
-  BLOB_MAX_BYTES,
   DELETE_COALESCE_MS,
   LOCAL_BULK_DELETE_THRESHOLD,
   MODIFY_COALESCE_MS,
@@ -85,7 +84,7 @@ export interface WatcherDeps {
    * nothing here has to know what platform it is running on. It gates the
    * resurrect hash exactly as it gates every other whole-file read.
    */
-  memoryCapBytes?: () => number;
+  memoryCapBytes: () => number;
   /** Local bulk-delete gate (§4.1 step 5). Default action MUST be cancel. */
   confirmLocalBulkDelete?: (count: number) => Promise<boolean>;
   /** §5.5 — dragging content out of the share. Default action MUST be 'undo'. */
@@ -503,7 +502,7 @@ export class VaultWatcher {
     }
     if (st === null) return null;         // I2
     if (st.bytes === 0) return null;
-    if (st.bytes > this.memoryCapBytes()) return null;   // §7.4: never read to answer
+    if (st.bytes > this.deps.memoryCapBytes()) return null;   // §7.4: never read to answer
     if (dead.xh === undefined) return null;
 
     let hash: string;
@@ -515,10 +514,6 @@ export class VaultWatcher {
     return hash === dead.xh ? { hash } : null;
   }
 
-  /** §7.4's cap on every whole-file allocation, this module's share of it. */
-  private memoryCapBytes(): number {
-    return this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
-  }
 
   /**
    * Spec §5.6. `g = x + 1`, which is the whole reason liveness is a COMPARISON

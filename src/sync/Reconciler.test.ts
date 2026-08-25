@@ -24,7 +24,7 @@ import { TreeDoc } from '../tree/TreeDoc.ts';
 import { Deletions, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import type { BlobPort } from './BlobPort.ts';
-import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import { DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { PublishQueue } from './PublishQueue.ts';
 import { Reconciler, RetryLater, type ReconcilerDeps, type DeletionContext } from './Reconciler.ts';
 import { Tickets, type TicketOp } from './Tickets.ts';
@@ -3638,6 +3638,7 @@ function makePeer(name: string, tree: TreeDoc, store: FakeBlobs): Peer {
     now: () => NOW,
     notice: (m) => { notices.push(m); },
     enqueuePublish: (id) => { queue.enqueue(id); },
+    ...DESKTOP_MEMORY_CAP,
   });
 
   const reconciler = new Reconciler({

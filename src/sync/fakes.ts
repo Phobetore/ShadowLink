@@ -26,6 +26,12 @@
 
 import { extOf, fold, hashOfBytes } from '../tree/paths.ts';
 import {
+  AUTOFETCH_MAX_BYTES,
+  AUTOFETCH_SESSION_BUDGET,
+  BLOB_MAX_BYTES,
+  REHASH_BUDGET_BYTES,
+} from '../tree/constants.ts';
+import {
   BlobDigestMismatch,
   BlobTooLarge,
   BlobTransport,
@@ -909,3 +915,35 @@ export class FakeBlobs implements BlobPort {
     if (error !== undefined) throw error;
   }
 }
+// ============================================================ platform numbers
+
+// §7.4 and §7.2 reach the engine as four plain numbers, and every class that
+// reads one takes it as a REQUIRED constructor argument — no fallback, because a
+// fallback is exactly what let `main.ts` forget one and hand a phone the desktop
+// ceilings with every test still green.
+//
+// Requiring them costs every harness in the suite the same four lines, so the
+// three shapes the engine actually asks for live here instead, spelled DESKTOP so
+// a test reading `{ ...DESKTOP_PASS_LIMITS }` can see which platform it is
+// standing on. A test about a phone overrides the one number it cares about; a
+// test that is not about sizes at all says nothing and gets the desktop values,
+// which is what it used to get from the fallbacks.
+
+/** What `PublishQueue`, `VaultWatcher` and `Deletions` need: the memory cap alone. */
+export const DESKTOP_MEMORY_CAP = {
+  memoryCapBytes: () => BLOB_MAX_BYTES,
+};
+
+/** What `Bootstrap` needs: the cap plus §7.2's two fetch gates. */
+export const DESKTOP_FETCH_LIMITS = {
+  ...DESKTOP_MEMORY_CAP,
+  autofetchMaxBytes: () => AUTOFETCH_MAX_BYTES,
+  sessionBudgetBytes: () => AUTOFETCH_SESSION_BUDGET,
+};
+
+/** What `Reconciler` needs: those three plus §3.5's per-pass re-hash budget. */
+export const DESKTOP_PASS_LIMITS = {
+  ...DESKTOP_FETCH_LIMITS,
+  rehashBudgetBytes: () => REHASH_BUDGET_BYTES,
+};
+

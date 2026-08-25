@@ -21,7 +21,7 @@ import { TreeDoc } from '../tree/TreeDoc.ts';
 import type { NodeFields, NodeKind } from '../tree/types.ts';
 import { Deletions } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
-import { FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import { DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
 import { Reconciler } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
 import type { Kind } from './VaultPort.ts';
@@ -114,6 +114,7 @@ function makeHarness(over: Partial<WatcherDeps> = {}): Harness {
     requeuePublish: (id, intent) => { requeued.push({ id, intent }); },
     confirmLocalBulkDelete: async (count) => { bulkPrompts.push(count); return true; },
     confirmUnshare: async (path, count) => { unsharePrompts.push({ path, count }); return 'unshare'; },
+    ...DESKTOP_MEMORY_CAP,
     ...over,
   });
 
