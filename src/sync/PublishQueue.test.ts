@@ -573,6 +573,90 @@ test('the same note publishes itself as soon as it has a byte in it', async () =
 });
 
 /**
+ * ⚠ The regression the refusal above ships on its own, and the reason `parked`
+ * exists.
+ *
+ * A refused entry stays `pending` on purpose — nothing else will ever re-offer
+ * the node, because `VaultWatcher.onModify` returns early for notes, so the
+ * 30-second retry IS the mechanism that publishes it after the first keystroke.
+ * But the status bar reads `pendingCount()` and says "ShadowLink: syncing…" /
+ * "N file(s) waiting to upload" for as long as it is above zero, and never
+ * reaches `syncedStatus()`.
+ *
+ * So one permanently-empty note in the share pins the status bar on "syncing…"
+ * for the lifetime of the vault. A note created and deleted before its first
+ * character is worse: publish entries are never pruned, so nothing can ever
+ * clear it.
+ *
+ * An empty note is not waiting to upload. There is nothing to upload.
+ */
+test('an empty note does not pin the status bar on "syncing…" for ever', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  // Both halves matter, and they point in opposite directions.
+  assert.equal(h.state.data.publish[id].state, 'pending', 'the entry stays: it is the retry');
+  assert.equal(h.queue.pendingCount(), 0, 'and nothing is reported as waiting to upload');
+  assert.deepEqual(h.queue.parked(), [id], 'it is not invisible either');
+});
+
+test('a parked note rejoins the count the moment a drain sees content in it', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  assert.deepEqual(h.queue.parked(), [id]);
+
+  h.vault.seed(`${SHARE}/Sans titre.md`, 'f', 'the first line');
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, 1, 'the note published on the retry, as designed');
+  assert.deepEqual(h.queue.parked(), [], 'and the park went with it');
+  assert.equal(h.queue.pendingCount(), 0);
+});
+
+test('a note that is not text is parked too, and stops pinning the bar as well', async () => {
+  // The same permanent shape, and it predates the empty-note refusal: a `.md`
+  // node over bytes that are not UTF-8 is refused on every drain for ever, and
+  // the file has to be renamed by hand before that can change. The user is told
+  // once, by Notice. The status bar has nothing to add and no business claiming
+  // an upload is in progress.
+  const h = makeHarness();
+  const notText = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0xc0, 0x80]);
+  const id = h.tree.createNode({ k: 'f', d: '', n: 'notes.md' }, NOW);
+  h.vault.seedBinary(`${SHARE}/notes.md`, notText);
+  h.state.data.owned[id] = true;
+  h.state.data.materialized[id] = `${SHARE}/notes.md`;
+  h.queue.enqueue(id);
+
+  await h.queue.drain();
+
+  assert.equal(h.state.data.publish[id].state, 'pending', 'still retried');
+  assert.deepEqual(h.queue.parked(), [id]);
+  assert.equal(h.queue.pendingCount(), 0, 'and not counted as an upload in progress');
+  assert.ok(h.queue.lastError(id) !== undefined, 'the reason is still in diagnostics');
+});
+
+test('a note deferred because it is open is still an upload this device owes', async () => {
+  // The line the park must not cross. Deferring a note the user has open (I7) is
+  // "not now", not "not ever": closing the tab is all it takes, and the file is
+  // full of the user's words in the meantime. That IS a file waiting to upload.
+  const h = makeHarness();
+  const id = h.add('open.md', 'a note the user is looking at');
+  h.open.id = id;
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined, 'nothing was published under the binding');
+  assert.deepEqual(h.queue.parked(), [], 'and it was not parked');
+  assert.equal(h.queue.pendingCount(), 1, 'the status bar is right to say so');
+});
+
+/**
  * ⚠ I17's second site, and the sharper half of it: a base is a claim that these
  * exact bytes are simultaneously IN THE WORKSPACE and ON THIS DISK.
  *

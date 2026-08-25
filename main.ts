@@ -674,6 +674,12 @@ class SyncRuntime {
     if (this.bootstrap.phase !== 'ready') {
       return { text: 'ShadowLink: starting…', tooltip: 'ShadowLink is joining the workspace.' };
     }
+    // `pendingCount()` is every entry the queue will act on by itself, and it
+    // deliberately EXCLUDES the ones it parked — an empty note, a `.md` file that
+    // is not text. Those stay queued and are retried every pass, because nothing
+    // else will ever re-offer a note, but no upload is owed for them and no
+    // amount of waiting changes that. Counting them here is what pinned this bar
+    // on "syncing…" for the lifetime of a vault holding one empty note.
     const pending = this.queue.pendingCount();
     if (this.reconciler.reconciling || this.reconcileRunning || this.reconcileTimer !== null
         || pending > 0) {

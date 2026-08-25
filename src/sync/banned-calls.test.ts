@@ -285,6 +285,8 @@ const VAULT_SHAPED = new Set(['vault', 'vaults', 'adapter', 'dataadapter', 'v', 
  *   ctx.disk            DiskIndex — the in-memory mirror of the pass's view
  *   ctx.boundAtFold     Map, ctx.have Map, this.byFold Map, this.store Map,
  *   this.errors Map, this.live Map, this.rooms Map, this.entries Map,
+ *   this.parkedNodes   Set — the publish queue's per-session record of which
+ *                      entries the last drain refused over the file itself
  *   m / derivedPath     Y.Map and a derived Map
  *   this.open, this.liveHandles, this.listeners, this.waiters,
  *   this.subscribers, this.decisionPending, this.selected   Sets
@@ -300,7 +302,7 @@ const IN_MEMORY: Record<string, string[]> = {
   'src/sync/DiskIndex.ts': ['this.byFold'],
   'src/sync/ObsidianDocPort.ts': ['this.live', 'this.rooms'],
   'src/sync/ProviderAck.ts': ['this.listeners'],
-  'src/sync/PublishQueue.ts': ['this.errors'],
+  'src/sync/PublishQueue.ts': ['this.errors', 'this.parkedNodes'],
   'src/sync/Reconciler.ts': ['ctx.disk', 'ctx.boundAtFold', 'ctx.have', 'this.localHashes'],
   'src/sync/Tickets.ts': ['this.store'],
   'src/sync/VaultWatcher.ts': ['this.decisionPending'],

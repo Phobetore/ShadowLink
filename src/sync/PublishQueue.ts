@@ -131,6 +131,37 @@ export class PublishQueue {
   private readonly seedRefused = new Set<string>();
 
   /**
+   * Nodes the last drain REFUSED for a reason only the user's file can change.
+   *
+   * Refusing is not failing, so the entry stays `pending` and no rung of the
+   * ladder is charged — and that has to stay true, because nothing else will
+   * ever re-offer a note: `VaultWatcher.onModify` returns early for one, so the
+   * 30-second retry cadence IS how an empty note publishes itself after the
+   * first keystroke. Take the entry away and the note is never published again.
+   *
+   * But an entry in that state is not WORK. Nothing is uploading, nothing is
+   * queued to upload, and nothing will change until the user types into the note
+   * or renames the file. `pendingCount()` is what the status bar turns into
+   * "ShadowLink: syncing… / N file(s) waiting to upload", and it never falls
+   * back to `syncedStatus()` while that number is above zero — so counting these
+   * pinned the bar on "syncing…" for the lifetime of the vault over one
+   * permanently empty note, and publish entries are never pruned, so a note
+   * created and deleted before its first character pinned it with nothing left
+   * to look at.
+   *
+   * IN MEMORY, and re-decided by every drain rather than persisted. It is a
+   * conclusion about a file, and a conclusion about a file goes stale the moment
+   * the file changes; the only honest place to reach it is where the file is
+   * read. The status bar therefore reports what the last pass found, which is
+   * exactly what every other number on it reports.
+   *
+   * The line this must not cross: a note DEFERRED because the user has it open
+   * (I7) is "not now", not "not ever" — closing the tab is all it takes, and the
+   * file is full of the user's words meanwhile. That one stays counted.
+   */
+  private readonly parkedNodes = new Set<string>();
+
+  /**
    * The server's per-file ceiling, once this session has managed to ask for it.
    *
    * Cached rather than re-fetched per item, and NOT cached as a failure: `limits()`
@@ -194,16 +225,44 @@ export class PublishQueue {
     // running for these bytes, done means they are already published.
     if (entry !== undefined && entry.intent === intent) return;
     data.publish[nodeId] = { state: 'pending', attempts: 0, nextAt: 0, intent };
+    // New bytes. Whatever the last drain refused was about the old ones, so the
+    // entry counts as work again from this moment rather than from the drain
+    // that re-examines it — this path HAS an event behind it (`onModify` for an
+    // attachment), which is exactly what a note does not have.
+    this.parkedNodes.delete(nodeId);
     this.deps.state.schedulePersist();
   }
 
-  /** Entries still owed work, whether or not they are due yet. */
+  /**
+   * Entries still owed work by THIS DEVICE, whether or not they are due yet.
+   *
+   * The status bar's number, and therefore a promise: every one of these is a
+   * file that is going to be uploaded without the user doing anything. A parked
+   * entry is not one — see `parkedNodes` — so it is excluded here and reported
+   * by `parked()` instead.
+   */
   pendingCount(): number {
     let n = 0;
-    for (const entry of Object.values(this.deps.state.data.publish)) {
-      if (entry.state === 'pending') n += 1;
+    for (const [id, entry] of Object.entries(this.deps.state.data.publish)) {
+      if (entry.state === 'pending' && !this.parkedNodes.has(id)) n += 1;
     }
     return n;
+  }
+
+  /**
+   * Pending ids the last drain refused over the state of the file itself — an
+   * empty note (I6), or a `.md` node whose bytes are not text (§3.6).
+   *
+   * They are still retried on every drain; this is what keeps them from being
+   * invisible now that they are out of `pendingCount()`. The reason for each is
+   * in `lastError`, and the ones that warrant it have already said so by Notice.
+   */
+  parked(): string[] {
+    const out: string[] = [];
+    for (const id of this.parkedNodes) {
+      if (this.deps.state.data.publish[id]?.state === 'pending') out.push(id);
+    }
+    return out.sort(compare);
   }
 
   /**
@@ -323,6 +382,11 @@ export class PublishQueue {
     // closed the tab — so nothing at all is touched, not even the disk.
     if (this.deps.openNodeId() === id) return;
 
+    // Past every deferral, so this attempt is genuinely going to look at the
+    // file. Whatever the last drain concluded about it stops being current here,
+    // and is re-established below only if this attempt reaches the same refusal.
+    this.parkedNodes.delete(id);
+
     const path = data.materialized[id];
     if (path === undefined || path === '') {
       // The reconciler has not bound this node to a file yet (or the binding was
@@ -379,7 +443,17 @@ export class PublishQueue {
       // here publishes it on the next drain after its first byte lands. Refusing
       // is not failing, so no rung of the ladder is charged and nothing is said to
       // the user about a note they are still writing.
-      if (published.length === 0) return;
+      //
+      // PARKED as it is kept, because those two facts are both needed and they
+      // pull opposite ways. The entry has to stay, or the note is never offered
+      // again; the STATUS BAR must not read it as an upload in progress, or one
+      // permanently empty note reports "1 file waiting to upload" for the
+      // lifetime of the vault and the bar never says "synced" again. There is no
+      // upload owed here: there is nothing to upload.
+      if (published.length === 0) {
+        this.parkedNodes.add(id);
+        return;
+      }
 
       this.deps.tree.patchNode(id, { s: 1 });
 
@@ -429,6 +503,9 @@ export class PublishQueue {
    * REFUSING IS NOT FAILING — no rung of the backoff ladder is charged, because a
    * file that is not text will not become text by waiting; the entry stays
    * pending, the reason reaches diagnostics, and the user is told exactly once.
+   * It is PARKED for the same reason an empty note is: waiting is not what fixes
+   * this, a rename by hand is, so there is no upload in progress for the status
+   * bar to report and no honest way to count one.
    *
    * A `stat` that cannot answer is a retry (I2): "I could not look" must not
    * become "seed it anyway".
@@ -443,6 +520,7 @@ export class PublishQueue {
     // bytes for every invalid one — so this cannot let mojibake through.
     if (encoded === st.bytes || encoded + BOM_BYTES === st.bytes) return true;
 
+    this.parkedNodes.add(id);
     this.errors.set(id, new Error(
       `${path} is ${st.bytes} bytes on disk but decodes to ${encoded}: not UTF-8 text`,
     ));
@@ -748,6 +826,10 @@ export class PublishQueue {
     };
     if (intent !== undefined) entry.intent = intent;
     this.deps.state.data.publish[id] = entry;
+    // Nothing owed, nothing refused. `parked()` already filters on the entry's
+    // state, so this is hygiene rather than correctness — but a set that only
+    // ever grows is how the next reader is misled.
+    this.parkedNodes.delete(id);
   }
 
   /**
