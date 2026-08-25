@@ -119,14 +119,23 @@ class FirstSyncModal extends DecisionModal<BootstrapDecision> {
       });
     }
     if (info.downloadDeferred.count > 0) {
-      // §7.2's three refusals are one sentence on purpose. "Over the auto-fetch
-      // ceiling", "past this session's budget" and "larger than this device can
-      // hold" are one fact to the person reading this — the file will not arrive
-      // yet — and the commands that fetch it are the same in all three cases.
+      // §7.2's three refusals stay ONE COUNT here, because `Bootstrap.classify`
+      // buckets them together and "the file will not arrive yet" is one fact to
+      // the person reading this.
+      //
+      // The REMEDY is not one thing, and this line used to say it was. "Over the
+      // auto-fetch ceiling" and "past this session's budget" are both lifted by
+      // the download command; "larger than this device can hold" is not — the cap
+      // is tested before an approval is consulted, so pressing that command for
+      // an oversized file does nothing, however many times. Promising otherwise
+      // sent the user to a command that answered "already downloaded" about a file
+      // that is not on the disk, which is two shipped surfaces contradicting each
+      // other with the wrong one winning.
       summary.createEl('li', {
         text: `${info.downloadDeferred.count} attachment(s) `
           + `(${sizeOf(info.downloadDeferred.bytes)}) will not be downloaded here yet. `
-          + 'Use "ShadowLink: Download attachments" to fetch them.',
+          + 'Use "ShadowLink: Download attachments" for the ones this device can hold; '
+          + 'anything larger than its memory limit is listed in the status bar instead.',
       });
     }
     summary.createEl('li', {

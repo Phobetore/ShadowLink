@@ -1826,6 +1826,106 @@ test('B24: an attachment over the memory cap is not fetched and not written', as
   assert.deepEqual(r.failures, [], 'and it is not an error: this device simply cannot hold it');
 });
 
+// ⚠ §7.5: "refused before any request is made, with a diagnostic naming the file,
+// its size and the cap". A node id pushed into an array the pass throws away is
+// none of those three, and the surfaces that DO ship then say the opposite —
+// "synced", and "every attachment in this workspace is already downloaded".
+test('§7.5: an attachment refused by the cap on the way IN is described, not just counted',
+  async () => {
+    const h = makeHarness({ memoryCapBytes: () => 32 });
+    h.vault.seed(SHARE, 'd');
+    const bytes = png(3, 512);
+    const id = nid('A');
+    h.nodes.set(id, await publishedBlob(h.blobs, 'clips', 'clip.mov', bytes));
+
+    const r = await h.reconciler.reconcile('remote');
+
+    assert.deepEqual(r.diagnostics.fetchTooLarge, [id]);
+    assert.deepEqual(h.reconciler.tooLargeAttachments, [
+      { id, path: `${SHARE}/clips/clip.mov`, sha256: await hashOfBytes(bytes), bytes: 512 },
+    ], 'named and sized, and remembered OUTSIDE the pass where the status bar can read it');
+    assert.deepEqual(
+      h.reconciler.deferredAttachments, [],
+      'and never offered as a download: the cap outranks an approval, so that button '
+      + 'could only fail',
+    );
+  });
+
+// ⚠ The trap the obvious version of this fix falls into. `tooLarge` has THREE
+// writers and only one of them means "the file is not here": `hashWithBudget` and
+// `adoptBlob` fire for a file that IS on disk and complete, where only this
+// device's question about it is unanswered. Folding them together would report a
+// downloaded attachment as missing — the exact error `rehashDeferred` exists as a
+// separate channel to avoid.
+test('a file this device cannot HASH is never reported as one it does not have', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 32 });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1, 512);
+  const path = `${SHARE}/diagram.png`;
+  h.vault.seedBinary(path, mine);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'diagram.png', png(2, 512)));
+
+  const r = await h.reconciler.reconcile('bootstrap');
+
+  assert.deepEqual(r.diagnostics.tooLarge, [id], 'the device limit is still reported');
+  assert.deepEqual(r.diagnostics.fetchTooLarge, [], 'but NOT as a file that is missing');
+  assert.deepEqual(h.reconciler.tooLargeAttachments, []);
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'because the file is right there');
+});
+
+// §6.5. The third state, and the only one nothing on this device can lift. It
+// still has to reach a surface: "bounded" is worth something only if the user is
+// told, and a Download button for it would be a button that can only fail.
+test('§6.5: an attachment the store no longer holds is described, not offered', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png(4, 128);
+  const id = nid('A');
+  const fields = await publishedBlob(h.blobs, '', 'old.zip', bytes);
+  h.nodes.set(id, fields);
+  h.blobs.setAbsent(fields.b!.slice(0, 64));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(r.diagnostics.unavailable, [id]);
+  assert.deepEqual(h.reconciler.unavailableAttachments, [
+    { id, path: `${SHARE}/old.zip`, sha256: await hashOfBytes(bytes), bytes: 128 },
+  ]);
+  assert.deepEqual(h.reconciler.deferredAttachments, []);
+});
+
+// All three lists are re-derived from scratch every pass, exactly as `lastDeferred`
+// is: a status bar counting files that stopped being outstanding last week is worse
+// than no status bar.
+test('the oversized and unavailable lists clear the moment they stop being true', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 32 });
+  h.vault.seed(SHARE, 'd');
+  const bytes = png(3, 512);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'clip.mov', bytes));
+
+  await h.reconciler.reconcile('remote');
+  assert.equal(h.reconciler.tooLargeAttachments.length, 1);
+
+  // A bigger device, or the same one after the file shrank.
+  h.reconciler = new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: h.blobs,
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    now: () => NOW,
+  });
+  const second = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(second.diagnostics.fetchTooLarge, []);
+  assert.deepEqual(h.reconciler.tooLargeAttachments, []);
+  assert.deepEqual(h.vault.binarySnapshot()[`${SHARE}/clip.mov`], bytes);
+});
+
 // Both tickets, before the write. Without the `create` ticket the watcher reads
 // our own write as a user action; without the `modify` one, so does the modify
 // handler P2-d registers — and a `'b'` node's modify handler resolves the node

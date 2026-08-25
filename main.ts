@@ -53,7 +53,7 @@ import {
   warnAttachmentFolder,
 } from './src/ui/modals';
 import { deferredEmbedProcessor, matchDeferred } from './src/ui/DeferredEmbeds';
-import { formatBytes, syncedStatus } from './src/ui/format';
+import { formatBytes, nothingToDownload, syncedStatus } from './src/ui/format';
 import { DEFAULT_SETTINGS, ShadowLinkSettings } from './src/types';
 
 import {
@@ -687,7 +687,18 @@ class SyncRuntime {
     // every peer that a path holds hash H while exactly one peer has the bytes, so
     // a bare "synced" beside twelve undownloaded attachments is false — and false
     // in the direction that stops the user looking for the file.
-    return syncedStatus(this.shareRoot, this.reconciler.deferredAttachments);
+    //
+    // ALL THREE BUCKETS, never just the fetchable one. §7.5's refusal leaves a
+    // file that is not on this disk exactly as §7.2's does, so a status bar
+    // counting only `deferred` says "synced" beside it — the same falsehood,
+    // now about the one bucket the user can do nothing about.
+    return syncedStatus(
+      this.shareRoot,
+      this.reconciler.deferredAttachments,
+      this.reconciler.tooLargeAttachments,
+      this.reconciler.unavailableAttachments,
+      blobMemoryCap(),
+    );
   }
 
   // ---------------------------------------------------------- §7.3 downloads
@@ -695,6 +706,21 @@ class SyncRuntime {
   /** Every attachment the last pass decided not to fetch, for the commands and the UI. */
   get deferredAttachments(): readonly DeferredAttachment[] {
     return this.reconciler.deferredAttachments;
+  }
+
+  /**
+   * The two buckets a download command CANNOT act on (§7.5, §6.5).
+   *
+   * Kept apart from `deferredAttachments` all the way to the surface, because
+   * every consumer of that list either offers a Download button for it or counts
+   * it as fetchable — and both are promises this device cannot keep for these.
+   */
+  get tooLargeAttachments(): readonly DeferredAttachment[] {
+    return this.reconciler.tooLargeAttachments;
+  }
+
+  get unavailableAttachments(): readonly DeferredAttachment[] {
+    return this.reconciler.unavailableAttachments;
   }
 
   /**
@@ -713,7 +739,11 @@ class SyncRuntime {
    */
   async downloadAttachments(ids: readonly string[]): Promise<void> {
     if (ids.length === 0) {
-      new Notice('ShadowLink: nothing to download — every attachment here is up to date.');
+      // Reached only by a caller that asked for nothing; every command has already
+      // said something more specific by here. It deliberately makes no claim about
+      // what IS downloaded — that answer belongs to `nothingToDownload`, which can
+      // see the buckets this early return cannot.
+      new Notice('ShadowLink: nothing to download.');
       return;
     }
     for (const id of ids) this.state.data.fetchApproved[id] = true;
@@ -734,19 +764,59 @@ class SyncRuntime {
     );
   }
 
+  /** §7.3's "download attachments in this note" — the fetchable bucket only. */
+  deferredInNote(path: string): DeferredAttachment[] {
+    return this.inNote(path, this.reconciler.deferredAttachments);
+  }
+
   /**
-   * §7.3's "download attachments in this note".
+   * §7.3's answer when a download command finds nothing it can fetch.
+   *
+   * The claim "every attachment here is already downloaded" is only true when
+   * NOTHING is outstanding, and the two buckets below are outstanding and
+   * unfetchable — the cap is tested before an approval is consulted, and the store
+   * has answered 404. This is where the first-sync modal sends the user, so the
+   * command answering falsely is the shipped surface that contradicts the other.
+   */
+  nothingToDownloadHere(): string {
+    return this.sayNothing(
+      'this workspace',
+      this.reconciler.tooLargeAttachments,
+      this.reconciler.unavailableAttachments,
+    );
+  }
+
+  /** The same answer, scoped to one note's embeds and links. */
+  nothingToDownloadInNote(path: string): string {
+    return this.sayNothing(
+      'this note',
+      this.inNote(path, this.reconciler.tooLargeAttachments),
+      this.inNote(path, this.reconciler.unavailableAttachments),
+    );
+  }
+
+  private sayNothing(
+    where: string,
+    tooLarge: readonly DeferredAttachment[],
+    unavailable: readonly DeferredAttachment[],
+  ): string {
+    return nothingToDownload(this.shareRoot, where, tooLarge, unavailable, blobMemoryCap());
+  }
+
+  /**
+   * Which of `entries` this note embeds or links to.
    *
    * The links come from Obsidian's own metadata cache, which lists an embed whether
-   * or not it resolves — and for a deferred attachment it never resolves, because
-   * there is deliberately nothing on disk to resolve to. That is why the match runs
-   * against the reconciler's list of paths rather than against a `TFile`.
+   * or not it resolves — and for an attachment that is not here it never resolves,
+   * because there is deliberately nothing on disk to resolve to. That is why the
+   * match runs against a list of paths rather than against a `TFile`, and it is why
+   * the same routine serves all three buckets: none of them has a file to look at.
    */
-  deferredInNote(path: string): DeferredAttachment[] {
+  private inNote(path: string, entries: readonly DeferredAttachment[]): DeferredAttachment[] {
+    if (entries.length === 0) return [];
     const file = this.plugin.app.vault.getFileByPath(path);
     if (file === null) return [];
     const cache = this.plugin.app.metadataCache.getFileCache(file);
-    const entries = this.reconciler.deferredAttachments;
     const out = new Map<string, DeferredAttachment>();
     for (const embed of cache?.embeds ?? []) {
       const hit = matchDeferred(embed.link, path, entries);
@@ -1051,7 +1121,7 @@ export default class ShadowLinkPlugin extends Plugin {
     }
     const wanted = runtime.deferredInNote(file.path);
     if (wanted.length === 0) {
-      new Notice('ShadowLink: every attachment in this note is already downloaded.');
+      new Notice(runtime.nothingToDownloadInNote(file.path));
       return;
     }
     await this.downloadAttachments(wanted.map((d) => d.id));
@@ -1070,7 +1140,7 @@ export default class ShadowLinkPlugin extends Plugin {
     if (runtime === null) return this.notRunning();
     const entries = runtime.deferredAttachments;
     if (entries.length === 0) {
-      new Notice('ShadowLink: every attachment in this workspace is already downloaded.');
+      new Notice(runtime.nothingToDownloadHere());
       return;
     }
     const bytes = entries.reduce((sum, d) => sum + d.bytes, 0);
@@ -1084,7 +1154,7 @@ export default class ShadowLinkPlugin extends Plugin {
     if (runtime === null) return this.notRunning();
     const entries = runtime.deferredAttachments;
     if (entries.length === 0) {
-      new Notice('ShadowLink: every attachment in this workspace is already downloaded.');
+      new Notice(runtime.nothingToDownloadHere());
       return;
     }
     const chosen = await chooseAttachments(this.app, entries);

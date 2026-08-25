@@ -65,6 +65,24 @@ export interface ReconcileDiagnostics {
    */
   tooLarge: string[];
   /**
+   * The subset of `tooLarge` refused on the way IN — a fetch the cap turned down
+   * before the request was made (§7.5).
+   *
+   * A FOURTH channel rather than a reading of the third, because `tooLarge` has
+   * three writers and only this one means "the bytes are not on this disk".
+   * `hashWithBudget` and `adoptBlob` fire for a file that IS there and complete,
+   * where only this device's question about it is unanswered — so describing
+   * `tooLarge` wholesale to the user would report a downloaded attachment as
+   * missing, which is precisely why `rehashDeferred` was split out below.
+   *
+   * As with `deferred`, the usual case is that nothing is at the path at all, and
+   * the narrower one is a REPLACEMENT that was held back with an older version
+   * still in place. Both are "this version is not here", and neither has a remedy
+   * on this device: the cap is tested before an approval is even consulted, so a
+   * download button offered for one of these could only fail.
+   */
+  fetchTooLarge: string[];
+  /**
    * Attachment nodes the fetch policy has not cleared yet (§7.2).
    *
    * Usually there is NOTHING on disk for them — no file, no placeholder, no stub,
@@ -444,6 +462,20 @@ export class Reconciler {
    * here rather than handed back in `ReconcileResult` and forgotten.
    */
   private lastDeferred: DeferredAttachment[] = [];
+  /**
+   * What the last completed pass refused to fetch because of the memory cap
+   * (§7.5), and what it could not fetch because the store no longer holds it
+   * (§6.5) — remembered for the same reason `lastDeferred` is.
+   *
+   * THREE LISTS, NEVER ONE. Every surface that reads them has to say something
+   * different: `lastDeferred` is the only one with a remedy on this device, so it
+   * is the only one a Download button belongs to. The cap is tested before an
+   * approval is consulted, and an unavailable object has been answered 404 for —
+   * a button offered for either could only fail, which is the same broken promise
+   * a bare "synced" was making.
+   */
+  private lastTooLarge: DeferredAttachment[] = [];
+  private lastUnavailable: DeferredAttachment[] = [];
 
   constructor(deps: ReconcilerDeps) {
     this.deps = deps;
@@ -483,6 +515,31 @@ export class Reconciler {
    */
   get deferredAttachments(): readonly DeferredAttachment[] {
     return this.lastDeferred;
+  }
+
+  /**
+   * Every attachment the last completed pass refused to FETCH because it is
+   * larger than this device will load (§7.4, §7.5).
+   *
+   * Deliberately not folded into `deferredAttachments`: this is the bucket with no
+   * remedy here, because `fetchVerdict` tests the cap before it consults an
+   * approval. Naming it in the same breath as "available" would offer a button
+   * that cannot work however many times it is pressed.
+   */
+  get tooLargeAttachments(): readonly DeferredAttachment[] {
+    return this.lastTooLarge;
+  }
+
+  /**
+   * Every attachment the workspace store has definitely answered that it no
+   * longer holds (§6.5).
+   *
+   * The only one of the three that nothing done on this device can lift, so it is
+   * the one whose wording has to send the user to a PERSON rather than to a
+   * command.
+   */
+  get unavailableAttachments(): readonly DeferredAttachment[] {
+    return this.lastUnavailable;
   }
 
   /**
@@ -555,7 +612,7 @@ export class Reconciler {
     const failures: ReconcileFailure[] = [];
     const diagnostics: ReconcileDiagnostics = {
       pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
-      unavailable: [], rehashDeferred: [],
+      unavailable: [], rehashDeferred: [], fetchTooLarge: [],
     };
     // Stays null until bindings have been observed, so a refusal partway through
     // cannot let the `finally` block rebuild `materialized` from an empty map.
@@ -1271,6 +1328,12 @@ export class Reconciler {
         return true;
       case 'tooLarge':
         ctx.diagnostics.tooLarge.push(id);
+        // ...and again in the narrow channel, because THIS is the writer that
+        // means the bytes are not on the disk. The other two `tooLarge` sites
+        // describe a local file the device merely cannot hash, and a user surface
+        // that could not tell them apart would call a downloaded attachment
+        // missing (§7.5).
+        ctx.diagnostics.fetchTooLarge.push(id);
         return false;
       case 'needsApproval':
         ctx.diagnostics.deferred.push(id);
@@ -1353,9 +1416,29 @@ export class Reconciler {
       if (!ctx.deferredByPolicy.has(id)) delete this.deps.state.data.fetchDeferred[id];
     }
 
+    this.lastDeferred = this.describe(ctx, ctx.diagnostics.deferred);
+    // §7.5 and §6.5 reach the user through the same rescue, and through their own
+    // lists rather than through `deferred`'s: all three are "this version is not
+    // here", and only the first has a remedy on this device.
+    this.lastTooLarge = this.describe(ctx, ctx.diagnostics.fetchTooLarge);
+    this.lastUnavailable = this.describe(ctx, ctx.diagnostics.unavailable);
+  }
+
+  /**
+   * Node ids -> everything a user surface needs to talk about them.
+   *
+   * `blobRefs` and `desired` are the pass's own derivation, so the path and the
+   * size come from the same place the verdict did rather than from a second guess
+   * about the tree. An id neither of them knows is dropped: the alternative is a
+   * status bar naming a file whose node the pass could not resolve.
+   *
+   * Rebuilt from scratch every pass and never accumulated, because a list still
+   * counting what stopped being outstanding last week is worse than no list.
+   */
+  private describe(ctx: PassContext, ids: readonly string[]): DeferredAttachment[] {
     const seen = new Set<string>();
     const out: DeferredAttachment[] = [];
-    for (const id of ctx.diagnostics.deferred) {
+    for (const id of ids) {
       if (seen.has(id)) continue;
       seen.add(id);
       const ref = ctx.blobRefs.get(id);
@@ -1364,7 +1447,7 @@ export class Reconciler {
       out.push({ id, path: want.path, sha256: ref.sha256, bytes: ref.bytes });
     }
     out.sort((a, b) => cmp(a.path, b.path));
-    this.lastDeferred = out;
+    return out;
   }
 
   /** The three ceilings §7.2 decides against, as one value. */
@@ -2110,7 +2193,7 @@ function refused(reason: string): ReconcileResult {
     failures: [],
     diagnostics: {
       pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
-      unavailable: [], rehashDeferred: [],
+      unavailable: [], rehashDeferred: [], fetchTooLarge: [],
     },
   };
 }

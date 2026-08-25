@@ -36,6 +36,15 @@ export interface StatusLine {
   tooltip: string;
 }
 
+/** One attachment the status line has to be able to name. */
+export interface NamedAttachment {
+  path: string;
+  bytes: number;
+}
+
+/** Longest sample the tooltip lists before it starts counting instead. */
+const MAX_NAMED = 3;
+
 /**
  * What the status bar says once a pass has finished and nothing is pending.
  *
@@ -47,18 +56,132 @@ export interface StatusLine {
  *
  * The count goes in the visible text and the byte total in the tooltip, because
  * the count is what makes somebody hover and the total is what makes the decision.
+ *
+ * THREE BUCKETS, NEVER ONE. §7.2, §7.4 and §6.5 are three different states and
+ * only the FIRST has a remedy on this device, so only the first names the download
+ * command. An oversized file is refused by the cap before an approval is even
+ * consulted, and an unavailable one is bytes the store has answered 404 for — a
+ * Download button offered for either is a button that can only fail, which is the
+ * same broken promise the bare word "synced" was making.
+ *
+ * @param tooLarge  refused by this device's memory cap ON THE WAY IN (§7.4/§7.5).
+ *                  NOT the local-file cases: a file this device cannot re-hash is
+ *                  on disk and complete, and reporting it here would tell the user
+ *                  a downloaded attachment is missing.
+ * @param unavailable  bytes the workspace store no longer holds (§6.5).
+ * @param memoryCapBytes  the cap `tooLarge` was measured against, so §7.5's
+ *                  "naming the file, its size and the cap" can be honoured.
  */
 export function syncedStatus(
   shareRoot: string,
   deferred: readonly { bytes: number }[],
+  tooLarge: readonly NamedAttachment[] = [],
+  unavailable: readonly NamedAttachment[] = [],
+  memoryCapBytes?: number,
 ): StatusLine {
-  if (deferred.length === 0) {
+  if (deferred.length === 0 && tooLarge.length === 0 && unavailable.length === 0) {
     return { text: 'ShadowLink: synced', tooltip: `Sharing ${shareRoot}` };
   }
-  const bytes = deferred.reduce((sum, d) => sum + d.bytes, 0);
-  return {
-    text: `ShadowLink: synced · ${deferred.length} attachment(s) available`,
-    tooltip: `${deferred.length} attachment(s) not downloaded (${formatBytes(bytes)}). `
+
+  const counts: string[] = [];
+  const lines: string[] = [];
+
+  if (deferred.length > 0) {
+    const bytes = deferred.reduce((sum, d) => sum + d.bytes, 0);
+    counts.push(`${deferred.length} attachment(s) available`);
+    lines.push(
+      `${deferred.length} attachment(s) not downloaded (${formatBytes(bytes)}). `
       + 'Run "ShadowLink: Download attachments" to choose which to fetch.',
-  };
+    );
+  }
+  if (tooLarge.length > 0) counts.push(`${tooLarge.length} too large for this device`);
+  if (unavailable.length > 0) counts.push(`${unavailable.length} unavailable`);
+  lines.push(...unfetchableLines(shareRoot, tooLarge, unavailable, memoryCapBytes));
+
+  return { text: `ShadowLink: synced · ${counts.join(' · ')}`, tooltip: lines.join('\n') };
+}
+
+/**
+ * What a download command answers when it has nothing left to fetch (§7.3).
+ *
+ * "Every attachment here is already downloaded" is a claim, and it is only true
+ * when NOTHING is outstanding. Said while an oversized or unavailable attachment
+ * is missing, it is the same falsehood a bare "synced" was, made worse by where it
+ * appears: the first-sync modal sends the user to this exact command, so the two
+ * shipped surfaces contradict each other and the user follows the wrong one.
+ *
+ * Neither remaining bucket can be fetched by pressing anything — `fetchVerdict`
+ * tests the memory cap before it consults an approval, and an unavailable object
+ * is one the store has answered 404 for — so this says what IS true and stops.
+ *
+ * @param where  the scope the caller searched, as a phrase: "this note",
+ *               "this workspace". It is the caller's, because only the caller
+ *               knows which of the two it just looked through.
+ */
+export function nothingToDownload(
+  shareRoot: string,
+  where: string,
+  tooLarge: readonly NamedAttachment[],
+  unavailable: readonly NamedAttachment[],
+  memoryCapBytes?: number,
+): string {
+  const lines = unfetchableLines(shareRoot, tooLarge, unavailable, memoryCapBytes);
+  if (lines.length === 0) {
+    return `ShadowLink: every attachment in ${where} is already downloaded.`;
+  }
+  return `ShadowLink: nothing in ${where} can be downloaded here. ${lines.join(' ')}`;
+}
+
+/**
+ * The two buckets nothing on this device can act on, as sentences.
+ *
+ * Shared by the status bar's tooltip and by the download commands' answer so the
+ * two cannot drift: a user who hovers the status bar and then runs the command is
+ * asking the same question twice, and getting two different answers is how a
+ * feature stops being believed.
+ */
+function unfetchableLines(
+  shareRoot: string,
+  tooLarge: readonly NamedAttachment[],
+  unavailable: readonly NamedAttachment[],
+  memoryCapBytes?: number,
+): string[] {
+  const out: string[] = [];
+  if (tooLarge.length > 0) {
+    const cap = memoryCapBytes === undefined ? '' : ` (limit ${formatBytes(memoryCapBytes)})`;
+    out.push(
+      `${tooLarge.length} attachment(s) are larger than this device will load${cap}: `
+      + `${sample(shareRoot, tooLarge)}. They are still in the workspace and nothing is `
+      + 'missing for anybody else — open them on a device with more memory.',
+    );
+  }
+  if (unavailable.length > 0) {
+    out.push(
+      `${unavailable.length} attachment(s) are no longer held by the workspace store: `
+      + `${sample(shareRoot, unavailable)}. Nothing on this device can fetch them; ask `
+      + 'whoever still has a copy to add it again.',
+    );
+  }
+  return out;
+}
+
+/**
+ * A few names with their sizes, and an honest count of the rest.
+ *
+ * Share-relative, because a status-bar tooltip listing `Shared/img/diagram.png`
+ * three times over is a wall the user reads none of — and because two files called
+ * `diagram.png` in different folders are two different files, so the bare basename
+ * would not do either.
+ */
+function sample(shareRoot: string, items: readonly NamedAttachment[]): string {
+  const shown = items
+    .slice(0, MAX_NAMED)
+    .map((e) => `${relativeTo(shareRoot, e.path)} (${formatBytes(e.bytes)})`);
+  if (items.length > MAX_NAMED) shown.push(`and ${items.length - MAX_NAMED} more`);
+  return shown.join(', ');
+}
+
+function relativeTo(shareRoot: string, path: string): string {
+  const prefix = `${shareRoot.replace(/\/+$/, '')}/`;
+  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
 }
