@@ -42,7 +42,14 @@ export interface ShareConfig {
   serverUrl: string;
   /** `sk_…`, from the server's SHADOWLINK_ADMIN_CREDS.txt. */
   serverKey: string;
-  /** [A-Za-z0-9_-]{1,64}. Identical for every member of a workspace. */
+  /**
+   * Identical for every member of a workspace, and constrained by
+   * `WORKSPACE_ID_RE` in `src/tree/ids.ts` — which is where the client states that
+   * charset, once, for both the settings tab and the two filenames the id becomes.
+   * Restating the pattern here would make this a third copy to keep in step.
+   *
+   * `''` means "not configured yet"; `ShadowLinkPlugin.configured` reads it.
+   */
   workspaceId: string;
   /** Vault-relative folder to share, e.g. 'Shared'. No leading or trailing slash. */
   sharedFolder: string;
