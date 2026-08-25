@@ -3,22 +3,64 @@
 //
 // One of only three files in `src/sync/` allowed to import `obsidian`.
 //
-// Both files live under `.obsidian/plugins/shadowlink/` and both are written
-// ATOMICALLY — a `.tmp` sibling first, then a rename over the target. That is not
-// ceremony. A torn device-state file read back on the next start is
+// Both files live under `.obsidian/plugins/shadowlink/`. What is at stake in how
+// they are written: a torn device-state file read back on the next start is
 // indistinguishable from a corrupt one, so `DeviceState.load` cold-starts, and a
-// cold start on every launch is a permanent silent degradation: `materialized`,
-// `owned` and `declinedPaths` are all rebuilt from scratch, and until the first
-// reconcile finishes the client believes it owns nothing. A truncated tree
-// snapshot is worse still: `Y.applyUpdate` throws on it, which spec §2.6's whole
-// purpose — being able to re-merge full tree history into a server whose snapshot
-// was lost — depends on not happening.
+// cold start is a silent degradation — `materialized`, `owned` and `declinedPaths`
+// are rebuilt from scratch and until the first reconcile finishes the client
+// believes it owns nothing. A truncated tree snapshot is worse still:
+// `Y.applyUpdate` throws on it, which spec §2.6's whole purpose — being able to
+// re-merge full tree history into a server whose snapshot was lost — depends on
+// not happening.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHAT THIS PORT CAN AND CANNOT PROMISE. Read this before "restoring" atomicity.
+//
+// Spec §2.5 and §2.6 both say these files are written "atomically (write `.tmp`,
+// then `adapter.rename`)". That prescription DOES NOT WORK, and the spec has been
+// amended to match this file rather than the other way round. `vault.adapter` is
+// not `node:fs`:
+//
+//   * `FileSystemAdapter.prototype.rename` tests the destination itself and
+//     throws BEFORE it reaches `fsPromises.rename` —
+//         if (await this._exists(newPath, false)
+//             && (!this.insensitive || path.toLowerCase() !== newPath.toLowerCase()))
+//           throw new Error('Destination file already exists!');
+//     — so an occupied destination is refused DETERMINISTICALLY, on every
+//     platform, mobile adapter included. It is not a transient Windows `EPERM`
+//     and no retry budget will ever clear it. (Node's own `fs.rename` DOES
+//     replace, which is what made this look fine in review and in the fake.)
+//   * `adapter.write` / `adapter.writeBinary` are a bare `fsPromises.writeFile`.
+//     Truncate-then-fill: the live file IS the half-written one while it runs.
+//   * The adapter's `remove` would let us free the destination and then rename
+//     into it — but it is banned in shipped source by I1's guard in
+//     `banned-calls.test.ts`, and that ban is not this file's to lift.
+//
+// Without a removal primitive you cannot recycle a name, and without recycling a
+// name there is no atomic replace to be had. So:
+//
+//   CREATE (destination free)  — genuinely atomic. Staged, then linked into
+//                                place. The file appears whole or not at all.
+//   OVERWRITE (destination in use) — NOT atomic, and cannot be made so here.
+//
+// The `.tmp` sibling is therefore NOT an atomicity mechanism on the overwrite
+// path; it is the read path's fallback copy, and it is rewritten BEFORE the live
+// file on every single write for one reason: so that it can never be STALE. A
+// stale device state is worse than a missing one, because it is read as
+// authoritative — it carries `contentHash` (I17), `declinedPaths` and the
+// deletion budget, and rolling those back by one revision is how a file that
+// should have been rescued gets proven deletable instead.
+//
+// It follows that both files keep a `.tmp` sibling on disk from the second write
+// onward. That is deliberate, not litter. Removing it would need the same
+// removal primitive that would have made the write atomic in the first place.
+// ─────────────────────────────────────────────────────────────────────────────
 //
 // The read path completes the story. If the target is absent but its `.tmp`
-// sibling is there, the process died between the write and the rename, and the
-// `.tmp` copy is a complete file that was never linked into place. Reading it is
-// recovery; reading it in PREFERENCE to an existing target would not be, so it is
-// only ever the fallback.
+// sibling is there, the process died between the write and the rename, or the
+// target was lost after one, and the `.tmp` copy is a complete file holding the
+// most recent bytes this port was given. Reading it is recovery; reading it in
+// PREFERENCE to an existing target would not be, so it is only ever the fallback.
 
 import { normalizePath } from 'obsidian';
 import type { DataAdapter } from 'obsidian';
@@ -44,17 +86,29 @@ export function treeSnapshotKey(workspaceId: string): string {
   return `tree-${workspaceId}.bin`;
 }
 
+/** Tuning for the rename retry. Defaults mirror `server/blobStore.js`. */
+export interface StatePortOptions {
+  /** Total rename attempts before the write is failed outright. */
+  readonly renameAttempts?: number;
+  /** Backoff base; attempt _n_ waits `renameDelayMs * n`. */
+  readonly renameDelayMs?: number;
+}
+
 export class ObsidianStatePort implements StatePort {
   private readonly adapter: DataAdapter;
   private readonly dir: string;
+  private readonly renameAttempts: number;
+  private readonly renameDelayMs: number;
 
   /**
    * @param dir The plugin's data directory, normally `plugin.manifest.dir`
    *            (`.obsidian/plugins/shadowlink`).
    */
-  constructor(adapter: DataAdapter, dir: string) {
+  constructor(adapter: DataAdapter, dir: string, options: StatePortOptions = {}) {
     this.adapter = adapter;
     this.dir = normalizePath(dir.replace(/\/+$/, ''));
+    this.renameAttempts = options.renameAttempts ?? 5;
+    this.renameDelayMs = options.renameDelayMs ?? 25;
   }
 
   // ---------------------------------------------------------- StatePort
@@ -68,11 +122,7 @@ export class ObsidianStatePort implements StatePort {
   }
 
   async write(key: string, data: string): Promise<void> {
-    const target = this.pathFor(key);
-    const tmp = `${target}.tmp`;
-    await this.ensureDir();
-    await this.adapter.write(tmp, data);
-    await this.commit(tmp, target, () => this.adapter.write(target, data));
+    await this.put(this.pathFor(key), (path) => this.adapter.write(path, data));
   }
 
   // ---------------------------------------------------------- §2.6 snapshot
@@ -88,14 +138,11 @@ export class ObsidianStatePort implements StatePort {
 
   async writeBinary(key: string, data: Uint8Array): Promise<void> {
     const target = this.pathFor(key);
-    const tmp = `${target}.tmp`;
-    await this.ensureDir();
     const buffer = data.buffer.slice(
       data.byteOffset,
       data.byteOffset + data.byteLength,
     ) as ArrayBuffer;
-    await this.adapter.writeBinary(tmp, buffer);
-    await this.commit(tmp, target, () => this.adapter.writeBinary(target, buffer));
+    await this.put(target, (path) => this.adapter.writeBinary(path, buffer));
   }
 
   // ---------------------------------------------------------- internals
@@ -133,19 +180,73 @@ export class ObsidianStatePort implements StatePort {
   }
 
   /**
-   * Link the staged copy into place.
+   * One write of one file, through the only atomic path this adapter has — and
+   * in place when it has none. See the header for why those are the only two.
    *
-   * Node's `rename` replaces an existing destination on every platform this
-   * plugin runs on, which is what makes the swap atomic. An adapter that refuses
-   * one anyway must not cost the caller its data, so the fallback writes the
-   * target directly: not atomic, but the complete `.tmp` copy written a moment
-   * ago is still on disk and the read path above knows how to find it.
+   * The staged copy is written FIRST in both cases, so that if the live file is
+   * about to be overwritten non-atomically, the fallback the read path would
+   * reach for already holds the NEW bytes rather than the previous revision.
+   *
+   * @param put Writes the given bytes at whatever path it is handed — the text
+   *            and binary arms differ in nothing else.
    */
-  private async commit(tmp: string, target: string, fallback: () => Promise<void>): Promise<void> {
-    try {
-      await this.adapter.rename(tmp, target);
-    } catch {
-      await fallback();
+  private async put(target: string, put: (path: string) => Promise<void>): Promise<void> {
+    const tmp = `${target}.tmp`;
+    await this.ensureDir();
+    await put(tmp);
+    if (await this.link(tmp, target)) return;
+    await put(target);
+  }
+
+  /**
+   * Try to link the staged copy into place, and say whether it worked.
+   *
+   * The rename is ATTEMPTED rather than predicted. Checking `exists(target)`
+   * first and skipping the call would hard-code today's Obsidian into this file;
+   * attempting it means an adapter that does replace a destination — a future
+   * Obsidian, or a desktop build whose behaviour we have not read — gets a truly
+   * atomic overwrite here with no code change at all.
+   *
+   * Failures split in two, and the old code's mistake was treating them alike:
+   *
+   *   * the destination EXISTS afterwards — the adapter's own occupancy check
+   *     refused it. Deterministic, unclearable without a removal primitive we do
+   *     not have, and identical on the next four attempts. Report it so the
+   *     caller falls back to the in-place write; retrying is pure waste.
+   *   * the destination is still free — the rename failed for a reason that has
+   *     nothing to do with occupancy: a scanner, a backup agent or an indexer
+   *     holding a handle, which on Windows surfaces as `EPERM`/`EACCES`/`EBUSY`
+   *     and clears on its own. This is `server/blobStore.js`'s `renameWithRetry`
+   *     case exactly, so it gets that treatment — a short backoff, a few tries.
+   *
+   * When the budget runs out the error is THROWN, not swallowed. The staged copy
+   * is complete and on disk for the read path, and `DeviceState` only records
+   * `lastWritten` once this returns, so a throw is what makes the next flush try
+   * again. Quietly writing the live file instead — which is what this used to do
+   * on the very first transient blip — turned a self-clearing failure into a
+   * permanently non-atomic write, and said nothing.
+   *
+   * The one thing it deliberately does NOT do is `server/blobStore.js`'s cleanup
+   * of the temporary file on give-up. That store's `.part` is an INCOMPLETE
+   * upload and keeping it would be wrong; this port's `.tmp` is a complete copy
+   * and is the only place the caller's bytes exist at that moment.
+   *
+   * @returns true when the staged copy is now the live file.
+   */
+  private async link(tmp: string, target: string): Promise<boolean> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.adapter.rename(tmp, target);
+        return true;
+      } catch (err) {
+        if (await this.adapter.exists(target)) return false;
+        if (attempt >= this.renameAttempts) throw err;
+        await sleep(this.renameDelayMs * attempt);
+      }
     }
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
