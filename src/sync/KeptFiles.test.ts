@@ -139,6 +139,7 @@ function makeHarness(): Harness {
     shareRoot: SHARE,
     now,
     notice: (m) => { notices.push(m); },
+    ...DESKTOP_MEMORY_CAP,
   });
 
   const kept = new KeptFiles({

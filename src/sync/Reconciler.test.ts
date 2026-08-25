@@ -863,6 +863,7 @@ function wireDeletions(answer: BulkChoice = 'apply', over: Partial<ReconcilerDep
       confirms.push(summary);
       return answer;
     },
+    ...DESKTOP_MEMORY_CAP,
   });
 
   return {

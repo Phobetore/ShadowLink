@@ -43,7 +43,7 @@
 // No `obsidian` import, no node builtins.
 
 import {
-  BLOB_MAX_BYTES, PROVE_HASH_MAX_BYTES, RECOVERED_DIR, REMOTE_DELETE_BUDGET,
+  PROVE_HASH_MAX_BYTES, RECOVERED_DIR, REMOTE_DELETE_BUDGET,
   REMOTE_DELETE_BYTES_ALERT,
 } from '../tree/constants.ts';
 import {
@@ -103,7 +103,7 @@ export interface DeletionsDeps {
    * nothing here has to know what platform it is running on. It gates the prove
    * hash exactly as it gates every other whole-file read.
    */
-  memoryCapBytes?: () => number;
+  memoryCapBytes: () => number;
   notice?: (msg: string, ms?: number) => void;
   /**
    * Ask the user about a batch that exceeds the budget. MUST default to 'keep':
@@ -459,7 +459,7 @@ export class Deletions {
       H = known!.sha256;                                 // cheap, and size+mtime gated
     } else {
       if (st.bytes > PROVE_HASH_MAX_BYTES) return false; // too costly to prove => rescue
-      if (st.bytes > this.memoryCapBytes()) return false; // cannot hash it at all => rescue
+      if (st.bytes > this.deps.memoryCapBytes()) return false; // cannot hash it at all => rescue
       H = await hashOfBytes(await env.vault.readBinary(item.path));
     }
 
@@ -470,10 +470,6 @@ export class Deletions {
     return (await blobs.has(H)).present;
   }
 
-  /** §7.4's cap on every whole-file allocation, this module's share of it. */
-  private memoryCapBytes(): number {
-    return this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
-  }
 
   /**
    * Move the file out of the share instead of removing it, and remember that the

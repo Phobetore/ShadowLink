@@ -31,7 +31,7 @@ import { BlobTransport } from './BlobPort.ts';
 import { Deletions, rescueName, type BulkChoice, type BulkSummary } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
-import { FakeBlobs, FakeDocs, FakeVault, type VaultOp } from './fakes.ts';
+import { DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeVault, type VaultOp } from './fakes.ts';
 import type { DeletionContext, ReconcileCause, ReconcileFailure } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
 import type { VaultPort } from './VaultPort.ts';
@@ -145,7 +145,7 @@ interface HarnessOptions {
   openNodeId?: () => string | null;
   /** Replace the port handed to both the DeletionContext and the Deletions deps. */
   vaultPort?: (inner: FakeVault) => VaultPort;
-  /** §7.4's per-device whole-file allocation cap. Omitted means the desktop default. */
+  /** §7.4's per-device whole-file allocation cap. Omitted means `DESKTOP_MEMORY_CAP`. */
   memoryCapBytes?: () => number;
 }
 
@@ -212,7 +212,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     tickets,
     shareRoot: SHARE,
     now,
-    memoryCapBytes: options.memoryCapBytes,
+    memoryCapBytes: options.memoryCapBytes ?? DESKTOP_MEMORY_CAP.memoryCapBytes,
     notice: (msg) => { notices.push(msg); },
     confirmBulk,
     openNodeId: options.openNodeId,

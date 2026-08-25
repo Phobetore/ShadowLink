@@ -986,6 +986,7 @@ test('44: replaying every reconciler mutation with no tickets writes nothing to 
     shareRoot: SHARE,
     now: h.now,
     confirmBulk: async () => 'apply',
+    ...DESKTOP_MEMORY_CAP,
   });
   const reconciler = new Reconciler({
     vault: h.vault,

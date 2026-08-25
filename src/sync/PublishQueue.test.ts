@@ -783,6 +783,7 @@ async function peerDeletionPass(
     // A batch big enough to need the dialog would be answered 'keep'; this one is
     // a single file, so nothing here depends on how the dialog answers.
     confirmBulk: async () => 'keep',
+    ...DESKTOP_MEMORY_CAP,
   });
 
   const batch = deletions.collectDeletable(ctx).length;
