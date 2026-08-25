@@ -4216,7 +4216,9 @@ test('a local attachment this device cannot hash is reported apart from the miss
   const onDisk = png(3, 512);
   const sha = await h.blobs.seed(png(4, 512));                  // the tree names something else
   const id = nid('A');
-  const path = await bindBlob(h, id, 'clip.mov', onDisk, { sha256: sha, bytes: 512, parent: null });
+  // The tree's version is a DIFFERENT size from the one on disk, deliberately: if
+  // both were 512 the surface below could read either number and still look right.
+  const path = await bindBlob(h, id, 'clip.mov', onDisk, { sha256: sha, bytes: 256, parent: null });
 
   const r = await h.reconciler.reconcile('sync');
 
