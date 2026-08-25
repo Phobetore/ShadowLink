@@ -1,6 +1,39 @@
 // src/ui/SettingsTab.ts
 import { App, PluginSettingTab, Setting } from 'obsidian';
 import type ShadowLinkPlugin from '../../main';
+import { isValidWorkspaceId } from '../tree/ids.ts';
+
+/** The rule, in the field's own words. Also the "nothing is wrong" state of the line. */
+const WORKSPACE_ID_DESC = 'Letters, digits, _ or - (max 64). Identical for all members.';
+
+/**
+ * What the field says the moment something the rule refuses is typed.
+ *
+ * "Not saved" is the whole message. The box goes on showing what was typed — that
+ * is the browser's doing, not this screen's — so without a line saying otherwise
+ * the user has every reason to believe the ID took.
+ */
+const WORKSPACE_ID_REJECTED =
+  'Not saved. A workspace ID may only contain letters, digits, _ or -, and at most 64 '
+  + 'of them. The server refuses any other ID, and this ID also names files in this vault.';
+
+/**
+ * And what it says when the ID ALREADY in `data.json` breaks the rule — hand
+ * edited, or written by a build that did not check.
+ *
+ * Nothing was typed, so nothing was rejected; what the user needs told is why a
+ * share that looks completely filled in never connects. Without this line that
+ * question has no answer anywhere on screen: the failure is a 400 at the socket
+ * upgrade, and the status bar simply stays on "starting…".
+ */
+const WORKSPACE_ID_STORED_BAD =
+  'This ID cannot work: letters, digits, _ or - only, at most 64 of them. The server '
+  + 'refuses it, so nothing will sync until it is corrected.';
+
+/** Empty is "not filled in yet" (what `configured` reads), never an error. */
+function describeWorkspaceId(id: string): string {
+  return id === '' || isValidWorkspaceId(id) ? WORKSPACE_ID_DESC : WORKSPACE_ID_STORED_BAD;
+}
 
 export class SettingsTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: ShadowLinkPlugin) {
@@ -60,12 +93,27 @@ export class SettingsTab extends PluginSettingTab {
         });
       });
 
-    new Setting(containerEl)
-      .setName('Workspace ID')
-      .setDesc('Letters, digits, _ or - (max 64). Identical for all members.')
+    // The ID is checked HERE, at the keystroke, and an ID that fails is not
+    // persisted. Everything downstream of this field is too late to be the place a
+    // user finds out: `configured` would already read the share as complete, so
+    // `main.ts` starts a session, the sockets open, and the server's 400 at the
+    // upgrade reaches no screen at all — the status bar just stays on "starting…".
+    // Before even that, the ID has become `state-<id>-<device>.json` and
+    // `tree-<id>.bin` inside the plugin's own directory.
+    const workspaceId = new Setting(containerEl).setName('Workspace ID');
+    workspaceId
+      .setDesc(describeWorkspaceId(this.plugin.settings.share.workspaceId))
       .addText((t) =>
         t.setValue(this.plugin.settings.share.workspaceId).onChange(async (v) => {
-          this.plugin.settings.share.workspaceId = v.trim();
+          const id = v.trim();
+          if (id !== '' && !isValidWorkspaceId(id)) {
+            // Contained: say so, change nothing. The last usable ID stays both in
+            // memory and on disk, so a stray keystroke cannot unconfigure a share.
+            workspaceId.setDesc(WORKSPACE_ID_REJECTED);
+            return;
+          }
+          workspaceId.setDesc(WORKSPACE_ID_DESC);
+          this.plugin.settings.share.workspaceId = id;
           await this.plugin.saveSettings();
         }),
       );

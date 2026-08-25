@@ -330,15 +330,16 @@ test('nothing checks the Server URL: scheme, host and path are stored as typed',
   assert.doesNotMatch(prose(tab.containerEl), /invalid|must start with|not a valid/i);
 });
 
-// ⚠ THE ONE FIELD WITH A WRITTEN RULE AND NO ENFORCEMENT OF IT.
+// ---------------------------------------------------------- the one real rule
 //
-// The description states the charset. `src/types.ts` states it again on
-// `ShareConfig.workspaceId`. `server/upgradeAuth.js` states it a third time as
-// `ID_RE = /^[A-Za-z0-9_-]{1,64}$/` and refuses the upgrade with a 400 when it
-// does not hold — and says why in a comment: the ids are "charset-validated so
-// they are safe to use as snapshot filenames". The client uses the very same id
-// as a filename and validates nothing.
-test('the Workspace ID is trimmed and nothing more, including the charset it advertises',
+// The Workspace ID is the only field on this screen with a rule
+// (`WORKSPACE_ID_RE`), and the only one that becomes a FILENAME:
+// `state-<id>-<device>.json` and `tree-<id>.bin` under `.obsidian/plugins/`.
+// `server/upgradeAuth.js` states the same charset independently and answers 400
+// — but that 400 arrives on no screen, long after the filename has been built,
+// so it is not a thing this field may lean on.
+
+test('the Workspace ID is trimmed, and one the rule refuses is not saved at all',
   async () => {
     const plugin = fakePlugin();
     const tab = await open(plugin);
@@ -348,15 +349,43 @@ test('the Workspace ID is trimmed and nothing more, including the charset it adv
 
     await ws.type('  team-alpha  ');
     assert.equal(plugin.settings.share.workspaceId, 'team-alpha', 'surrounding space comes off');
+    assert.equal(plugin.saves.length, 1);
 
     for (const typed of ['team alpha', 'team/alpha', '../../elsewhere', 'x'.repeat(65)]) {
       await ws.type(typed);
-      assert.equal(plugin.settings.share.workspaceId, typed,
-        'stored despite the rule three files agree on');
+      assert.equal(plugin.settings.share.workspaceId, 'team-alpha',
+        `"${typed}" left the last usable ID standing`);
+      assert.equal(plugin.saves.length, 1, 'and reached no save at all');
+      // The box still shows what was typed, so the field itself has to say that
+      // what is on screen is not what is stored.
+      assert.match(field(tab, 'Workspace ID').desc, /^Not saved\./,
+        'and the field says so, where the user is looking');
     }
+
+    await ws.type('team_beta');
+    assert.equal(plugin.settings.share.workspaceId, 'team_beta', 'a correction saves again');
+    assert.equal(plugin.saves.length, 2);
+    assert.match(field(tab, 'Workspace ID').desc, /Letters, digits, _ or - \(max 64\)/,
+      'and the complaint is withdrawn');
   });
 
-test('an unchecked Workspace ID reaches both a socket that refuses it and a filename',
+// An empty field is where every share starts. Refusing it as malformed would tell
+// a first-time self-hoster their blank box is an error, and `configured` already
+// reads '' as "not set up yet".
+test('clearing the Workspace ID is not an error — it is "not configured yet"', async () => {
+  const plugin = fakePlugin(GOOD, { deviceId: DEVICE });
+  const tab = await open(plugin);
+
+  await box(tab, 'Workspace ID').type('');
+
+  assert.equal(plugin.settings.share.workspaceId, '', 'saved as empty');
+  assert.equal(plugin.saves.length, 1);
+  assert.equal(plugin.configured, false);
+  assert.match(field(tab, 'Workspace ID').desc, /Letters, digits, _ or - \(max 64\)/,
+    'and nothing on the field calls it a mistake');
+});
+
+test('a Workspace ID that would escape the plugin folder never becomes a running share',
   async () => {
     const plugin = fakePlugin({}, { deviceId: DEVICE });
     const tab = await open(plugin);
@@ -366,37 +395,31 @@ test('an unchecked Workspace ID reaches both a socket that refuses it and a file
     await box(tab, 'Shared folder').type('Shared');
     await box(tab, 'Workspace ID').type('../../../elsewhere');
 
-    // The share now looks complete, so `main.ts` builds a runtime and opens the
-    // sockets — at a server whose `authorizeUpgrade` answers 400 for this id,
-    // which surfaces on no screen the user can see.
-    assert.equal(plugin.configured, true);
-
-    // And before any of that fails, the device-state filename leaves the plugin's
-    // own directory. `ObsidianStatePort` joins this onto
-    // `.obsidian/plugins/shadowlink/` with `normalizePath`, which tidies slashes
-    // and does not resolve `..`.
-    assert.equal(
-      deviceStateKey(plugin.settings.share.workspaceId, plugin.settings.deviceId),
-      `state-../../../elsewhere-${DEVICE}.json`,
-    );
+    // What used to happen instead: the share read as complete, `main.ts` built a
+    // runtime and opened sockets the server answers 400 to — which surfaces on no
+    // screen, leaving the status bar on "starting…" — and before any of that,
+    // `deviceStateKey` had already produced `state-../../../elsewhere-<device>.json`,
+    // which `ObsidianStatePort` joins onto the plugin's own directory with
+    // `normalizePath`, and `normalizePath` tidies slashes without resolving `..`.
+    assert.equal(plugin.settings.share.workspaceId, '', 'nothing was persisted');
+    assert.equal(plugin.configured, false, 'so no session starts on an ID that cannot work');
+    assert.match(field(tab, 'Workspace ID').desc, /^Not saved\./);
   });
 
-test('a Workspace ID the server can never accept is not what gets persisted', {
-  // DEFECT, unfixed. `SettingsTab.ts` stores `v.trim()` with no charset check,
-  // so an id the server refuses and a path that escapes the plugin folder are
-  // both one keystroke away. The rule itself is unambiguous — three files state
-  // the same regex — but the REMEDY is not: refusing the keystroke, refusing the
-  // save, or showing an error are three different screens, and picking one is a
-  // design decision rather than a patch. Left for whoever owns that call.
-  skip: 'defect: no charset check on Workspace ID — see the comment on this test',
-}, async () => {
-  const plugin = fakePlugin({ workspaceId: 'alpha' });
-  const tab = await open(plugin);
+// The other way an unusable id gets here, and the reason the filename sites still
+// refuse one of their own: `data.json` is a plain file users open, and it is also
+// written by whatever version of this plugin ran last.
+test('an ID already in data.json that breaks the rule is called out as the tab opens',
+  async () => {
+    const plugin = fakePlugin({ ...GOOD, workspaceId: '../elsewhere' }, { deviceId: DEVICE });
+    const tab = await open(plugin);
 
-  await box(tab, 'Workspace ID').type('team/alpha');
-
-  assert.notEqual(plugin.settings.share.workspaceId, 'team/alpha');
-});
+    assert.match(field(tab, 'Workspace ID').desc, /cannot work/,
+      'the field explains why nothing is syncing');
+    assert.equal(box(tab, 'Workspace ID').value, '../elsewhere',
+      'and shows it as it is, so it can be corrected rather than guessed at');
+    assert.equal(plugin.saves.length, 0, 'opening a tab rewrites nothing');
+  });
 
 // ---------------------------------------------------------------- the secret
 
