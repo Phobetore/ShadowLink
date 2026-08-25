@@ -16,7 +16,9 @@
 // non-idempotent handler shows up here as an echo loop rather than as nothing at
 // all (Group C test 71).
 
-import { FakeVault } from '../../../src/sync/fakes.ts';
+import {
+  DESKTOP_FETCH_LIMITS, DESKTOP_MEMORY_CAP, DESKTOP_PASS_LIMITS, FakeVault,
+} from '../../../src/sync/fakes.ts';
 import { TreeDoc, LOCAL_ORIGIN } from '../../../src/tree/TreeDoc.ts';
 import { deriveTree } from '../../../src/tree/TreeIndex.ts';
 import { fold, isLive, relPath } from '../../../src/tree/paths.ts';
@@ -225,7 +227,11 @@ export class Client {
       },
     });
 
+    // §7.4/§7.2's platform numbers are required arguments, and this suite is a
+    // desktop client: the shared constants below are the same values the engine
+    // used to fall back to, now said out loud.
     this.publishQueue = new PublishQueue({
+      ...DESKTOP_MEMORY_CAP,
       docs: this.docs,
       vault: this.vault,
       blobs: this.blobs,
@@ -241,6 +247,7 @@ export class Client {
     });
 
     this.watcher = new VaultWatcher({
+      ...DESKTOP_MEMORY_CAP,
       tree: this.tree,
       entries: () => this.tree.entries(),
       vault: this.vault,
@@ -265,6 +272,7 @@ export class Client {
     });
 
     this.deletions = new Deletions({
+      ...DESKTOP_MEMORY_CAP,
       vault: this.vault,
       state: this.state,
       tickets: this.tickets,
@@ -277,6 +285,7 @@ export class Client {
     });
 
     this.reconciler = new Reconciler({
+      ...DESKTOP_PASS_LIMITS,
       vault: this.vault,
       docs: this.docs,
       blobs: this.blobs,
@@ -303,6 +312,7 @@ export class Client {
 
     this.snapshotBytes = null;
     this.bootstrap = new Bootstrap({
+      ...DESKTOP_FETCH_LIMITS,
       state: this.state,
       tree: this.tree,
       vault: this.vault,
