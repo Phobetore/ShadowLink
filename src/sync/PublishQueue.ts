@@ -358,9 +358,9 @@ export class PublishQueue {
         throw new RetryLater(`content doc n_${id} was not confirmed`);
       }
 
-      // Whatever is actually in the document is what this device has confirmed —
-      // the local text when we seeded it, the remote text when a peer had already
-      // published. Never the local copy in the second case.
+      // What the WORKSPACE is confirmed to hold: the local text where we seeded
+      // it, the remote text where a peer had already published. Never the local
+      // copy in the second case — the doc was not ours to overwrite (I5).
       const published = remote.length === 0 ? text : remote;
 
       // I6, and the same refusal the attachment arm already makes for a zero-byte
