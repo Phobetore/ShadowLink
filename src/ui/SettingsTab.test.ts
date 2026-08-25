@@ -24,7 +24,8 @@ import * as nodeModule from 'node:module';
 // The real key function, not a copy of it: one of the assertions below is about
 // what a workspace id becomes on disk, and a locally retyped `state-${id}-…`
 // would keep agreeing with itself long after the two drifted apart.
-import { deviceStateKey } from '../sync/DeviceState.ts';
+import { DeviceState, deviceStateKey } from '../sync/DeviceState.ts';
+import type { StatePort } from '../sync/DeviceState.ts';
 import { DEFAULT_SETTINGS } from '../types.ts';
 import type { ShadowLinkSettings, ShareConfig } from '../types.ts';
 
@@ -164,6 +165,18 @@ const GOOD: Partial<ShareConfig> = {
 };
 
 const DEVICE = 'ab12cd34ef567890';
+
+/**
+ * Enough of a `StatePort` to construct a `DeviceState`. It is never read from or
+ * written to: the only test that builds one asks what filename that instance
+ * settled on, which its constructor decides before any I/O.
+ */
+function nullStatePort(): StatePort {
+  return {
+    read: () => Promise.resolve(null),
+    write: () => Promise.resolve(),
+  };
+}
 
 async function open(plugin: FakePlugin): Promise<Tab> {
   const { SettingsTab } = await settingsTab();
@@ -542,32 +555,47 @@ test('editing a share field changes the object a running session is already hold
     assert.equal(live.sharedFolder, 'Elsewhere');
   });
 
-test('changing the Workspace ID mid-session does not repoint that session\'s tree snapshot', {
-  // DEFECT, unfixed, and NOT in this file — the fix belongs to `main.ts`, which
-  // this group does not own.
-  //
-  // Every share field is captured BY VALUE when `SyncRuntime` is constructed —
-  // the ports, the providers, `DeviceState`, and the snapshot LOAD key — with one
-  // exception: `writeSnapshot()` re-reads `settings.share.workspaceId` live every
-  // time it runs. So typing a new workspace id here, while a share is live, means
-  // the next tree change writes `tree-<new>.bin` holding the OLD workspace's
-  // tree. Nothing guards that file by content: `DeviceState` discards a state
-  // file naming another workspace, but the snapshot is trusted purely by
-  // filename, and `Bootstrap` applies it into the document before connecting.
-  // Reload onto the new workspace and the old workspace's whole tree is merged
-  // into it and pushed up.
-  //
-  // Either end fixes it: capture the snapshot key at construction like every
-  // other share field, or stop writing a live workspace id through to a running
-  // session. Both are outside `SettingsTab.ts`.
-  skip: 'defect in main.ts writeSnapshot() — see the comment on this test',
-}, async () => {
-  const plugin = fakePlugin(GOOD, { deviceId: DEVICE });
-  const startedWith = plugin.settings.share.workspaceId;
-  const tab = await open(plugin);
+// The other half of the same fact, and the reason the pair is worth stating.
+//
+// Writing through the live object is only half of what a running session does
+// with a share field. Every one of them is also captured BY VALUE at construction
+// — `new DeviceState(port, deviceId, share.workspaceId)`, `w: share.workspaceId`
+// on each provider, the same on both HTTP ports — and `DeviceState` then fixes
+// `key` in its constructor from what it was handed. So one edit puts the session
+// in two states at once: it reads the NEW id out of `settings.share` and it goes
+// on reading and writing the OLD id's files and rooms.
+//
+// This is asserted against the real `DeviceState`, constructed exactly as
+// `main.ts` constructs it, because a hand-written "the key is fixed" fixture would
+// agree with itself no matter what the class did.
+test('a mid-session Workspace ID edit does not move the state file that session is writing',
+  async () => {
+    const plugin = fakePlugin(GOOD, { deviceId: DEVICE });
+    // main.ts:271, verbatim: the id goes in by value, once.
+    const state = new DeviceState(nullStatePort(), DEVICE, plugin.settings.share.workspaceId);
+    const tab = await open(plugin);
 
-  await box(tab, 'Workspace ID').type('beta');
+    await box(tab, 'Workspace ID').type('beta');
 
-  assert.equal(plugin.settings.share.workspaceId, startedWith,
-    'a live session still names the workspace it started in');
-});
+    assert.equal(plugin.settings.share.workspaceId, 'beta', 'the edit landed and was saved');
+    assert.equal(state.key, deviceStateKey('alpha', DEVICE),
+      'while the session goes on reading and writing the state file it opened with');
+    assert.notEqual(state.key, deviceStateKey('beta', DEVICE));
+  });
+
+// ⚠ DEFECT, real, and NOT fixable from this file.
+//
+// One share field escapes the by-value capture above: `main.ts`'s
+// `writeSnapshot()` re-reads `this.plugin.settings.share.workspaceId` on every
+// run. So the divergence the two tests above describe is not symmetric — after
+// this edit the session talks to `alpha` on every socket and writes `alpha`'s
+// state file, but the next tree change writes `tree-beta.bin` holding `alpha`'s
+// tree. Nothing guards that file by content: `DeviceState` discards a state file
+// naming another workspace, while the snapshot is trusted purely by filename and
+// `Bootstrap` applies it into the document before connecting. Reload onto `beta`
+// and `alpha`'s whole tree merges into it and is pushed up.
+//
+// It is deliberately NOT a skipped test here. A skipped test is a claim that this
+// file could make it pass, and it cannot: both remedies — capturing the snapshot
+// key at construction like every other share field, or not writing a live
+// workspace id through to a running session at all — are edits to `main.ts`.
