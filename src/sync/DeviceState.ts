@@ -25,10 +25,19 @@ import {
 import { isValidWorkspaceId } from '../tree/ids.ts';
 
 /**
- * Persistence for one opaque blob. The real implementation writes through
- * `vault.adapter` ATOMICALLY — write `.tmp`, then `adapter.rename` — because a
- * torn state file read back on the next start is indistinguishable from a corrupt
- * one, and cold-starting on every launch would be a permanent silent degradation.
+ * Persistence for one opaque blob.
+ *
+ * This used to promise an ATOMIC write — "`.tmp`, then `adapter.rename`" — and
+ * the real implementation cannot keep it. Obsidian's adapter refuses a rename
+ * onto an occupied destination, deterministically and on every platform, so only
+ * the FIRST write of a key is atomic and every one after it overwrites the live
+ * file in place. `ObsidianStatePort.ts`'s header has the whole story, including
+ * what a crash inside that window costs and why the removal call that would
+ * change it was weighed and refused.
+ *
+ * What survives of the promise, and what `load()` below is built on: a torn state
+ * file read back on the next start is indistinguishable from a corrupt one, so it
+ * must cold-start rather than partially adopt.
  */
 export interface StatePort {
   read(key: string): Promise<string | null>;

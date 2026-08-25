@@ -3,13 +3,20 @@
 // The adapter that persists device state (§2.5) and the offline tree snapshot
 // (§2.6), against a hand-rolled `DataAdapter`.
 //
-// Both files are written ATOMICALLY — a `.tmp` sibling, then a rename over the
-// target — and the reason is not tidiness. A torn device-state file read back on
-// the next start is indistinguishable from a corrupt one, so `DeviceState.load`
-// cold-starts; a cold start on every launch is a permanent silent degradation, in
-// which `materialized`, `owned` and `declinedPaths` are rebuilt from nothing and
-// the client believes it owns no node at all until the first reconcile finishes.
-// A truncated tree snapshot is worse: `Y.applyUpdate` throws on it.
+// This header used to open "both files are written ATOMICALLY — a `.tmp` sibling,
+// then a rename over the target". They are not, and saying so is what let the
+// fake below model Node's `rename` instead of Obsidian's for three phases. Only
+// the FIRST write of each file is atomic, because only there is the destination
+// free; every write after it stages a `.tmp` and then overwrites the live file in
+// place. `ObsidianStatePort.ts`'s header carries the full reasoning, including
+// why the removal call that would change this was weighed and refused.
+//
+// What is at stake is unchanged: a torn device-state file read back on the next
+// start is indistinguishable from a corrupt one, so `DeviceState.load`
+// cold-starts, and a cold start rebuilds `materialized`, `owned` and
+// `declinedPaths` from nothing — the client believes it owns no node at all until
+// the first reconcile finishes. A truncated tree snapshot is worse:
+// `Y.applyUpdate` throws on it.
 //
 // So the assertions here are about the ORDER of the writes, the fallbacks when a
 // step fails, and the one answer a missing file must produce: null, never an
@@ -153,6 +160,21 @@ class FakeAdapter {
     this.files.set(path, '');                 // a directory, as far as `exists` cares
   }
 
+  /**
+   * Offered so the port CAN call it, and so a test can prove it does not.
+   *
+   * Freeing the destination and then renaming into it is the one shape that would
+   * turn the in-place overwrite into something a crash cannot tear, and it is the
+   * first thing a reader of this file thinks of. `ObsidianStatePort.ts`'s header
+   * records why it was weighed and refused; the test below is what makes that
+   * decision hold rather than merely being written down.
+   */
+  async remove(path: string): Promise<void> {
+    this.record('remove', [path]);
+    this.files.delete(path);
+    this.binaries.delete(path);
+  }
+
   private record(op: string, args: readonly unknown[]): void {
     this.calls.push({ op, args });
     const queue = this.failures.get(op);
@@ -277,6 +299,35 @@ test('a second write cannot be atomic — Obsidian’s adapter offers no atomic 
   );
   assert.equal(adapter.files.get(`${DIR}/state.json.tmp`), 'second',
     'so the copy the read path falls back to is never a stale revision');
+});
+
+// THE DECISION, pinned here rather than only argued in a comment.
+//
+// The port could free the destination and rename into it, and `banned-calls`'
+// existing exemption for this file — it writes the plugin's own two files inside
+// the plugin's own directory and can name nothing of the user's — covers the
+// removal call word for word. It was refused: remove-then-rename is not atomic
+// either, it only trades a torn target for an absent one, and buying it costs a
+// hole in three separate I1 guards, one of which asserts that an adapter-shaped
+// receiver "may never be allowlisted".
+//
+// So the overwrite is IN PLACE, on purpose, and this is the exact call sequence
+// that decision produces. A future reader who reaches for a removal to make the
+// write safe will change this list, which is where they will find out.
+test('the overwrite recycles no name: the port never removes the file it replaces', async () => {
+  const { adapter, port } = await makePort();
+  await port.write('state.json', 'first');
+
+  adapter.calls.length = 0;
+  await port.write('state.json', 'second');
+
+  assert.deepEqual(
+    adapter.ops(),
+    ['exists', 'write', 'rename', 'exists', 'write'],
+    'stage the copy, attempt the link, learn the destination is occupied, overwrite in place',
+  );
+  assert.equal(adapter.callsTo('remove').length, 0, 'and nothing is ever removed to make room');
+  assert.equal(await port.read('state.json'), 'second');
 });
 
 // One attempt, then the documented in-place path. The refusal is a destination

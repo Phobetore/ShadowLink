@@ -33,8 +33,8 @@
 //   * `adapter.write` / `adapter.writeBinary` are a bare `fsPromises.writeFile`.
 //     Truncate-then-fill: the live file IS the half-written one while it runs.
 //   * The adapter's `remove` would let us free the destination and then rename
-//     into it — but it is banned in shipped source by I1's guard in
-//     `banned-calls.test.ts`, and that ban is not this file's to lift.
+//     into it. It is banned in shipped source by I1's guard in
+//     `banned-calls.test.ts`, and the ban was WEIGHED AND KEPT — see below.
 //
 // Without a removal primitive you cannot recycle a name, and without recycling a
 // name there is no atomic replace to be had. So:
@@ -42,6 +42,45 @@
 //   CREATE (destination free)  — genuinely atomic. Staged, then linked into
 //                                place. The file appears whole or not at all.
 //   OVERWRITE (destination in use) — NOT atomic, and cannot be made so here.
+//
+// THE REMOVAL CALL: CONSIDERED, REFUSED, AND WHAT THAT COSTS.
+//
+// `banned-calls.test.ts` already exempts this one file from the ban on
+// `adapter.writeBinary`, on the ground that it writes the plugin's own two files
+// inside the plugin's own data directory and can name nothing of the user's.
+// That ground covers `adapter.remove` word for word, so widening the exemption
+// and doing remove-then-rename was available. It was not taken, for two reasons:
+//
+//   1. IT WOULD NOT BUY THE WORD. remove-then-rename is not atomic either — it
+//      opens a window in which the target does not exist at all. What it buys is
+//      a different failure: "target absent, complete `.tmp` beside it" instead of
+//      "target torn". Better, but this whole file exists because the code claimed
+//      an atomicity the adapter cannot deliver, and buying a hole in I1's guard
+//      in order to STILL not be able to say "atomic" is the wrong trade.
+//   2. THE HOLE IS BIGGER THAN THE ONE SENTENCE. The removal ban is enforced by
+//      three tests, not one: the literal needle, a rule that no destructive call
+//      may be written on a vault- or adapter-shaped receiver, and an allowlist
+//      whose own guard asserts that such a receiver "may never be allowlisted".
+//      Turning that never into a sometimes — in the file that holds the
+//      `DataAdapter` — costs more than the failure it removes.
+//
+// SO, PLAINLY: on this platform the plugin's own state is written NON-ATOMICALLY
+// whenever the target already exists, which is every write after the first. A
+// crash or a power loss inside one `writeFile` of one small file leaves the live
+// file torn, and the read path below prefers an existing target, so it is the
+// torn copy that gets read back.
+//
+// What that costs, in full, and why it is survivable:
+//   * device state — `DeviceState.load` cannot parse it and cold-starts.
+//     `materialized`, `owned`, `declinedPaths`, `contentHash` and the deletion
+//     budget are all rebuilt from nothing. Ignorance, not a wrong answer: every
+//     reader of a missing base defaults to RESCUE, so the direction is safe.
+//   * tree snapshot — `Bootstrap.loadSnapshot` catches the `Y.applyUpdate` throw,
+//     tells the user, and refetches from the server. The offline baseline is lost
+//     until then.
+// Neither loses the user's content, and both are already written that way on
+// purpose. If a future Obsidian ships an adapter whose `rename` replaces, this
+// file gets a genuinely atomic overwrite with no change at all — see `link`.
 //
 // The `.tmp` sibling is therefore NOT an atomicity mechanism on the overwrite
 // path; it is the read path's fallback copy, and it is rewritten BEFORE the live
