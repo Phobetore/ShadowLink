@@ -23,12 +23,14 @@
 //
 // No `obsidian` import, no node builtins.
 
-import { BLOB_MAX_BYTES, RECOVERED_DIR, STAGING_DIR } from '../tree/constants.ts';
+import {
+  BLOB_MAX_BYTES, RECOVERED_DIR, REHASH_BUDGET_BYTES, STAGING_DIR,
+} from '../tree/constants.ts';
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
 import {
-  assertInsideShare, extOf, fold, hashOf, hashOfBytes, isLive, nodeKindOf, relPath, splitRel,
-  validateRel, type BlobRef,
+  assertInsideShare, extOf, fold, hashOf, hashOfBytes, isLive, nodeKindOf, relPath, replaceVerdict,
+  splitRel, validateRel, type BlobRef,
 } from '../tree/paths.ts';
 import type { BlobPort } from './BlobPort.ts';
 import type { DeviceState } from './DeviceState.ts';
@@ -62,6 +64,13 @@ export interface ReconcileDiagnostics {
   tooLarge: string[];
   /** Attachment nodes the fetch policy has not cleared yet (§7.2). Nothing is on disk. */
   deferred: string[];
+  /**
+   * Attachment nodes whose local bytes this pass ran out of re-hash budget for
+   * (§3.5). A separate channel from `deferred` on purpose: the file IS on disk
+   * and complete, and only this device's question about it is unanswered, so
+   * folding the two together would report a downloaded attachment as missing.
+   */
+  rehashDeferred: string[];
 }
 
 export interface ReconcileResult {
@@ -143,6 +152,31 @@ export interface ReconcilerDeps {
    * plain number so nothing here has to know what platform it is running on.
    */
   memoryCapBytes?: () => number;
+  /**
+   * How many bytes step 2.5 may re-hash in one pass (§3.5). Injected for the same
+   * reason as the memory cap: the number is a platform fact, not an engine one.
+   */
+  rehashBudgetBytes?: () => number;
+  /**
+   * Paths the modify handler has flagged since the last pass, folded, and TAKEN
+   * (not copied): the pass owns the set it is given.
+   *
+   * They bypass the re-hash budget, because they are the one change the user is
+   * actually waiting on. `VaultWatcher.takeDirtyPaths` is the implementation; the
+   * default is an empty set, which costs nothing but a slower first hash.
+   */
+  takeDirtyPaths?: () => ReadonlySet<string>;
+  /**
+   * §3.5 rule 2: this device's copy of an attachment differs from the tree, and
+   * the tree still names what this device last confirmed — so the difference is
+   * ours and unpublished. `PublishQueue.requeue` is the implementation.
+   *
+   * An injected collaborator rather than a `PublishQueue` dependency, for the same
+   * reason as `publishUntracked`: the reconciler is a pure driver over a tree
+   * snapshot, and giving it the queue would let a future pass publish from inside
+   * the loop that is deciding what to publish.
+   */
+  requeuePublish?: (nodeId: string, intent: string) => void;
 }
 
 /**
@@ -190,8 +224,27 @@ interface PassContext extends DeletionContext {
    * exiles the user's real file (§3.4).
    */
   blobRefs: Map<string, BlobRef>;
+  /**
+   * fold(path) of every file the modify handler flagged since the last pass.
+   *
+   * Taken once per pass, so a save that lands mid-pass is answered by the next
+   * one rather than half-answered by this one.
+   */
+  dirtyPaths: ReadonlySet<string>;
   diagnostics: ReconcileDiagnostics;
   bind: (id: string, path: string) => void;
+}
+
+/**
+ * What one pass may still spend on re-hashing (§3.5).
+ *
+ * `spent` exists so the FIRST hash of a pass is always permitted, however large
+ * the file: a share whose smallest attachment is bigger than the whole budget
+ * would otherwise defer the same node on every pass, for ever.
+ */
+interface RehashBudget {
+  remaining: number;
+  spent: number;
 }
 
 function dirOf(path: string): string {
@@ -394,6 +447,7 @@ export class Reconciler {
     const failures: ReconcileFailure[] = [];
     const diagnostics: ReconcileDiagnostics = {
       pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
+      rehashDeferred: [],
     };
     // Stays null until bindings have been observed, so a refusal partway through
     // cannot let the `finally` block rebuild `materialized` from an empty map.
@@ -424,6 +478,7 @@ export class Reconciler {
 
       await this.ensureFolders(ctx);             // step 1
       await this.applyMoves(ctx);                // step 2 (+ unstageAll)
+      await this.reconcileBlobBytes(ctx);        // step 2.5
       await this.materialize(ctx);               // step 3
       await this.runDeletions(ctx);              // step 4 — injected collaborator
       await this.sweepEmptyFolders(ctx);         // step 5
@@ -538,6 +593,10 @@ export class Reconciler {
       now: this.now,
       desired,
       blobRefs: derived.blobs,
+      // Taken, not read: the watcher hands the set over and starts a fresh one, so
+      // a save that lands while this pass runs is answered by the next pass rather
+      // than silently absorbed by this one after its hashing was decided.
+      dirtyPaths: this.deps.takeDirtyPaths?.() ?? EMPTY_SET,
       folderPaths,
       deadFolderPaths,
       vacatedDirs: new Set<string>(),
@@ -813,6 +872,127 @@ export class Reconciler {
     await this.unstageAll(ctx);
   }
 
+  // ---------------------------------------------------------- step 2.5
+
+  /**
+   * Spec §3.5. Make each bound attachment's BYTES and the tree agree.
+   *
+   * It runs after the moves and before materialize, over every bound, live,
+   * published `'b'` node, sorted by id — and it is a full recompute, never a
+   * delta (I8): the verdict is a function of three hashes that are all re-read
+   * every pass, so a missed event, a crash and a restart all converge to the same
+   * answer as an uninterrupted run.
+   *
+   * The cost is what makes this affordable at three gigabytes: `b` rides in the
+   * tree, which is already synced, so "is my copy current?" is one `stat` per
+   * attachment and a hash only when the recorded size and mtime disagree with
+   * what is on disk. Nothing here opens a room, and nothing here touches the
+   * network unless a verdict says bytes have to move.
+   *
+   * `blobRefs` is the kind test for the whole pass (it is derived once, from the
+   * same derivation as `desired`), so this loop never re-asks what a node is.
+   */
+  private async reconcileBlobBytes(ctx: PassContext): Promise<void> {
+    const budget: RehashBudget = { remaining: this.rehashBudgetBytes(), spent: 0 };
+
+    for (const id of [...ctx.blobRefs.keys()].sort(cmp)) {
+      const ref = ctx.blobRefs.get(id)!;
+      const path = ctx.have.get(id);
+      // Not bound HERE: nothing on this disk is this node's copy yet, so there is
+      // nothing to compare. Step 3 adopts the file at its path or materializes it.
+      if (path === undefined) continue;
+
+      await this.guarded(ctx.failures, `bytes:${id}`, async () => {
+        // I2: null is a definite not-found — the file went away between `list()`
+        // and now, and step 3 re-materializes it. A `stat` that could not look
+        // REJECTS, and leaves through `guarded` with no verdict reached at all.
+        const st = await this.deps.vault.stat(path);
+        if (st === null) return;
+
+        const base = this.deps.state.data.contentHash[id];
+        // The staleness oracle, and both clauses are load-bearing. SIZE alone
+        // misses every same-size edit; without the MTIME clause a recorded hash is
+        // trusted for ever, so an edit made while Obsidian was closed is invisible.
+        // A base with no mtime at all (the post-write `stat` did not answer) is not
+        // trusted either: this device confirmed a hash but never confirmed WHEN.
+        const fresh = base !== undefined
+          && base.mtime !== undefined
+          && base.mtime === st.mtime
+          && base.len === st.bytes;
+        const local = fresh
+          ? base.sha256
+          : await this.hashWithBudget(ctx, id, path, st.bytes, budget);
+        // Refused by the cap or the budget. NEVER "assume converged": the whole
+        // point of refusing is that this device does not know what is on disk.
+        if (local === null) return;
+
+        switch (replaceVerdict(local, ref, base?.sha256)) {
+          case 'converged':
+            // I17 in its cheapest form: what was confirmed, and when. Recording it
+            // is what makes every later pass one `stat`.
+            this.recordBlobHash(id, local, st.bytes, st.mtime);
+            return;
+          case 'republish':
+            // The difference is ours and unpublished. The base is deliberately NOT
+            // advanced here — it names what is simultaneously on disk and in the
+            // tree, and the tree does not name these bytes until the publish
+            // confirms (I17).
+            this.deps.requeuePublish?.(id, local);
+            return;
+          case 'replace':
+            await this.cleanReplace(ctx, id, path, ref, st);
+            return;
+          default:
+            await this.forkAndTake(ctx, id, path, local, ref);
+        }
+      });
+    }
+  }
+
+  /**
+   * Hash a file, or refuse — and a refusal is never an answer about its content.
+   *
+   * TWO ceilings, for two different failures. The memory cap is about this device
+   * (§7.4): hashing needs the whole file in memory, and a phone that reads a
+   * 200 MB video to answer a question it could have skipped simply dies. The
+   * per-pass budget is about this PASS: a cold share has no recorded mtimes, so
+   * without it the first pass hashes everything at once and the plugin appears to
+   * hang on launch.
+   *
+   * A path the modify handler flagged bypasses the budget but NOT the cap: the
+   * user just saved that file, and answering "not this pass" for the one change
+   * they made is the wrong trade. The charge is still taken, so one huge save
+   * cannot also drag the rest of the share through the same pass.
+   */
+  private async hashWithBudget(
+    ctx: PassContext,
+    id: string,
+    path: string,
+    bytes: number,
+    budget: RehashBudget,
+  ): Promise<string | null> {
+    if (bytes > this.memoryCapBytes()) {
+      ctx.diagnostics.tooLarge.push(id);
+      return null;
+    }
+    const urgent = ctx.dirtyPaths.has(fold(path));
+    // `spent > 0` keeps the first hash of every pass permitted however large it
+    // is, so a share whose smallest attachment exceeds the budget still converges
+    // instead of deferring the same node for ever.
+    if (!urgent && budget.spent > 0 && bytes > budget.remaining) {
+      ctx.diagnostics.rehashDeferred.push(id);
+      return null;
+    }
+    budget.spent += bytes;
+    budget.remaining -= bytes;
+    return await hashOfBytes(await this.deps.vault.readBinary(path));
+  }
+
+  /** How many bytes this pass may re-hash before it starts deferring (§3.5). */
+  private rehashBudgetBytes(): number {
+    return this.deps.rehashBudgetBytes?.() ?? REHASH_BUDGET_BYTES;
+  }
+
   // ---------------------------------------------------------- step 3
 
   /**
@@ -1074,6 +1254,26 @@ export class Reconciler {
       }
       await this.forkAndTake(ctx, id, path, local, ref);
     });
+  }
+
+  /**
+   * §3.5 rule 3, STUBBED for this commit: the tree's version descends from
+   * exactly the bytes on disk, so taking it loses nothing — but taking it means
+   * fetching, re-checking and swapping through the staging journal, which is the
+   * next commit. Recording the divergence is what makes "not yet" visible and
+   * repeatable; the local file is untouched and the next pass asks again.
+   */
+  private async cleanReplace(
+    _ctx: PassContext,
+    id: string,
+    path: string,
+    ref: BlobRef,
+    _st: { bytes: number; mtime: number },
+  ): Promise<void> {
+    throw new RetryLater(
+      `${path} is superseded by ${ref.sha256.slice(0, 8)} for node ${id}: `
+      + 'left untouched until the replace rule lands',
+    );
   }
 
   /**
@@ -1454,6 +1654,7 @@ function refused(reason: string): ReconcileResult {
     failures: [],
     diagnostics: {
       pending: [], invalid: [], deletedButPresent: [], tooLarge: [], deferred: [],
+      rehashDeferred: [],
     },
   };
 }

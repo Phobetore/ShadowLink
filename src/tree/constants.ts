@@ -68,3 +68,30 @@ export const BLOB_MAX_BYTES_MOBILE = 33_554_432;    //  32 MB, mobile
  * all four markdown slots and park every note's publication behind it.
  */
 export const BLOB_PUBLISH_CONCURRENCY = 2;
+
+/**
+ * How many bytes one pass may re-hash before it defers the rest (spec §3.5).
+ *
+ * Step 2.5 asks "is my copy current?" for every attachment, and answers it from
+ * one `stat` whenever the recorded size and mtime still agree. The first pass on
+ * a cold share has no recorded mtimes at all, so it would otherwise hash the
+ * whole share at once — three gigabytes of scans, in one pass, on a phone.
+ * Charging each hash against a per-pass budget amortizes that over several
+ * passes instead, and a deferral is exactly that: never a report that the file
+ * converged.
+ *
+ * A pass always hashes at least one file, however large, so a share whose
+ * smallest attachment exceeds the budget still makes progress.
+ */
+export const REHASH_BUDGET_BYTES = 268_435_456;         // 256 MB, desktop
+export const REHASH_BUDGET_BYTES_MOBILE = 33_554_432;   //  32 MB, mobile
+
+/**
+ * How long the modify handler waits before asking for a reconcile (spec §3.5).
+ *
+ * Obsidian fires `modify` while a file is still being written, and an editor that
+ * saves in three steps fires it three times. Coalescing costs two seconds of
+ * latency on a change nobody else is waiting for, and saves a hash (and possibly
+ * an upload) of bytes that were about to change again.
+ */
+export const MODIFY_COALESCE_MS = 2_000;

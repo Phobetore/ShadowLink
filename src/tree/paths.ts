@@ -123,6 +123,52 @@ export function formatBlobRef(sha256: string, bytes: number, parent: string | nu
 }
 
 /**
+ * What a device should do about its own copy of an attachment (spec §4.1).
+ *
+ *  - `converged`  the bytes on disk are the bytes the tree names; write nothing.
+ *  - `republish`  the difference is ours and unpublished; publish it.
+ *  - `replace`    the tree's version descends from exactly our bytes; take it.
+ *  - `fork`       concurrent, or unknown ancestry; keep ours AND take theirs.
+ */
+export type ReplaceVerdict = 'converged' | 'republish' | 'replace' | 'fork';
+
+/**
+ * The conflict rule, stated once (spec §4.1), as a pure function of three hashes.
+ *
+ *   `local` — what is on disk right now.
+ *   `ref`   — the converged tree reference: which bytes belong here, and what
+ *             they replaced.
+ *   `base`  — the last hash THIS device confirmed was simultaneously on disk and
+ *             named by the tree. `undefined` when it has never confirmed one.
+ *
+ * Three properties are load-bearing, and all three are visible in these four
+ * lines rather than spread across the reconciler:
+ *
+ * RULE 2 IS EVALUATED BEFORE RULE 3, deliberately. A user who restored an older
+ * version from a backup or from `.trash` has put those bytes there on purpose, so
+ * the honest answer is to republish them, not to silently undo the restore — even
+ * though the tree's version does descend from what is on disk.
+ *
+ * AN UNKNOWN BASE IS RULE 4, never rule 1. "I have never confirmed what is here"
+ * is precisely the state in which overwriting destroys bytes no other peer holds.
+ *
+ * NOTHING HERE READS A CLOCK, a device id or an ordering heuristic. `parent`
+ * travels in the same LWW register as the hash, so it can never be split from it,
+ * and each peer decides only about its own copy — which is what makes the outcome
+ * order-independent with no coordinator.
+ */
+export function replaceVerdict(
+  local: string,
+  ref: BlobRef,
+  base: string | undefined,
+): ReplaceVerdict {
+  if (local === ref.sha256) return 'converged';
+  if (base === ref.sha256) return 'republish';
+  if (ref.parent === local) return 'replace';
+  return 'fork';
+}
+
+/**
  * The ONE place a path becomes a tree kind (spec §2.2). `diskKind` is what the
  * filesystem reports — `'f' | 'd'`, all Obsidian knows — and the tree kind is
  * derived from the name. Every call site routes through this rather than testing

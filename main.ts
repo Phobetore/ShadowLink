@@ -56,6 +56,8 @@ import {
   BLOB_MAX_BYTES,
   BLOB_MAX_BYTES_MOBILE,
   RECONCILE_DEBOUNCE_MS,
+  REHASH_BUDGET_BYTES,
+  REHASH_BUDGET_BYTES_MOBILE,
   TREE_SNAPSHOT_DEBOUNCE_MS,
 } from './src/tree/constants';
 import { TreeDoc } from './src/tree/TreeDoc';
@@ -97,6 +99,18 @@ const PUBLISH_RETRY_MS = 30_000;
  */
 function blobMemoryCap(): number {
   return Platform.isMobile ? BLOB_MAX_BYTES_MOBILE : BLOB_MAX_BYTES;
+}
+
+/**
+ * Spec §3.5/§7.4: how many bytes one reconcile pass may re-hash.
+ *
+ * The same platform reasoning as the memory cap, applied to a different failure:
+ * the first pass over a share with no recorded mtimes would hash all of it at
+ * once, which on a phone is the difference between a slow launch and a killed
+ * renderer.
+ */
+function blobRehashBudget(): number {
+  return Platform.isMobile ? REHASH_BUDGET_BYTES_MOBILE : REHASH_BUDGET_BYTES;
 }
 
 /** Spec §2.5: 16 random hex characters, minted once per device. */
@@ -299,9 +313,16 @@ class SyncRuntime {
       blobs: this.blobs,
       state: this.state,
       memoryCapBytes: () => blobMemoryCap(),
+      // §3.5: the same platform test, applied to the first-pass hash sweep. A
+      // cold 3 GB share amortizes it over several passes instead of freezing one.
+      rehashBudgetBytes: () => blobRehashBudget(),
       tickets: this.tickets,
       shareRoot: this.shareRoot,
       entries: () => this.tree.entries(),
+      // §3.5 rule 2. The queue is reached through a callback rather than injected,
+      // so the pass stays a driver over a tree snapshot; the entry it writes is
+      // drained by step 7 below, in this same pass.
+      requeuePublish: (nodeId, intent) => { this.queue.requeue(nodeId, intent); },
       // §5.5: a pass firing while the unshare modal is open must not put back the
       // very file the user just dragged out.
       pendingDecision: () => this.watcher.pendingDecision,

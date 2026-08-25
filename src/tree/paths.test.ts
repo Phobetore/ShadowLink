@@ -530,3 +530,54 @@ test('a dead attachment node is excluded from the assignment like any other node
   assert.equal(out.has('AAAAAAAAAAAAAAAAAAAAAA'), false);
   assert.equal(out.get('BBBBBBBBBBBBBBBBBBBBBB'), 'diagram.png');
 });
+
+// ── P2 §4.1: the replace decision table ──────────────────────────────────────
+
+import { replaceVerdict, type BlobRef } from './paths.ts';
+
+const H0 = 'a'.repeat(64);
+const HA = 'b'.repeat(64);
+const HB = 'c'.repeat(64);
+
+const refOf = (sha256: string, parent: string | null): BlobRef => ({ sha256, bytes: 120, parent });
+
+// Spec test A10 ⚠ — the whole conflict rule, as a pure function of what this
+// device can see. Nothing here reads a clock, a device id or an ordering
+// heuristic: `parent` travels in the same LWW register as the hash, and every
+// peer decides only about its own copy, which is what makes the outcome
+// order-independent with no coordinator.
+test('the replace verdict answers each of the four rules', () => {
+  // 1. The bytes on disk ARE the bytes the workspace names.
+  assert.equal(replaceVerdict(H0, refOf(H0, null), H0), 'converged');
+  assert.equal(replaceVerdict(H0, refOf(H0, HB), undefined), 'converged',
+    'rule 1 needs no base at all: the comparison is the evidence');
+
+  // 2. The tree still names what this device last confirmed, so the difference
+  //    is ours and it has not been published yet.
+  assert.equal(replaceVerdict(HA, refOf(H0, null), H0), 'republish');
+
+  // 3. The publisher's version descends from exactly the bytes we hold.
+  assert.equal(replaceVerdict(H0, refOf(HB, H0), H0), 'replace');
+
+  // 4. Two people changed it without seeing each other.
+  assert.equal(replaceVerdict(HA, refOf(HB, H0), HA), 'fork');
+});
+
+// ⚠ Rule 2 is evaluated BEFORE rule 3, deliberately. A user who restored an older
+// version from a backup or from `.trash` put those bytes there on purpose: the
+// honest answer is to republish them, not to silently undo the restore.
+test('a deliberate revert is republished, never quietly replaced', () => {
+  // The disk holds H0 again; the tree names H_B, whose parent IS H0 — rule 3's
+  // condition holds. But the base says this device already confirmed H_B was
+  // here, so the H0 on disk is something the user put back.
+  assert.equal(replaceVerdict(H0, refOf(HB, H0), HB), 'republish');
+});
+
+// ⚠ An unknown base is rule 4, never rule 1. "I have never confirmed what is
+// here" is the one state where overwriting would destroy bytes nobody else holds.
+test('an unknown base with differing bytes forks rather than assuming convergence', () => {
+  assert.equal(replaceVerdict(HA, refOf(HB, H0), undefined), 'fork');
+  assert.equal(replaceVerdict(HA, refOf(HB, null), undefined), 'fork');
+  // …and a base that names neither side is just as unknown.
+  assert.equal(replaceVerdict(HA, refOf(HB, H0), H0), 'fork');
+});

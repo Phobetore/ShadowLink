@@ -2086,3 +2086,309 @@ test('an attachment round-trips: published on A, materialized byte-identically o
   assert.deepEqual(store.calls, [], 'no re-fetch');
   assert.equal(mutations(vaultB), 0, 'and no second write');
 });
+
+// ---------------------------------------------------------------- P2 §3.5: step 2.5
+
+/** One `requeue` the pass asked for: which node, and for which bytes. */
+interface Requeued {
+  id: string;
+  intent: string;
+}
+
+/**
+ * A bound, published attachment: the file on disk, the node in the tree, and the
+ * device-state binding a device that materialized it would hold.
+ *
+ * `base` is what makes this a step-2.5 fixture rather than an adopt fixture. A
+ * device that has confirmed its copy records one; a device whose post-write
+ * `stat` threw has none, and must re-hash rather than assume (§3.5).
+ */
+async function bindBlob(
+  h: Harness,
+  id: string,
+  rel: string,
+  onDisk: Uint8Array,
+  ref: { sha256: string; bytes: number; parent: string | null },
+  /** `mtimeShift` moves the recorded mtime off the file's real one, as an external edit does. */
+  base?: { sha256: string; len: number; mtimeShift?: number },
+): Promise<string> {
+  const path = `${SHARE}/${rel}`;
+  const cut = rel.lastIndexOf('/');
+  const d = cut === -1 ? '' : rel.slice(0, cut);
+  const n = rel.slice(cut + 1);
+  h.vault.seedBinary(path, onDisk);
+  h.nodes.set(id, blob(d, n, `${ref.sha256}:${ref.bytes}:${ref.parent ?? '-'}`));
+  h.state.data.materialized[id] = path;
+  if (base !== undefined) {
+    h.state.data.contentHash[id] = {
+      sha256: base.sha256,
+      len: base.len,
+      mtime: (await mtimeOf(h.vault, path)) + (base.mtimeShift ?? 0),
+    };
+  }
+  return path;
+}
+
+/** The mtime the fake reports for a path, without leaving a `stat` in the call log. */
+async function mtimeOf(vault: FakeVault, path: string): Promise<number> {
+  const before = vault.calls.length;
+  const st = await vault.stat(path);
+  vault.calls.length = before;
+  return st!.mtime;
+}
+
+// B27. The whole affordability claim of the design, as a number: a pass over a
+// converged share asks the filesystem one question per attachment and nothing
+// else. No re-hash, no read, and not one call to the store — `b` is in the tree,
+// which is already synced, so "is my copy current?" is decided locally.
+test('B27: a pass over 200 converged attachments costs 200 stats and nothing else', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  for (let i = 0; i < 200; i++) {
+    const bytes = png(i + 1);
+    const sha = await h.blobs.seed(bytes);
+    await bindBlob(h, nid(`N${pad3(i)}`), `img/f${pad3(i)}.png`, bytes, {
+      sha256: sha, bytes: bytes.length, parent: null,
+    });
+  }
+
+  // The first pass records every base; the second is the steady state.
+  await h.reconciler.reconcile('sync');
+  h.vault.resetCalls();
+  h.blobs.resetCalls();
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.equal(h.vault.callsTo('stat').length, 200, 'one stat per attachment, and no more');
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'nothing was re-hashed');
+  assert.deepEqual(h.blobs.calls, [], 'and the store was not asked anything at all');
+  assert.equal(mutations(h.vault), 0);
+});
+
+// ⚠ B28. The cold-start sweep is budgeted, so a 3 GB share amortizes its first
+// full hash over several passes instead of freezing one — and a node the budget
+// deferred is NEVER reported as converged, which is the difference between "not
+// yet" and a wrong answer.
+test('B28: a cold start hashes at most the budget per pass and converges over several', async () => {
+  const h = makeHarness({ rehashBudgetBytes: () => 200 });      // three 64-byte files a pass
+  h.vault.seed(SHARE, 'd');
+  const ids: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    const bytes = png(i + 1);
+    const sha = await h.blobs.seed(bytes);
+    const id = nid(`N${pad3(i)}`);
+    ids.push(id);
+    // No base at all: the state file predates the hash, or a post-write `stat`
+    // never answered. Either way the bytes have to be hashed.
+    await bindBlob(h, id, `f${pad3(i)}.png`, bytes, { sha256: sha, bytes: bytes.length, parent: null });
+  }
+
+  let passes = 0;
+  for (let i = 0; i < 10; i++) {
+    h.vault.resetCalls();
+    const r = await h.reconciler.reconcile('sync');
+    passes += 1;
+    const hashed = h.vault.callsTo('readBinary').length;
+    assert.ok(hashed <= 4, `pass ${i} hashed ${hashed} files, over the budget`);
+    // Whatever the budget deferred is absent from `contentHash` — never recorded
+    // as confirmed on the strength of not having looked.
+    for (const id of ids) {
+      const recorded = h.state.data.contentHash[id];
+      if (recorded === undefined) continue;
+      assert.equal(
+        recorded.sha256, h.nodes.get(id)!.b!.slice(0, 64),
+        `${id} recorded a hash it never computed`,
+      );
+    }
+    if (ids.every((id) => h.state.data.contentHash[id] !== undefined)) break;
+    assert.ok(r.diagnostics.rehashDeferred.length > 0, 'the deferral is reported, not silent');
+  }
+
+  assert.ok(passes > 2, `the budget was not applied at all (converged in ${passes} passes)`);
+  for (const id of ids) assert.ok(h.state.data.contentHash[id] !== undefined, `${id} never converged`);
+  assert.equal(mutations(h.vault), 0, 'and hashing never wrote anything');
+});
+
+// ⚠ The staleness oracle, and the reason it has two clauses. A recorded hash is
+// trusted only when size AND mtime agree; drop the mtime clause and an external
+// edit that happens to keep the file's size is invisible for ever.
+test('a recorded hash whose mtime no longer matches is re-hashed, not trusted', async () => {
+  const requeued: Requeued[] = [];
+  const h = makeHarness({ requeuePublish: (id, intent) => { requeued.push({ id, intent }); } });
+  h.vault.seed(SHARE, 'd');
+  const theirs = png(1);
+  const mine = png(2, theirs.length);                          // SAME size, other bytes
+  const sha = await hashOfBytes(theirs);
+  const id = nid('A');
+  const path = await bindBlob(h, id, 'diagram.png', mine, {
+    sha256: sha, bytes: theirs.length, parent: null,
+  }, {
+    // The base claims the tree's hash, at the right size, with an mtime from
+    // before the user's external edit.
+    sha256: sha, len: theirs.length, mtimeShift: -5_000,
+  });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.equal(h.vault.callsTo('readBinary').length, 1, 'the stale mtime forced a re-hash');
+  assert.deepEqual(
+    requeued, [{ id, intent: await hashOfBytes(mine) }],
+    'and the local change is published rather than silently lost',
+  );
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'the file itself is untouched');
+});
+
+test('a recorded hash whose size and mtime both agree costs one stat and no read', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  const sha = await hashOfBytes(bytes);
+  const id = nid('A');
+  await bindBlob(h, id, 'diagram.png', bytes, { sha256: sha, bytes: bytes.length, parent: null }, {
+    sha256: sha, len: bytes.length,
+  });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.equal(h.vault.callsTo('readBinary').length, 0);
+  assert.equal(h.vault.callsTo('stat').length, 1);
+});
+
+// ⚠ The P2-c handover, stated as a test: a node materialized by a pass whose
+// post-write `stat` threw carries NO base. An absent base is not "converged" —
+// it is "this device has confirmed nothing", and the only honest answer is to
+// hash the file and find out.
+test('a bound attachment with no recorded base is re-hashed rather than assumed current', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  const sha = await h.blobs.seed(bytes);
+  const id = nid('A');
+  await bindBlob(h, id, 'diagram.png', bytes, { sha256: sha, bytes: bytes.length, parent: null });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.equal(h.vault.callsTo('readBinary').length, 1, 'it looked instead of assuming');
+  assert.equal(h.state.data.contentHash[id]?.sha256, sha, 'and recorded what it found');
+  assert.ok(h.state.data.contentHash[id]?.mtime !== undefined);
+  assert.equal(mutations(h.vault), 0);
+});
+
+// ⚠ B7. A local replacement is PUBLISHED, and the user's file is never written to
+// on the way. `requeue` carries the hash it was queued for, so a pass that runs
+// every few seconds cannot defeat the publish ladder.
+test('B7: locally edited bytes are requeued for publication and never overwritten', async () => {
+  const requeued: Requeued[] = [];
+  const h = makeHarness({ requeuePublish: (id, intent) => { requeued.push({ id, intent }); } });
+  h.vault.seed(SHARE, 'd');
+  const first = png(1);
+  const edited = png(2, 96);
+  const sha0 = await h.blobs.seed(first);
+  const id = nid('A');
+  const path = await bindBlob(h, id, 'diagram.png', first, {
+    sha256: sha0, bytes: first.length, parent: null,
+  }, {
+    sha256: sha0, len: first.length,
+  });
+
+  // The user edits the file in an external editor.
+  h.vault.seedBinary(path, edited);
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(requeued, [{ id, intent: await hashOfBytes(edited) }]);
+  assert.deepEqual(h.vault.binarySnapshot()[path], edited, 'the edit is still there, in full');
+  assert.equal(mutations(h.vault), 0, 'step 2.5 did not touch the disk');
+  assert.deepEqual(h.blobs.calls, [], 'and did not fetch anything: the difference is ours');
+  assert.equal(
+    h.state.data.contentHash[id]?.sha256, sha0,
+    'the base still names what the tree names: it advances when the publish confirms (I17)',
+  );
+});
+
+// ⚠ B24, the step-2.5 arm. Hashing needs the whole file in memory, so a file over
+// the cap is not hashed — and, because it was not hashed, no verdict is reached
+// about it at all: not converged, not conflicted, not published.
+test('B24: an attachment over the memory cap is not re-hashed and reaches no verdict', async () => {
+  const requeued: Requeued[] = [];
+  const h = makeHarness({
+    memoryCapBytes: () => 32,
+    requeuePublish: (id, intent) => { requeued.push({ id, intent }); },
+  });
+  h.vault.seed(SHARE, 'd');
+  const bytes = png(3, 512);
+  const sha = await h.blobs.seed(png(4, 512));                  // the tree names something else
+  const id = nid('A');
+  await bindBlob(h, id, 'clip.mov', bytes, { sha256: sha, bytes: 512, parent: null });
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'never held in memory');
+  assert.deepEqual(r.diagnostics.tooLarge, [id]);
+  assert.deepEqual(requeued, [], 'no publish was queued for bytes nobody hashed');
+  assert.equal(h.state.data.contentHash[id], undefined, 'and no base was recorded');
+  assert.deepEqual(r.failures, [], 'this is a fact about the device, not an error');
+});
+
+// A path the modify handler named is hashed even when the budget is spent: the
+// user just saved that file, and answering "not this pass" for the one change
+// they made is the wrong trade.
+test('a path the modify handler flagged bypasses the re-hash budget', async () => {
+  const requeued: Requeued[] = [];
+  const dirty = new Set<string>([fold(`${SHARE}/diagram.png`)]);
+  const h = makeHarness({
+    rehashBudgetBytes: () => 0,
+    takeDirtyPaths: () => dirty,
+    requeuePublish: (id, intent) => { requeued.push({ id, intent }); },
+  });
+  h.vault.seed(SHARE, 'd');
+  const first = png(1);
+  const edited = png(2, 96);
+  const sha0 = await h.blobs.seed(first);
+  const id = nid('A');
+  const other = nid('B');
+  await bindBlob(h, id, 'diagram.png', edited, {
+    sha256: sha0, bytes: first.length, parent: null,
+  }, { sha256: sha0, len: first.length, mtimeShift: -5_000 });
+  const otherBytes = png(5);
+  const otherSha = await h.blobs.seed(otherBytes);
+  await bindBlob(h, other, 'other.png', otherBytes, {
+    sha256: otherSha, bytes: otherBytes.length, parent: null,
+  });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(requeued, [{ id, intent: await hashOfBytes(edited) }], 'the saved file was hashed');
+  assert.deepEqual(
+    r.diagnostics.rehashDeferred, [other],
+    'and the one nobody asked about waits for a pass with budget left',
+  );
+});
+
+// I2. "I could not look" is not an answer, and must not become a verdict: no
+// publish, no fetch, no write — one recorded failure, and the next pass asks again.
+test('a stat that could not answer decides nothing about an attachment', async () => {
+  const requeued: Requeued[] = [];
+  const h = makeHarness({ requeuePublish: (id, intent) => { requeued.push({ id, intent }); } });
+  h.vault.seed(SHARE, 'd');
+  const bytes = png();
+  const sha = await h.blobs.seed(png(9));                       // the tree names other bytes
+  const id = nid('A');
+  const path = await bindBlob(h, id, 'diagram.png', bytes, { sha256: sha, bytes: 64, parent: null });
+  h.vault.failNext('stat', new Error('EIO: the volume is unreadable'));
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures.map((f) => f.key), [`bytes:${id}`]);
+  assert.deepEqual(requeued, []);
+  assert.deepEqual(h.blobs.calls, []);
+  assert.equal(mutations(h.vault), 0);
+  assert.deepEqual(h.vault.binarySnapshot()[path], bytes);
+});
