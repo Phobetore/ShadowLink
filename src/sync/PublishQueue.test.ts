@@ -449,7 +449,7 @@ test('a content doc that already holds text is never overwritten', async () => {
   // recording the local's would let `isProvenNote` trash unpublished work. Neither
   // is true, so neither is written. The full argument, with the deletion pass that
   // measures the cost, is in "a base is not recorded for a remote text this disk
-  // does not hold (I17)" above.
+  // does not hold (I17)" below.
   assert.equal(
     h.state.data.contentHash[id], undefined,
     'no bytes are in the workspace and on this disk at once, so there is no base',
