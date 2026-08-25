@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import { RESURRECT_WINDOW_MS, TICKET_TTL_MS } from '../tree/constants.ts';
-import { fold, hashOf, isLive, relPath } from '../tree/paths.ts';
+import { fold, hashOf, hashOfBytes, isLive, relPath } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
 import type { NodeFields, NodeKind } from '../tree/types.ts';
 import { Deletions } from './Deletions.ts';
@@ -58,6 +58,8 @@ interface Harness {
   readOnly: string[];
   reconciles: string[];
   published: string[];
+  /** `(nodeId, intent)` pairs handed to the publish queue's repeatable admission. */
+  requeued: Array<{ id: string; intent: string }>;
   shareRootWrites: string[];
   bulkPrompts: number[];
   unsharePrompts: Array<{ path: string; count: number }>;
@@ -87,6 +89,7 @@ function makeHarness(over: Partial<WatcherDeps> = {}): Harness {
   const readOnly: string[] = [];
   const reconciles: string[] = [];
   const published: string[] = [];
+  const requeued: Array<{ id: string; intent: string }> = [];
   const shareRootWrites: string[] = [];
   const bulkPrompts: number[] = [];
   const unsharePrompts: Array<{ path: string; count: number }> = [];
@@ -108,6 +111,7 @@ function makeHarness(over: Partial<WatcherDeps> = {}): Harness {
     enterReadOnly: (r) => { readOnly.push(r); },
     scheduleReconcile: (c) => { reconciles.push(c); },
     enqueuePublish: (id) => { published.push(id); },
+    requeuePublish: (id, intent) => { requeued.push({ id, intent }); },
     confirmLocalBulkDelete: async (count) => { bulkPrompts.push(count); return true; },
     confirmUnshare: async (path, count) => { unsharePrompts.push({ path, count }); return 'unshare'; },
     ...over,
@@ -115,7 +119,8 @@ function makeHarness(over: Partial<WatcherDeps> = {}): Harness {
 
   return {
     vault, docs, tree, state, tickets, watcher, counts,
-    notices, readOnly, reconciles, published, shareRootWrites, bulkPrompts, unsharePrompts,
+    notices, readOnly, reconciles, published, requeued, shareRootWrites, bulkPrompts,
+    unsharePrompts,
     now,
     setClock: (ms) => { clock = ms; },
     setPhase: (p) => { phase = p; },
@@ -1253,6 +1258,46 @@ test('58: deleting a folder cascades to its live descendants and leaves escapees
   assert.equal(h.state.data.materialized[inside], undefined, 'unbound');
 });
 
+// B17. The cascade needed no change for attachments and this test is what says
+// so out loud: `xp` is a string-prefix rule over stored paths, and an attachment
+// is killed by it, and escapes it, exactly as a note does. What differs is only
+// `xh` — raw bytes rather than text — which is what step 4 later proves against.
+test('B17: an attachment under a deleted folder cascades, and one that moved out survives', async () => {
+  const h = makeHarness();
+  const folder = mint(h.tree, { k: 'd', d: '', n: 'Archive' });
+  const shot = mint(h.tree, {
+    k: 'b', d: 'Archive', n: 'shot.png', s: 1, b: `${'b'.repeat(64)}:12:-`,
+  });
+  const deeper = mint(h.tree, {
+    k: 'b', d: 'Archive/sub', n: 'deep.pdf', s: 1, b: `${'d'.repeat(64)}:34:-`,
+  });
+  const movedOut = mint(h.tree, {
+    k: 'b', d: 'Active', n: 'kept.png', s: 1, b: `${'e'.repeat(64)}:56:-`,
+  });
+  h.state.data.materialized[folder] = `${SHARE}/Archive`;
+  h.state.data.materialized[shot] = `${SHARE}/Archive/shot.png`;
+  // The raw-BYTE hash this device confirmed, which is what a peer's `isProvenBlob`
+  // will compare against the tree.
+  h.state.data.contentHash[shot] = { sha256: 'b'.repeat(64), len: 12, mtime: NOW };
+  h.vault.seed(SHARE, 'd');
+
+  h.watcher.onDelete(`${SHARE}/Archive`, 'd');
+  await h.watcher.flushDeleteBatch();
+
+  for (const id of [shot, deeper]) {
+    const f = h.tree.get(id)!;
+    assert.equal(isLive(f), false, 'cascaded');
+    assert.equal(f.xp, 'Archive', 'the cascade marker, so it can still escape (§2.2)');
+    assert.equal(f.k, 'b', 'and it is still an attachment');
+  }
+  assert.equal(h.tree.get(shot)!.xh, 'b'.repeat(64), 'the raw-byte hash rides on the tombstone');
+  assert.equal(h.tree.get(shot)!.b, `${'b'.repeat(64)}:12:-`, 'the reference is left intact');
+
+  assert.equal(isLive(h.tree.get(movedOut)!), true, 'an attachment outside the folder survives');
+  assert.equal(h.tree.get(movedOut)!.xp, undefined);
+  assert.equal(h.state.data.materialized[shot], undefined, 'unbound');
+});
+
 test('58b: a cascaded child that later moves out of the folder comes back to life', async () => {
   const h = makeHarness();
   const folder = mint(h.tree, { k: 'd', d: '', n: 'Archive' });
@@ -1528,16 +1573,88 @@ test('B20: renaming a folder of 50 attachments rewrites one d per node and moves
   assert.equal(h.counts.txns, 0);
 });
 
-// §3.8's first clause. A dead node's `xh` is a hash of TEXT for a note and of RAW
-// BYTES for an attachment; letting one kind adopt the other's tombstone binds a
-// node whose `b` names completely different content.
-test('a dead note never resurrects into an attachment at the same path', async () => {
-  const h = makeHarness();
-  h.vault.seed(SHARE, 'd');
-  const gone = mint(h.tree, {
-    k: 'b', d: '', n: 'diagram.png', s: 1, b: `${'c'.repeat(64)}:3:-`,
-    x: 1, xa: NOW - 1_000, xh: 'c'.repeat(64),
+// ---------------------------------------------------------------- §3.8 / B18
+
+/** Seed a dead attachment node whose `xh` names `bytes`, and whose `b` may not. */
+async function seedDeadBlob(
+  h: Harness,
+  opts: { rel: string; xa: number; xh?: string; ref?: string; bytes: number },
+): Promise<string> {
+  const { dir, name } = splitOf(opts.rel);
+  const id = mint(h.tree, {
+    k: 'b', d: dir, n: name, s: 1,
+    b: opts.ref ?? `${'c'.repeat(64)}:${opts.bytes}:-`,
   });
+  h.tree.patchNode(id, { x: 1, xa: opts.xa, xb: 'Ann', xh: opts.xh });
+  return id;
+}
+
+// B18. Delete then Ctrl-Z, for an attachment: the same bytes back at the same
+// path inside the window is the same file, so the node — and the identity every
+// peer already has for it — comes back rather than being replaced.
+test('B18: an attachment recreated with the same bytes resurrects its node', async () => {
+  const h = makeHarness();
+  const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+  const hash = await hashOfBytes(bytes);
+  const id = await seedDeadBlob(h, {
+    rel: 'diagram.png', xa: NOW - 60_000, xh: hash, bytes: bytes.length,
+    ref: `${hash}:${bytes.length}:-`,
+  });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/diagram.png`, bytes);
+
+  await h.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+
+  assert.equal(h.tree.size(), 1, 'the SAME node, not a second one');
+  const f = h.tree.get(id)!;
+  assert.equal(isLive(f), true);
+  assert.equal(f.g, 2, 'g = x + 1, so a concurrent delete loses');
+  assert.deepEqual(
+    [f.xa, f.xb, f.xh, f.xp],
+    [undefined, undefined, undefined, undefined],
+  );
+  assert.equal(f.b, `${hash}:${bytes.length}:-`, 'the reference is left alone (R-S3)');
+  assert.equal(h.state.data.materialized[id], `${SHARE}/diagram.png`);
+  assert.equal(h.vault.callsTo('read').length, 0, 'and the PNG is never decoded as text');
+
+  // The disk is the authority on what is there now, so the node republishes it.
+  assert.deepEqual(h.requeued, [{ id, intent: hash }]);
+});
+
+test('B18: a resurrected attachment republishes the bytes that are actually on disk', async () => {
+  const h = makeHarness();
+  // The tombstone's `b` names the version the workspace last saw; `xh` names what
+  // this device last confirmed on disk, and they have drifted apart.
+  const bytes = new Uint8Array([9, 8, 7, 6, 5]);
+  const hash = await hashOfBytes(bytes);
+  const id = await seedDeadBlob(h, {
+    rel: 'diagram.png', xa: NOW - 1_000, xh: hash, bytes: 3,
+    ref: `${'a'.repeat(64)}:3:-`,
+  });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/diagram.png`, bytes);
+
+  await h.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+
+  assert.equal(isLive(h.tree.get(id)!), true, 'resurrected');
+  assert.deepEqual(
+    h.requeued,
+    [{ id, intent: hash }],
+    'the intent is the DISK hash, so the tree converges on what is there',
+  );
+});
+
+// B18's other half, and the reason §3.8 drops the zero-length escape for a
+// binary. For a note an empty file is a state a recreate genuinely passes through
+// and the CRDT merges over the mistake; for a binary there is no merge, so the
+// escape would bind a live node with a stale `b` to a COMPLETELY DIFFERENT file
+// and restore the deleted image on every peer.
+test('B18: a zero-length file never resurrects an attachment (no escape)', async () => {
+  const h = makeHarness();
+  const gone = await seedDeadBlob(h, {
+    rel: 'diagram.png', xa: NOW - 1_000, xh: 'c'.repeat(64), bytes: 3,
+  });
+  h.vault.seed(SHARE, 'd');
   h.vault.seed(`${SHARE}/diagram.png`, 'f', '');       // a zero-length file at the same path
 
   await h.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
@@ -1548,6 +1665,119 @@ test('a dead note never resurrects into an attachment at the same path', async (
   assert.notEqual(live[0].id, gone);
   assert.equal(live[0].k, 'b');
   assert.equal(h.vault.callsTo('read').length, 0, 'and the PNG is never decoded as text');
+  assert.deepEqual(h.requeued, [], 'nothing was resurrected, so nothing is requeued');
+  assert.deepEqual(h.published, [live[0].id], 'the fresh node publishes as a first version');
+});
+
+test('B18: an empty file is refused even when the tombstone names empty bytes', async () => {
+  // The one case where the hash comparison alone would let an empty file through:
+  // a tombstone whose confirmed content really was zero bytes. Publication never
+  // produces one (§3.2 refuses a 0-byte attachment), so reaching this state means
+  // something is already wrong — and binding a live, seeded node to a file that is
+  // still being written is not the way to recover from it.
+  const h = makeHarness();
+  const gone = await seedDeadBlob(h, {
+    rel: 'diagram.png', xa: NOW - 1_000, xh: await hashOfBytes(new Uint8Array(0)), bytes: 0,
+  });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/diagram.png`, 'f', '');
+
+  await h.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+
+  assert.equal(isLive(h.tree.get(gone)!), false, 'still dead');
+  assert.equal(h.tree.size(), 2, 'a fresh node instead');
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'and the file was never even read');
+});
+
+test('B18: a different image at the same path mints a new node instead', async () => {
+  const h = makeHarness();
+  const theirs = new Uint8Array([1, 1, 1, 1]);
+  const ours = new Uint8Array([2, 2, 2, 2]);
+  const gone = await seedDeadBlob(h, {
+    rel: 'diagram.png', xa: NOW - 1_000, xh: await hashOfBytes(theirs), bytes: theirs.length,
+  });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/diagram.png`, ours);
+
+  await h.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+
+  assert.equal(isLive(h.tree.get(gone)!), false);
+  assert.equal(h.tree.size(), 2, 'a fresh node, because content addressing makes that cheap');
+  assert.deepEqual(h.requeued, []);
+});
+
+test('B18: outside the window, and with no recorded hash, an attachment never resurrects', async () => {
+  const bytes = new Uint8Array([4, 4, 4, 4]);
+  const hash = await hashOfBytes(bytes);
+
+  const stale = makeHarness();
+  const old = await seedDeadBlob(stale, {
+    rel: 'diagram.png', xa: NOW - RESURRECT_WINDOW_MS - 1, xh: hash, bytes: bytes.length,
+  });
+  stale.vault.seed(SHARE, 'd');
+  stale.vault.seedBinary(`${SHARE}/diagram.png`, bytes);
+  await stale.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+  assert.equal(isLive(stale.tree.get(old)!), false, 'the window is what bounds the reuse');
+  assert.equal(stale.tree.size(), 2);
+
+  const unknown = makeHarness();
+  const never = await seedDeadBlob(unknown, {
+    rel: 'diagram.png', xa: NOW - 1_000, bytes: bytes.length,      // no xh
+  });
+  unknown.vault.seed(SHARE, 'd');
+  unknown.vault.seedBinary(`${SHARE}/diagram.png`, bytes);
+  await unknown.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+  assert.equal(isLive(unknown.tree.get(never)!), false, 'and nothing is reused unverified');
+  assert.equal(unknown.tree.size(), 2);
+});
+
+test('B24: an attachment over the memory cap is never hashed to decide a resurrect', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 4 });
+  const bytes = new Uint8Array([5, 5, 5, 5, 5, 5, 5, 5]);
+  const gone = await seedDeadBlob(h, {
+    rel: 'diagram.png', xa: NOW - 1_000, xh: await hashOfBytes(bytes), bytes: bytes.length,
+  });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seedBinary(`${SHARE}/diagram.png`, bytes);
+
+  await h.watcher.onCreate(`${SHARE}/diagram.png`, 'f');
+
+  assert.equal(isLive(h.tree.get(gone)!), false, 'a node this device cannot verify is not reused');
+  assert.equal(h.vault.callsTo('readBinary').length, 0, 'and the file is never read into memory');
+});
+
+// §3.8's first clause. `xh` is a hash of TEXT for a note and of RAW BYTES for an
+// attachment, and a folder node has no content at all — so a tombstone of one
+// kind can never be evidence about a file of another.
+test('a dead node never resurrects across kinds', async () => {
+  const h = makeHarness();
+  // A FOLDER may legitimately be named `Archive.md` on disk, so this pair is the
+  // one place two kinds can meet at the same path — and a resurrect here would
+  // bind a directory node to a file.
+  const gone = mint(h.tree, { k: 'd', d: '', n: 'Archive.md' });
+  h.tree.patchNode(gone, { x: 1, xa: NOW - 1_000, xb: 'Ann' });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/Archive.md`, 'f', '');        // empty: the note escape would fire
+
+  await h.watcher.onCreate(`${SHARE}/Archive.md`, 'f');
+
+  assert.equal(isLive(h.tree.get(gone)!), false, 'the dead folder node stays dead');
+  const live = fieldsOf(h.tree).filter((n) => n.live);
+  assert.equal(live.length, 1);
+  assert.notEqual(live[0].id, gone);
+  assert.equal(live[0].k, 'f', 'and the new node is a note, as its path says');
+});
+
+test('a resurrected NOTE requeues nothing: markdown converges through the CRDT', async () => {
+  const h = makeHarness();
+  const id = await seedTombstone(h, { rel: 'todo.md', xa: NOW - 60_000, text: 'body' });
+  h.vault.seed(SHARE, 'd');
+  h.vault.seed(`${SHARE}/todo.md`, 'f', 'body');
+
+  await h.watcher.onCreate(`${SHARE}/todo.md`, 'f');
+
+  assert.equal(isLive(h.tree.get(id)!), true);
+  assert.deepEqual(h.requeued, [], 'a note has no bytes to republish');
 });
 
 // ---------------------------------------------------------------- I1 guard

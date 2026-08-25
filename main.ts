@@ -289,6 +289,16 @@ class SyncRuntime {
         this.queue.enqueue(nodeId);
         this.scheduleReconcile('sync');
       },
+      // §3.8: an attachment that just came back from the dead republishes the
+      // bytes that are actually on disk, so a reference that had drifted from
+      // them converges instead of pointing at a version nobody has.
+      requeuePublish: (nodeId, intent) => {
+        this.queue.requeue(nodeId, intent);
+        this.scheduleReconcile('sync');
+      },
+      // §7.4: the same platform cap again, here on the hash that decides whether
+      // a recreated attachment may reuse a dead node.
+      memoryCapBytes: () => blobMemoryCap(),
       confirmLocalBulkDelete: (count) => confirmLocalBulkDelete(app, count),
       confirmUnshare: (rootPath, count) => confirmUnshare(app, rootPath, count),
     });
@@ -376,6 +386,10 @@ class SyncRuntime {
         return waitForSync(this.treeProvider, ms);
       },
       confirm: (confirmation) => confirmFirstSync(app, confirmation),
+      // §7.5: the same cap the reconciler will apply, so the attachments the
+      // modal says will not be downloaded are exactly the ones the first pass
+      // then declines to fetch.
+      memoryCapBytes: () => blobMemoryCap(),
       reconcile: (cause) => this.reconciler.reconcile(cause),
       // Both halves of the same answer: one module must not report `ready` while
       // the other is refusing every pass.

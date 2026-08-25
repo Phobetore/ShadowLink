@@ -165,6 +165,58 @@ test('removal is spelled trashLocal, and the adapter provides it', () => {
   );
 });
 
+test('the adapter-level binary write and removal appear nowhere in shipped source (I1)', () => {
+  // WIDENED IN P2-e. Binary writes exist now, so the adapter's own file calls are
+  // reachable in a way they were not while every write went through
+  // `vault.create`. Each is unrecoverable in the same way the vault's hard delete
+  // is:
+  //
+  //  * the adapter's binary WRITE overwrites whatever is at the path, with no
+  //    folded occupancy check and nothing retained. `VaultPort.createBinary`
+  //    refuses an occupied path for precisely that reason, and the replace
+  //    primitive stages the previous bytes out BEFORE the new ones exist (I1);
+  //  * the adapter's REMOVE deletes with nothing left behind — not even the
+  //    vault-local `.trash` that Settings → Files → Deleted files restores from
+  //    on every platform.
+  //
+  // The second is also caught by the receiver scan below, which bans these calls
+  // on anything adapter-shaped. It is spelled out here as well because a literal
+  // needle and a receiver rule fail in different directions, and this pair is now
+  // one refactor away from being written by accident.
+  //
+  // ONE EXEMPTION, and it is about WHAT is written rather than how: the state
+  // port writes the plugin's OWN two files, inside the plugin's own data
+  // directory, and an atomic overwrite is precisely what they need (§2.5, §2.6).
+  // Nothing it can address is the user's content — which the assertions below
+  // check rather than assume.
+  const banned = [`adapter.${'writeBinary'}(`, `adapter.${'remove'}(`];
+  const ownFilesOnly = 'src/sync/ObsidianStatePort.ts';
+  for (const file of SOURCES) {
+    const source = read(file);
+    for (const needle of banned) {
+      if (relative(file) === ownFilesOnly && needle === `adapter.${'writeBinary'}(`) continue;
+      assert.equal(
+        source.includes(needle),
+        false,
+        `${relative(file)} must not contain ${needle}. Writes go through `
+        + 'VaultPort.createBinary, which refuses an occupied path; removal goes '
+        + 'through VaultPort.trashLocal, which is the vault-local trash.',
+      );
+    }
+  }
+
+  // The exemption is only sound while that file cannot address anything outside
+  // the plugin's data directory: every path it touches is built by `pathFor`,
+  // which prefixes `this.dir`, and it has no notion of a shared folder at all.
+  const port = read(join(REPO_ROOT, ownFilesOnly));
+  assert.ok(port.includes('${this.dir}/${key}'), `${ownFilesOnly}: paths must derive from this.dir`);
+  assert.equal(
+    port.includes('shareRoot'),
+    false,
+    `${ownFilesOnly} must have no way to name the shared folder`,
+  );
+});
+
 test('the adapter-level system trash appears in NO shipped file (I1)', () => {
   // Same ban as above, no longer limited to the one file that happens to hold a
   // `Vault`: `ObsidianStatePort` holds a `DataAdapter`, and the plugin entry point

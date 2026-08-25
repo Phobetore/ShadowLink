@@ -116,16 +116,37 @@ class FirstSyncModal extends DecisionModal<BootstrapDecision> {
       text: `Shared folder: ${info.shareRoot}`,
     });
 
+    // §7.5: counts AND byte totals, because "412 files" and "412 files, 3.1 GB"
+    // are different decisions — and the second one is the one being asked for.
     const summary = contentEl.createEl('ul');
     summary.createEl('li', {
       text: `${info.adopt.size} local file(s) already match this workspace and will be adopted.`,
     });
     summary.createEl('li', {
-      text: `${info.download.size} file(s) will be downloaded from this workspace.`,
+      text: `${info.downloadNotes.count} note(s) will be downloaded from this workspace.`,
     });
+    if (info.downloadNow.count > 0) {
+      summary.createEl('li', {
+        text: `${info.downloadNow.count} attachment(s) (${sizeOf(info.downloadNow.bytes)}) `
+          + 'will be downloaded.',
+      });
+    }
+    if (info.downloadDeferred.count > 0) {
+      summary.createEl('li', {
+        text: `${info.downloadDeferred.count} attachment(s) `
+          + `(${sizeOf(info.downloadDeferred.bytes)}) are too large for this device and will `
+          + 'stay in the workspace without being downloaded here.',
+      });
+    }
     summary.createEl('li', {
-      text: `${info.upload.length} local file(s) can be shared with this workspace.`,
+      text: `${info.uploadNotes.count} local note(s) can be shared with this workspace.`,
     });
+    if (info.uploadAttachments.count > 0) {
+      summary.createEl('li', {
+        text: `${info.uploadAttachments.count} local attachment(s) `
+          + `(${sizeOf(info.uploadAttachments.bytes)}) can be uploaded to this workspace.`,
+      });
+    }
     if (info.pending.length > 0) {
       summary.createEl('li', {
         text: `${info.pending.length} file(s) are waiting for their author to upload them, `

@@ -28,6 +28,7 @@
 // No `obsidian` import, no node builtins.
 
 import {
+  BLOB_MAX_BYTES,
   FOUNDER_GRACE_MS,
   FOUNDER_QUIET_MS,
   FOUNDER_SETTLE_MS,
@@ -45,20 +46,58 @@ import type { Phase } from './VaultWatcher.ts';
 
 // ============================================================ public surface
 
-/** Spec §4.5 step 7. Nothing in here has been acted on. */
+/**
+ * One line of the first-sync modal: how many, and how big.
+ *
+ * `bytes` is 0 when a size is not knowable at classification time, not when it is
+ * genuinely zero. A note's bytes live in a content doc that has not synced, and
+ * inventing a number for them would describe a pass that does not happen. An
+ * attachment's size rides in the tree and a local file's is on disk, so those two
+ * are real.
+ */
+export interface BucketTotals {
+  count: number;
+  bytes: number;
+}
+
+/** Spec §4.5 step 7 and §7.5. Nothing in here has been acted on. */
 export interface BootstrapBuckets {
   /** A live seeded node whose desired path already holds a local file. nodeId -> literal path. */
   adopt: Map<string, string>;
   /** A live seeded node with no local file. nodeId -> the vault path it wants. */
   download: Map<string, string>;
   /**
-   * Local markdown under the share that no live node claims, that is not at a
-   * dead node's last path, and that the user has not already declined. Literal
-   * vault paths, sorted.
+   * Local content under the share that no live node claims, that is not at a dead
+   * node's last path, and that the user has not already declined. Literal vault
+   * paths, sorted, NOTES AND ATTACHMENTS TOGETHER: this is the list the
+   * confirmation acts on, so nothing may fall between it and the counts below.
    */
   upload: string[];
   /** Live valid file nodes whose author has not published yet — shown, never acted on (I6). */
   pending: string[];
+
+  // §7.5. A user joining a mature folder needs to be told what 3 GB means before
+  // it starts, and a user upgrading an existing vault needs to be told they are
+  // about to upload 3.1 GB of scans. Four numbers `upload` and `download` cannot
+  // express, none of which costs more than a `stat` per local candidate.
+
+  /** Notes to download. `bytes` is 0 — see `BucketTotals`. */
+  downloadNotes: BucketTotals;
+  /** Attachments the first pass will actually fetch, sized from the tree. */
+  downloadNow: BucketTotals;
+  /**
+   * Attachments the first pass will NOT fetch, sized from the tree.
+   *
+   * Today that is exactly the ones over this device's memory cap (§7.4): the node
+   * stays live, valid, published and simply unmaterialized HERE. P2-f adds the
+   * ones the fetch policy holds back for approval, which from the user's side is
+   * the same fact — "this will not arrive yet" — and belongs on the same line.
+   */
+  downloadDeferred: BucketTotals;
+  /** Local markdown that would be shared, sized from disk. */
+  uploadNotes: BucketTotals;
+  /** Local attachments that would be shared, sized from disk. */
+  uploadAttachments: BucketTotals;
 }
 
 /** What the confirmation modal is handed. The modal itself is P1c Task 4's. */
@@ -143,6 +182,15 @@ export interface BootstrapDeps {
   notice?: (msg: string) => void;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * §7.4's per-device whole-file allocation cap, injected as a plain number so
+   * nothing here has to know what platform it is running on.
+   *
+   * Classification only READS it, to say which attachments this device will not
+   * be fetching. The reconciler applies the same number when the pass actually
+   * runs, which is what keeps the counts a description of that pass.
+   */
+  memoryCapBytes?: () => number;
   treeSyncTimeoutMs?: number;
   founderWaitCapMs?: number;
 }
@@ -294,7 +342,7 @@ export class Bootstrap {
     if (this._phase === 'boot') await this.founderClaim();
 
     // 6 + 7. Walk the share and classify, touching nothing.
-    const buckets = this.classify();
+    const buckets = await this.classify();
     this._buckets = buckets;
 
     // 8. One confirmation. Mandatory on the first sync of this workspace on this
@@ -356,13 +404,20 @@ export class Bootstrap {
    * rather than minting a rival node at every path and leaving both peers with
    * `note (2).md` beside every note.
    */
-  private classify(): BootstrapBuckets {
+  private async classify(): Promise<BootstrapBuckets> {
     const disk = DiskIndex.build(this.deps.vault, this.shareRoot);
     const entries = this.deps.tree.entries();
     const derived = deriveTree(entries);
 
     const adopt = new Map<string, string>();
     const download = new Map<string, string>();
+    // §7.5's three download lines. All three come out of the tree, which is
+    // already synced, so counting them costs nothing at all.
+    const downloadNotes = { count: 0, bytes: 0 };
+    const downloadNow = { count: 0, bytes: 0 };
+    const downloadDeferred = { count: 0, bytes: 0 };
+    const cap = this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
+
     for (const id of [...derived.files.keys()].sort(cmp)) {
       const path = this.vaultPathOf(derived.files.get(id)!);
       // Mirrors the reconciler's step 3 exactly: occupied means adopt, free
@@ -370,6 +425,21 @@ export class Bootstrap {
       // shown to the user a description of a pass that never happens.
       if (disk.hasFold(path)) adopt.set(id, disk.literal(path)!);
       else download.set(id, path);
+    }
+
+    for (const id of download.keys()) {
+      const ref = derived.blobs.get(id);
+      if (ref === undefined) {
+        // A note. Its size is in a content doc that has not synced, so there is
+        // no honest number to show — see `BucketTotals`.
+        downloadNotes.count += 1;
+        continue;
+      }
+      // The same test `materialize` applies, on the same number, so the modal
+      // and the pass cannot disagree about what will arrive here.
+      const bucket = ref.bytes > cap ? downloadDeferred : downloadNow;
+      bucket.count += 1;
+      bucket.bytes += ref.bytes;
     }
 
     // Occupancy, rebuilt from REAL paths rather than by prefixing `deriveTree`'s
@@ -394,6 +464,8 @@ export class Bootstrap {
     const declined = new Set(this.deps.state.data.declinedPaths);
     const rootDepth = this.shareRoot.split('/').length;
     const upload: string[] = [];
+    const uploadNotePaths: string[] = [];
+    const uploadAttachmentPaths: string[] = [];
     for (const path of disk.filesUnderShare()) {
       const key = fold(path);
       if (claimedFold.has(key)) continue;
@@ -408,12 +480,50 @@ export class Bootstrap {
       // every attachment in the vault on the floor: the counts the user is shown
       // before their first sync would then describe a pass that does something
       // else, and 3 GB of scans would be uploaded — or not — without a word.
-      if (!validateRel(d, n, nodeKindOf(rel, 'f'))) continue;   // §7: not eligible
+      const kind = nodeKindOf(rel, 'f');
+      if (!validateRel(d, n, kind)) continue;            // §7: not eligible
       upload.push(path);
+      (kind === 'b' ? uploadAttachmentPaths : uploadNotePaths).push(path);
     }
     upload.sort(cmp);
+    uploadNotePaths.sort(cmp);
+    uploadAttachmentPaths.sort(cmp);
 
-    return { adopt, download, upload, pending: [...derived.pending] };
+    return {
+      adopt,
+      download,
+      upload,
+      pending: [...derived.pending],
+      downloadNotes,
+      downloadNow,
+      downloadDeferred,
+      uploadNotes: await this.sizeOf(uploadNotePaths),
+      uploadAttachments: await this.sizeOf(uploadAttachmentPaths),
+    };
+  }
+
+  /**
+   * Total the sizes of local files, with one `stat` each.
+   *
+   * A read, never a mutation, so I2 stands: classification still touches nothing.
+   * It is the only way to answer §7.5's question at all — `list()` reports paths
+   * and kinds and no sizes — and it is paid once, on a cold start, over untracked
+   * files only.
+   *
+   * A `stat` that fails contributes nothing rather than aborting the run: this
+   * number goes into a sentence, and a sentence is not a decision.
+   */
+  private async sizeOf(paths: string[]): Promise<BucketTotals> {
+    let bytes = 0;
+    for (const path of paths) {
+      try {
+        const st = await this.deps.vault.stat(path);
+        if (st !== null) bytes += st.bytes;
+      } catch {
+        // Counted, unsized. Never a reason to refuse the sync.
+      }
+    }
+    return { count: paths.length, bytes };
   }
 
   // ---------------------------------------------------------- step 5
@@ -555,7 +665,15 @@ export class Bootstrap {
 // ============================================================ helpers
 
 function emptyBuckets(): BootstrapBuckets {
-  return { adopt: new Map(), download: new Map(), upload: [], pending: [] };
+  return {
+    adopt: new Map(), download: new Map(), upload: [], pending: [],
+    downloadNotes: noTotals(), downloadNow: noTotals(), downloadDeferred: noTotals(),
+    uploadNotes: noTotals(), uploadAttachments: noTotals(),
+  };
+}
+
+function noTotals(): BucketTotals {
+  return { count: 0, bytes: 0 };
 }
 
 function cmp(a: string, b: string): number {

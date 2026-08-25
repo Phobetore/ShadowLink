@@ -32,6 +32,7 @@
 // No `obsidian` import, no node builtins.
 
 import {
+  BLOB_MAX_BYTES,
   DELETE_COALESCE_MS,
   LOCAL_BULK_DELETE_THRESHOLD,
   MODIFY_COALESCE_MS,
@@ -41,7 +42,7 @@ import {
 } from '../tree/constants.ts';
 import { DIR_SENTINEL, deriveTree, type DerivedTree } from '../tree/TreeIndex.ts';
 import {
-  fold, hashOf, isUnderDir, nodeKindOf, relPath, splitRel, validateRel,
+  fold, hashOf, hashOfBytes, isUnderDir, nodeKindOf, relPath, splitRel, validateRel,
 } from '../tree/paths.ts';
 import type { NodePatch, TreeDoc } from '../tree/TreeDoc.ts';
 import type { NodeFields, NodeKind } from '../tree/types.ts';
@@ -72,6 +73,19 @@ export interface WatcherDeps {
   scheduleReconcile?: (cause: string) => void;
   /** I5 — only the creator publishes. Called for a node this device just minted. */
   enqueuePublish?: (nodeId: string) => void;
+  /**
+   * §3.8: repeatable admission, for a `'b'` node that just came back from the
+   * dead. The intent is the hash of the bytes ON DISK, so a node whose reference
+   * had drifted converges on what is actually there rather than on whatever the
+   * tree last happened to name. `PublishQueue.requeue` is the implementation.
+   */
+  requeuePublish?: (nodeId: string, intent: string) => void;
+  /**
+   * §7.4's per-device whole-file allocation cap, injected as a plain number so
+   * nothing here has to know what platform it is running on. It gates the
+   * resurrect hash exactly as it gates every other whole-file read.
+   */
+  memoryCapBytes?: () => number;
   /** Local bulk-delete gate (§4.1 step 5). Default action MUST be cancel. */
   confirmLocalBulkDelete?: (count: number) => Promise<boolean>;
   /** §5.5 — dragging content out of the share. Default action MUST be 'undo'. */
@@ -107,6 +121,15 @@ interface WatcherIndex {
 
 /** The three coalesced batches, each with its own timer and its own window. */
 type Batch = 'delete' | 'unshare' | 'modify';
+
+/**
+ * §3.8's answer when a dead node may be reused: `hash` is the disk digest of a
+ * `'b'` node's bytes, which the resurrect then requeues for publication. Null,
+ * not this, is the refusal — so "no verdict" can never be read as "go ahead".
+ */
+interface ResurrectVerdict {
+  hash?: string;
+}
 
 /** Shared empty answer for `takeDirtyPaths`, so the common case allocates nothing. */
 const EMPTY_DIRTY: ReadonlySet<string> = new Set<string>();
@@ -345,9 +368,12 @@ export class VaultWatcher {
     if (nodeKind === 'd' && idx.tree.wantAtFold.get(key) === DIR_SENTINEL) return;
 
     const dead = idx.tree.deadByFoldRel.get(key);
-    if (dead !== undefined && await this.canResurrect(dead, path, nodeKind)) {
-      this.resurrect(dead.nodeId, path);
-      return;
+    if (dead !== undefined) {
+      const verdict = await this.canResurrect(dead, path, nodeKind);
+      if (verdict !== null) {
+        this.resurrect(dead.nodeId, path, verdict.hash);
+        return;
+      }
     }
 
     const { d, n } = splitRel(rel);
@@ -417,48 +443,81 @@ export class VaultWatcher {
   // ---------------------------------------------------------- §5.6
 
   /**
-   * Spec §5.6. Delete then Ctrl-Z brings the node back — and with it the content
-   * doc and its entire history. Everything outside that narrow window is a
-   * different file that merely shares a name.
+   * Spec §5.6 and §3.8. Delete then Ctrl-Z brings the node back — and with it the
+   * content doc and its entire history. Everything outside that narrow window is
+   * a different file that merely shares a name.
    *
    * Both clauses are load-bearing. The WINDOW is what stops "Bob drags his own
    * `inbox.md` into the share three months later and is silently handed Alice's
    * March note". The CONTENT test is what stops the same thing happening inside
-   * five minutes. `local.length === 0` is not a loophole: Obsidian emits `create`
-   * for a file whose bytes have not landed yet, and an empty file is exactly the
-   * state a recreate passes through.
+   * five minutes.
+   *
+   * Null refuses. A verdict resurrects, and for a `'b'` it carries the hash of
+   * the bytes that were actually on disk, which is what the node then republishes.
    */
   private async canResurrect(
     dead: { nodeId: string; k: NodeKind; xa?: number; xh?: string },
     path: string,
     kind: NodeKind,
-  ): Promise<boolean> {
-    // §3.8: a dead `.md` never adopts a `.png`. `xh` is a hash of TEXT for a note
-    // and of RAW BYTES for an attachment, so a cross-kind reuse would bind a live
-    // node whose reference names entirely different content — and, through the
-    // zero-length escape below, would do it without comparing anything at all.
-    if (dead.k !== kind) return false;
+  ): Promise<ResurrectVerdict | null> {
+    // §3.8: a dead `.md` never adopts a `.png`, and a dead FOLDER never adopts
+    // either. `xh` is a hash of TEXT for a note and of RAW BYTES for an
+    // attachment, and a directory has no content at all — so a tombstone of one
+    // kind is never evidence about a file of another, and reusing it across kinds
+    // would bind a live node to content it has never described.
+    if (dead.k !== kind) return null;
     // A directory has no bytes to compare, so there is nothing to bound the reuse
     // with. A fresh dir node is free — directories carry no content and dedupe by
     // path (§1.4) — so the safe answer is always to mint one.
-    //
-    // An attachment is refused here for now: its arm of §3.8 compares RAW BYTES
-    // and has no zero-length escape, and it lands with the rest of the deletion
-    // work in P2-e. Refusing costs a fresh node and no content, because content
-    // addressing means the bytes are already in the store.
-    if (kind !== 'f') return false;
-    if (dead.xa === undefined) return false;
-    if (this.nowFn() - dead.xa > RESURRECT_WINDOW_MS) return false;
+    if (kind === 'd') return null;
+    if (dead.xa === undefined) return null;
+    if (this.nowFn() - dead.xa > RESURRECT_WINDOW_MS) return null;
 
-    let local: string;
-    try {
-      local = normLF(await this.deps.vault.read(path));
-    } catch {
-      return false;                       // I2: "I could not look" is never evidence
+    if (kind === 'f') {
+      let local: string;
+      try {
+        local = normLF(await this.deps.vault.read(path));
+      } catch {
+        return null;                      // I2: "I could not look" is never evidence
+      }
+      // Not a loophole: Obsidian emits `create` for a file whose bytes have not
+      // landed yet, and an empty file is exactly the state a recreate passes
+      // through. The CRDT merges over the mistake afterwards.
+      if (local.length === 0) return {};
+      if (dead.xh === undefined) return null;
+      return await hashOf(local) === dead.xh ? {} : null;
     }
-    if (local.length === 0) return true;
-    if (dead.xh === undefined) return false;
-    return await hashOf(local) === dead.xh;
+
+    // kind === 'b'. THE ZERO-LENGTH ESCAPE IS DELIBERATELY ABSENT. For a note an
+    // empty file is a state a recreate genuinely passes through and the CRDT
+    // merges over it; for a binary there is no merge, so the escape would bind a
+    // live, seeded node with a stale `b` to a COMPLETELY DIFFERENT file — and the
+    // workspace would then restore the deleted image on every peer while the
+    // user's new one existed only here. Refusing costs almost nothing: content
+    // addressing makes a fresh node a HEAD and a tree write.
+    let st: { bytes: number } | null;
+    try {
+      st = await this.deps.vault.stat(path);
+    } catch {
+      return null;                        // I2
+    }
+    if (st === null) return null;         // I2
+    if (st.bytes === 0) return null;
+    if (st.bytes > this.memoryCapBytes()) return null;   // §7.4: never read to answer
+    if (dead.xh === undefined) return null;
+
+    let hash: string;
+    try {
+      hash = await hashOfBytes(await this.deps.vault.readBinary(path));
+    } catch {
+      return null;                        // I2
+    }
+    return hash === dead.xh ? { hash } : null;
+  }
+
+  /** §7.4's cap on every whole-file allocation, this module's share of it. */
+  private memoryCapBytes(): number {
+    return this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
   }
 
   /**
@@ -468,9 +527,11 @@ export class VaultWatcher {
    * `deleted: true` would resolve that race by coin flip.
    *
    * `s` is deliberately untouched (R-S3): the content doc still holds the bytes,
-   * and clearing `s` would strand them behind a node nobody may publish.
+   * and clearing `s` would strand them behind a node nobody may publish. `b` is
+   * untouched for the same reason — and because the requeue below is what makes
+   * it right again if it has drifted.
    */
-  private resurrect(id: string, path: string): void {
+  private resurrect(id: string, path: string, hash?: string): void {
     const f = this.deps.tree.get(id);
     const rel = this.toRel(path);
     if (f === null || rel === null) return;
@@ -485,6 +546,11 @@ export class VaultWatcher {
       xp: undefined,
     });
     this.bind(id, path);
+    // §3.8. An attachment's bytes live outside the tree, so nothing else would
+    // notice that `b` and the disk disagree; a repeatable admission keyed on the
+    // DISK hash converges the tree on what is actually there. A matching intent
+    // is a no-op in the queue, so a node that never drifted costs nothing.
+    if (hash !== undefined) this.deps.requeuePublish?.(id, hash);
   }
 
   // ---------------------------------------------------------- onRename

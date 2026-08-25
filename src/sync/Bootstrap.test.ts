@@ -136,6 +136,20 @@ function seededNode(tree: TreeDoc, rel: string): string {
   return tree.createNode({ k: 'f', d, n, s: 1 }, NOW);
 }
 
+/**
+ * A live, published attachment node whose reference CLAIMS `bytes`.
+ *
+ * The size rides in the tree, so a classification can talk about gigabytes
+ * without any test ever allocating one — which is exactly why the first-sync
+ * modal can tell the user what 3 GB means before it starts.
+ */
+function blobNode(tree: TreeDoc, rel: string, bytes: number): string {
+  const i = rel.lastIndexOf('/');
+  const d = i === -1 ? '' : rel.slice(0, i);
+  const n = i === -1 ? rel : rel.slice(i + 1);
+  return tree.createNode({ k: 'b', d, n, s: 1, b: `${'a'.repeat(64)}:${bytes}:-` }, NOW);
+}
+
 function mutations(vault: FakeVault): number {
   return vault.calls.filter(
     (c) => c.op === 'create' || c.op === 'createFolder' || c.op === 'rename' || c.op === 'trashLocal',
@@ -168,12 +182,81 @@ test('classification sorts every path and node into the four buckets and touches
 
   // The classification runs BEFORE the confirmation, so at the moment the user
   // is asked, nothing whatsoever has been done to their vault (I2).
+  //
+  // CHANGED IN P2-e: `stat` joins the allowed reads. §7.5 requires the modal to
+  // state the byte total of the local files about to be uploaded, and `list()`
+  // reports paths and kinds and no sizes — so one `stat` per upload candidate is
+  // the only way to answer it. It is a READ: the property this assertion is about
+  // is unchanged, and it is now also asserted directly.
   assert.equal(h.confirms.length, 1);
+  assert.equal(mutations(h.vault), 0, 'a plan is not a mutation');
+  const reads = new Set(['list', 'exists', 'listDir', 'stat']);
   assert.equal(
-    h.vault.calls.findIndex((c) => c.op !== 'list' && c.op !== 'exists' && c.op !== 'listDir'),
+    h.vault.calls.findIndex((c) => !reads.has(c.op)),
     -1,
     JSON.stringify(h.vault.calls),
   );
+});
+
+test('B30: notes and attachments are counted separately, with byte totals', async () => {
+  const h = makeHarness({ deps: { memoryCapBytes: () => 1_000 } });
+
+  // Two notes to download (no size: a note's bytes live in a doc that has not
+  // synced yet, and inventing one would be a claim this pass cannot support).
+  seededNode(h.tree, 'theirs.md');
+  seededNode(h.tree, 'notes/more.md');
+  // One attachment this device will fetch, and one it will not: over the memory
+  // cap is a per-device refusal, so the count the user is shown has to say so.
+  blobNode(h.tree, 'small.png', 400);
+  blobNode(h.tree, 'huge.mov', 5_000);
+  // Local files of both kinds, whose sizes are on disk and therefore knowable.
+  h.vault.seed(`${SHARE}/mine.md`, 'f', 'abcde');            // 5 bytes
+  h.vault.seedBinary(`${SHARE}/scan.png`, new Uint8Array(64));
+
+  const result = await h.boot.run();
+  const b = result.buckets;
+
+  assert.deepEqual(b.downloadNotes, { count: 2, bytes: 0 });
+  assert.deepEqual(b.downloadNow, { count: 1, bytes: 400 });
+  assert.deepEqual(b.downloadDeferred, { count: 1, bytes: 5_000 });
+  assert.deepEqual(b.uploadNotes, { count: 1, bytes: 5 });
+  assert.deepEqual(b.uploadAttachments, { count: 1, bytes: 64 });
+
+  // The union is still what the confirmation acts on, so nothing is lost between
+  // the counts the user reads and the decision they take.
+  assert.deepEqual(b.upload, [`${SHARE}/mine.md`, `${SHARE}/scan.png`]);
+  assert.equal(b.download.size, 4, 'every live seeded node is still downloadable');
+  assert.deepEqual(h.confirms[0].uploadAttachments, { count: 1, bytes: 64 });
+});
+
+test('B30: unchecking "share my local files" declines BOTH upload buckets', async () => {
+  const h = makeHarness({ decision: { proceed: true, shareLocalFiles: false } });
+  h.vault.seed(`${SHARE}/mine.md`, 'f', 'a note');
+  h.vault.seedBinary(`${SHARE}/scan.png`, new Uint8Array(32));
+
+  const result = await h.boot.run();
+
+  assert.equal(result.outcome, 'ready');
+  assert.deepEqual(result.buckets.uploadNotes.count, 1);
+  assert.deepEqual(result.buckets.uploadAttachments.count, 1);
+  assert.deepEqual(
+    h.state.data.declinedPaths,
+    [fold(`${SHARE}/mine.md`), fold(`${SHARE}/scan.png`)],
+    'an attachment nobody declined would be uploaded on the very next pass',
+  );
+});
+
+test('B30: a workspace with no attachments reports empty attachment buckets', async () => {
+  const h = makeHarness();
+  seededNode(h.tree, 'theirs.md');
+  h.vault.seed(`${SHARE}/mine.md`, 'f', 'x');
+
+  const b = (await h.boot.run()).buckets;
+
+  assert.deepEqual(b.downloadNow, { count: 0, bytes: 0 });
+  assert.deepEqual(b.downloadDeferred, { count: 0, bytes: 0 });
+  assert.deepEqual(b.uploadAttachments, { count: 0, bytes: 0 });
+  assert.deepEqual(b.downloadNotes, { count: 1, bytes: 0 });
 });
 
 test('the buckets are ordered by node id and by path, whatever order the tree yields', async () => {
