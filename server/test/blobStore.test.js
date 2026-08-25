@@ -737,9 +737,16 @@ test('a finalisation whose rename never succeeds leaves no half-stored object', 
     };
     store.renameDelayMs = 1;
 
-    await assert.rejects(store.appendChunk(WS, hash, {
-      offset: 0, total: buf.length, length: buf.length, stream: Readable.from([buf]),
-    }));
+    // Matched on `code`, not merely "something threw": an unmatched `rejects`
+    // is satisfied by any rejection at all, including one raised long before the
+    // rename this test is about. `code` rather than the message because it is the
+    // field `renameWithRetry` actually branches on for its transient set.
+    await assert.rejects(
+      store.appendChunk(WS, hash, {
+        offset: 0, total: buf.length, length: buf.length, stream: Readable.from([buf]),
+      }),
+      { code: 'EPERM' },
+    );
 
     assert.equal(await store.stat(WS, hash), null);
     assert.deepEqual(store.usage(WS), { bytes: 0, files: 0 }, 'usage never counted it');
