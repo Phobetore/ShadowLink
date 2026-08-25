@@ -28,9 +28,6 @@
 // No `obsidian` import, no node builtins.
 
 import {
-  AUTOFETCH_MAX_BYTES,
-  AUTOFETCH_SESSION_BUDGET,
-  BLOB_MAX_BYTES,
   FOUNDER_GRACE_MS,
   FOUNDER_QUIET_MS,
   FOUNDER_SETTLE_MS,
@@ -210,7 +207,7 @@ export interface BootstrapDeps {
    * be fetching. The reconciler applies the same number when the pass actually
    * runs, which is what keeps the counts a description of that pass.
    */
-  memoryCapBytes?: () => number;
+  memoryCapBytes: () => number;
   /**
    * §7.2's two policy ceilings, injected for exactly the same reason as the
    * memory cap: they are platform facts, and classification only READS them.
@@ -220,8 +217,8 @@ export interface BootstrapDeps {
    * downloaded" about a pass that fetches forty of them, because the cap is not
    * the rule `materialize` applies — the fetch policy is.
    */
-  autofetchMaxBytes?: () => number;
-  sessionBudgetBytes?: () => number;
+  autofetchMaxBytes: () => number;
+  sessionBudgetBytes: () => number;
   /**
    * How much of this session's fetch budget the reconciler has already spent.
    *
@@ -478,9 +475,9 @@ export class Bootstrap {
     // does not happen — which is the whole failure the fetch policy's user-facing
     // half exists to avoid.
     const limits: FetchLimits = {
-      memoryCapBytes: this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES,
-      autofetchMaxBytes: this.deps.autofetchMaxBytes?.() ?? AUTOFETCH_MAX_BYTES,
-      sessionBudgetBytes: this.deps.sessionBudgetBytes?.() ?? AUTOFETCH_SESSION_BUDGET,
+      memoryCapBytes: this.deps.memoryCapBytes(),
+      autofetchMaxBytes: this.deps.autofetchMaxBytes(),
+      sessionBudgetBytes: this.deps.sessionBudgetBytes(),
     };
     let spent = this.deps.sessionSpentBytes?.() ?? 0;
     const approved = this.deps.state.data.fetchApproved;
@@ -576,7 +573,7 @@ export class Bootstrap {
   private async splitUploads(
     paths: readonly string[],
   ): Promise<{ shareable: BucketTotals; tooLarge: BucketTotals }> {
-    const cap = this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
+    const cap = this.deps.memoryCapBytes();
     const shareable: BucketTotals = { count: 0, bytes: 0 };
     const tooLarge: BucketTotals = { count: 0, bytes: 0 };
     for (const path of paths) {

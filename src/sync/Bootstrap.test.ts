@@ -28,7 +28,7 @@ import {
   type BootstrapDeps,
 } from './Bootstrap.ts';
 import { DeviceState, deviceStateKey, type StatePort } from './DeviceState.ts';
-import { FakeBlobs, FakeVault } from './fakes.ts';
+import { DESKTOP_FETCH_LIMITS, FakeBlobs, FakeVault } from './fakes.ts';
 import { Reconciler } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
 
@@ -114,6 +114,7 @@ function makeHarness(options: Options = {}): Harness {
     now: () => NOW,
     sleep: async () => undefined,
     founderWaitCapMs: 20,
+    ...DESKTOP_FETCH_LIMITS,
     ...options.deps,
   });
 
@@ -556,6 +557,7 @@ test('the local tree snapshot is loaded before the provider is connected', async
     replayPendingEvents: async () => undefined,
     now: () => NOW,
     sleep: async () => undefined,
+    ...DESKTOP_FETCH_LIMITS,
   });
 
   await boot.run();
@@ -672,6 +674,7 @@ test('the phase reaches ready before the bootstrap reconcile, and events replay 
     replayPendingEvents: async () => { order.push('replay'); },
     now: () => NOW,
     sleep: async () => undefined,
+    ...DESKTOP_FETCH_LIMITS,
   });
 
   await boot.run();
@@ -794,6 +797,7 @@ test('an already-claimed workspace is not re-claimed, and the loser waits for no
     // The founder's claim lands while we sleep out the grace window.
     sleep: async () => { h.tree.claimFounder('the-other-device', NOW - 1); },
     founderWaitCapMs: 1_000,
+    ...DESKTOP_FETCH_LIMITS,
   });
   h.vault.seed(`${SHARE}/shared note.md`, 'f', 'my copy');
 
@@ -830,6 +834,7 @@ test('the loser waits for the founder\'s LAST node, not its first', async () => 
     now: () => NOW,
     sleep: async () => { h.tree.claimFounder('the-other-device', NOW - 1); },
     founderWaitCapMs: 5_000,
+    ...DESKTOP_FETCH_LIMITS,
   });
 
   // The founder's four nodes, one per tick rather than all in one frame.
@@ -859,6 +864,7 @@ test('a founder wait that times out proceeds anyway', async () => {
     now: () => NOW,
     sleep: async () => { h.tree.claimFounder('the-other-device', NOW - 1); },
     founderWaitCapMs: 20,
+    ...DESKTOP_FETCH_LIMITS,
   });
   h.vault.seed(`${SHARE}/mine.md`, 'f', 'local');
 
@@ -913,6 +919,7 @@ test('75: two clients with the same 100 files MERGE rather than duplicating', as
     // The partition heals during the founder grace window: A's whole tree lands.
     sleep: async () => { b.tree.applyUpdate(Y.encodeStateAsUpdate(a.tree.doc)); },
     founderWaitCapMs: 20,
+    ...DESKTOP_FETCH_LIMITS,
   });
 
   const bResult = await boot.run();
