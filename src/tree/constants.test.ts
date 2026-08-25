@@ -113,10 +113,16 @@ test('the per-file ceiling stays under the memory cap, on both platforms', () =>
       `${name}: the auto-fetch ceiling (${limits.autofetchMaxBytes}) must not exceed the `
       + `memory cap (${limits.memoryCapBytes})`,
     );
-    assert.equal(
+    // Stated as "not tooLarge" rather than "yes" on purpose: the claim here is
+    // only that the cap does not swallow the ceiling. Whether such a file is
+    // fetched also depends on the budget, and that is the test above's business —
+    // a memory-cap assertion that failed for a budget reason would send the next
+    // reader to the wrong constant.
+    assert.notEqual(
       fetchVerdict(limits.autofetchMaxBytes, limits, false, 0),
-      'yes',
-      `${name}: a file exactly at the auto-fetch ceiling must still be fetchable`,
+      'tooLarge',
+      `${name}: the memory cap refuses a file at the auto-fetch ceiling, so the ceiling `
+      + 'is dead code and every deferred attachment becomes an unfixable "too large"',
     );
   }
 });

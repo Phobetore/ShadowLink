@@ -101,6 +101,39 @@ Do not weaken an existing test to make a change pass. If a test genuinely encode
 the wrong expectation, say so in the pull request and explain why — that is a
 legitimate change, and a silent one is not.
 
+### Probing with `tools/mutate.mjs`
+
+Breaking the code by hand is where that second habit goes wrong: a probe that
+silently changes nothing looks exactly like a test that caught something. The
+working tree is CRLF (`core.autocrlf=true` on Windows), so a needle pasted with
+Unix line endings matches zero times, the suite stays green, and that gets
+written down as evidence. It has happened here more than once.
+
+`tools/mutate.mjs` applies one mutation, runs a command against it, and puts the
+file back:
+
+```bash
+node tools/mutate.mjs probe src/sync/FetchPolicy.ts \
+  --find "bytes > limits.memoryCapBytes" \
+  --replace "bytes >= limits.memoryCapBytes" \
+  --count 1 -- node --test --experimental-transform-types src/sync/FetchPolicy.test.ts
+```
+
+It refuses to run unless the needle matches `--count` times exactly, and refuses
+a replacement that changes nothing; when a needle matches nothing it says what is
+different about the text rather than shrugging. Both line-ending forms are
+matched, so the needle can be typed either way. It exits 0 when the command
+**fails** — the mutant was killed, which is the result you want — and 1 when the
+command passes, which means nothing tests that mutation.
+
+The original bytes are copied to `<file>.mutation-backup` before anything is
+written, and the restore copies them back and compares byte for byte before
+removing the backup. Nothing in the tool runs git: `git checkout -- <file>` takes
+every uncommitted edit in the file with it, which is how a probe here once
+destroyed real work. If a run is interrupted, `node tools/mutate.mjs restore
+<file>` puts it back, and `node tools/mutate.mjs sweep` reports anything left
+behind. `node tools/mutate.mjs --help` has the rest.
+
 ## Commits
 
 Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`, `build:`, `refactor:`).

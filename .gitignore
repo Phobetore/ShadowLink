@@ -37,3 +37,7 @@ server/data/*
 # Internal design record: audit, specs, implementation plans.
 # Working material, kept locally and out of the published repository.
 docs/
+
+# Originals held by tools/mutate.mjs while a mutation probe is applied.
+# One should never outlive a run; `node tools/mutate.mjs sweep` finds any that do.
+*.mutation-backup
