@@ -70,6 +70,34 @@ export const BLOB_MAX_BYTES_MOBILE = 33_554_432;    //  32 MB, mobile
 export const BLOB_PUBLISH_CONCURRENCY = 2;
 
 /**
+ * The largest attachment this device downloads WITHOUT ASKING (spec §7.2).
+ *
+ * Deliberately far below the memory cap, because the two answer different
+ * questions: the cap is "could this device hold the whole file at once", this one
+ * is "would the user expect this to arrive on its own". A 40 MB video that syncs
+ * silently onto a phone on a hotel connection is not a feature.
+ *
+ * Above it the node is deferred and the deferral is PERSISTED, so the download
+ * button in the note and the download commands both know the file exists and how
+ * big it is, without a pass having to be running.
+ */
+export const AUTOFETCH_MAX_BYTES = 10_485_760;          //  10 MB, desktop
+export const AUTOFETCH_MAX_BYTES_MOBILE = 2_097_152;    //   2 MB, mobile
+
+/**
+ * How many bytes one SESSION fetches unattended, across every attachment (§7.2).
+ *
+ * The second gate, and the reason a per-file ceiling alone is not enough: four
+ * thousand files of one megabyte each pass every per-file check that has ever
+ * been written and still eat a data plan. Charged only on a COMPLETED fetch, so a
+ * flaky link cannot burn the whole allowance retrying one file, and deliberately
+ * NOT persisted — it is a statement about this afternoon, not about the share, so
+ * the next session starts from zero and picks up where this one stopped.
+ */
+export const AUTOFETCH_SESSION_BUDGET = 536_870_912;        // 512 MB, desktop
+export const AUTOFETCH_SESSION_BUDGET_MOBILE = 20_971_520;  //  20 MB, mobile
+
+/**
  * How many bytes one pass may re-hash before it defers the rest (spec §3.5).
  *
  * Step 2.5 asks "is my copy current?" for every attachment, and answers it from

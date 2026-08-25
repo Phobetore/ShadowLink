@@ -2217,6 +2217,206 @@ test('B28: a cold start hashes at most the budget per pass and converges over se
   assert.equal(mutations(h.vault), 0, 'and hashing never wrote anything');
 });
 
+// ---------------------------------------------------------------- P2 §7.2: fetch policy
+
+/** A reconciler over the SAME vault, store, state and tree: a restarted session. */
+function freshSession(h: Harness, over: Partial<ReconcilerDeps> = {}): Reconciler {
+  return new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: h.blobs,
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    publishUntracked: async (paths) => { h.published.push(paths); },
+    notice: (m) => { h.notices.push(m); },
+    now: () => NOW,
+    ...over,
+  });
+}
+
+/** Let a zero-delay `schedulePersist` timer fire, so write counts are settled. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, 5); });
+}
+
+// B25, the persisted half. Over the auto-fetch ceiling the node is DEFERRED: the
+// decision is taken before a request is made, the record survives a restart so
+// the download button knows the file exists and how big it is, and — §7.3, I6
+// applied literally — nothing whatsoever lands on disk. A 0-byte `poster.png` at
+// the canonical path looks correct, so the user deletes it, and a local delete is
+// a tombstone that propagates to everyone.
+test('B25: an attachment over the auto-fetch ceiling is deferred, and nothing lands on disk', async () => {
+  const h = makeHarness({ autofetchMaxBytes: () => 100 });
+  h.vault.seed(SHARE, 'd');
+  const bytes = png(3, 512);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'poster.png', bytes));
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(h.blobs.calls, [], 'the decision is taken BEFORE any request');
+  assert.deepEqual(inShare(h.vault), {}, 'no file, no placeholder, no stub, no sidecar');
+  assert.deepEqual(r.diagnostics.deferred, [id]);
+  assert.deepEqual(r.diagnostics.tooLarge, [], 'policy, not a device limit: a separate channel');
+  assert.deepEqual(r.failures, [], 'and not an error — this is a decision, not a fault');
+  assert.deepEqual(
+    h.state.data.fetchDeferred[id],
+    { sha256: await hashOfBytes(bytes), bytes: bytes.length },
+    'persisted, so the UI can offer it without a pass having to be running',
+  );
+});
+
+// B25, the NOT-persisted half. A session budget is a statement about this
+// afternoon on this connection, never about the share — writing it down would
+// make a tethered morning permanent.
+test('B25: a session-budget refusal is not persisted, and the next session fetches it', async () => {
+  const limits = { autofetchMaxBytes: () => 10_000, sessionBudgetBytes: () => 600 };
+  const h = makeHarness(limits);
+  h.vault.seed(SHARE, 'd');
+  const a = png(1, 512);
+  const b = png(2, 512);
+  h.nodes.set(nid('A'), await publishedBlob(h.blobs, '', 'a.png', a));
+  h.nodes.set(nid('B'), await publishedBlob(h.blobs, '', 'b.png', b));
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(h.vault.binarySnapshot()[`${SHARE}/a.png`], a, 'the budget bought one');
+  assert.equal(h.vault.binarySnapshot()[`${SHARE}/b.png`], undefined, 'and stopped');
+  assert.deepEqual(r.diagnostics.deferred, [nid('B')]);
+  assert.deepEqual(h.state.data.fetchDeferred, {}, 'nothing about this session is written down');
+
+  // A restart is what clears it. The budget resets to zero, and the pass picks up
+  // exactly where the last one stopped.
+  const next = freshSession(h, limits);
+  const second = await next.reconcile('sync');
+
+  assert.deepEqual(second.diagnostics.deferred, []);
+  assert.deepEqual(h.vault.binarySnapshot()[`${SHARE}/b.png`], b);
+});
+
+// B25, the approval half. The commands and the download button do exactly this:
+// set `fetchApproved[id]`, then run the pass.
+test('B25: approving a deferred attachment is what fetches it, and drops its record', async () => {
+  const h = makeHarness({ autofetchMaxBytes: () => 100 });
+  h.vault.seed(SHARE, 'd');
+  const bytes = png(3, 512);
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'poster.png', bytes));
+
+  await h.reconciler.reconcile('remote');
+  assert.notEqual(h.state.data.fetchDeferred[id], undefined, 'deferred first');
+
+  h.state.data.fetchApproved[id] = true;
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(h.vault.binarySnapshot()[`${SHARE}/poster.png`], bytes);
+  assert.deepEqual(r.diagnostics.deferred, []);
+  assert.equal(
+    h.state.data.fetchDeferred[id], undefined,
+    'a record for a file that is now on disk is a lie the UI would repeat',
+  );
+});
+
+// ⚠ B25, the ordering clause. A budget cutoff has to be a decision, not an
+// accident of 22 random nodeId characters: ascending byte order makes the same
+// share converge to the same set on every device, and maximizes the FILE COUNT
+// that fits in a given allowance.
+test('B25: materialize iterates blob nodes in ascending byte order', async () => {
+  // nodeId order is A, B, C. Byte order is B(100) < C(200) < A(300), and the
+  // budget stops after 300 bytes — so nodeId order would buy ONE file and byte
+  // order buys TWO.
+  const h = makeHarness({ autofetchMaxBytes: () => 10_000, sessionBudgetBytes: () => 350 });
+  h.vault.seed(SHARE, 'd');
+  h.nodes.set(nid('A'), await publishedBlob(h.blobs, '', 'big.png', png(1, 300)));
+  h.nodes.set(nid('B'), await publishedBlob(h.blobs, '', 'small.png', png(2, 100)));
+  h.nodes.set(nid('C'), await publishedBlob(h.blobs, '', 'mid.png', png(3, 200)));
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('remote');
+
+  assert.deepEqual(
+    h.blobs.callsTo('get').map((c) => c.args[1]), [100, 200],
+    'smallest first, and the cutoff falls where the budget runs out',
+  );
+  assert.deepEqual(r.diagnostics.deferred, [nid('A')], 'the one that did not fit');
+  assert.deepEqual(Object.keys(inShare(h.vault)).sort(), [`${SHARE}/mid.png`, `${SHARE}/small.png`]);
+});
+
+// ⚠ The charge is taken on a COMPLETED fetch. Charging on the attempt means a
+// flaky link burns the whole session allowance retrying one file, and the user
+// sees an afternoon of "not downloaded" for a connection that was merely bad.
+test('the session budget is charged on a completed fetch, never on an attempt', async () => {
+  const h = makeHarness({ autofetchMaxBytes: () => 10_000, sessionBudgetBytes: () => 512 });
+  h.vault.seed(SHARE, 'd');
+  const bytes = png(1, 512);                       // exactly the whole session budget
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'a.png', bytes));
+  h.blobs.failNext('get', new Error('socket hang up'));
+
+  const first = await h.reconciler.reconcile('remote');
+  assert.equal(first.failures.length, 1, 'the attempt failed');
+  assert.equal(h.vault.binarySnapshot()[`${SHARE}/a.png`], undefined, 'and wrote nothing');
+
+  const second = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(second.diagnostics.deferred, [], 'the failed attempt cost nothing');
+  assert.deepEqual(h.vault.binarySnapshot()[`${SHARE}/a.png`], bytes);
+});
+
+// ⚠ B29. `DeviceState.flush()` serializes the WHOLE state object, so an
+// unconditional per-pass write of ~1,100 deferral records is a multi-megabyte
+// write every couple of seconds — on a phone, on battery. The record is written
+// only when its value actually changes, and a pass that decided nothing new
+// writes nothing at all.
+test('B29: fetchDeferred does not grow across passes, and a converged pass writes no state', async () => {
+  const h = makeHarness({ autofetchMaxBytes: () => 100 });
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  h.nodes.set(id, await publishedBlob(h.blobs, '', 'poster.png', png(3, 512)));
+
+  await h.reconciler.reconcile('bootstrap');
+  await settle();
+  const writesAfterFirstPass = h.port.writes.length;
+  const recorded = JSON.stringify(h.state.data.fetchDeferred);
+
+  // The write site itself, not just its effect on the disk. `flushIfChanged`
+  // would swallow an unconditional re-write of an identical record, so without
+  // this counter the rule "write only when the value changes" is untestable and
+  // the next refactor drops it for free.
+  let scheduled = 0;
+  const realSchedule = h.state.schedulePersist.bind(h.state);
+  h.state.schedulePersist = (): void => { scheduled += 1; realSchedule(); };
+
+  for (let i = 0; i < 5; i++) {
+    await h.reconciler.reconcile('sync');
+    await settle();
+  }
+
+  assert.deepEqual(Object.keys(h.state.data.fetchDeferred), [id], 'one record, not six');
+  assert.equal(JSON.stringify(h.state.data.fetchDeferred), recorded, 'and it never changed');
+  assert.equal(scheduled, 0, 'an unchanged deferral is not re-written on every pass');
+  assert.equal(
+    h.port.writes.length, writesAfterFirstPass,
+    'five passes that decided nothing new wrote nothing at all',
+  );
+});
+
+// The other end of the same rule: a record whose node stopped being deferred is
+// DROPPED. A map that only ever grows is a status bar that counts files the user
+// downloaded last week.
+test('a fetchDeferred record for a node the tree no longer has is dropped', async () => {
+  const h = makeHarness({ autofetchMaxBytes: () => 100 });
+  h.vault.seed(SHARE, 'd');
+  h.state.data.fetchDeferred[nid('Z')] = { sha256: 'b'.repeat(64), bytes: 9_000 };
+
+  await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(h.state.data.fetchDeferred, {});
+});
+
 // ⚠ The staleness oracle, and the reason it has two clauses. A recorded hash is
 // trusted only when size AND mtime agree; drop the mtime clause and an external
 // edit that happens to keep the file's size is invisible for ever.

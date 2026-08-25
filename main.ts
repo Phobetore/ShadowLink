@@ -53,6 +53,10 @@ import {
 import { DEFAULT_SETTINGS, ShadowLinkSettings } from './src/types';
 
 import {
+  AUTOFETCH_MAX_BYTES,
+  AUTOFETCH_MAX_BYTES_MOBILE,
+  AUTOFETCH_SESSION_BUDGET,
+  AUTOFETCH_SESSION_BUDGET_MOBILE,
   BLOB_MAX_BYTES,
   BLOB_MAX_BYTES_MOBILE,
   RECONCILE_DEBOUNCE_MS,
@@ -111,6 +115,31 @@ function blobMemoryCap(): number {
  */
 function blobRehashBudget(): number {
   return Platform.isMobile ? REHASH_BUDGET_BYTES_MOBILE : REHASH_BUDGET_BYTES;
+}
+
+/**
+ * Spec §7.2's first gate: the largest attachment this device fetches unasked.
+ *
+ * Far below the memory cap, and about a different question. The cap asks whether
+ * this device COULD hold the file; this asks whether the user would expect it to
+ * arrive on its own. A 40 MB video syncing silently onto a phone on a hotel
+ * connection is not a feature, and it is exactly the complaint every comparable
+ * product collects.
+ */
+function blobAutofetchMax(): number {
+  return Platform.isMobile ? AUTOFETCH_MAX_BYTES_MOBILE : AUTOFETCH_MAX_BYTES;
+}
+
+/**
+ * Spec §7.2's second gate: how many bytes one session fetches unattended.
+ *
+ * The per-file ceiling cannot express this one — 4,000 files of a megabyte each
+ * pass every per-file check ever written and still eat a data plan. Not
+ * persisted, deliberately: it is a statement about this afternoon, so a restart
+ * picks up exactly where the last session stopped.
+ */
+function blobSessionBudget(): number {
+  return Platform.isMobile ? AUTOFETCH_SESSION_BUDGET_MOBILE : AUTOFETCH_SESSION_BUDGET;
 }
 
 /** Spec §2.5: 16 random hex characters, minted once per device. */
@@ -333,6 +362,10 @@ class SyncRuntime {
       // §3.5: the same platform test, applied to the first-pass hash sweep. A
       // cold 3 GB share amortizes it over several passes instead of freezing one.
       rehashBudgetBytes: () => blobRehashBudget(),
+      // §7.2's two gates. Both are plain numbers by the time they reach the
+      // engine, so nothing under src/sync has to know what a phone is.
+      autofetchMaxBytes: () => blobAutofetchMax(),
+      sessionBudgetBytes: () => blobSessionBudget(),
       tickets: this.tickets,
       shareRoot: this.shareRoot,
       entries: () => this.tree.entries(),
@@ -386,10 +419,14 @@ class SyncRuntime {
         return waitForSync(this.treeProvider, ms);
       },
       confirm: (confirmation) => confirmFirstSync(app, confirmation),
-      // §7.5: the same cap the reconciler will apply, so the attachments the
-      // modal says will not be downloaded are exactly the ones the first pass
-      // then declines to fetch.
+      // §7.2/§7.5: the same three numbers the reconciler applies, so the
+      // attachments the modal says will not be downloaded are exactly the ones
+      // the first pass then declines to fetch. A split made on the memory cap
+      // alone described a pass that does something else.
       memoryCapBytes: () => blobMemoryCap(),
+      autofetchMaxBytes: () => blobAutofetchMax(),
+      sessionBudgetBytes: () => blobSessionBudget(),
+      sessionSpentBytes: () => this.reconciler.fetchedThisSession,
       reconcile: (cause) => this.reconciler.reconcile(cause),
       // Both halves of the same answer: one module must not report `ready` while
       // the other is refusing every pass.

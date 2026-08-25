@@ -28,7 +28,9 @@ import {
   type BootstrapDeps,
 } from './Bootstrap.ts';
 import { DeviceState, deviceStateKey, type StatePort } from './DeviceState.ts';
-import { FakeVault } from './fakes.ts';
+import { FakeBlobs, FakeVault } from './fakes.ts';
+import { Reconciler } from './Reconciler.ts';
+import { Tickets } from './Tickets.ts';
 
 // ---------------------------------------------------------------- fixtures
 
@@ -227,6 +229,89 @@ test('B30: notes and attachments are counted separately, with byte totals', asyn
   assert.deepEqual(b.upload, [`${SHARE}/mine.md`, `${SHARE}/scan.png`]);
   assert.equal(b.download.size, 4, 'every live seeded node is still downloadable');
   assert.deepEqual(h.confirms[0].uploadAttachments, { count: 1, bytes: 64 });
+});
+
+/** Real bytes in the store, and the node that names them. Sized to order. */
+async function realBlobNode(
+  tree: TreeDoc,
+  blobs: FakeBlobs,
+  rel: string,
+  length: number,
+  seed: number,
+): Promise<string> {
+  const data = new Uint8Array(length);
+  for (let i = 0; i < length; i++) data[i] = (i * 31 + seed * 97) & 0xff;
+  const sha = await blobs.seed(data);
+  const i = rel.lastIndexOf('/');
+  const d = i === -1 ? '' : rel.slice(0, i);
+  const n = i === -1 ? rel : rel.slice(i + 1);
+  return tree.createNode({ k: 'b', d, n, s: 1, b: `${sha}:${length}:-` }, NOW);
+}
+
+// ⚠ B25/B30. The modal's honesty rests entirely on this: `classify` splitting on
+// a different rule from the one `materialize` applies makes its counts a guess,
+// and the user is told 412 attachments will arrive while 40 do. So both sides ask
+// the SAME pure predicate, in the SAME ascending byte order — and this test runs
+// a real reconcile pass over the same tree and the same store to prove it, rather
+// than asserting the arithmetic twice.
+test('B25: the download split is the predicate the pass will actually apply', async () => {
+  const blobs = new FakeBlobs();
+  const limits = {
+    memoryCapBytes: () => 10_000,
+    autofetchMaxBytes: () => 1_000,
+    sessionBudgetBytes: () => 900,
+  };
+  let reconciler: Reconciler | null = null;
+  const h = makeHarness({
+    deps: {
+      ...limits,
+      sessionSpentBytes: () => reconciler?.fetchedThisSession ?? 0,
+      reconcile: async (cause) => { await reconciler!.reconcile(cause); },
+    },
+  });
+  reconciler = new Reconciler({
+    vault: h.vault,
+    docs: { openHeadless: async () => { throw new Error('no note is involved'); } } as never,
+    blobs,
+    state: h.state,
+    tickets: new Tickets(() => NOW),
+    shareRoot: SHARE,
+    entries: () => h.tree.entries(),
+    now: () => NOW,
+    ...limits,
+  });
+
+  // Ascending byte order: 400 fits, 600 then overruns the 900-byte session
+  // budget, and 5,000 is over the per-file ceiling before the budget is reached.
+  await realBlobNode(h.tree, blobs, 'a.png', 400, 1);
+  await realBlobNode(h.tree, blobs, 'b.png', 600, 2);
+  await realBlobNode(h.tree, blobs, 'c.png', 5_000, 3);
+
+  const b = (await h.boot.run()).buckets;
+
+  assert.deepEqual(b.downloadNow, { count: 1, bytes: 400 });
+  assert.deepEqual(b.downloadDeferred, { count: 2, bytes: 5_600 });
+
+  // …and the pass that followed did exactly what the modal said it would.
+  const landed = h.vault.list()
+    .filter((e) => e.kind === 'f' && e.path.startsWith(`${SHARE}/`))
+    .map((e) => e.path);
+  assert.deepEqual(landed, [`${SHARE}/a.png`], 'one file, the one the user was promised');
+});
+
+// The gate the memory cap alone cannot express. A share of ten-megabyte scans
+// passes every per-file check on a desktop and still costs a data plan, so the
+// ceiling has to be able to defer a file the device could perfectly well hold.
+test('B25: an attachment over the auto-fetch ceiling counts as deferred, not as "now"', async () => {
+  const h = makeHarness({
+    deps: { memoryCapBytes: () => 1_000_000, autofetchMaxBytes: () => 1_000 },
+  });
+  blobNode(h.tree, 'scan.png', 4_000);
+
+  const b = (await h.boot.run()).buckets;
+
+  assert.deepEqual(b.downloadNow, { count: 0, bytes: 0 });
+  assert.deepEqual(b.downloadDeferred, { count: 1, bytes: 4_000 });
 });
 
 test('B30: unchecking "share my local files" declines BOTH upload buckets', async () => {

@@ -236,6 +236,13 @@ export class DeviceState {
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** Serializes writes, so a debounced write and a flush cannot land out of order. */
   private queue: Promise<void> = Promise.resolve();
+  /**
+   * The serialization of the last write that reached the port, or null.
+   *
+   * Deliberately not seeded from `load()`: the file on disk may hold fields
+   * `normalize` dropped, so the first write of a session is what canonicalizes it.
+   */
+  private lastWritten: string | null = null;
 
   constructor(
     port: StatePort,
@@ -308,6 +315,37 @@ export class DeviceState {
     await this.persistNow();
   }
 
+  /**
+   * Flush only when the bytes would DIFFER from the last write this instance made.
+   *
+   * The reconciler ends every pass here, and a converged share reconciles on every
+   * remote change: rebuilding the same maps out of the same evidence and writing
+   * them again is a whole-object serialization plus a disk write, repeatedly, for
+   * a file that did not move. On a share with a thousand attachments that is
+   * megabytes every couple of seconds on a phone.
+   *
+   * It is a SEPARATE method rather than a change to `flush`, because `flush`'s
+   * contract — called on unload, before a rename, after a staging journal entry —
+   * is "the disk now holds this", and a caller that needs that guarantee must not
+   * have it quietly turned into "…unless I thought nothing changed".
+   *
+   * @returns true when a write was actually issued.
+   */
+  async flushIfChanged(): Promise<boolean> {
+    const json = JSON.stringify(this.data);
+    if (json === this.lastWritten) {
+      // A debounce armed by a change that has since been undone would only rewrite
+      // these same bytes.
+      if (this.timer !== null) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      return false;
+    }
+    await this.flush();
+    return true;
+  }
+
   // ---------------------------------------------------------- delete rate window
 
   /** Record one APPLIED remote deletion (spec §5.4). */
@@ -351,8 +389,12 @@ export class DeviceState {
     return next;
   }
 
-  private write(): Promise<void> {
+  private async write(): Promise<void> {
     // Serialize at write time, not at schedule time, so the newest state wins.
-    return this.port.write(this.key, JSON.stringify(this.data));
+    const json = JSON.stringify(this.data);
+    await this.port.write(this.key, json);
+    // Only after the port RETURNED: a write that threw did not reach the disk, and
+    // recording it would let `flushIfChanged` skip the retry.
+    this.lastWritten = json;
   }
 }

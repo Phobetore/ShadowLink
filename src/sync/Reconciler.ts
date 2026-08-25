@@ -24,7 +24,8 @@
 // No `obsidian` import, no node builtins.
 
 import {
-  BLOB_MAX_BYTES, RECOVERED_DIR, REHASH_BUDGET_BYTES, STAGING_DIR,
+  AUTOFETCH_MAX_BYTES, AUTOFETCH_SESSION_BUDGET, BLOB_MAX_BYTES, RECOVERED_DIR,
+  REHASH_BUDGET_BYTES, STAGING_DIR,
 } from '../tree/constants.ts';
 import { DIR_SENTINEL, deriveTree } from '../tree/TreeIndex.ts';
 import type { NodeFields } from '../tree/types.ts';
@@ -34,6 +35,7 @@ import {
 } from '../tree/paths.ts';
 import type { BlobPort } from './BlobPort.ts';
 import type { DeviceState } from './DeviceState.ts';
+import { fetchVerdict, type FetchLimits } from './FetchPolicy.ts';
 import { DiskIndex } from './DiskIndex.ts';
 import type { DocPort } from './DocPort.ts';
 import type { Tickets } from './Tickets.ts';
@@ -71,6 +73,20 @@ export interface ReconcileDiagnostics {
    * folding the two together would report a downloaded attachment as missing.
    */
   rehashDeferred: string[];
+}
+
+/**
+ * One attachment this device decided not to fetch, with everything the UI needs
+ * to talk about it — and to offer to fetch it (§7.3).
+ *
+ * `path` is where the node WANTS to live, which is the only handle an unresolved
+ * embed can be matched against: there is deliberately nothing on disk to look at.
+ */
+export interface DeferredAttachment {
+  id: string;
+  path: string;
+  sha256: string;
+  bytes: number;
 }
 
 export interface ReconcileResult {
@@ -177,6 +193,17 @@ export interface ReconcilerDeps {
    */
   rehashBudgetBytes?: () => number;
   /**
+   * §7.2's per-file auto-fetch ceiling. Above it an attachment is DEFERRED and
+   * the deferral is persisted, so the user can ask for the file later.
+   */
+  autofetchMaxBytes?: () => number;
+  /**
+   * §7.2's second gate: how many bytes this session fetches unattended, across
+   * every attachment. A per-file ceiling alone is not enough — 4,000 files of one
+   * megabyte each pass every per-file check and still eat a data plan.
+   */
+  sessionBudgetBytes?: () => number;
+  /**
    * Paths the modify handler has flagged since the last pass, folded, and TAKEN
    * (not copied): the pass owns the set it is given.
    *
@@ -245,6 +272,16 @@ interface PassContext extends DeletionContext {
    * one rather than half-answered by this one.
    */
   dirtyPaths: ReadonlySet<string>;
+  /**
+   * Node ids this pass refused to fetch on POLICY grounds (§7.2) — the auto-fetch
+   * ceiling or the session budget, never the memory cap.
+   *
+   * It is what keeps `state.fetchDeferred` from being a map that only grows: an
+   * id absent from here when the pass ends is one this pass either fetched,
+   * adopted, or no longer knows about, and a record for it would make the status
+   * bar count files the user downloaded last week.
+   */
+  deferredByPolicy: Set<string>;
   diagnostics: ReconcileDiagnostics;
   bind: (id: string, path: string) => void;
 }
@@ -368,6 +405,21 @@ export class Reconciler {
    * both are positive evidence about that directory, not an absence of it.
    */
   private preexistingDirs: Set<string> | null = null;
+  /**
+   * §7.2's session budget, spent. Deliberately NOT persisted and deliberately on
+   * the reconciler rather than in device state: it is a statement about this run
+   * of the plugin, so a restart starts it at zero and the share picks up exactly
+   * where the last session stopped.
+   */
+  private sessionFetchedBytes = 0;
+  /**
+   * What the last completed pass decided not to fetch (§7.3).
+   *
+   * The status bar, the download commands and the markdown post-processor all
+   * read it, and all three run OUTSIDE a pass — which is why it is remembered
+   * here rather than handed back in `ReconcileResult` and forgotten.
+   */
+  private lastDeferred: DeferredAttachment[] = [];
 
   constructor(deps: ReconcilerDeps) {
     this.deps = deps;
@@ -389,6 +441,24 @@ export class Reconciler {
   /** Why the vault is not being mutated, for the persistent status indicator. */
   get readOnlyReason(): string | null {
     return this.paused?.reason ?? null;
+  }
+
+  /**
+   * §7.2's session budget, spent so far. Read by `Bootstrap` so the first-sync
+   * modal's counts describe the pass that is actually about to run.
+   */
+  get fetchedThisSession(): number {
+    return this.sessionFetchedBytes;
+  }
+
+  /**
+   * Every attachment the last completed pass decided not to fetch (§7.3).
+   *
+   * The status bar reads it to say "Synced · 12 attachments available" instead of
+   * a bare "Synced", which on a share whose bytes only one peer holds is a lie.
+   */
+  get deferredAttachments(): readonly DeferredAttachment[] {
+    return this.lastDeferred;
   }
 
   /**
@@ -505,6 +575,7 @@ export class Reconciler {
       try {
         this.deps.tickets.clearArmed();
         this.absorbCollaboratorBindings(ctx);
+        this.recordDeferredAttachments(ctx);
         this.rebuildDeviceStateFromObserved(ctx);
         await this.persist();
       } finally {
@@ -612,6 +683,7 @@ export class Reconciler {
       // a save that lands while this pass runs is answered by the next pass rather
       // than silently absorbed by this one after its hashing was decided.
       dirtyPaths: this.deps.takeDirtyPaths?.() ?? EMPTY_SET,
+      deferredByPolicy: new Set<string>(),
       folderPaths,
       deadFolderPaths,
       vacatedDirs: new Set<string>(),
@@ -1019,7 +1091,7 @@ export class Reconciler {
    * deleted by hand.
    */
   private async materialize(ctx: PassContext): Promise<void> {
-    for (const id of [...ctx.desired.keys()].sort(cmp)) {
+    for (const id of this.materializeOrder(ctx)) {
       const path = ctx.desired.get(id)!.path;
       if (ctx.have.has(id)) continue;
       if (ctx.disk.hasFold(path)) {
@@ -1058,6 +1130,33 @@ export class Reconciler {
   }
 
   /**
+   * The order step 3 works in: notes first by id, then attachments by ASCENDING
+   * BYTE COUNT (§7.2).
+   *
+   * The byte order is the load-bearing half. A session budget has to stop
+   * somewhere, and where it stops must be a decision rather than an accident of
+   * 22 random nodeId characters: sorting by size makes the cutoff identical on
+   * every device that sees the same tree, and it maximizes the number of FILES
+   * that fit in a given allowance instead of spending it on whichever happened to
+   * sort first. Ties break on the id, so the order is total.
+   *
+   * Notes lead because they cost the blob budget nothing, and because the pass
+   * that materializes a note is the pass the user is actually waiting on. Nothing
+   * else depends on the order: `deriveTree` gives every node its own path, so no
+   * two items in this loop can contend for one slot.
+   */
+  private materializeOrder(ctx: PassContext): string[] {
+    return [...ctx.desired.keys()].sort((a, b) => {
+      const ra = ctx.blobRefs.get(a);
+      const rb = ctx.blobRefs.get(b);
+      if (ra === undefined && rb === undefined) return cmp(a, b);
+      if (ra === undefined) return -1;
+      if (rb === undefined) return 1;
+      return ra.bytes - rb.bytes || cmp(a, b);
+    });
+  }
+
+  /**
    * Spec §3.3. An attachment arrives: fetch, verify what arrived, then ONE write.
    *
    * The discipline is the markdown path's, for the same reason — a file that
@@ -1074,24 +1173,14 @@ export class Reconciler {
     path: string,
     ref: BlobRef,
   ): Promise<void> {
-    // §7.4. Refused BEFORE the request is made: `get` buffers the whole object, so
-    // a device that discovers the problem afterwards has already paid for it. The
-    // node stays live, valid, published and simply unmaterialized here, which is
-    // the correct state — this is a fact about this device, not about the file.
-    if (ref.bytes > this.memoryCapBytes()) {
-      ctx.diagnostics.tooLarge.push(id);
-      return;
-    }
-    // §7.2's policy lands in P2-f. Until then every fetch is allowed, and the
-    // shape is here so the decision is taken BEFORE the request — and so that a
-    // refusal writes nothing at all: no stub, no sidecar, no zero-byte
-    // placeholder standing in for the file (I6).
-    if (!this.mayFetch(id, ref)) {
-      ctx.diagnostics.deferred.push(id);
-      return;
-    }
+    // §7.2/§7.4. Refused BEFORE the request is made: `get` buffers the whole
+    // object, so a device that discovers the problem afterwards has already paid
+    // for it. The node stays live, valid, published and simply unmaterialized
+    // here — and a refusal writes nothing at all: no stub, no sidecar, no
+    // zero-byte placeholder standing in for the file (I6, §7.3).
+    if (!this.mayFetch(ctx, id, ref)) return;
 
-    const bytes = await this.deps.blobs.get(ref.sha256, ref.bytes);
+    const bytes = await this.fetchBlob(ref);
     // `get` never throws and answers null for every failure there is. Not one of
     // them is evidence about the user's disk (I2).
     if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
@@ -1123,15 +1212,120 @@ export class Reconciler {
   }
 
   /**
-   * §7.2's fetch policy, stubbed to "yes" for this slice.
+   * §7.2's fetch policy, at the one place every fetch goes through.
    *
-   * It is a seam rather than a TODO because the call site is the part that has to
-   * be right: the decision is taken before any request is made, and a refusal
-   * writes nothing whatsoever. P2-f fills in the ceilings, the session budget and
-   * the user's approvals behind it.
+   * Three call sites ask it — materialize, clean replace and fork — and all three
+   * ask BEFORE any request is made, because `get` buffers the whole object and a
+   * device that discovers the problem afterwards has already paid for it.
+   *
+   * The three refusals are three different user-actionable states, and each is
+   * recorded differently:
+   *
+   *  - `tooLarge` is a fact about this DEVICE (§7.4). Reported, never persisted:
+   *    it is re-derived for free from a reference that is already in the tree, and
+   *    persisting it would mean re-showing a dismissed notice on every launch.
+   *  - `needsApproval` is a decision about this FILE, so it is persisted — that
+   *    record is what lets the download button in a note know the attachment
+   *    exists, and how big it is, with no pass running.
+   *  - `sessionBudget` is a statement about this AFTERNOON, so it is written
+   *    nowhere at all and the next session starts from zero.
    */
-  private mayFetch(_id: string, _ref: BlobRef): boolean {
-    return true;
+  private mayFetch(ctx: PassContext, id: string, ref: BlobRef): boolean {
+    const verdict = fetchVerdict(
+      ref.bytes,
+      this.fetchLimits(),
+      this.deps.state.data.fetchApproved[id] === true,
+      this.sessionFetchedBytes,
+    );
+    switch (verdict) {
+      case 'yes':
+        return true;
+      case 'tooLarge':
+        ctx.diagnostics.tooLarge.push(id);
+        return false;
+      case 'needsApproval':
+        ctx.diagnostics.deferred.push(id);
+        ctx.deferredByPolicy.add(id);
+        this.recordDeferral(id, ref);
+        return false;
+      default:
+        ctx.diagnostics.deferred.push(id);
+        // Deliberately no write. The id still joins `deferredByPolicy` so that an
+        // EARLIER approval record is not dropped by this pass — leaving a record
+        // alone and writing one are different things, and only the second is what
+        // §7.2 forbids here.
+        ctx.deferredByPolicy.add(id);
+        return false;
+    }
+  }
+
+  /**
+   * Fetch an attachment's bytes and charge the session budget for them.
+   *
+   * THE CHARGE IS ON A COMPLETED FETCH, NEVER ON AN ATTEMPT. `get` answers null
+   * for every failure there is, so a flaky link would otherwise burn the whole
+   * session allowance retrying one file and leave the user with an afternoon of
+   * "not downloaded" for a connection that was merely bad.
+   */
+  private async fetchBlob(ref: BlobRef): Promise<Uint8Array | null> {
+    const bytes = await this.deps.blobs.get(ref.sha256, ref.bytes);
+    if (bytes === null) return null;
+    this.sessionFetchedBytes += bytes.length;
+    return bytes;
+  }
+
+  /**
+   * §7.2: write the deferral only when its VALUE changes.
+   *
+   * `DeviceState.flush()` serializes the whole state object, so an unconditional
+   * per-pass write of ~1,100 records turns persistence into a multi-megabyte write
+   * every couple of seconds — on a phone, on battery, for a map that did not move.
+   */
+  private recordDeferral(id: string, ref: BlobRef): void {
+    const current = this.deps.state.data.fetchDeferred[id];
+    if (current !== undefined && current.sha256 === ref.sha256 && current.bytes === ref.bytes) {
+      return;
+    }
+    this.deps.state.data.fetchDeferred[id] = { sha256: ref.sha256, bytes: ref.bytes };
+    this.deps.state.schedulePersist();
+  }
+
+  /**
+   * Close the pass's account with `fetchDeferred`, and remember what the UI has
+   * to say about it (§7.3).
+   *
+   * Every id NOT refused by policy this pass is dropped: it was fetched, it was
+   * adopted from a file that was already there, or the tree no longer has it.
+   * Without the drop the map only ever grows, and a status bar counting files the
+   * user downloaded last week is worse than no status bar.
+   */
+  private recordDeferredAttachments(ctx: PassContext | null): void {
+    if (ctx === null) return;                    // the pass refused; it observed nothing
+    for (const id of Object.keys(this.deps.state.data.fetchDeferred)) {
+      if (!ctx.deferredByPolicy.has(id)) delete this.deps.state.data.fetchDeferred[id];
+    }
+
+    const seen = new Set<string>();
+    const out: DeferredAttachment[] = [];
+    for (const id of ctx.diagnostics.deferred) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const ref = ctx.blobRefs.get(id);
+      const want = ctx.desired.get(id);
+      if (ref === undefined || want === undefined) continue;
+      out.push({ id, path: want.path, sha256: ref.sha256, bytes: ref.bytes });
+    }
+    out.sort((a, b) => cmp(a.path, b.path));
+    this.lastDeferred = out;
+  }
+
+  /** The three ceilings §7.2 decides against, as one value. */
+  private fetchLimits(): FetchLimits {
+    return {
+      memoryCapBytes: this.memoryCapBytes(),
+      autofetchMaxBytes: this.deps.autofetchMaxBytes?.() ?? AUTOFETCH_MAX_BYTES,
+      sessionBudgetBytes: this.deps.sessionBudgetBytes?.() ?? AUTOFETCH_SESSION_BUDGET,
+    };
   }
 
   /** The largest attachment this device will hold in memory (§7.4). */
@@ -1302,18 +1496,12 @@ export class Reconciler {
     // I7, before the request: a file the user has open is not one this pass pays
     // to download for, let alone writes to.
     if (this.deps.vault.isOpenInLeaf(path)) return;
-    // §7.4. Refused before the request is made, exactly as in `materializeBlob`:
-    // the node stays live, valid, published and simply not current on this device.
-    if (ref.bytes > this.memoryCapBytes()) {
-      ctx.diagnostics.tooLarge.push(id);
-      return;
-    }
-    if (!this.mayFetch(id, ref)) {
-      ctx.diagnostics.deferred.push(id);
-      return;
-    }
+    // §7.2/§7.4. Refused before the request is made, exactly as in
+    // `materializeBlob`: the node stays live, valid, published and simply not
+    // current on this device.
+    if (!this.mayFetch(ctx, id, ref)) return;
 
-    const bytes = await this.deps.blobs.get(ref.sha256, ref.bytes);
+    const bytes = await this.fetchBlob(ref);
     if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
     // The second of two independent checks — the first lives inside the port, and
     // the point of the second is that the first can be wrong.
@@ -1408,19 +1596,12 @@ export class Reconciler {
     // I7: renaming a file out from under an open view is precisely what this
     // invariant exists to prevent. One pass of delay costs nothing.
     if (this.deps.vault.isOpenInLeaf(path)) return;
-    // §7.4, before the request: a device that cannot hold the incoming object
-    // must not fork either — half of the operation is not an outcome.
-    if (ref.bytes > this.memoryCapBytes()) {
-      ctx.diagnostics.tooLarge.push(id);
-      return;
-    }
-    if (!this.mayFetch(id, ref)) {
-      ctx.diagnostics.deferred.push(id);
-      return;
-    }
+    // §7.2/§7.4, before the request: a device that will not fetch the incoming
+    // object must not fork either — half of the operation is not an outcome.
+    if (!this.mayFetch(ctx, id, ref)) return;
 
     const forkPath = await this.forkPathFor(path, local);
-    const bytes = await this.deps.blobs.get(ref.sha256, ref.bytes);
+    const bytes = await this.fetchBlob(ref);
     if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
     if (await hashOfBytes(bytes) !== ref.sha256) {
       throw new Error(`fork: ${path} did not match its digest`);
@@ -1763,9 +1944,18 @@ export class Reconciler {
     data.oversized = sortRecord(data.oversized);
   }
 
+  /**
+   * Write device state at the end of the pass — but only if it MOVED.
+   *
+   * A converged share reconciles on every remote change, and every pass rebuilds
+   * the same maps out of the same evidence. Flushing unconditionally serializes
+   * the whole state object and writes it again each time, which on a share with a
+   * thousand attachments is a multi-megabyte write every couple of seconds, on a
+   * phone, for a file whose contents did not change.
+   */
   private async persist(): Promise<void> {
     try {
-      await this.deps.state.flush();
+      await this.deps.state.flushIfChanged();
     } catch (err) {
       this.deps.state.lastPersistError = err;
     }

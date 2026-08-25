@@ -28,6 +28,8 @@
 // No `obsidian` import, no node builtins.
 
 import {
+  AUTOFETCH_MAX_BYTES,
+  AUTOFETCH_SESSION_BUDGET,
   BLOB_MAX_BYTES,
   FOUNDER_GRACE_MS,
   FOUNDER_QUIET_MS,
@@ -40,6 +42,7 @@ import { deriveTree } from '../tree/TreeIndex.ts';
 import type { TreeDoc } from '../tree/TreeDoc.ts';
 import type { DeviceState } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
+import { fetchVerdict, type FetchLimits } from './FetchPolicy.ts';
 import type { ReconcileCause } from './Reconciler.ts';
 import type { VaultPort } from './VaultPort.ts';
 import type { Phase } from './VaultWatcher.ts';
@@ -88,10 +91,11 @@ export interface BootstrapBuckets {
   /**
    * Attachments the first pass will NOT fetch, sized from the tree.
    *
-   * Today that is exactly the ones over this device's memory cap (§7.4): the node
-   * stays live, valid, published and simply unmaterialized HERE. P2-f adds the
-   * ones the fetch policy holds back for approval, which from the user's side is
-   * the same fact — "this will not arrive yet" — and belongs on the same line.
+   * Three refusals land here and they are deliberately one line to the user,
+   * because from their side they are one fact — "this will not arrive yet":
+   * over this device's memory cap (§7.4), over the auto-fetch ceiling, or past
+   * this session's fetch budget (§7.2). The node stays live, valid, published and
+   * simply unmaterialized HERE in every one of those cases.
    */
   downloadDeferred: BucketTotals;
   /** Local markdown that would be shared, sized from disk. */
@@ -191,6 +195,25 @@ export interface BootstrapDeps {
    * runs, which is what keeps the counts a description of that pass.
    */
   memoryCapBytes?: () => number;
+  /**
+   * §7.2's two policy ceilings, injected for exactly the same reason as the
+   * memory cap: they are platform facts, and classification only READS them.
+   *
+   * Both are load-bearing for the modal rather than for the vault. Splitting the
+   * download counts on the memory cap alone said "412 attachments will be
+   * downloaded" about a pass that fetches forty of them, because the cap is not
+   * the rule `materialize` applies — the fetch policy is.
+   */
+  autofetchMaxBytes?: () => number;
+  sessionBudgetBytes?: () => number;
+  /**
+   * How much of this session's fetch budget the reconciler has already spent.
+   *
+   * `Reconciler.fetchedThisSession` is the implementation. It is zero on a first
+   * join, which is when the modal is shown; wiring it anyway is what keeps the two
+   * modules from disagreeing on a re-classification later in the session.
+   */
+  sessionSpentBytes?: () => number;
   treeSyncTimeoutMs?: number;
   founderWaitCapMs?: number;
 }
@@ -416,7 +439,6 @@ export class Bootstrap {
     const downloadNotes = { count: 0, bytes: 0 };
     const downloadNow = { count: 0, bytes: 0 };
     const downloadDeferred = { count: 0, bytes: 0 };
-    const cap = this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES;
 
     for (const id of [...derived.files.keys()].sort(cmp)) {
       const path = this.vaultPathOf(derived.files.get(id)!);
@@ -427,19 +449,33 @@ export class Bootstrap {
       else download.set(id, path);
     }
 
+    // A note's size is in a content doc that has not synced, so there is no honest
+    // number to show for it — see `BucketTotals`.
+    const blobIds: string[] = [];
     for (const id of download.keys()) {
-      const ref = derived.blobs.get(id);
-      if (ref === undefined) {
-        // A note. Its size is in a content doc that has not synced, so there is
-        // no honest number to show — see `BucketTotals`.
-        downloadNotes.count += 1;
-        continue;
-      }
-      // The same test `materialize` applies, on the same number, so the modal
-      // and the pass cannot disagree about what will arrive here.
-      const bucket = ref.bytes > cap ? downloadDeferred : downloadNow;
+      if (derived.blobs.has(id)) blobIds.push(id);
+      else downloadNotes.count += 1;
+    }
+    // §7.2, walked exactly as `Reconciler.materialize` walks it: ASCENDING BYTE
+    // ORDER, through the same pure predicate, charging the same session budget as
+    // it goes. Anything else makes these two counts a description of a pass that
+    // does not happen — which is the whole failure the fetch policy's user-facing
+    // half exists to avoid.
+    const limits: FetchLimits = {
+      memoryCapBytes: this.deps.memoryCapBytes?.() ?? BLOB_MAX_BYTES,
+      autofetchMaxBytes: this.deps.autofetchMaxBytes?.() ?? AUTOFETCH_MAX_BYTES,
+      sessionBudgetBytes: this.deps.sessionBudgetBytes?.() ?? AUTOFETCH_SESSION_BUDGET,
+    };
+    let spent = this.deps.sessionSpentBytes?.() ?? 0;
+    const approved = this.deps.state.data.fetchApproved;
+    blobIds.sort((a, b) => derived.blobs.get(a)!.bytes - derived.blobs.get(b)!.bytes || cmp(a, b));
+    for (const id of blobIds) {
+      const ref = derived.blobs.get(id)!;
+      const willFetch = fetchVerdict(ref.bytes, limits, approved[id] === true, spent) === 'yes';
+      const bucket = willFetch ? downloadNow : downloadDeferred;
       bucket.count += 1;
       bucket.bytes += ref.bytes;
+      if (willFetch) spent += ref.bytes;
     }
 
     // Occupancy, rebuilt from REAL paths rather than by prefixing `deriveTree`'s

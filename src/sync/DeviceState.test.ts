@@ -250,6 +250,63 @@ test('a debounced write failure is captured rather than thrown into the event lo
   assert.match(String((s.lastPersistError as Error)?.message), /ENOSPC/);
 });
 
+// A converged share reconciles on every remote change, and every pass rebuilds
+// the same maps out of the same evidence. `flush` would serialize the whole state
+// object and write it again each time — on a share with a thousand attachments,
+// megabytes every couple of seconds, on a phone, for a file that did not move.
+test('flushIfChanged writes once and then skips a state that has not moved', async () => {
+  const port = new MemoryStatePort();
+  const s = new DeviceState(port, DEVICE, WORKSPACE, () => 0, DEBOUNCE);
+  await s.load();
+
+  s.data.materialized['n1'] = 'Shared/a.md';
+  assert.equal(await s.flushIfChanged(), true, 'the first write canonicalizes the file');
+  assert.equal(port.writes, 1);
+
+  assert.equal(await s.flushIfChanged(), false, 'nothing moved, so nothing is written');
+  assert.equal(await s.flushIfChanged(), false);
+  assert.equal(port.writes, 1);
+
+  s.data.materialized['n2'] = 'Shared/b.md';
+  assert.equal(await s.flushIfChanged(), true);
+  assert.equal(port.writes, 2);
+  assert.match(port.store.get(s.key)!, /Shared\/b\.md/);
+});
+
+// I2, applied to persistence: a write that THREW did not reach the disk, so the
+// next call must not skip it on the strength of having tried.
+test('flushIfChanged retries after a write that failed', async () => {
+  const port = new MemoryStatePort();
+  const s = new DeviceState(port, DEVICE, WORKSPACE, () => 0, DEBOUNCE);
+  await s.load();
+  s.data.materialized['n1'] = 'Shared/a.md';
+
+  const original = port.write.bind(port);
+  port.write = async () => { throw new Error('ENOSPC'); };
+  await assert.rejects(() => s.flushIfChanged(), /ENOSPC/);
+
+  port.write = original;
+  assert.equal(await s.flushIfChanged(), true, 'the same bytes are still owed to the disk');
+  assert.match(port.store.get(s.key)!, /Shared\/a\.md/);
+});
+
+// A debounce armed by a change that has since been undone would only rewrite the
+// bytes already on disk.
+test('flushIfChanged cancels a pending debounce it has nothing to add to', async () => {
+  const port = new MemoryStatePort();
+  const s = new DeviceState(port, DEVICE, WORKSPACE, () => 0, DEBOUNCE);
+  await s.load();
+
+  s.data.owned['n1'] = true;
+  await s.flush();
+  assert.equal(port.writes, 1);
+
+  s.schedulePersist();
+  assert.equal(await s.flushIfChanged(), false);
+  await delay(DEBOUNCE * 8);
+  assert.equal(port.writes, 1, 'the cancelled timer never fires');
+});
+
 test('a failed write does not wedge later writes', async () => {
   const port = new MemoryStatePort();
   const s = new DeviceState(port, DEVICE, WORKSPACE);

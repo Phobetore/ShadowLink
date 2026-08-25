@@ -132,10 +132,14 @@ class FirstSyncModal extends DecisionModal<BootstrapDecision> {
       });
     }
     if (info.downloadDeferred.count > 0) {
+      // §7.2's three refusals are one sentence on purpose. "Over the auto-fetch
+      // ceiling", "past this session's budget" and "larger than this device can
+      // hold" are one fact to the person reading this — the file will not arrive
+      // yet — and the commands that fetch it are the same in all three cases.
       summary.createEl('li', {
         text: `${info.downloadDeferred.count} attachment(s) `
-          + `(${sizeOf(info.downloadDeferred.bytes)}) are too large for this device and will `
-          + 'stay in the workspace without being downloaded here.',
+          + `(${sizeOf(info.downloadDeferred.bytes)}) will not be downloaded here yet. `
+          + 'Use "ShadowLink: Download attachments" to fetch them.',
       });
     }
     summary.createEl('li', {
