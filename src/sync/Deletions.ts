@@ -32,17 +32,19 @@
 // mobile; the two irreversible vault calls named by invariant I1 appear nowhere
 // in this file, and `Deletions.test.ts` asserts that by reading the source.
 //
-// The circuit breaker (§5.4) sits in front of all of it. A batch that would push
-// this device past its persisted deletion rate window — and ANY batch on a
-// bootstrap pass, which is the "you were offline while the team reorganized"
-// case — applies nothing until a human says otherwise. A missing dialog, a
-// rejected dialog and an explicit "keep my copies" are all the same answer:
-// decline, persist the decision, never ask again.
+// The circuit breaker (§5.4, §5.3) sits in front of all of it. A batch that would
+// push this device past its persisted deletion rate window, a batch whose
+// attachments total more than the byte alert, and ANY batch on a bootstrap pass —
+// the "you were offline while the team reorganized" case — apply nothing until a
+// human says otherwise. A missing dialog, a rejected dialog and an explicit "keep
+// my copies" are all the same answer: decline, persist the decision, never ask
+// again.
 //
 // No `obsidian` import, no node builtins.
 
 import {
   BLOB_MAX_BYTES, PROVE_HASH_MAX_BYTES, RECOVERED_DIR, REMOTE_DELETE_BUDGET,
+  REMOTE_DELETE_BYTES_ALERT,
 } from '../tree/constants.ts';
 import {
   assertInsideShare, extOf, fold, hashOf, hashOfBytes, parseBlobRef, safeInFilename,
@@ -62,6 +64,13 @@ export type BulkChoice = 'apply' | 'keep';
 /** What the aggregated dialog needs to describe a batch it is refusing to apply. */
 export interface BulkSummary {
   count: number;
+  /**
+   * Total size of the batch's ATTACHMENTS, from their tree references (§5.3).
+   *
+   * Zero for a batch of notes: markdown has no size in the tree, and inventing
+   * one would mean reading every file to answer a question about a dialog.
+   */
+  bytes: number;
   /** Distinct display names taken from `xb`, in first-seen order. */
   deletedBy: string[];
   /** A few literal paths, for the dialog's body. */
@@ -198,12 +207,18 @@ export function rescueName(path: string, f: NodeFields, fallbackAt: number): str
 
 function summaryOf(batch: Deletable[]): BulkSummary {
   const deletedBy: string[] = [];
+  let bytes = 0;
   for (const item of batch) {
     const name = item.f.xb;
     if (name !== undefined && !deletedBy.includes(name)) deletedBy.push(name);
+    // The tree's own claim about how big the file is. It is already here, so the
+    // byte total costs no `stat` and no read — which is what makes it affordable
+    // to compute for every batch, tripped or not.
+    bytes += parseBlobRef(item.f.b)?.bytes ?? 0;
   }
   return {
     count: batch.length,
+    bytes,
     deletedBy,
     samplePaths: batch.slice(0, SAMPLE_PATHS).map((item) => item.path),
   };
@@ -234,10 +249,16 @@ export class Deletions {
     const batch = this.collectDeletable(ctx);
 
     if (batch.length > 0) {
-      // Bootstrap is unconditional: a batch that arrived while this device was
-      // away is exactly the case a user cannot undo by hand.
-      const tripped = ctx.cause === 'bootstrap' || this.overBudget(env, batch.length);
-      const choice = tripped ? await this.askOnce(summaryOf(batch)) : 'apply';
+      const summary = summaryOf(batch);
+      // Three conditions, and the third is why a count is not enough on its own:
+      // deleting one 200 MB video is at least as consequential as deleting eleven
+      // notes, and the count budget waves it straight through. Bootstrap remains
+      // unconditional — a batch that arrived while this device was away is
+      // exactly the case a user cannot undo by hand.
+      const tripped = ctx.cause === 'bootstrap'
+        || this.overBudget(env, batch.length)
+        || summary.bytes > REMOTE_DELETE_BYTES_ALERT;
+      const choice = tripped ? await this.askOnce(summary) : 'apply';
 
       if (choice === 'apply') {
         for (const item of batch) {

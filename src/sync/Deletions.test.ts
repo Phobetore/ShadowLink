@@ -24,7 +24,8 @@ import {
   fold, formatBlobRef, hashOf, hashOfBytes, isLive, relPath, validateRel,
 } from '../tree/paths.ts';
 import {
-  PROVE_HASH_MAX_BYTES, REMOTE_DELETE_BUDGET, REMOTE_DELETE_WINDOW_MS,
+  PROVE_HASH_MAX_BYTES, REMOTE_DELETE_BUDGET, REMOTE_DELETE_BYTES_ALERT,
+  REMOTE_DELETE_WINDOW_MS,
 } from '../tree/constants.ts';
 import { BlobTransport } from './BlobPort.ts';
 import { Deletions, rescueName, type BulkChoice, type BulkSummary } from './Deletions.ts';
@@ -1099,6 +1100,83 @@ test('a dead node the same derivation also reports as live is rescued, never tra
   assert.equal(h.vault.callsTo('trashLocal').length, 0, 'nothing removed');
   assert.equal(rescuedInto(h.vault).length, 1, 'the copy was kept');
   assert.deepEqual(h.blobs.calls, [], 'and no verdict was even attempted');
+});
+
+// ------------------------------------------------------- B16: the byte trip condition
+
+/**
+ * Seed one attachment whose TREE reference claims `claimBytes`, with real bytes
+ * on disk that are nothing like that big.
+ *
+ * That is not a contrived state: `ref.bytes` is what the workspace says the file
+ * is, it is already in the tree, and reading it costs no I/O at all — which is
+ * exactly why the breaker may use it. The fixture keeps the test honest about
+ * that by never allocating the megabytes it is talking about.
+ */
+async function placeClaimed(
+  h: Harness,
+  id: string,
+  name: string,
+  claimBytes: number,
+): Promise<Uint8Array> {
+  const bytes = png(id.charCodeAt(0));
+  const ref = formatBlobRef(await hashOfBytes(bytes), claimBytes, null);
+  h.nodes.set(id, dead(blob('', name, { s: 1, b: ref })));
+  await placeBinary(h, id, `${SHARE}/${name}`, bytes);
+  await h.blobs.seed(bytes);
+  return bytes;
+}
+
+test('B16: two attachments over the byte alert trip the breaker and report their size', async () => {
+  const h = makeHarness({ answer: 'keep' });
+  h.vault.seed(SHARE, 'd');
+  await placeClaimed(h, nid('A'), 'a.webm', 130_000_000);
+  await placeClaimed(h, nid('B'), 'b.webm', 120_000_000);
+
+  const ctx = h.ctx();
+  assert.equal(h.deletions.collectDeletable(ctx).length, 2, 'two files, far under the count budget');
+
+  await h.deletions.apply(ctx);
+
+  assert.equal(h.confirms.length, 1, 'one coalesced dialog');
+  assert.equal(h.confirms[0].count, 2);
+  assert.equal(h.confirms[0].bytes, 250_000_000, 'so the dialog can say "2 files (238 MB)"');
+
+  // Declined: nothing on disk changed, and the decision is remembered.
+  assert.equal(mutations(h.vault), 0, 'a declined batch removes nothing');
+  assert.deepEqual([...h.state.data.declinedNodes].sort(), [nid('A'), nid('B')]);
+  assert.deepEqual(h.blobs.callsTo('has'), [], 'and no verdict was even reached');
+});
+
+test('B16: the byte alert is a ceiling, not a floor — a small batch still applies silently', async () => {
+  const h = makeHarness({ answer: 'keep' });
+  h.vault.seed(SHARE, 'd');
+  // Exactly AT the alert, which must not trip: the gate is `>`, and a breaker
+  // that fires on the ordinary case is a breaker users learn to click through.
+  await placeClaimed(h, nid('A'), 'a.png', REMOTE_DELETE_BYTES_ALERT);
+  h.nodes.set(nid('B'), dead(file('', 'b.md', { s: 1 })));
+  await place(h, nid('B'), `${SHARE}/b.md`, 'body');
+
+  await h.deletions.apply(h.ctx());
+
+  assert.deepEqual(h.confirms, [], 'no dialog');
+  assert.equal(h.vault.callsTo('trashLocal').length, 2, 'both removed, both restorable');
+  assert.equal(h.vault.trashedFor(`${SHARE}/a.png`).length, 1);
+});
+
+test('B16: a batch of notes carries no bytes at all, so only the count can trip it', async () => {
+  const h = makeHarness({ answer: 'keep' });
+  h.vault.seed(SHARE, 'd');
+  for (let i = 0; i < 3; i++) {
+    const id = nid(`N${pad3(i)}`);
+    h.nodes.set(id, dead(file('', `n${pad3(i)}.md`, { s: 1 })));
+    await place(h, id, `${SHARE}/n${pad3(i)}.md`, `body ${i}`);
+  }
+
+  await h.deletions.apply(h.ctx());
+
+  assert.deepEqual(h.confirms, [], 'markdown has no size in the tree and no dialog is owed');
+  assert.equal(h.vault.callsTo('trashLocal').length, 3);
 });
 
 test('B14: a note is still decided by the markdown rule and never touches the store', async () => {

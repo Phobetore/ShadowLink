@@ -30,6 +30,21 @@ import type { KeptEntry } from '../sync/KeptFiles.ts';
 /** Longest list any of these dialogs renders inline before it summarizes. */
 const MAX_LISTED = 8;
 
+/**
+ * Bytes as a size a human reads, for the dialogs that have to make "a lot"
+ * concrete.
+ *
+ * "3 files" and "3 files (218 MB)" are different questions, and only the second
+ * one can actually be answered.
+ */
+function sizeOf(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+  if (mb >= 10) return `${Math.round(mb)} MB`;
+  if (mb >= 0.1) return `${mb.toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
 abstract class DecisionModal<T> extends Modal {
   /** Resolves exactly once, with the safe answer if the user never chose. */
   readonly answer: Promise<T>;
@@ -170,8 +185,14 @@ class BulkDeleteModal extends DecisionModal<BulkChoice> {
     titleEl.setText('ShadowLink — a lot of files were deleted');
 
     const who = summary.deletedBy.length > 0 ? summary.deletedBy.join(', ') : 'someone';
+    // The size is named only when there is one: a batch of notes carries no bytes
+    // in the tree, and "(0 KB)" would be a claim about the files rather than about
+    // what this dialog actually knows.
+    const how = summary.bytes > 0
+      ? `${summary.count} file(s) (${sizeOf(summary.bytes)})`
+      : `${summary.count} file(s)`;
     contentEl.createEl('p', {
-      text: `${summary.count} file(s) in the shared folder were deleted by ${who}. `
+      text: `${how} in the shared folder were deleted by ${who}. `
         + 'ShadowLink has not touched your copies yet.',
     });
     this.listPaths(summary.samplePaths);

@@ -99,6 +99,17 @@ export const REHASH_BUDGET_BYTES_MOBILE = 33_554_432;   //  32 MB, mobile
 export const PROVE_HASH_MAX_BYTES = 67_108_864;         //  64 MB
 
 /**
+ * How many BYTES a batch of remote deletions may carry before the circuit
+ * breaker asks a human (spec §5.3).
+ *
+ * A count alone measures the wrong thing for attachments: deleting one 200 MB
+ * video is at least as consequential as deleting eleven notes, and the count
+ * budget would wave it straight through. The total comes from each node's `b`
+ * reference, which is already in the tree, so this condition costs no I/O at all.
+ */
+export const REMOTE_DELETE_BYTES_ALERT = 104_857_600;   // 100 MB
+
+/**
  * How long the modify handler waits before asking for a reconcile (spec §3.5).
  *
  * Obsidian fires `modify` while a file is still being written, and an editor that
