@@ -516,6 +516,12 @@ test('the Sync status line agrees with the fields the user has just filled in', 
   // per keystroke destroys the input the user is typing into and takes the caret
   // with it. A real fix updates that one `Setting` in place, which is a change to
   // how this screen is built rather than a line edit.
+  //
+  // That change has since been made for one field: the Workspace ID keeps a handle
+  // on its `Setting` and calls `setDesc` from its own `onChange`. So the remedy is
+  // no longer hypothetical and it needs nothing outside `SettingsTab.ts` — give
+  // Sync status the same handle and refresh it from each of the four share
+  // handlers. Left undone here only because this branch was scoped away from it.
   skip: 'defect: the status line is computed once per display() — see the comment',
 }, async () => {
   const plugin = fakePlugin();
