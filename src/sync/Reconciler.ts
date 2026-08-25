@@ -1257,23 +1257,103 @@ export class Reconciler {
   }
 
   /**
-   * §3.5 rule 3, STUBBED for this commit: the tree's version descends from
-   * exactly the bytes on disk, so taking it loses nothing — but taking it means
-   * fetching, re-checking and swapping through the staging journal, which is the
-   * next commit. Recording the divergence is what makes "not yet" visible and
-   * repeatable; the local file is untouched and the next pass asks again.
+   * §3.5 rule 3. A peer replaced the file, and the version it published descends
+   * from exactly the bytes on this disk — so nothing here is anybody's
+   * unpublished work, and taking it is what "sync" means.
+   *
+   * FETCH FIRST, MUTATE SECOND, RE-CHECK BETWEEN, and each of the three is a
+   * separate refusal to guess:
+   *
+   *  - the bytes are in hand and verified before anything is touched, so a fetch
+   *    that fails leaves the file exactly where it was (I2);
+   *  - `isOpenInLeaf` is asked AGAIN afterwards, mirroring `Deletions.applyOne`'s
+   *    verdict/re-check pair, because a fetch is bounded by file size rather than
+   *    by an 8 s doc timeout: this window is minutes wide, and the user can open
+   *    the file inside it (I7);
+   *  - the file itself is re-`stat`ed, because bytes that changed while the
+   *    download ran are unpublished local work, and overwriting them would
+   *    destroy the only copy of a change nobody else has seen.
+   *
+   * The swap then runs through the staging journal, so the only crash window
+   * leaves a visible file and a replayable line rather than a hole.
    */
   private async cleanReplace(
-    _ctx: PassContext,
+    ctx: PassContext,
     id: string,
     path: string,
     ref: BlobRef,
-    _st: { bytes: number; mtime: number },
+    seen: { bytes: number; mtime: number },
   ): Promise<void> {
-    throw new RetryLater(
-      `${path} is superseded by ${ref.sha256.slice(0, 8)} for node ${id}: `
-      + 'left untouched until the replace rule lands',
-    );
+    // I7, before the request: a file the user has open is not one this pass pays
+    // to download for, let alone writes to.
+    if (this.deps.vault.isOpenInLeaf(path)) return;
+    // §7.4. Refused before the request is made, exactly as in `materializeBlob`:
+    // the node stays live, valid, published and simply not current on this device.
+    if (ref.bytes > this.memoryCapBytes()) {
+      ctx.diagnostics.tooLarge.push(id);
+      return;
+    }
+    if (!this.mayFetch(id, ref)) {
+      ctx.diagnostics.deferred.push(id);
+      return;
+    }
+
+    const bytes = await this.deps.blobs.get(ref.sha256, ref.bytes);
+    if (bytes === null) throw new RetryLater(`blob ${ref.sha256} did not fetch`);
+    // The second of two independent checks — the first lives inside the port, and
+    // the point of the second is that the first can be wrong.
+    if (await hashOfBytes(bytes) !== ref.sha256) {
+      throw new Error(`replace: ${path} did not match its digest`);
+    }
+
+    // Everything below re-reads the world this verdict was based on.
+    if (this.deps.vault.isOpenInLeaf(path)) return;
+    const st = await this.deps.vault.stat(path);
+    if (st === null || st.mtime !== seen.mtime || st.bytes !== seen.bytes) return;
+
+    await this.swapBytes(ctx, id, path, bytes);
+    // I17: the base advances only once the write has RETURNED, and it carries the
+    // mtime that write produced.
+    const after = await this.deps.vault.stat(path);
+    this.recordBlobHash(id, ref.sha256, ref.bytes, after?.mtime);
+  }
+
+  /**
+   * Replace a file's bytes without ever hard-deleting them, and without a moment
+   * in which they exist nowhere (spec §8.1).
+   *
+   * There is deliberately NO in-place write anywhere in this plugin: an
+   * interrupted overwrite leaves a corrupt file at the canonical path with no way
+   * to detect it. The previous bytes are RENAMED into the visible staging folder
+   * — journal first, rename second — and only then does the new file appear. A
+   * crash between the two leaves a file the user can see plus a line
+   * `drainStaging` replays; trash-then-create would leave a hole instead.
+   *
+   * The staged name is per-nodeId, so repeated replaces of DIFFERENT files cannot
+   * collide on one basename in the flat vault trash.
+   */
+  private async swapBytes(
+    ctx: PassContext,
+    id: string,
+    path: string,
+    bytes: Uint8Array,
+  ): Promise<void> {
+    await this.stageOut(ctx, id, path);
+    // Both echoes armed, and both before the write: `create` is what the watcher
+    // would otherwise read as the user adding a file, and `modify` what
+    // `onModify` would read as the user editing one — which for a `'b'` node
+    // means queueing a publish of the bytes we have just fetched.
+    this.deps.tickets.arm('create', path);
+    this.deps.tickets.arm('modify', path);
+    await this.deps.vault.createBinary(path, bytes);
+    ctx.disk.add(path, 'f');
+    this.bindPath(ctx, id, path);
+
+    const staged = `${STAGING_DIR}/${id}${extOf(path)}`;
+    this.deps.tickets.arm('delete', staged);
+    await this.deps.vault.trashLocal(staged);                 // I1: vault-local .trash
+    delete this.deps.state.data.staging[id];
+    await this.deps.state.flush();
   }
 
   /**

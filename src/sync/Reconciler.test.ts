@@ -2392,3 +2392,424 @@ test('a stat that could not answer decides nothing about an attachment', async (
   assert.equal(mutations(h.vault), 0);
   assert.deepEqual(h.vault.binarySnapshot()[path], bytes);
 });
+
+// ---------------------------------------------------------------- P2 §3.5: rule 3
+
+/**
+ * A node whose tree reference SUPERSEDES what is on disk: the publisher's version
+ * descends from exactly the bytes this device holds, which is rule 3.
+ */
+async function supersededBlob(
+  h: Harness,
+  id: string,
+  rel: string,
+  mine: Uint8Array,
+  theirs: Uint8Array,
+): Promise<{ path: string; mineSha: string; theirsSha: string }> {
+  const mineSha = await hashOfBytes(mine);
+  const theirsSha = await h.blobs.seed(theirs);
+  const path = await bindBlob(h, id, rel, mine, {
+    sha256: theirsSha, bytes: theirs.length, parent: mineSha,
+  }, { sha256: mineSha, len: mine.length });
+  return { path, mineSha, theirsSha };
+}
+
+// B8. The ordinary remote replace, and the only one that is allowed to overwrite
+// anything: the reference the workspace converged on names bytes that descend
+// from exactly what is on this disk, so nothing here is anybody's unpublished
+// work. The previous bytes still go to the vault-local trash (I1) — every sync
+// tool does this, and it is what "recoverable" means when there is no merge.
+test('B8: a peer replacement that descends from our bytes is fetched and swapped in', async () => {
+  const tickets = new RecordingTickets(() => NOW);
+  const h = makeHarness({ tickets });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path, theirsSha } = await supersededBlob(h, id, 'img/diagram.png', mine, theirs);
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs, 'the workspace version is at the path');
+  assert.equal(h.vault.callsTo('createBinary').length, 1, 'one write, never create-then-fill');
+  assert.equal(h.state.data.contentHash[id]?.sha256, theirsSha, 'the base advanced (I17)');
+  assert.ok(h.state.data.contentHash[id]?.mtime !== undefined, 'with the mtime the write produced');
+  assert.equal(h.state.data.materialized[id], path, 'and the node is still bound to its file');
+  assert.deepEqual(h.state.data.staging, {}, 'the journal is clear');
+
+  // I1, positively: the superseded bytes are retained, not destroyed.
+  const retained = [...h.vault.trashed.values()].filter((e) => e.bytes.length === mine.length);
+  assert.equal(retained.length, 1, 'exactly one retained copy');
+  assert.deepEqual(retained[0].bytes, mine, 'byte-identical to what was replaced');
+
+  // Nothing is left parked outside the share.
+  for (const p of Object.keys(h.vault.snapshot())) {
+    assert.ok(!p.startsWith('ShadowLink Staging/'), `${p} was left in staging`);
+  }
+
+  const staged = `ShadowLink Staging/${id}.png`;
+  assert.deepEqual(
+    tickets.armed.filter((a) => a.includes(path) || a.includes(staged)),
+    [`rename ${path} -> ${staged}`, `create ${path}`, `modify ${path}`, `delete ${staged}`],
+    'the old bytes leave through staging BEFORE the new ones exist, and every echo is armed',
+  );
+});
+
+// A second pass is inert: rule 1, one stat, no fetch, no write.
+test('a replaced attachment converges after one pass and re-fetches nothing', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const id = nid('A');
+  await supersededBlob(h, id, 'diagram.png', png(1), png(2, 96));
+
+  await h.reconciler.reconcile('sync');
+  h.vault.resetCalls();
+  h.blobs.resetCalls();
+  const second = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(second.failures, []);
+  assert.deepEqual(h.blobs.calls, [], 'nothing was fetched a second time');
+  assert.equal(mutations(h.vault), 0);
+  assert.equal(h.vault.callsTo('stat').length, 1, 'one stat, and the pass is over');
+});
+
+// ⚠ B11. The re-check after the fetch, which is the whole reason the fetch comes
+// first. `isOpenInLeaf` was false when the verdict was reached and true by the
+// time the bytes arrived — a fetch is bounded by file size, not by an 8 s doc
+// timeout, so this window is minutes wide (I7).
+test('B11: a file opened DURING the fetch is not replaced', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+
+  h.reconciler = new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: blobPortOf(h.blobs, {
+      get: async (sha, n) => {
+        // The user double-clicks the image while the download is running.
+        h.vault.setOpen(path, true);
+        return h.blobs.get(sha, n);
+      },
+    }),
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    now: () => NOW,
+  });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'the open file was left exactly as it was');
+  assert.equal(h.vault.callsTo('createBinary').length, 0);
+  assert.equal(h.vault.callsTo('rename').length, 0, 'and it was not staged out either');
+  assert.deepEqual(h.state.data.staging, {}, 'no journal entry for a swap that never began');
+});
+
+// I7 again, before the fetch: a file the user has open is not even downloaded for.
+test('an attachment open in a leaf is not replaced, and nothing is fetched for it', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'diagram.png', mine, png(2, 96));
+  h.vault.setOpen(path, true);
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(r.failures, []);
+  assert.deepEqual(h.blobs.calls, [], 'no fetch at all');
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine);
+});
+
+// ⚠ B12. The file changed under us while the bytes were in flight — the user
+// saved a new version, or an external tool rewrote it. Those bytes are now
+// unpublished local work, and overwriting them would destroy the only copy.
+test('B12: bytes that changed during the fetch are not overwritten', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const edited = png(3, 48);
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+
+  h.reconciler = new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: blobPortOf(h.blobs, {
+      get: async (sha, n) => {
+        const bytes = await h.blobs.get(sha, n);
+        h.vault.seedBinary(path, edited);          // the user saves over it mid-download
+        return bytes;
+      },
+    }),
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    now: () => NOW,
+  });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(h.vault.binarySnapshot()[path], edited, 'the newer local bytes survived');
+  assert.equal(h.vault.callsTo('createBinary').length, 0);
+  assert.deepEqual(h.state.data.staging, {}, 'and nothing was staged out');
+  assert.deepEqual(r.failures, [], 'this is a deferral, not an error');
+});
+
+// ⚠ B12, the same-size case. Only the mtime distinguishes a file that was
+// rewritten with a same-length version, which is exactly what an image editor
+// re-exporting a PNG produces.
+test('B12: a same-size rewrite during the fetch is still not overwritten', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const edited = png(4, mine.length);              // SAME size, different bytes
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+
+  h.reconciler = new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: blobPortOf(h.blobs, {
+      get: async (sha, n) => {
+        const bytes = await h.blobs.get(sha, n);
+        h.vault.seedBinary(path, edited);
+        return bytes;
+      },
+    }),
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    now: () => NOW,
+  });
+
+  await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(h.vault.binarySnapshot()[path], edited, 'the same-size rewrite survived');
+  assert.equal(h.vault.callsTo('createBinary').length, 0);
+});
+
+// ⚠ A fetch that did not complete is a no-op, never a hole and never a delete.
+test('a replacement whose bytes will not fetch leaves the local file in place', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path, theirsSha } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+  h.blobs.setAbsent(theirsSha);                    // swept, or never finished
+
+  const first = await h.reconciler.reconcile('sync');
+
+  assert.equal(first.failures.length, 1);
+  assert.ok(first.failures[0].err instanceof RetryLater, 'a missing object is "not yet" (I2)');
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'nothing moved, nothing was staged');
+  assert.deepEqual(h.state.data.staging, {});
+
+  // …and it converges the moment the bytes are there.
+  await h.blobs.seed(theirs);
+  const second = await h.reconciler.reconcile('retry');
+  assert.deepEqual(second.failures, []);
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs);
+});
+
+// The second of two independent checks, on the replace path. A port that hands
+// back bytes it did not verify is one refactor away, and this is the only thing
+// between it and the user's file.
+test('replacement bytes that arrive unverified are refused and nothing is swapped', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+  const other = png(9, 96);                        // same length, other bytes
+
+  h.reconciler = new Reconciler({
+    vault: h.vault,
+    docs: h.docs,
+    blobs: blobPortOf(h.blobs, { get: async () => other }),
+    state: h.state,
+    tickets: h.tickets,
+    shareRoot: SHARE,
+    entries: () => [...h.nodes],
+    now: () => NOW,
+  });
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine, 'the wrong bytes never reached the disk');
+  assert.equal(h.vault.callsTo('createBinary').length, 0);
+  assert.deepEqual(r.failures.map((f) => f.key), [`bytes:${id}`]);
+  assert.equal(h.state.data.contentHash[id]?.sha256, await hashOfBytes(mine), 'the base still names ours');
+});
+
+// ⚠ B13. The crash window, and why the swap goes through the journal at all: the
+// process dies between the rename and the write. What is left is a VISIBLE file
+// plus a journal line, and the next pass puts the bytes back — never a hole where
+// the user's attachment used to be.
+test('B13: a crash between the stage-out and the write restores the old bytes next pass', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path, mineSha, theirsSha } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+
+  // The state a process death mid-swap leaves behind, built by hand because a
+  // crash is not something a failing call models: the journal line is on disk,
+  // the bytes are parked in the visible staging folder, and the binding is gone.
+  h.vault.seedBinary(`ShadowLink Staging/${id}.png`, mine);
+  h.state.data.staging[id] = { from: path, to: path, at: NOW };
+  delete h.state.data.materialized[id];
+  await h.vault.trashLocal(`${SHARE}/diagram.png`);        // the rename had removed it
+  h.vault.trashed.clear();
+  h.vault.resetCalls();
+  // The store cannot serve the replacement either, so the pass restores and stops
+  // there: what is asserted below is the RESTORE, not a second swap on top of it.
+  h.blobs.setAbsent(theirsSha);
+
+  const next = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(
+    h.vault.binarySnapshot()[path], mine,
+    'the old bytes are back at the canonical path — never a hole where the file was',
+  );
+  assert.equal(
+    h.vault.binarySnapshot()[`ShadowLink Staging/${id}.png`], undefined,
+    'and nothing is left parked in staging',
+  );
+  assert.deepEqual(h.state.data.staging, {}, 'the journal is clear again');
+  assert.equal(h.state.data.materialized[id], path, 'with the binding restored');
+  assert.equal(h.state.data.contentHash[id]?.sha256, mineSha, 'and the base still names what is there');
+  // The replace itself is simply owed again; it is a deferral, not a loss.
+  assert.deepEqual(next.failures.map((f) => f.key), [`bytes:${id}`]);
+});
+
+// The same interruption from the other direction: the write itself failed. The
+// pass must not end with an empty canonical path, and the bytes it staged must
+// still exist — this one is about what the pass does with its own failure, not
+// about what a restart finds.
+test('a swap whose write fails leaves neither a hole nor a lost copy', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+  h.vault.failNext('createBinary', new Error('EIO: the disk went away mid-write'));
+
+  const crashed = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(crashed.failures.map((f) => f.key), [`bytes:${id}`]);
+  assert.notEqual(h.vault.binarySnapshot()[path], undefined, 'the path is not left empty');
+  const survivors = Object.values(h.vault.binarySnapshot())
+    .filter((b) => b.length === mine.length && b.every((x, i) => x === mine[i]));
+  assert.equal(survivors.length, 1, 'and the staged copy still exists somewhere visible');
+
+  const next = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs, 'the replacement lands');
+  assert.deepEqual(h.state.data.staging, {}, 'the journal is clear');
+  const rescued = Object.entries(h.vault.binarySnapshot())
+    .filter(([p]) => p.startsWith('ShadowLink Recovered/'));
+  assert.equal(rescued.length, 1, 'and the old bytes are visible, not dropped');
+  assert.deepEqual(rescued[0][1], mine);
+  assert.deepEqual(next.failures, []);
+});
+
+// ⚠ I17, on the replace path: a watermark may only describe a write that
+// RETURNED. Recording the base before the swap would leave device state claiming
+// the file holds the workspace's bytes while it holds the user's — and the
+// staleness oracle would then trust that claim for as long as the mtime happens
+// to match, which is how a replace that never happened becomes "converged".
+test('a swap that could not write records no base for bytes that never landed', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path, mineSha, theirsSha } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+  // Twice: the swap's write, and step 3's attempt to re-materialize afterwards.
+  // What is left is the state a disk that stopped answering really produces.
+  h.vault.failNext('createBinary', new Error('EIO: the disk went away mid-write'));
+  h.vault.failNext('createBinary', new Error('EIO: still gone'));
+
+  const stormed = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(stormed.failures.map((f) => f.key).sort(), [`bytes:${id}`, `materialize:${id}`]);
+  assert.equal(
+    h.state.data.contentHash[id]?.sha256, mineSha,
+    'the base still names the bytes this device actually confirmed',
+  );
+  assert.deepEqual(
+    h.vault.binarySnapshot()[`ShadowLink Staging/${id}.png`], mine,
+    'and the user’s bytes are parked where they can be seen',
+  );
+
+  const next = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(next.failures, []);
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs, 'the next pass converges');
+  assert.equal(h.state.data.contentHash[id]?.sha256, theirsSha);
+  assert.deepEqual(h.state.data.staging, {});
+});
+
+// ⚠ B13, the other half: the process died AFTER the new bytes landed. The staged
+// copy cannot go back to a path that is now occupied, so it is rescued into
+// `ShadowLink Recovered/` with a Notice — visible, and never silently dropped.
+test('B13: a crash after the new bytes landed rescues the staged copy instead of losing it', async () => {
+  const h = makeHarness();
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1);
+  const theirs = png(2, 96);
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'diagram.png', mine, theirs);
+  // The trash call is the last step of the swap: failing it models a crash with
+  // the new bytes already at the canonical path and the old ones still staged.
+  h.vault.failNext('trashLocal', new Error('EPERM: the trash folder is locked'));
+
+  await h.reconciler.reconcile('sync');
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs, 'the new bytes did land');
+
+  const next = await h.reconciler.reconcile('retry');
+
+  assert.deepEqual(h.vault.binarySnapshot()[path], theirs, 'and they stay');
+  const rescued = Object.entries(h.vault.binarySnapshot())
+    .filter(([p]) => p.startsWith('ShadowLink Recovered/'));
+  assert.equal(rescued.length, 1, 'the staged copy was rescued, not dropped');
+  assert.deepEqual(rescued[0][1], mine, 'byte-identical to what was replaced');
+  assert.deepEqual(h.state.data.staging, {}, 'and the journal is clear');
+  assert.deepEqual(next.failures, []);
+});
+
+// ⚠ B24, the replace arm. A device that cannot hold the incoming object does not
+// ask for it: the node stays live, valid, published and simply not current here.
+test('B24: a replacement over the memory cap is not fetched and the local file stands', async () => {
+  const h = makeHarness({ memoryCapBytes: () => 80 });
+  h.vault.seed(SHARE, 'd');
+  const mine = png(1, 64);
+  const theirs = png(2, 512);
+  const id = nid('A');
+  const { path } = await supersededBlob(h, id, 'clip.mov', mine, theirs);
+  h.blobs.resetCalls();
+
+  const r = await h.reconciler.reconcile('sync');
+
+  assert.deepEqual(h.blobs.calls, [], 'not one request was made');
+  assert.deepEqual(h.vault.binarySnapshot()[path], mine);
+  assert.deepEqual(r.diagnostics.tooLarge, [id]);
+  assert.deepEqual(r.failures, []);
+});
