@@ -383,7 +383,26 @@ export class PublishQueue {
 
       this.deps.tree.patchNode(id, { s: 1 });
 
-      data.contentHash[id] = { sha256: await hashOf(published), len: published.length };
+      // I17, second half: a base names bytes that are simultaneously in the
+      // WORKSPACE and on THIS DISK, and it is recorded only when both are true.
+      // When the document already held a peer's text, `published` is the
+      // workspace's copy and `text` is this disk's; if they differ there are no
+      // such bytes, and both available answers are lies with different victims.
+      // The remote's hash names a file this disk does not hold, so every reader of
+      // the base reasons about content that is not there. The local's hash is
+      // worse: `Deletions.isProvenNote` compares the base with the disk, finds
+      // they agree, and lets a remote tombstone TRASH unpublished local work that
+      // no peer can give back.
+      //
+      // So nothing is recorded, and any stale base is dropped rather than left to
+      // speak for bytes it no longer describes. Every reader defaults to rescue on
+      // ignorance, which is the answer that keeps the user's file; the divergence
+      // itself is the reconciler's to resolve, not the publisher's.
+      if (published === text) {
+        data.contentHash[id] = { sha256: await hashOf(published), len: published.length };
+      } else {
+        delete data.contentHash[id];
+      }
       data.publish[id] = { state: 'done', attempts: 0, nextAt: 0 };
       this.errors.delete(id);
     } catch (err) {

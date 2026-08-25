@@ -438,13 +438,22 @@ test('a content doc that already holds text is never overwritten', async () => {
     h.docs.calls.filter((c) => c.op === 'insertIfEmpty').length, 0,
     'insertIfEmpty is not even attempted against a non-empty doc',
   );
-  // The node IS published — by the other device — so the watermark is the remote
-  // text, never the local text this device happened to be holding.
+  // The node IS published — by the other device.
   assert.equal(h.tree.get(id)!.s, 1);
-  assert.deepEqual(h.state.data.contentHash[id], {
-    sha256: await hashOf('someone else got here first'),
-    len: 'someone else got here first'.length,
-  });
+  // ⚠ CHANGED, deliberately. This used to read "so the watermark is the remote
+  // text, never the local text this device happened to be holding", and assert
+  // `contentHash = hash('someone else got here first')`. That is the second site
+  // of the lying watermark: I17 says a base names bytes simultaneously in the
+  // WORKSPACE and on THIS DISK, and here the disk holds 'my local copy'. Recording
+  // the remote's hash makes the base describe a file that is not there — and
+  // recording the local's would let `isProvenNote` trash unpublished work. Neither
+  // is true, so neither is written. The full argument, with the deletion pass that
+  // measures the cost, is in "a base is not recorded for a remote text this disk
+  // does not hold (I17)" above.
+  assert.equal(
+    h.state.data.contentHash[id], undefined,
+    'no bytes are in the workspace and on this disk at once, so there is no base',
+  );
   assert.equal(h.state.data.publish[id].state, 'done');
 });
 
@@ -561,6 +570,59 @@ test('the same note publishes itself as soon as it has a byte in it', async () =
     ben.files, { [`${SHARE}/Sans titre.md`]: 'the first line' },
     'and the peer materializes the note the author wrote, not a decoy',
   );
+});
+
+/**
+ * ⚠ I17's second site, and the sharper half of it: a base is a claim that these
+ * exact bytes are simultaneously IN THE WORKSPACE and ON THIS DISK.
+ *
+ * When the content doc already holds a peer's text, the queue publishes nothing
+ * and marks the node `s: 1` — correctly, the workspace really does hold published
+ * content. But the disk still holds this device's own copy, so there are no bytes
+ * that satisfy both halves, and there is therefore no base to record. Both
+ * available answers are lies with different victims:
+ *
+ *  * the REMOTE's hash names bytes this disk does not hold — every reader of the
+ *    base is then reasoning about a file that is not there;
+ *  * the LOCAL's hash names bytes the workspace does not hold — and that one has
+ *    teeth, because `isProvenNote` compares the base with the disk, finds they
+ *    agree, and lets the deletion pass TRASH unpublished local work that no peer
+ *    can give back.
+ *
+ * So: no base. Ignorance is the answer that keeps the file, and the pass below is
+ * the real `Deletions` proving it.
+ */
+test('a base is not recorded for a remote text this disk does not hold (I17)', async () => {
+  const h = makeHarness();
+  const local = 'my own unpublished draft';                       // 24
+  const remote = 'the body a peer published first, which is longer';  // 48
+  const id = h.add('todo.md', local);
+  h.docs.setText(`n_${id}`, remote);
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.docs.text(`n_${id}`), remote, 'the remote copy stands (I5)');
+  assert.equal(h.tree.get(id)!.s, 1, 'and the node IS published — by the other device');
+  assert.equal(
+    h.state.data.contentHash[id], undefined,
+    'but no bytes are in the workspace and on this disk at once, so no base is recorded',
+  );
+  assert.equal(h.state.data.publish[id].state, 'done');
+
+  // What the missing base is worth. Somebody deletes the node; this device's copy
+  // is 24 bytes of work that is in no content doc anywhere.
+  const f = h.tree.get(id)!;
+  h.tree.patchNode(id, { x: f.g, xa: h.clock.now, xb: 'Ben' });
+  const verdict = await deletionPassHere(h, `${SHARE}/todo.md`);
+
+  assert.equal(verdict.batch, 1, 'the tombstone is acted on');
+  assert.equal(verdict.trashed, false, 'the unpublished draft is not trashed');
+  assert.equal(verdict.rescued, true, 'it is moved aside into ShadowLink Recovered/ instead');
+  const rescued = Object.entries(h.vault.snapshot())
+    .filter(([p]) => p.startsWith(`${RECOVERED_DIR}/`))
+    .map(([, text]) => text);
+  assert.deepEqual(rescued, [local], 'with the bytes the user actually had');
 });
 
 // ---------------------------------------------------------------- backoff
@@ -858,10 +920,7 @@ interface PeerVerdict {
  * A queue test can only assert what the tree says; the harm a bad tombstone does
  * happens on the other machine, so this builds Ben: his own vault holding the
  * last published version, his own device state with the node bound and its base
- * recorded, and the SAME content-addressed store Ada uploaded to. The context is
- * assembled the way `Reconciler.describeDesiredState` assembles it, deliberately
- * spelled out rather than shared with a helper, so a change to either one shows
- * up here as a difference instead of as a silently agreeing abstraction.
+ * recorded, and the SAME content-addressed store Ada uploaded to.
  */
 async function peerDeletionPass(
   h: Harness, id: string, name: string, bytes: Uint8Array,
@@ -880,6 +939,35 @@ async function peerDeletionPass(
     sha256: await hashOfBytes(bytes), len: bytes.length, mtime: st.mtime,
   };
   vault.resetCalls();
+
+  return await runDeletionPass(h, vault, state, path, notices);
+}
+
+/**
+ * The same pass, on THIS device, over the vault and device state the queue has
+ * just been publishing from.
+ *
+ * The queue writes the base a later deletion reads, so "what does a tombstone do
+ * to the file this device is holding?" is a question about the queue's own output
+ * and not only about a peer's. `isProvenNote` is three clauses — `s`, the recorded
+ * base, and the disk — and the queue writes two of them.
+ */
+async function deletionPassHere(h: Harness, path: string): Promise<PeerVerdict> {
+  h.vault.resetCalls();
+  return await runDeletionPass(h, h.vault, h.state, path, h.notices);
+}
+
+/**
+ * The `DeletionContext` a reconcile pass assembles, spelled out here the way
+ * `Reconciler.describeDesiredState` spells it out rather than shared with it, so a
+ * change to either one shows up as a difference instead of as a silently agreeing
+ * abstraction. Shared between the two callers ABOVE, which are the same pass on
+ * two devices and must not drift apart from each other.
+ */
+async function runDeletionPass(
+  h: Harness, vault: FakeVault, state: DeviceState, path: string, notices: string[],
+): Promise<PeerVerdict> {
+  const now = (): number => h.clock.now;
   const tickets = new Tickets(now);
 
   const entries = h.tree.entries();
@@ -947,7 +1035,7 @@ async function peerDeletionPass(
 
   const batch = deletions.collectDeletable(ctx).length;
   await deletions.apply(ctx);
-  assert.deepEqual(failures, [], "the peer's pass ran cleanly");
+  assert.deepEqual(failures, [], 'the deletion pass ran cleanly');
 
   const after = vault.binarySnapshot();
   return {
