@@ -222,6 +222,54 @@ test('every edit is written to disk immediately — there is no Save button', as
   assert.equal(plugin.settings.share.serverUrl, 'ws://host:4000');
 });
 
+/**
+ * Every editable field, the value used to exercise it, and where that value has
+ * to turn up in what was saved.
+ *
+ * One test per row rather than one test over the table, because the failure this
+ * guards is per-handler: each `onChange` ends in its own
+ * `await this.plugin.saveSettings()`, and a missing one is invisible from every
+ * other field.
+ */
+const PERSISTED: ReadonlyArray<{
+  field: string;
+  typed: string;
+  read: (s: ShadowLinkSettings) => string;
+}> = [
+  { field: 'Display name', typed: 'Ann', read: (s) => s.displayName },
+  { field: 'Cursor color', typed: '#00ff00', read: (s) => s.cursorColor },
+  { field: 'Server URL', typed: 'ws://host:4000', read: (s) => s.share.serverUrl },
+  { field: 'Server key', typed: 'sk_key', read: (s) => s.share.serverKey },
+  { field: 'Workspace ID', typed: 'team-alpha', read: (s) => s.share.workspaceId },
+  { field: 'Shared folder', typed: 'Shared', read: (s) => s.share.sharedFolder },
+];
+
+// ⚠ WHY THIS IS SIX TESTS AND NOT AN ASSERTION ON THE LIVE OBJECT.
+//
+// The tab writes THROUGH `plugin.settings`, which is the same object a running
+// session captured, so an edit takes effect immediately whether or not it is ever
+// saved. Drop the `saveSettings()` from one handler and nothing on screen and
+// nothing in the session changes: the field accepts the value, the status line
+// agrees, syncing follows it. The value is simply not in `data.json`, so the next
+// launch loads the previous one — and for the Workspace ID that means silently
+// reconnecting to the workspace the user just moved away from.
+//
+// So each of these asserts the SAVED copy, not the live one. `saveSettings` in
+// the fake deep-copies, which is what makes "reached the disk on this keystroke"
+// distinguishable from "is in the object by now".
+for (const { field: name, typed, read } of PERSISTED) {
+  test(`"${name}" reaches data.json and not only the live settings object`, async () => {
+    const plugin = fakePlugin();
+    const tab = await open(plugin);
+
+    await box(tab, name).type(typed);
+
+    assert.equal(read(plugin.settings), typed, 'the live object took the edit');
+    assert.equal(plugin.saves.length, 1, 'and exactly one save carried it out of memory');
+    assert.equal(read(plugin.saves[0]!), typed, 'which is what the next launch would load');
+  });
+}
+
 // Two fields rewrite what was typed before saving it. Both are helpful; both are
 // silent; and for one input both erase the field entirely, which is how a share
 // can become "not configured" from a single keystroke.
