@@ -132,6 +132,32 @@ function tick(): Promise<void> {
   return new Promise<void>((resolve) => { setTimeout(resolve, 0); });
 }
 
+/**
+ * Spin the event loop until `ready()` holds.
+ *
+ * Bounded and loud: a lane that never fills must fail with the reason rather than
+ * hang the suite until the runner's own timeout reports nothing useful.
+ */
+async function until(ready: () => boolean, why: string): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    if (ready()) return;
+    await tick();
+  }
+  throw new Error(`timed out waiting for ${why}`);
+}
+
+/** A latch a test opens by hand: work parks on `open` until `release` is called. */
+function gate(): { open: Promise<void>; release: () => void } {
+  let release = (): void => undefined;
+  const open = new Promise<void>((resolve) => { release = () => { resolve(); }; });
+  return { open, release };
+}
+
+/** How many nodes of `kind` the tree currently reports as published. */
+function publishedCount(h: Harness, kind: 'f' | 'b'): number {
+  return h.tree.entries().filter(([, f]) => f.k === kind && f.s === 1).length;
+}
+
 /** A plain `VaultPort` view of a `FakeVault`, so one method can be overridden. */
 function portOf(inner: FakeVault): VaultPort {
   return {
@@ -776,6 +802,17 @@ function blobPortOf(inner: FakeBlobs, overrides: Partial<BlobPort>): BlobPort {
   return { ...base, ...overrides };
 }
 
+/** The same for the note lane's document access, so one method can be gated. */
+function docPortOf(inner: FakeDocs, overrides: Partial<DocPort>): DocPort {
+  const base: DocPort = {
+    openHeadless: (room) => inner.openHeadless(room),
+    insertIfEmpty: (handle, text) => inner.insertIfEmpty(handle, text),
+    flush: (handle) => inner.flush(handle),
+    close: (handle) => { inner.close(handle); },
+  };
+  return { ...base, ...overrides };
+}
+
 test('B1: an attachment uploads once, sets `s` and `b` together, and records the base', async () => {
   const h = makeHarness();
   const bytes = png();
@@ -1255,35 +1292,81 @@ test('a failed attachment publish keeps its intent, so requeueing cannot reset t
   assert.equal(h.state.data.publish[id].nextAt, NOW + PUBLISH_BACKOFF_MS[0]);
 });
 
-// One 200 MB upload must not occupy every slot and park the publication of every
-// note in the vault behind it.
+// ⚠ The property §8.4 exists for is not "the attachment lane is capped" — it is
+// "a 200 MB video occupying every slot must not park the publication of every
+// note in the vault behind it for the whole upload". A test that instruments only
+// the attachment path measures the cap and says nothing at all about that:
+// serializing the two lanes outright, `await Promise.all(lane(attachments, …))`
+// and only then the notes, leaves such a test green.
+//
+// So this one holds BOTH lanes open at once and watches them overlap. Each lane
+// is parked at its own gate; the test waits for both to fill to their own width
+// SIMULTANEOUSLY, which is unreachable under any serialization in either order,
+// and then releases the notes alone and watches every one of them publish while
+// an attachment upload is still open.
 test('attachments drain in their own lane, and notes keep theirs', async () => {
   const h = makeHarness();
   for (let i = 0; i < 6; i++) h.addBlob(`img-${i}.png`, png(i));
   for (let i = 0; i < 6; i++) h.add(`note-${i}.md`, `body ${i}`);
 
-  let inFlight = 0;
-  let peak = 0;
-  const gated = blobPortOf(h.blobs, {
+  const uploads = gate();
+  const seeds = gate();
+  let blobsInFlight = 0;
+  let blobPeak = 0;
+  let notesInFlight = 0;
+  let notePeak = 0;
+
+  // The 200 MB video: a `has` probe that does not come back until the test says so.
+  const gatedBlobs = blobPortOf(h.blobs, {
     has: async (sha) => {
-      inFlight += 1;
-      peak = Math.max(peak, inFlight);
-      await tick();
+      blobsInFlight += 1;
+      blobPeak = Math.max(blobPeak, blobsInFlight);
+      await uploads.open;
       const answer = await h.blobs.has(sha);
-      inFlight -= 1;
+      blobsInFlight -= 1;
       return answer;
     },
   });
+  const gatedDocs = docPortOf(h.docs, {
+    openHeadless: async (room) => {
+      notesInFlight += 1;
+      notePeak = Math.max(notePeak, notesInFlight);
+      await seeds.open;
+      const opened = await h.docs.openHeadless(room);
+      notesInFlight -= 1;
+      return opened;
+    },
+  });
   const q = new PublishQueue({
-    docs: h.docs, vault: h.vault, blobs: gated, state: h.state, tree: h.tree,
+    docs: gatedDocs, vault: h.vault, blobs: gatedBlobs, state: h.state, tree: h.tree,
     openNodeId: () => null, now: () => h.clock.now, settleMs: 0,
   });
 
   for (const id of Object.keys(h.state.data.owned)) q.enqueue(id);
-  await q.drain();
+  const drained = q.drain();
 
-  assert.equal(peak, BLOB_PUBLISH_CONCURRENCY, 'the attachment lane is capped at its own width');
-  assert.equal(q.pendingCount(), 0, 'and everything published');
+  // Both lanes saturated at the same instant. Under `lane(attachments)` then
+  // `lane(notes)` the note count never leaves zero; under the reverse ordering the
+  // attachment count never does. Either way this never becomes true.
+  await until(
+    () => blobsInFlight === BLOB_PUBLISH_CONCURRENCY && notesInFlight === PUBLISH_CONCURRENCY,
+    'both lanes to fill to their own width at once',
+  );
+  assert.equal(blobPeak, BLOB_PUBLISH_CONCURRENCY, 'the attachment lane is capped at its width');
+  assert.equal(notePeak, PUBLISH_CONCURRENCY, 'and the note lane runs at its own, wider one');
+
+  // The whole point, stated as the user would state it: the notes finish while
+  // the upload is still going.
+  seeds.release();
+  await until(() => publishedCount(h, 'f') === 6, 'every note to publish');
+  assert.ok(blobsInFlight > 0, 'and the attachment lane was still mid-upload the whole time');
+  assert.equal(publishedCount(h, 'b'), 0, 'no attachment had finished yet');
+
+  uploads.release();
+  await drained;
+
+  assert.equal(publishedCount(h, 'b'), 6, 'and then the attachments land too');
+  assert.equal(q.pendingCount(), 0, 'everything published');
 });
 
 // ---------------------------------------------------------------- P2 §3.6: the seed guard
