@@ -16,8 +16,8 @@ the first minute.
 
 > **Before you install it.** The engine has been under test for months; the plugin
 > was first opened inside a real Obsidian this week, and that session found three
-> bugs. [Where it is today](#where-it-is-today) names all three, what they can
-> still do to you, and what they could not reach. Read it before you decide.
+> bugs in twenty minutes. [Where it is today](#where-it-is-today) names all three,
+> what fixing them cost, and what they could not reach. Read it before you decide.
 
 ---
 
@@ -239,18 +239,31 @@ travels. Separately, each device recorded the *other* device's copy as its water
 for what it held locally, and that watermark is what the deletion path consults when
 choosing between the vault trash and a rescue.
 
-As of this commit: all three are diagnosed to the line and written up, and none of
-the three fixes is in the tree yet. The editor bind is being moved out of the
-"cannot be tested without a GUI" category, where it never belonged, so the next
-version of this bug fails a test instead of a share.
+All three are fixed, and the editor bind has left the "cannot be tested without a
+GUI" category it never belonged in. That took seven rounds, six of which were
+thrown away: the first attempt destroyed characters typed while a note was
+opening, the next disabled the retry loop it depended on, another wrote U+FFFD
+into the shared document whenever somebody swapped one emoji for another, and
+two more added a guard that guessed. **Every one of those was caught before it
+shipped, and every one was caught by running something rather than by reading**
+— which is the same lesson as the original bug, learned five more times.
 
-And the part I would want to know if I were installing it. The first bug can leave
-you looking at a stale note. The second can put an empty file on your disk. The
-third can send a deleted file to the vault trash when it should have gone to
-`ShadowLink Recovered/`. What none of the three did, and none could reach, is
-destroy a file with nothing left behind: every removal path in the source resolves
-to the vault trash or to a rescue, and that is enforced on shipped code rather than
-promised. Everything in that session came back.
+What survived is smaller than what was tried. The two rounds that held were the
+two that deleted a mechanism rather than adding one.
+
+And the part I would want to know if I were installing it. Before the fixes, the
+first bug could leave you looking at a stale note, the second could put an empty
+file on your disk, and the third could send a deleted file to the vault trash when
+it should have gone to `ShadowLink Recovered/`. What none of the three did, and
+none could reach, is destroy a file with nothing left behind: every removal path in
+the source resolves to the vault trash or to a rescue, and that is enforced on
+shipped code rather than promised. Everything in that session came back.
+
+One thing those rounds cost, and it is in the limitations below: a note you have
+just created is shared when Obsidian next saves it to disk, and becomes
+collaborative the next time you open it. The version that did it instantly needed
+the plugin to read your editor rather than your file, and that is how somebody
+else's note ends up published under your new one's name.
 
 So: treat it as a beta, keep the backups you would keep anyway, and please
 [open an issue](https://github.com/Phobetore/ShadowLink/issues) when something
@@ -300,6 +313,13 @@ Real limitations of the current release, not hypothetical ones.
   [Where it is today](#where-it-is-today) is that today it is not. Attachments are
   unaffected: every pass checks whether each one is current, though on a cold share
   that re-hashing is spread over several passes.
+- **A brand-new note is shared a beat late.** Its first bytes are taken from the
+  file, not from the editor, so it reaches the workspace once Obsidian saves it —
+  a couple of seconds of not typing — and becomes collaborative the next time you
+  open it. Nothing is lost meanwhile and the status bar says what is waiting. The
+  instant version is only possible if the plugin treats the editor as evidence of
+  what a new note is, which is exactly how another note's body gets published
+  under this one's name.
 - **Two people replacing one attachment produce two files, not one**, as described
   above — including two people editing one `.canvas` at the same time.
 - **`ShadowLink Recovered/` is never pruned.** It is an ordinary folder in your
