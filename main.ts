@@ -78,7 +78,7 @@ import { ObsidianBlobPort } from './src/sync/ObsidianBlobPort';
 import { ObsidianDocPort } from './src/sync/ObsidianDocPort';
 import { ObsidianStatePort, treeSnapshotKey } from './src/sync/ObsidianStatePort';
 import { ObsidianVaultPort } from './src/sync/ObsidianVaultPort';
-import { PublishQueue } from './src/sync/PublishQueue';
+import { PublishQueue, type ParkReason } from './src/sync/PublishQueue';
 import { Reconciler } from './src/sync/Reconciler';
 import type { DeferredAttachment, ReconcileCause } from './src/sync/Reconciler';
 import { Tickets } from './src/sync/Tickets';
@@ -191,6 +191,34 @@ function toCause(reason: string): ReconcileCause {
   return reason === 'remote' || reason === 'sync' || reason === 'bootstrap' || reason === 'retry'
     ? reason
     : 'sync';
+}
+
+/**
+ * The tooltip line for entries the publish queue parked.
+ *
+ * Two refusals, two sentences, because they ask the user for different things:
+ * one ends when they type, the other when they rename the file. "Waiting to
+ * upload" would be false for both, and "synced" alone is false in the direction
+ * that stops them looking.
+ */
+function parkedLine(parked: ReadonlyArray<{ reason: ParkReason }>): string {
+  const empty = parked.filter((p) => p.reason === 'empty').length;
+  const notText = parked.length - empty;
+  const lines: string[] = [];
+  if (empty > 0) {
+    lines.push(
+      `${empty} ${empty === 1 ? 'note is' : 'notes are'} empty and ${empty === 1 ? 'has' : 'have'} `
+      + `not been shared yet — ${empty === 1 ? 'it' : 'they'} will be shared as soon as you type.`,
+    );
+  }
+  if (notText > 0) {
+    lines.push(
+      `${notText} ${notText === 1 ? 'file is' : 'files are'} named .md but `
+      + `${notText === 1 ? 'is' : 'are'} not text — rename `
+      + `${notText === 1 ? 'it' : 'them'} to share ${notText === 1 ? 'it' : 'them'}.`,
+    );
+  }
+  return lines.join('\n');
 }
 
 /** Resolves TRUE only on a genuine provider `sync` event. A timeout is not a sync (I3). */
@@ -311,6 +339,9 @@ class SyncRuntime {
       // deferring on that node for as long as the note stays open — a full
       // reconcile pass every 30 seconds, and a status bar that never says synced.
       markPublished: (nodeId) => { this.queue.markPublished(nodeId); },
+      // The other half of the same I7 handoff: a note that CLOSES stops being
+      // deferred, and a pass now beats one up to 30 seconds from now.
+      scheduleReconcile: (cause) => { this.scheduleReconcile(toCause(cause)); },
     });
 
     this.queue = new PublishQueue({
@@ -534,9 +565,7 @@ class SyncRuntime {
 
     // The ladder in `state.publish` is measured in minutes; this is only what
     // guarantees somebody asks once a rung comes due.
-    this.retryTimer = setInterval(() => {
-      if (this.queue.pendingCount() > 0) this.scheduleReconcile('retry');
-    }, PUBLISH_RETRY_MS);
+    this.retryTimer = setInterval(() => { void this.drainTick(); }, PUBLISH_RETRY_MS);
 
     try {
       await this.bootstrap.run();
@@ -589,6 +618,26 @@ class SyncRuntime {
     if (answer !== 'dismiss') return;
     this.plugin.settings.attachmentFolderWarningDismissed = true;
     await this.plugin.saveSettings();
+  }
+
+  /**
+   * TWO questions, deliberately, and this is what the park got wrong.
+   *
+   * `pendingCount()` is the STATUS BAR's number and excludes parked entries — an
+   * empty note, a `.md` file that is not text — because no upload is owed for
+   * them and no amount of waiting changes that. The DRAIN must still reach them,
+   * and nothing else ever will: `VaultWatcher.onModify` returns early for a note
+   * by design (I7), so this interval is the ONLY periodic drain in the plugin.
+   * Narrowing the number without widening this is what silently unhooked it, and
+   * an empty note that could never publish again is not a status-bar bug.
+   *
+   * `repark()` is a `stat` per parked entry, typically zero, rather than a full
+   * pass — an idle vault holding one permanently empty note would otherwise pay
+   * a tree derivation and a stat per attachment every 30 seconds for ever.
+   */
+  private async drainTick(): Promise<void> {
+    if (this.queue.pendingCount() > 0) { this.scheduleReconcile('retry'); return; }
+    if (await this.queue.repark()) this.scheduleReconcile('retry');
   }
 
   async dispose(): Promise<void> {
@@ -710,7 +759,7 @@ class SyncRuntime {
     // remedy, nothing to download, and no honest place in a count of what is
     // outstanding, because nothing about it is outstanding for anybody else. It
     // reaches the tooltip and stops there.
-    return syncedStatus(
+    const synced = syncedStatus(
       this.shareRoot,
       this.reconciler.deferredAttachments,
       this.reconciler.tooLargeAttachments,
@@ -718,6 +767,14 @@ class SyncRuntime {
       blobMemoryCap(),
       this.reconciler.uncheckableAttachments,
     );
+    // The same principle one more time. A parked entry is not "waiting to
+    // upload" — waiting is not what fixes either of these — but a bare "synced"
+    // beside a note that is not being shared is false in the direction that
+    // stops the user looking. So it stays out of the count and reaches the
+    // tooltip, worded as what would actually end it.
+    const parked = this.queue.parked();
+    if (parked.length === 0) return synced;
+    return { text: synced.text, tooltip: `${synced.tooltip}\n${parkedLine(parked)}` };
   }
 
   // ---------------------------------------------------------- §7.3 downloads

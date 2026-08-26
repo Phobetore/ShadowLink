@@ -302,7 +302,9 @@ const IN_MEMORY: Record<string, string[]> = {
   'src/sync/DiskIndex.ts': ['this.byFold'],
   'src/sync/ObsidianDocPort.ts': ['this.live', 'this.rooms'],
   'src/sync/ProviderAck.ts': ['this.listeners'],
-  'src/sync/PublishQueue.ts': ['this.errors', 'this.parkedNodes'],
+  // `parkedStat` is an in-memory Map of what a parked entry's file looked like,
+  // so `repark` can answer with one `stat` instead of a pass.
+  'src/sync/PublishQueue.ts': ['this.errors', 'this.parkedNodes', 'this.parkedStat'],
   'src/sync/Reconciler.ts': ['ctx.disk', 'ctx.boundAtFold', 'ctx.have', 'this.localHashes'],
   'src/sync/Tickets.ts': ['this.store'],
   'src/sync/VaultWatcher.ts': ['this.decisionPending'],

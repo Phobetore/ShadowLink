@@ -353,6 +353,14 @@ export interface WorkspaceSessionDeps {
    * answer.
    */
   markPublished?: (nodeId: string) => void;
+  /**
+   * Ask for a reconcile pass. Called when a session CLOSES, and that is the whole
+   * handoff: `publishOne` defers on a node this session holds open (I7), and the
+   * deferral lifts the moment `openNodeId()` goes null. Without this the queue
+   * finds out at the next 30-second tick, so a note the user closed sits
+   * unpublished for up to half a minute for no reason.
+   */
+  scheduleReconcile?: (cause: string) => void;
   now?: () => number;
   /** Bound wait for the tree to name a node for the path (spec §6.1). */
   nodeWaitMs?: number;
@@ -895,6 +903,11 @@ export class WorkspaceSession {
       /* the view is already gone; nothing left to unbind */
     }
     release(session.provider, session.doc);
+    // `openNodeId()` is null from here, so the queue's I7 deferral has just
+    // lifted. Telling it now rather than letting the 30-second tick find out is
+    // the difference between a note publishing when the user closes it and half
+    // a minute later.
+    this.deps.scheduleReconcile?.('sync');
   }
 
   /**

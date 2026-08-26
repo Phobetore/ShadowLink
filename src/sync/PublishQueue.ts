@@ -79,6 +79,16 @@ import type { VaultPort } from './VaultPort.ts';
 
 // ============================================================ public surface
 
+/**
+ * Why a pending entry is not work.
+ *
+ * Two refusals, worded differently to the user because they call for different
+ * things: `'empty'` ends when the author types, `'not-text'` ends when somebody
+ * renames the file. Neither ends by waiting, which is why neither is "waiting to
+ * upload".
+ */
+export type ParkReason = 'empty' | 'not-text';
+
 export interface PublishQueueDeps {
   docs: DocPort;
   vault: VaultPort;
@@ -159,7 +169,13 @@ export class PublishQueue {
    * (I7) is "not now", not "not ever" — closing the tab is all it takes, and the
    * file is full of the user's words meanwhile. That one stays counted.
    */
-  private readonly parkedNodes = new Set<string>();
+  private readonly parkedNodes = new Map<string, ParkReason>();
+
+  /**
+   * What the file looked like when it was parked, so `repark` can tell whether
+   * it has moved without running a whole pass.
+   */
+  private readonly parkedStat = new Map<string, { bytes: number; mtime?: number }>();
 
   /**
    * The server's per-file ceiling, once this session has managed to ask for it.
@@ -229,7 +245,7 @@ export class PublishQueue {
     // entry counts as work again from this moment rather than from the drain
     // that re-examines it — this path HAS an event behind it (`onModify` for an
     // attachment), which is exactly what a note does not have.
-    this.parkedNodes.delete(nodeId);
+    this.unpark(nodeId);
     this.deps.state.schedulePersist();
   }
 
@@ -253,16 +269,66 @@ export class PublishQueue {
    * Pending ids the last drain refused over the state of the file itself — an
    * empty note (I6), or a `.md` node whose bytes are not text (§3.6).
    *
-   * They are still retried on every drain; this is what keeps them from being
-   * invisible now that they are out of `pendingCount()`. The reason for each is
-   * in `lastError`, and the ones that warrant it have already said so by Notice.
+   * They are still retried; this is what keeps them from being invisible now
+   * that they are out of `pendingCount()`. THE REASON TRAVELS WITH THEM because
+   * the status bar words the two cases differently, and it has to: "it will be
+   * shared as soon as you type in it" and "rename it to share it" are different
+   * instructions to the user, and neither is "waiting to upload".
    */
-  parked(): string[] {
-    const out: string[] = [];
-    for (const id of this.parkedNodes) {
-      if (this.deps.state.data.publish[id]?.state === 'pending') out.push(id);
+  parked(): Array<{ id: string; reason: ParkReason }> {
+    const out: Array<{ id: string; reason: ParkReason }> = [];
+    for (const [id, reason] of this.parkedNodes) {
+      if (this.deps.state.data.publish[id]?.state === 'pending') out.push({ id, reason });
     }
-    return out.sort(compare);
+    return out.sort((a, b) => compare(a.id, b.id));
+  }
+
+  /**
+   * Ask, cheaply, whether any parked entry's file has moved — and unpark it if
+   * so. Returns whether anything was unparked.
+   *
+   * THIS IS THE OTHER HALF OF THE PARK, and leaving it out is what turned a
+   * status-bar fix into permanent content loss. Nothing else in the plugin ever
+   * re-offers a note: `VaultWatcher.onModify` returns early for one by design
+   * (I7), so `main.ts`'s interval is the ONLY periodic drain there is, and that
+   * interval asks `pendingCount() > 0`. Take parked entries out of that number
+   * without giving the interval a second question and the drain can never reach
+   * them again — an empty note publishes on the first keystroke and then never.
+   *
+   * A `stat` per parked entry, typically zero of them, rather than a full pass:
+   * an idle vault holding one permanently empty note would otherwise pay a tree
+   * derivation and a stat per attachment every 30 seconds for the life of the
+   * vault. A `stat` that cannot answer LEAVES THE ENTRY PARKED (I2): "I could
+   * not look" must never become "assume it changed", or an unhappy filesystem
+   * becomes a drain that publishes nothing and re-parks on a 30-second cadence.
+   */
+  async repark(): Promise<boolean> {
+    let woke = false;
+    for (const [id, reason] of [...this.parkedNodes]) {
+      if (this.deps.state.data.publish[id]?.state !== 'pending') {
+        this.unpark(id);
+        continue;
+      }
+      const path = this.deps.state.data.materialized[id];
+      if (path === undefined || path === '') continue;
+      let st: Awaited<ReturnType<VaultPort['stat']>>;
+      try {
+        st = await this.deps.vault.stat(path);
+      } catch {
+        continue;                                        // I2: asked, not answered
+      }
+      if (st === null) continue;
+      const was = this.parkedStat.get(id);
+      // An empty note needs a byte in it; a file that is not text needs to have
+      // been rewritten, and only its size and mtime can say so from out here.
+      const moved = reason === 'empty'
+        ? st.bytes > 0
+        : was === undefined || st.bytes !== was.bytes || st.mtime !== was.mtime;
+      if (!moved) continue;
+      this.unpark(id);
+      woke = true;
+    }
+    return woke;
   }
 
   /**
@@ -404,7 +470,7 @@ export class PublishQueue {
     // Past every deferral, so this attempt is genuinely going to look at the
     // file. Whatever the last drain concluded about it stops being current here,
     // and is re-established below only if this attempt reaches the same refusal.
-    this.parkedNodes.delete(id);
+    this.unpark(id);
 
     const path = data.materialized[id];
     if (path === undefined || path === '') {
@@ -470,7 +536,7 @@ export class PublishQueue {
       // lifetime of the vault and the bar never says "synced" again. There is no
       // upload owed here: there is nothing to upload.
       if (published.length === 0) {
-        this.parkedNodes.add(id);
+        await this.park(id, 'empty', path);
         return;
       }
 
@@ -539,7 +605,8 @@ export class PublishQueue {
     // bytes for every invalid one — so this cannot let mojibake through.
     if (encoded === st.bytes || encoded + BOM_BYTES === st.bytes) return true;
 
-    this.parkedNodes.add(id);
+    this.parkedNodes.set(id, 'not-text');
+    this.parkedStat.set(id, { bytes: st.bytes, mtime: st.mtime });
     this.errors.set(id, new Error(
       `${path} is ${st.bytes} bytes on disk but decodes to ${encoded}: not UTF-8 text`,
     ));
@@ -831,6 +898,27 @@ export class PublishQueue {
     return this.serverMaxBytes;
   }
 
+  /**
+   * Record a refusal only the user's file can lift, together with what that file
+   * looked like — which is what `repark` compares against, and the whole reason
+   * it can answer with one `stat` instead of a pass.
+   */
+  private async park(id: string, reason: ParkReason, path: string): Promise<void> {
+    this.parkedNodes.set(id, reason);
+    try {
+      const st = await this.deps.vault.stat(path);
+      if (st === null) this.parkedStat.delete(id);
+      else this.parkedStat.set(id, { bytes: st.bytes, mtime: st.mtime });
+    } catch {
+      this.parkedStat.delete(id);                        // I2: asked, not answered
+    }
+  }
+
+  private unpark(id: string): void {
+    this.parkedNodes.delete(id);
+    this.parkedStat.delete(id);
+  }
+
   /** I17: the base — what this device confirmed is simultaneously on disk and in the tree. */
   private recordBlob(id: string, sha256: string, len: number, mtime?: number): void {
     this.deps.state.data.contentHash[id] = mtime === undefined
@@ -848,7 +936,7 @@ export class PublishQueue {
     // Nothing owed, nothing refused. `parked()` already filters on the entry's
     // state, so this is hygiene rather than correctness — but a set that only
     // ever grows is how the next reader is misled.
-    this.parkedNodes.delete(id);
+    this.unpark(id);
   }
 
   /**

@@ -218,6 +218,39 @@ function fixtureBlock(src: string, anchor: string): string {
   return blockOf(src, anchor, `no such block: ${anchor}`);
 }
 
+/**
+ * The block whose opening brace is the LAST character of `anchor`.
+ *
+ * `blockOf` starts at the first `{` after the anchor, which is right whenever
+ * that brace opens the body — and wrong for a signature whose RETURN TYPE is an
+ * object literal, because there the first brace belongs to the type and its
+ * match ends the "block" before the method has begun. A guard reading an empty
+ * body would then assert green about a method it never looked at, which is
+ * exactly the failure this file's reader exists to rule out.
+ */
+function bodyOf(src: string, anchor: string, missing: string): string {
+  const { code, skeleton } = readable(src);
+  const start = code.indexOf(anchor);
+  assert.notEqual(start, -1, missing);
+  assert.equal(code.indexOf(anchor, start + 1), -1, `"${anchor.trim()}" is not unique in main.ts`);
+  assert.equal(anchor[anchor.length - 1], '{', 'the anchor must END at the body\'s brace');
+
+  let depth = 0;
+  for (let i = start + anchor.length - 1; i < skeleton.length; i += 1) {
+    if (skeleton[i] === '{') depth += 1;
+    else if (skeleton[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  throw new Error(`unbalanced braces after "${anchor.trim()}"`);
+}
+
+/** A method body in `main.ts`, for a signature carrying braces of its own. */
+function body(anchor: string, missing: string): string {
+  return bodyOf(MAIN, anchor, missing);
+}
+
 // ============================================================ the reader's own tests
 
 // Every assertion below rests on this, so it is checked against a source built
@@ -249,6 +282,30 @@ test('the source reader is not fooled by a brace in a string, a comment or a reg
   );
   assert.ok(found.endsWith('}'));
   assert.ok(found.includes('/^[{}]+$/'), 'the source is returned intact, not the skeleton');
+});
+
+test('a signature whose return type carries braces is read to the end of its BODY', () => {
+  // `blockOf` starts at the first `{` after the anchor. For `status(): { text:
+  // string; tooltip: string } {` that brace is the TYPE's, and its match ends
+  // the "block" before the method has begun — so every assertion about the body
+  // would pass by looking at nothing at all. That is the fail-open shape this
+  // whole reader exists to rule out.
+  const src = '\nfunction shaped(): { a: string; b: string } {\n  return { a: BODY, b: \'x\' };\n}\n';
+  const anchor = '\nfunction shaped(): { a: string; b: string } {';
+
+  assert.equal(
+    fixtureBlock(src, anchor).includes('BODY'), false,
+    'blockOf stops at the return type — which is why bodyOf exists',
+  );
+  assert.ok(
+    bodyOf(src, anchor, 'no such block').includes('BODY'),
+    'bodyOf starts at the anchor\'s own final brace and reads the body',
+  );
+  assert.throws(
+    () => bodyOf(src, '\nfunction shaped(): ', 'no such block'),
+    /must END at the body/,
+    'an anchor that does not end at a brace is a guard about to read the wrong span',
+  );
 });
 
 test('the source reader refuses an anchor it cannot find, or one that is not unique', () => {
@@ -403,5 +460,80 @@ test('the attachment-folder warning is actually reachable on start (§7.5)', () 
   assert.ok(
     warn.includes('attachmentFolderWarningDismissed = true') && warn.includes('saveSettings()'),
     'dismissing must be persisted',
+  );
+});
+
+// §6.2. THE ONLY PERIODIC DRAIN IN THE PLUGIN, and it has to ask two questions.
+//
+// `VaultWatcher.onModify` returns early for a note by design (I7), so nothing
+// but this interval ever re-offers one. `pendingCount()` deliberately EXCLUDES
+// the entries the queue parked — an empty note, a `.md` file that is not text —
+// because no upload is owed for them and no waiting changes that; the last round
+// narrowed that number without widening this interval, and an empty note that
+// can never publish again is not a status-bar bug.
+//
+// Both halves are pinned here because this is a two-line method somebody will
+// try to simplify back into one.
+test('the retry interval asks about parked entries as well as pending ones (§6.2)', () => {
+  const timer = block(
+    '\n    this.retryTimer = setInterval(',
+    'main.ts no longer installs the publish retry interval',
+  );
+  assert.ok(timer.includes('drainTick()'), 'the interval must reach the drain tick');
+
+  const tick = block(
+    '\n  private async drainTick(): Promise<void> {',
+    'main.ts no longer defines drainTick',
+  );
+  assert.ok(
+    tick.includes('queue.pendingCount()'),
+    'the tick must still ask whether an upload is owed',
+  );
+  assert.ok(
+    tick.includes('queue.repark()'),
+    'and it MUST ask whether a parked entry\'s file has moved — nothing else ever will',
+  );
+  assert.equal(
+    (tick.match(/scheduleReconcile\(/g) ?? []).length, 2,
+    'each question that answers yes asks for a pass',
+  );
+});
+
+test('the status bar reads the count that excludes parked entries (§6.2)', () => {
+  // `body`, not `block`: this signature's return type is an object literal, so
+  // the first brace after the anchor is the TYPE's and its match would end the
+  // block before the method started.
+  const status = body(
+    '\n  status(): { text: string; tooltip: string } {',
+    'main.ts no longer defines status()',
+  );
+  assert.ok(
+    status.includes('this.queue.pendingCount()'),
+    '"N file(s) waiting to upload" is the count of work, not of entries',
+  );
+  assert.ok(
+    status.includes('this.queue.parked()'),
+    'and a parked entry still reaches the tooltip: a bare "synced" beside a note that '
+    + 'is not being shared is false in the direction that stops the user looking',
+  );
+});
+
+// §6.2's other handoff. `publishOne` defers on a node the session holds open,
+// and both ends of that deferral have to be told when it lifts: the session
+// publishes a note it holds (so the entry must be closed), and a note that
+// CLOSES stops being deferred (so a pass is owed now rather than up to 30
+// seconds from now).
+test('both ends of the I7 publish deferral are wired to the session (§6.2)', () => {
+  const session = block(
+    '\n    this.session = new WorkspaceSession({',
+    'main.ts no longer constructs the WorkspaceSession',
+  );
+  assert.ok(
+    /markPublished:[^,]*queue\.markPublished\(/.test(session),
+    'the session is the one writer of `s` that is not the queue, so it must tell the queue',
+  );
+  assert.ok(
+    /scheduleReconcile:[^,]*scheduleReconcile\(/.test(session),
+    'and closing a note must ask for the pass that publishes it',
   );
 });

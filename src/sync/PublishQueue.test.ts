@@ -646,7 +646,7 @@ test('an empty note does not pin the status bar on "syncing…" for ever', async
   // Both halves matter, and they point in opposite directions.
   assert.equal(h.state.data.publish[id].state, 'pending', 'the entry stays: it is the retry');
   assert.equal(h.queue.pendingCount(), 0, 'and nothing is reported as waiting to upload');
-  assert.deepEqual(h.queue.parked(), [id], 'it is not invisible either');
+  assert.deepEqual(h.queue.parked(), [{ id, reason: 'empty' }], 'it is not invisible either');
 });
 
 test('a parked note rejoins the count the moment a drain sees content in it', async () => {
@@ -654,7 +654,7 @@ test('a parked note rejoins the count the moment a drain sees content in it', as
   const id = h.add('Sans titre.md', '');
   h.queue.enqueue(id);
   await h.queue.drain();
-  assert.deepEqual(h.queue.parked(), [id]);
+  assert.deepEqual(h.queue.parked(), [{ id, reason: 'empty' }]);
 
   h.vault.seed(`${SHARE}/Sans titre.md`, 'f', 'the first line');
   await h.queue.drain();
@@ -681,9 +681,115 @@ test('a note that is not text is parked too, and stops pinning the bar as well',
   await h.queue.drain();
 
   assert.equal(h.state.data.publish[id].state, 'pending', 'still retried');
-  assert.deepEqual(h.queue.parked(), [id]);
+  assert.deepEqual(h.queue.parked(), [{ id, reason: 'not-text' }]);
   assert.equal(h.queue.pendingCount(), 0, 'and not counted as an upload in progress');
   assert.ok(h.queue.lastError(id) !== undefined, 'the reason is still in diagnostics');
+});
+
+/**
+ * ⚠ The regression the PARK ships on its own, and it is worse than the one the
+ * park fixed.
+ *
+ * Nothing else in the plugin ever re-offers a note. `VaultWatcher.onModify`
+ * returns early for one by design (I7), so `main.ts`'s 30-second interval is the
+ * ONLY periodic drain there is — and that interval asks `pendingCount() > 0`.
+ * Take parked entries out of that number without giving the interval a second
+ * question, and the drain can never reach them again: an empty note publishes
+ * itself on the first keystroke and then never, and a `.md` file the user
+ * renames back to text stays refused for the lifetime of the vault.
+ *
+ * `repark()` is that second question, and it is a `stat` per parked entry —
+ * typically zero of them — rather than a full pass, because an idle vault
+ * holding one permanently empty note would otherwise pay a tree derivation and a
+ * stat per attachment every 30 seconds for ever.
+ */
+test('a park is not a grave: repark is what lets the drain reach one again', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.queue.pendingCount(), 0, 'the interval\'s first question says nothing is owed');
+  assert.equal(await h.queue.repark(), false, 'and its second agrees while the file is empty');
+  assert.equal(h.vault.callsTo('stat').length > 0, true, 'having actually looked at the file');
+
+  h.vault.seed(`${SHARE}/Sans titre.md`, 'f', 'the first line');
+
+  assert.equal(await h.queue.repark(), true, 'the file changed, so there is work again');
+  assert.equal(h.queue.pendingCount(), 1, 'and the bar says so too');
+  await h.queue.drain();
+  assert.equal(h.tree.get(id)!.s, 1);
+  assert.deepEqual(h.queue.parked(), []);
+});
+
+test('a stat that cannot answer leaves the entry parked (I2)', async () => {
+  // "I could not look" must never become "assume it changed": an unparked entry
+  // that is still empty is a drain that publishes nothing and re-parks, on a
+  // 30-second cadence, for as long as the filesystem is unhappy.
+  const inner = new FakeVault();
+  const blind = { on: false };
+  const h = makeHarness({
+    vault: {
+      ...portOf(inner),
+      stat: (path: string) => (blind.on
+        ? Promise.reject(new Error('EIO'))
+        : inner.stat(path)),
+    },
+  });
+  const id = h.tree.createNode({ k: 'f', d: '', n: 'Sans titre.md' }, NOW);
+  inner.seed(SHARE, 'd');
+  inner.seed(`${SHARE}/Sans titre.md`, 'f', '');
+  h.state.data.owned[id] = true;
+  h.state.data.materialized[id] = `${SHARE}/Sans titre.md`;
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  assert.deepEqual(h.queue.parked().map((p) => p.id), [id], 'parked while it is empty');
+
+  // The author types, and the filesystem stops answering in the same moment.
+  inner.seed(`${SHARE}/Sans titre.md`, 'f', 'the first line');
+  blind.on = true;
+
+  assert.equal(await h.queue.repark(), false, 'a stat that throws unparks nothing');
+  assert.equal(h.queue.pendingCount(), 0);
+  assert.deepEqual(h.queue.parked().map((p) => p.id), [id], 'and the entry is still there');
+
+  blind.on = false;
+  assert.equal(await h.queue.repark(), true, 'once it can look again, the work is found');
+});
+
+test('parked entries carry the reason, because the two are worded differently', async () => {
+  const h = makeHarness();
+  const empty = h.add('Sans titre.md', '');
+  const notText = h.tree.createNode({ k: 'f', d: '', n: 'notes.md' }, NOW);
+  h.vault.seedBinary(`${SHARE}/notes.md`, new Uint8Array([0xff, 0xfe, 0xc0, 0x80]));
+  h.state.data.owned[notText] = true;
+  h.state.data.materialized[notText] = `${SHARE}/notes.md`;
+  h.queue.enqueue(empty);
+  h.queue.enqueue(notText);
+
+  await h.queue.drain();
+
+  const parked = h.queue.parked();
+  assert.equal(parked.length, 2);
+  assert.equal(parked.find((p) => p.id === empty)?.reason, 'empty');
+  assert.equal(parked.find((p) => p.id === notText)?.reason, 'not-text');
+});
+
+test('a note that is not text unparks when its size or mtime moves', async () => {
+  const h = makeHarness();
+  const id = h.tree.createNode({ k: 'f', d: '', n: 'notes.md' }, NOW);
+  h.vault.seedBinary(`${SHARE}/notes.md`, new Uint8Array([0xff, 0xfe, 0xc0, 0x80]));
+  h.state.data.owned[id] = true;
+  h.state.data.materialized[id] = `${SHARE}/notes.md`;
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  assert.equal(await h.queue.repark(), false, 'nothing about the file has moved');
+
+  h.vault.seed(`${SHARE}/notes.md`, 'f', 'the user fixed it by hand');
+
+  assert.equal(await h.queue.repark(), true);
+  await h.queue.drain();
+  assert.equal(h.tree.get(id)!.s, 1);
 });
 
 test('a note deferred because it is open is still an upload this device owes', async () => {
