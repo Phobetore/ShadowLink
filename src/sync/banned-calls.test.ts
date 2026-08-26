@@ -303,8 +303,11 @@ const IN_MEMORY: Record<string, string[]> = {
   'src/sync/ObsidianDocPort.ts': ['this.live', 'this.rooms'],
   'src/sync/ProviderAck.ts': ['this.listeners'],
   // `parkedStat` is an in-memory Map of what a parked entry's file looked like,
-  // so `repark` can answer with one `stat` instead of a pass.
-  'src/sync/PublishQueue.ts': ['this.errors', 'this.parkedNodes', 'this.parkedStat'],
+  // so `repark` can answer with one `stat` instead of a pass. `blockedNodes` is
+  // the third state, also a Map: pending entries nothing can ever lift.
+  'src/sync/PublishQueue.ts': [
+    'this.errors', 'this.parkedNodes', 'this.parkedStat', 'this.blockedNodes',
+  ],
   'src/sync/Reconciler.ts': ['ctx.disk', 'ctx.boundAtFold', 'ctx.have', 'this.localHashes'],
   'src/sync/Tickets.ts': ['this.store'],
   'src/sync/VaultWatcher.ts': ['this.decisionPending'],

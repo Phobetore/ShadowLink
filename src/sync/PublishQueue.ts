@@ -178,6 +178,32 @@ export class PublishQueue {
   private readonly parkedStat = new Map<string, { bytes: number; mtime?: number }>();
 
   /**
+   * Pending entries NOTHING can lift, and why — the third state, and its absence
+   * is what left four of these counted for the lifetime of the vault.
+   *
+   * `parkedNodes` says "the user's file can lift this", and `repark` is how the
+   * drain reaches one again. There was no way to say "nothing can lift this", so
+   * a dead node, an entry for a node this device does not own and an attachment
+   * deleted before it published all fell down paths that RETURN — correctly,
+   * because none of them is a failure and none should charge a rung — and were
+   * left `pending`, counted by `pendingCount()`, and offered to the user as
+   * "N file(s) waiting to upload" for ever. Worse, since no rung was charged,
+   * `stalled()` was empty and `lastError` was undefined, so they were invisible
+   * in diagnostics too.
+   *
+   * IN MEMORY and re-decided by every drain, exactly like the park and for the
+   * same reason: it is a conclusion about the tree and the state file, and a
+   * conclusion goes stale the moment either moves. `repark` re-asks it too, so
+   * an entry does not have to wait for some other note to create work before the
+   * periodic tick can notice that ownership has arrived.
+   *
+   * NOT the status bar's business, and that is deliberate. `parked()` reaches the
+   * tooltip because there is something the user can do; there is nothing to say
+   * about a note that no longer exists beyond not claiming to be uploading it.
+   */
+  private readonly blockedNodes = new Map<string, string>();
+
+  /**
    * The server's per-file ceiling, once this session has managed to ask for it.
    *
    * Cached rather than re-fetched per item, and NOT cached as a failure: `limits()`
@@ -260,9 +286,28 @@ export class PublishQueue {
   pendingCount(): number {
     let n = 0;
     for (const [id, entry] of Object.entries(this.deps.state.data.publish)) {
-      if (entry.state === 'pending' && !this.parkedNodes.has(id)) n += 1;
+      if (entry.state !== 'pending') continue;
+      if (this.parkedNodes.has(id) || this.blockedNodes.has(id)) continue;
+      n += 1;
     }
     return n;
+  }
+
+  /**
+   * Pending ids the last drain found nothing could ever lift, with the reason.
+   *
+   * Diagnostics, not the status bar: unlike a parked entry there is no sentence
+   * to put in front of the user, because there is nothing for them to do. The
+   * point is that these stop being counted WITHOUT becoming invisible — they
+   * carry a `lastError` too, which the paths that produce them did not set,
+   * because none of them is a failure.
+   */
+  blocked(): Array<{ id: string; reason: string }> {
+    const out: Array<{ id: string; reason: string }> = [];
+    for (const [id, reason] of this.blockedNodes) {
+      if (this.deps.state.data.publish[id]?.state === 'pending') out.push({ id, reason });
+    }
+    return out.sort((a, b) => compare(a.id, b.id));
   }
 
   /**
@@ -304,6 +349,20 @@ export class PublishQueue {
    */
   async repark(): Promise<boolean> {
     let woke = false;
+    // The blocked half first, and it needs no `stat` at all: every reason an
+    // entry is blocked is a fact about the tree or the state file, both of which
+    // are in memory. Asking here rather than only inside a drain is what keeps a
+    // vault where EVERY entry is blocked from needing some unrelated note to
+    // create work before the tick can notice that ownership has arrived.
+    for (const id of [...this.blockedNodes.keys()]) {
+      if (this.deps.state.data.publish[id]?.state !== 'pending') {
+        this.blockedNodes.delete(id);
+        continue;
+      }
+      if (this.blockOf(id) !== null) continue;
+      this.blockedNodes.delete(id);
+      woke = true;
+    }
     for (const [id, reason] of [...this.parkedNodes]) {
       if (this.deps.state.data.publish[id]?.state !== 'pending') {
         this.unpark(id);
@@ -454,18 +513,25 @@ export class PublishQueue {
       return;
     }
 
-    // I5. Re-checked here and not only in `enqueue`, because this entry may have
-    // been read back from a state file written before ownership was resolved.
-    // Left exactly as it is: refusing is not failing, so it costs no backoff step,
-    // and `pendingCount()` keeps reporting it rather than dropping it.
-    if (data.owned[id] !== true) return;
-
     // I7. The editing session seeds a note it has open, and a second writer under
     // a live yCollab binding is exactly the whole-document overwrite that
     // invariant exists to prevent. Deferring is not a failure either — charging a
     // backoff step here would park the publish for minutes after the user simply
     // closed the tab — so nothing at all is touched, not even the disk.
+    //
+    // Before the block below, because a deferral is "not now" and outranks every
+    // conclusion drawn from a tree the session is actively writing into.
     if (this.deps.openNodeId() === id) return;
+
+    // NOTHING CAN LIFT THIS — a node that is gone or dead, or one this device
+    // has no business publishing (I5, re-checked here and not only in `enqueue`
+    // because this entry may have been read back from a state file written
+    // before ownership was resolved). Each of these already RETURNED, correctly:
+    // none is a failure and none should charge a rung. What none of them did was
+    // stop being counted.
+    const why = this.blockOf(id, fields);
+    if (why !== null) { this.block(id, why); return; }
+    this.unblock(id);
 
     const path = data.materialized[id];
     if (path === undefined || path === '') {
@@ -643,16 +709,16 @@ export class PublishQueue {
   private async publishBlobOne(id: string, f: NodeFields): Promise<void> {
     const data = this.deps.state.data;
 
-    // I13. A node that is dead — the user deleted it, or an earlier attempt
-    // retracted it — is never published. Not a failure, so no rung is charged.
-    if (!isLive(f)) return;
-
-    // I5a. The FIRST publish is creator-only, for the reason I5 exists at all; a
-    // REPLACE may be published by any peer holding the node materialized, because
-    // two writers of a content-addressed store produce two objects and one LWW
-    // winner, where two seeds of a `Y.Text` produce one note holding itself twice.
-    // Re-checked here and not only at admission (§4.4).
-    if (f.s !== 1 && data.owned[id] !== true) return;
+    // I13 and I5a, both of them now SAYING SO rather than returning silently.
+    // A dead node is never published — the user deleted it, or an earlier attempt
+    // retracted it — and the first publish of a live one is creator-only, for the
+    // reason I5 exists at all. Neither is a failure, so no rung is charged; what
+    // neither may do is leave the entry counted as an upload in progress for the
+    // lifetime of the vault, which is what an attachment deleted before it
+    // published did.
+    const why = this.blockOf(id, f);
+    if (why !== null) { this.block(id, why); return; }
+    this.unblock(id);
 
     const path = data.materialized[id];
     if (path === undefined || path === '') {
@@ -928,6 +994,51 @@ export class PublishQueue {
     this.parkedStat.delete(id);
   }
 
+  /**
+   * Why nothing can ever lift this entry, or null when something can.
+   *
+   * PURE, and it reads only the tree and the state file — no `stat`, no network
+   * — which is what lets `repark` re-ask it for every blocked entry without
+   * paying for a pass. The reasons are the ones the two publish arms already
+   * returned on; naming them in one place is what makes "the queue owes nothing
+   * here" a state rather than three separate silent returns.
+   */
+  private blockOf(id: string, fields?: NodeFields | null): string | null {
+    const f = fields === undefined ? this.deps.tree.get(id) : fields;
+    if (f === null) return `${id} is no longer in the tree`;
+    // I13. Dead, and no drain, rename or keystroke brings a tombstoned node back.
+    if (!isLive(f)) return `${id} has been deleted`;
+    // I5 / I5a. A note is creator-only outright; an attachment's FIRST publish is,
+    // and a replace is not (§4.4), so a published blob is never blocked here.
+    const creatorOnly = f.k !== 'b' || f.s !== 1;
+    if (creatorOnly && this.deps.state.data.owned[id] !== true) {
+      return `${id} is not this device's to publish`;
+    }
+    return null;
+  }
+
+  /**
+   * Stop counting an entry, and say why where a diagnostics panel can read it.
+   *
+   * The entry stays `pending` and no rung is charged, exactly as the silent
+   * returns left it, so nothing is thrown away: the drain still reaches it and
+   * `repark` re-asks the question. The two things that change are that the
+   * status bar stops promising an upload, and that `lastError` stops being
+   * `undefined` for a state the user could otherwise not see at all.
+   */
+  private block(id: string, reason: string): void {
+    this.blockedNodes.set(id, reason);
+    this.errors.set(id, new Error(reason));
+    // A blocked entry is not refused over the state of the FILE, so it must not
+    // also claim a park — the two say different things to the status bar and only
+    // one of them has a sentence for the user.
+    this.unpark(id);
+  }
+
+  private unblock(id: string): void {
+    this.blockedNodes.delete(id);
+  }
+
   /** I17: the base — what this device confirmed is simultaneously on disk and in the tree. */
   private recordBlob(id: string, sha256: string, len: number, mtime?: number): void {
     this.deps.state.data.contentHash[id] = mtime === undefined
@@ -942,10 +1053,11 @@ export class PublishQueue {
     };
     if (intent !== undefined) entry.intent = intent;
     this.deps.state.data.publish[id] = entry;
-    // Nothing owed, nothing refused. `parked()` already filters on the entry's
-    // state, so this is hygiene rather than correctness — but a set that only
-    // ever grows is how the next reader is misled.
+    // Nothing owed, nothing refused, nothing blocked. Both accessors already
+    // filter on the entry's state, so this is hygiene rather than correctness —
+    // but a map that only ever grows is how the next reader is misled.
     this.unpark(id);
+    this.unblock(id);
   }
 
   /**

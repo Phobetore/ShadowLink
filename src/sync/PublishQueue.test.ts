@@ -326,7 +326,15 @@ test('a pending entry restored for a node we do not own is refused, not acted on
   assert.equal(h.docs.calls.length, 0, 'not one doc call (I5)');
   assert.equal(h.vault.callsTo('read').length, 0, 'and not one disk read');
   assert.equal(h.tree.get(id)!.s, undefined);
-  assert.equal(h.queue.pendingCount(), 1, 'the entry is kept and reported, never dropped');
+  // KEPT AND REPORTED, NEVER DROPPED — and this assertion used to read
+  // `pendingCount() === 1`, which is where the entry was reported and it was the
+  // wrong number: nothing about this entry is waiting to upload, and no amount
+  // of waiting changes it, so the status bar promised an upload for the lifetime
+  // of the vault. Kept is the half that matters and it is unchanged.
+  assert.deepEqual(h.state.data.publish[id].state, 'pending', 'the entry is kept');
+  assert.equal(h.queue.pendingCount(), 0, 'and is not an upload in progress');
+  assert.deepEqual(h.queue.blocked().map((b) => b.id), [id], 'it is reported here instead');
+  assert.notEqual(h.queue.lastError(id), undefined, 'and it is not invisible');
 });
 
 // ---------------------------------------------------------------- I4: never seed an unsynced doc
@@ -755,6 +763,86 @@ test('an ordinary drain does not destroy a park it cannot lift', async () => {
   }
   assert.equal(h.queue.pendingCount(), 0,
     'nothing is owed for a note that does not exist, at any point');
+});
+
+/**
+ * FOUR STATES NOTHING CAN EVER LIFT, and `park` cannot express any of them.
+ *
+ * `park` says "the user's file can lift this" — an empty note, a `.md` file that
+ * is not text — and `repark` is how the drain reaches one again. There was no
+ * state for "nothing can lift this", so a dead node, an unowned entry and a
+ * deleted attachment all stayed `pending` and counted for ever, and because no
+ * rung of the ladder is charged on those paths `stalled()` was empty and
+ * `lastError` was undefined, so they were invisible in diagnostics as well.
+ *
+ * Every one of these winds the clock past every rung of the ladder and drains
+ * again, because "for ever" is the claim being tested.
+ */
+async function drainForYears(h: Harness): Promise<void> {
+  for (let i = 0; i < 8; i++) {
+    h.clock.now += 3_600_000;
+    await h.queue.drain();
+    await h.queue.repark();
+  }
+}
+
+test('a note deleted before its first character stops being work', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+
+  // The user deletes it: the watcher tombstones the node and unbinds the file.
+  h.tree.patchNode(id, { x: h.tree.get(id)!.g });
+  await h.vault.trashLocal(`${SHARE}/Sans titre.md`);
+  delete h.state.data.materialized[id];
+
+  await h.queue.drain();
+  assert.equal(h.queue.pendingCount(), 0, 'nothing is owed for a note that does not exist');
+  assert.deepEqual(h.queue.parked(), [], 'and nothing is offered to the user to fix');
+  assert.notEqual(h.queue.lastError(id), undefined, 'but it is not invisible either');
+  assert.deepEqual(h.queue.blocked().map((b) => b.id), [id]);
+
+  await drainForYears(h);
+  assert.equal(h.queue.pendingCount(), 0);
+});
+
+test('an attachment deleted before it publishes stops being work', async () => {
+  const h = makeHarness();
+  const id = h.addBlob('clip.png', new Uint8Array([1, 2, 3, 4]));
+  h.queue.enqueue(id);
+  h.tree.patchNode(id, { x: h.tree.get(id)!.g });
+
+  await h.queue.drain();
+  assert.equal(h.queue.pendingCount(), 0);
+  assert.notEqual(h.queue.lastError(id), undefined);
+  assert.deepEqual(h.queue.blocked().map((b) => b.id), [id]);
+
+  await drainForYears(h);
+  assert.equal(h.queue.pendingCount(), 0);
+});
+
+test('an entry for a node this device does not own stops being work', async () => {
+  // The restart case the I5 re-check exists for: an entry read back from a state
+  // file written before ownership was resolved.
+  const h = makeHarness();
+  const id = h.add('theirs.md', 'a peer wrote this');
+  h.queue.enqueue(id);
+  delete h.state.data.owned[id];
+
+  await h.queue.drain();
+  assert.equal(h.queue.pendingCount(), 0);
+  assert.notEqual(h.queue.lastError(id), undefined);
+
+  await drainForYears(h);
+  assert.equal(h.queue.pendingCount(), 0);
+
+  // And it is a conclusion, not a verdict: ownership arriving makes it work again.
+  h.state.data.owned[id] = true;
+  assert.equal(await h.queue.repark(), true, 'the drain is asked for, once there is work');
+  assert.equal(h.queue.pendingCount(), 1);
+  await h.queue.drain();
+  assert.equal(h.tree.get(id)!.s, 1);
+  assert.deepEqual(h.queue.blocked(), []);
 });
 
 test('a stat that cannot answer leaves the entry parked (I2)', async () => {
@@ -1558,7 +1646,10 @@ test('an unpublished attachment this device does not own is never uploaded', asy
   assert.equal(h.blobs.calls.length, 0);
   assert.equal(h.vault.callsTo('readBinary').length, 0);
   assert.equal(h.tree.get(id)!.s, undefined);
-  assert.equal(h.queue.pendingCount(), 1, 'kept and reported, never dropped');
+  // Kept, and reported where it is true. See the note on the markdown twin.
+  assert.equal(h.state.data.publish[id].state, 'pending', 'the entry is kept');
+  assert.equal(h.queue.pendingCount(), 0, 'and is not an upload in progress');
+  assert.deepEqual(h.queue.blocked().map((b) => b.id), [id]);
 });
 
 // I13. A node the user deleted while its publish was queued is not published back
