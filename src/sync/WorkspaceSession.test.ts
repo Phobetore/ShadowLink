@@ -37,8 +37,9 @@ import { RECOVERED_DIR } from '../tree/constants.ts';
 import { forkName, hashOf } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
+import type { DocHandle, DocPort } from './DocPort.ts';
 import {
-  DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeEditorBinding, FakeVault,
+  DESKTOP_MEMORY_CAP, FakeBlobs, FakeEditorBinding, FakeVault,
 } from './fakes.ts';
 import { PublishQueue } from './PublishQueue.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
@@ -116,6 +117,7 @@ class FakeProvider implements SessionProvider {
     readonly room: string,
     readonly doc: Y.Doc,
     private readonly config: RoomConfig,
+    private readonly rooms: Rooms | null = null,
   ) {}
 
   on(_event: 'sync', handler: (isSynced: boolean) => void): void {
@@ -144,7 +146,9 @@ class FakeProvider implements SessionProvider {
 
   /** Deliver the server's state and announce a GENUINE sync. */
   emitSync(): void {
-    if (this.config.remoteUpdate !== null) {
+    if (this.rooms !== null) {
+      this.rooms.join(this.room, this.doc);
+    } else if (this.config.remoteUpdate !== null) {
       Y.applyUpdate(this.doc, this.config.remoteUpdate);
     } else if (this.config.remote.length > 0 && this.doc.getText('content').length === 0) {
       this.doc.getText('content').insert(0, this.config.remote);
@@ -168,9 +172,80 @@ class FakeProvider implements SessionProvider {
   }
 }
 
+/**
+ * ONE `Y.Doc` PER ROOM, which is what a room is — and the reason this exists.
+ *
+ * The session reaches a content document through `ProviderPort`; the publish
+ * queue reaches the same document through `DocPort`. Modelling those as two
+ * registries that happen to agree on the room NAME makes every question about
+ * their ORDERING unaskable: whichever one writes, the other cannot see it, so a
+ * test can assert that both put the right string in their own copy and learn
+ * nothing about what a peer would receive. That is exactly how a test named
+ * "the note the seed arm refused still reaches the workspace" came to be made
+ * about a document the session had never seen.
+ *
+ * This is the document, for both. `Rooms` IS the `DocPort` the queue publishes
+ * through, and a `FakeProviders` constructed over it relays the room's state
+ * into the session's `Y.Doc` at sync and every update afterwards, in both
+ * directions — a real Yjs relay, so `insertIfEmpty`'s I5 guard is the real one
+ * and a double seed would show up as the concatenation it is.
+ */
+const RELAY = Symbol('relay');
+
+class Rooms implements DocPort {
+  readonly docs = new Map<string, Y.Doc>();
+
+  doc(room: string): Y.Doc {
+    let doc = this.docs.get(room);
+    if (doc === undefined) {
+      doc = new Y.Doc();
+      this.docs.set(room, doc);
+    }
+    return doc;
+  }
+
+  text(room: string): string {
+    return this.doc(room).getText('content').toString();
+  }
+
+  /** Join a session's own `Y.Doc` to the room, the way a provider's sync does. */
+  join(room: string, local: Y.Doc): void {
+    const shared = this.doc(room);
+    Y.applyUpdate(local, Y.encodeStateAsUpdate(shared), RELAY);
+    local.on('update', (update: Uint8Array, origin: unknown) => {
+      if (origin !== RELAY) Y.applyUpdate(shared, update, RELAY);
+    });
+    shared.on('update', (update: Uint8Array, origin: unknown) => {
+      if (origin !== RELAY) Y.applyUpdate(local, update, RELAY);
+    });
+  }
+
+  // ---------------------------------------------------------- DocPort
+
+  async openHeadless(room: string): Promise<{ text: string; synced: boolean; handle: DocHandle }> {
+    return { text: this.text(room), synced: true, handle: { room } };
+  }
+
+  async insertIfEmpty(handle: DocHandle, text: string): Promise<boolean> {
+    const content = this.doc(handle.room).getText('content');
+    if (content.length !== 0) return false;                      // I5, for real
+    content.insert(0, text);
+    return true;
+  }
+
+  async flush(): Promise<boolean> {
+    return true;
+  }
+
+  close(): void { /* nothing to release */ }
+}
+
 class FakeProviders implements ProviderPort {
   readonly created: FakeProvider[] = [];
   private readonly configs = new Map<string, RoomConfig>();
+
+  /** When set, every room is backed by one shared `Y.Doc` instead of `remote`. */
+  constructor(private readonly rooms: Rooms | null = null) {}
 
   configure(room: string, over: Partial<RoomConfig>): void {
     this.configs.set(room, { ...this.configOf(room), ...over });
@@ -178,7 +253,7 @@ class FakeProviders implements ProviderPort {
 
   connect(room: string, doc: Y.Doc): SessionProvider {
     const config = this.configOf(room);
-    const provider = new FakeProvider(room, doc, config);
+    const provider = new FakeProvider(room, doc, config, this.rooms);
     this.created.push(provider);
     if (config.mode === 'immediate') provider.emitSync();
     return provider;
@@ -298,12 +373,12 @@ interface Harness {
 
 function makeHarness(
   over: Partial<WorkspaceSessionDeps> = {},
-  opts: { wrapVault?: (inner: FakeVault) => VaultPort } = {},
+  opts: { wrapVault?: (inner: FakeVault) => VaultPort; rooms?: Rooms } = {},
 ): Harness {
   const vault = new FakeVault();
   const state = new DeviceState(new MemoryStatePort(), 'device-1', 'ws-1', () => NOW, 0);
   const tree = new TreeDoc();
-  const providers = new FakeProviders();
+  const providers = new FakeProviders(opts.rooms ?? null);
   const editor = new FakeEditorBinding(vault);
   const notices: string[] = [];
   const active: { path: string | null } = { path: null };
@@ -1448,23 +1523,23 @@ test('the note the seed arm refused still reaches the workspace, from the file',
   // THE HANDOFF, end to end, because "the publish path takes it from here" is
   // the load-bearing half of refusing to seed from a buffer and is worth nothing
   // as an assertion about the session alone. One vault, one tree, one state
-  // file, a real session and a real queue.
+  // file, ONE `Y.Doc` PER ROOM, a real session and a real queue.
   //
-  // What it costs is a beat, and the beat is one retry interval — the queue
-  // parks the note `empty` while the file is 0 bytes, `repark` lifts the park on
-  // the first tick after Obsidian writes the buffer out, and the drain that
-  // follows seeds the document from the FILE. What it does not restore is the
-  // binding: nothing re-opens a note, so the note is shared but not
-  // collaborative until the next `file-open`.
-  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  // The document matters as much as the rest of it. This test used to wire the
+  // queue to a `FakeDocs` of its own while the session was connected through
+  // `h.providers` — two registries agreeing on the room NAME and sharing nothing
+  // — so `docs.text(...)` asserted the queue had written a string into a
+  // document the session had never seen, and no ordering between the two could
+  // be observed at all. Now the assertion is made about the document the session
+  // is bound through, which is the one a peer would receive.
+  const rooms = new Rooms();
+  const h = makeHarness({ syncTimeoutMs: 5_000 }, { rooms });
   const id = h.add('Untitled.md', '', { owned: true });
   const path = `${SHARE}/Untitled.md`;
-  h.providers.configure(`n_${id}`, { remote: '' });
   h.editor.openLeaf(path, 'the body of some other note entirely.');
 
-  const docs = new FakeDocs();
   const queue = new PublishQueue({
-    docs, vault: h.vault, blobs: new FakeBlobs(), state: h.state, tree: h.tree,
+    docs: rooms, vault: h.vault, blobs: new FakeBlobs(), state: h.state, tree: h.tree,
     openNodeId: h.session.openNodeId,
     now: () => NOW, settleMs: 0, sleep: async () => undefined,
     displayName: 'Ada', notice: () => { /* counted through the session's list */ },
@@ -1475,6 +1550,7 @@ test('the note the seed arm refused still reaches the workspace, from the file',
   await h.session.open(path);
   assert.equal(h.session.openNodeId(), null, 'the seed arm refused');
   assert.equal(h.tree.get(id)?.s, undefined);
+  assert.equal(rooms.text(`n_${id}`), '', 'and nothing of that buffer reached the room');
 
   await queue.drain();
   assert.deepEqual(queue.parked().map((p) => p.reason), ['empty'],
@@ -1489,12 +1565,59 @@ test('the note the seed arm refused still reaches the workspace, from the file',
   assert.equal(await queue.repark(), true, 'ONE tick lifts the park');
   await queue.drain();
   assert.equal(h.tree.get(id)?.s, 1, 'and the note is published');
-  assert.equal(docs.text(`n_${id}`), 'the first sentence the user typed');
+  assert.equal(rooms.text(`n_${id}`), 'the first sentence the user typed');
   assert.deepEqual(queue.parked(), []);
   assert.equal(queue.pendingCount(), 0, 'nothing is left owed');
 
-  // The residual, asserted rather than left to be discovered: still unbound.
-  assert.equal(h.session.openNodeId(), null);
+  // And the note becomes collaborative again on its own: the next open — which
+  // `drainTick` now asks for when nothing is bound (R18) — reads that same
+  // document and agrees with the buffer Obsidian saved.
+  h.editor.openLeaf(path, 'the first sentence the user typed');
+  await h.session.open(path);
+  assert.equal(h.session.openNodeId(), id, 'bound, from the document the queue published');
+  assert.equal(rooms.text(`n_${id}`), 'the first sentence the user typed',
+    'and the session added no second copy of it');
+});
+
+test('a drain landing inside an open publishes once, and the session adds no copy', async () => {
+  // THE ORDERING THE OLD TEST COULD NOT ASK ABOUT. `publishOne` defers on a node
+  // the session holds OPEN (I7), and `openNodeId()` is null for the whole of
+  // `doOpen` — so this device's own drain can seed the room from the file while
+  // an open of the same note is still in flight. Both writers are real here and
+  // they share one document, so a second seed would show up as the concatenation
+  // I5 is named for.
+  //
+  // What makes it safe is that the session reads the shared document AFTER its
+  // last await and writes into it in the same turn: by the time it decides, the
+  // queue's insert is simply part of `R`.
+  const body = 'the first sentence the user typed';
+  const rooms = new Rooms();
+  const h = makeHarness({ syncTimeoutMs: 5_000 }, { rooms });
+  const id = h.add('Untitled.md', body, { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual' });
+
+  const queue = new PublishQueue({
+    docs: rooms, vault: h.vault, blobs: new FakeBlobs(), state: h.state, tree: h.tree,
+    openNodeId: h.session.openNodeId,
+    now: () => NOW, settleMs: 0, sleep: async () => undefined,
+    displayName: 'Ada', notice: () => { /* through the session's list */ },
+    ...DESKTOP_MEMORY_CAP,
+  });
+  queue.enqueue(id);
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  await queue.drain();                       // the 30-second tick, mid-open
+  assert.equal(rooms.text(`n_${id}`), body, 'the queue seeded it from the file');
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  assert.equal(rooms.text(`n_${id}`), body, 'exactly one copy in the room');
+  assert.equal(h.editor.document(path), body, 'and one on screen');
+  assert.equal(h.session.openNodeId(), id, 'bound, because the two sides agree');
+  assert.deepEqual(h.stashes(), []);
+  assert.deepEqual(h.notices, []);
 });
 
 test('a new note whose bytes never reach the disk binds nothing and loses nothing', async () => {
