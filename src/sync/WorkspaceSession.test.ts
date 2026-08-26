@@ -225,25 +225,22 @@ class GatedVault implements VaultPort {
 }
 
 /**
- * A vault in which every candidate name under `ShadowLink Recovered/` is taken,
- * so `uniquify` exhausts its 1000 tries and throws.
- *
- * Reachable for real: the stash name is derived from the note's basename and a
- * timestamp, so a note that is opened repeatedly inside one second competes with
- * its own earlier copies for the same names.
+ * A vault whose `create` always fails — a full disk, a read-only volume, a
+ * permission the user revoked. I15's rule is that the failure must not abort the
+ * open and must not be silent; I1's is that it must not be followed by a bind,
+ * because a bind lets Obsidian save the shared text over bytes nothing holds.
  */
-class CrowdedRecovered implements VaultPort {
+class RefusingCreate implements VaultPort {
   constructor(private readonly inner: FakeVault) {}
 
-  exists(path: string): Promise<boolean> {
-    if (path.startsWith(`${RECOVERED_DIR}/`)) return Promise.resolve(true);
-    return this.inner.exists(path);
+  create(): Promise<void> {
+    return Promise.reject(new Error('the disk is full'));
   }
 
+  exists(path: string): Promise<boolean> { return this.inner.exists(path); }
   list(): Array<{ path: string; kind: Kind }> { return this.inner.list(); }
   listDir(path: string): Promise<string[]> { return this.inner.listDir(path); }
   read(path: string): Promise<string> { return this.inner.read(path); }
-  create(path: string, data: string): Promise<void> { return this.inner.create(path, data); }
   readBinary(path: string): Promise<Uint8Array> { return this.inner.readBinary(path); }
   createBinary(path: string, data: Uint8Array): Promise<void> {
     return this.inner.createBinary(path, data);
@@ -936,7 +933,11 @@ test('a mount that refuses AFTER replacing the buffer still preserves what it re
 
   assert.equal(h.session.openNodeId(), null, 'nothing claims to be bound');
   assert.equal(h.providers.created[0].destroyed, true, 'and the provider was released');
-  assert.deepEqual(h.stashes().map(([, text]) => text), [`${STALE} and what I typed`]);
+  assert.deepEqual(
+    h.stashes().map(([, text]) => text).sort(),
+    [STALE, `${STALE} and what I typed`].sort(),
+    'the buffer the plan was made about, and the one the apply says it displaced',
+  );
 });
 
 test('a mount that replaced nothing and found no divergence stashes nothing', async () => {
@@ -953,12 +954,14 @@ test('a mount that replaced nothing and found no divergence stashes nothing', as
   assert.equal(mutations(h.vault), 0);
 });
 
-test('a stash that can find no free name is a notice, not an open that gives up', async () => {
-  // `uniquify` throws after 1000 collisions, and it used to throw OUTSIDE
-  // `stashLocalCopy`'s try — so it propagated out of `doOpen`, past the watermark
-  // step, to `open`'s catch-all, which says "ShadowLink: <message>" about bytes
-  // nothing preserved. The document had already been replaced by then.
-  const h = makeHarness({}, { wrapVault: (inner) => new CrowdedRecovered(inner) });
+test('a preservation that fails means NO BIND, and says so (I15)', async () => {
+  // The ordering that makes I1 a rule rather than an aspiration. The copy is
+  // written BEFORE the buffer is displaced, so a `create` that throws leaves the
+  // user's text exactly where it is — and the note deliberately does not bind,
+  // because binding would let Obsidian save the shared text over bytes nothing
+  // holds. Every step is inside the try, hashing and name-finding included: a
+  // rule that only holds for the failures somebody happened to wrap is not one.
+  const h = makeHarness({}, { wrapVault: (inner) => new RefusingCreate(inner) });
   const id = h.add('a.md', STALE, { s: 1 });
   const path = `${SHARE}/a.md`;
   h.providers.configure(`n_${id}`, { remote: SHARED });
@@ -966,7 +969,9 @@ test('a stash that can find no free name is a notice, not an open that gives up'
   await h.session.open(path);
 
   assert.ok(
-    h.notices.some((n) => n.startsWith(`Could not save a local copy of "a.md"`)),
+    h.notices.some((n) => n.startsWith('Could not save a copy of "a.md"')
+      && n.includes('the disk is full')
+      && n.includes('has not been applied')),
     h.notices.join(' | '),
   );
   assert.equal(
@@ -974,7 +979,108 @@ test('a stash that can find no free name is a notice, not an open that gives up'
     false,
     'and not the generic catch-all, which names neither the file nor the reason',
   );
-  assert.equal(h.session.openNodeId(), id, 'the open finished: the note is bound');
+  assert.equal(h.session.openNodeId(), null, 'nothing is bound');
+  assert.equal(h.editor.document(path), STALE, 'and the user\'s text is untouched');
+  assert.equal(h.providers.created[0].destroyed, true);
+});
+
+// ================================================================ redundancy
+//
+// Notes are never rewritten from the CRDT while closed — the reconciler skips
+// every bound node — and the only two writers of a note's bytes are materialize
+// (unbound only) and adopt. So a STALE DISK COPY IS THE NORMAL STATE of every
+// note a collaborator has touched, and a design that preserves on every
+// divergence writes a recovery file and a "your local copy differed" notice on
+// the single most common event in the product.
+//
+// A copy is owed only for bytes nothing else holds. Two watermarks can answer
+// that, and they answer different questions: `contentHash` says THIS DISK held
+// these bytes, and the session's own record of what it last BOUND says THIS
+// WORKSPACE'S DOCUMENT held them.
+
+test('an ordinary collaborative open preserves nothing, because the disk is redundant', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  const path = `${SHARE}/Sans titre.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  // What every note this device has ever materialized or published carries.
+  h.state.data.contentHash[id] = { sha256: await hashOf(STALE), len: STALE.length };
+
+  await h.session.open(path);
+
+  assert.deepEqual(h.stashes(), [], 'the workspace can give those bytes back');
+  assert.equal(h.editor.document(path), SHARED);
+  assert.deepEqual(h.notices, ['"Sans titre.md" was updated to the shared version.']);
+});
+
+test('with nothing able to vouch for the disk, the same open preserves exactly once', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  const path = `${SHARE}/Sans titre.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+
+  await h.session.open(path);
+
+  const stashes = h.stashes();
+  assert.deepEqual(stashes.map(([, t]) => t), [STALE]);
+  const digest = await hashOf(STALE);
+  assert.equal(
+    stashes[0][0],
+    `${RECOVERED_DIR}/Sans titre (conflicted copy — Ada, ${digest.slice(0, 8)}).md`,
+    'the name is derived from the CONTENT, so re-observing the same divergence lands on it',
+  );
+  assert.ok(h.notices[0].includes(stashes[0][0]), h.notices.join(' | '));
+});
+
+test('a second divergent open does not fork the revision the workspace itself gave it', async () => {
+  // The case `contentHash` cannot answer: a divergent open deliberately deletes
+  // the watermark (I17 — after it there are no bytes both in the workspace and
+  // on this disk), so on the NEXT divergence nothing would vouch for a buffer
+  // this very session put there. Without a second record, every peer edit after
+  // a conflict files another copy of the workspace's own text.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', STALE, { s: 1 });
+  const path = `${SHARE}/Sans titre.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+
+  await h.session.open(path);
+  assert.equal(h.stashes().length, 1, 'the first divergence is genuine');
+  h.editor.save(path);                                   // Obsidian catches the disk up
+
+  await h.session.open(null);
+  const later = `${SHARED} — and then a collaborator added this.`;
+  h.providers.configure(`n_${id}`, { remote: later });
+  await h.session.open(path);
+
+  assert.equal(h.editor.document(path), later);
+  assert.equal(h.stashes().length, 1, 'no second copy of what the workspace already holds');
+});
+
+test('typing during the preservation is preserved too, rather than replacing it', async () => {
+  // The one arm with an await between reading the buffer and acting on it. The
+  // pre-write covers the buffer the decision was made about; `replaced` is the
+  // belt-and-braces report for whatever the editor held by the time it ran.
+  let gated: GatedVault | null = null;
+  const h = makeHarness({}, {
+    wrapVault: (inner) => { gated = new GatedVault(inner); return gated; },
+  });
+  const id = h.add('a.md', STALE, { s: 1 });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  const vault = gated!;
+  vault.gates.add('create');
+
+  const open = h.session.open(path);
+  await until(() => vault.parked, 'the open to park writing the copy');
+  h.editor.type(path, ' and one more thought');
+  vault.release();
+  await open;
+
+  assert.deepEqual(
+    h.stashes().map(([, t]) => t).sort(),
+    [STALE, `${STALE} and one more thought`].sort(),
+    'both the buffer that was decided about and the one that was displaced',
+  );
   assert.equal(h.editor.document(path), SHARED);
 });
 
@@ -1316,16 +1422,12 @@ test('an open superseded by a read failure stays silent', async () => {
   assert.equal(a in h.state.data.contentHash, false);
 });
 
-// The stash now runs AFTER the mount, because it exists to preserve bytes the
-// mount is replacing and there is nothing to preserve until something replaces
-// them. These two tests used to gate the stash as a PRE-mount await point and
-// assert that the superseded open "never mounts". That assertion is no longer
-// about the stash — the mount happens first now — so they are rewritten around
-// what the ordering actually guarantees. The I7 property they were guarding, an
-// open that lost its token never reaching the editor, is still covered at every
-// pre-mount await: the node wait, the file read, the sync wait and the flush.
+// The preservation runs BEFORE the displacement, so it is a pre-bind await point
+// again — and the strongest one there is. An open that loses its token there has
+// written the user's bytes to disk and has NOT touched the editor, which is
+// exactly the pair of guarantees I1 and I7 want out of it.
 
-test('an open superseded while stashing still preserves the bytes, and loses the editor', async () => {
+test('an open superseded while preserving still writes the bytes, and binds nothing', async () => {
   let gated: GatedVault | null = null;
   const h = makeHarness({ syncTimeoutMs: 5_000 }, {
     wrapVault: (inner) => { gated = new GatedVault(inner); return gated; },
@@ -1346,10 +1448,12 @@ test('an open superseded while stashing still preserves the bytes, and loses the
   vault.release();
   await Promise.all([first, second]);
 
-  // The stash itself must still complete — those are the user's bytes.
+  // The copy itself must still complete — those are the user's bytes.
   assert.deepEqual(h.stashes().map(([, text]) => text), ['my offline edit']);
   assert.equal(h.providers.forRoom(`n_${a}`)[0].destroyed, true);
-  assert.equal(h.editor.unmounts, 1, 'the superseded session was torn down');
+  assert.deepEqual(h.editor.mounts.map((m) => m.notePath), [`${SHARE}/b.md`],
+    'the superseded open never bound: it lost the token before it displaced anything');
+  assert.equal(h.editor.document(`${SHARE}/a.md`), 'my offline edit', 'so a.md is untouched');
   assert.equal(h.editor.current?.notePath, `${SHARE}/b.md`);
   assert.equal(h.session.openNodeId(), b);
 });

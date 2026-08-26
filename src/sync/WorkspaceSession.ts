@@ -77,7 +77,9 @@ import type { Extension } from '@codemirror/state';
 import type { EditorView } from '@codemirror/view';
 
 import { NODE_WAIT_MS, NOTE_SYNC_TIMEOUT_MS, RECOVERED_DIR } from '../tree/constants.ts';
-import { assertInsideShare, extOf, fold, hashOf } from '../tree/paths.ts';
+import {
+  assertInsideShare, fallbackForkName, fold, forkName, hashOf, validateRel,
+} from '../tree/paths.ts';
 import { deriveTree } from '../tree/TreeIndex.ts';
 import type { TreeDoc } from '../tree/TreeDoc.ts';
 import type { DeviceState } from './DeviceState.ts';
@@ -379,21 +381,29 @@ export class WorkspaceSession {
   private queue: Promise<void> = Promise.resolve();
 
   /**
-   * The digest of the local bytes already preserved for a node in this session.
+   * The digest of the shared text this session most recently BOUND for a node.
    *
-   * Obsidian's save of the editor's buffer is asynchronous and the plugin cannot
-   * make it happen, so between a divergent open and that save the file on disk
-   * still holds the revision that was just stashed. Obsidian fires `file-open`
-   * more than once for one file — an existing test says so — and a restored
-   * layout fires it again, so without this every one of those opens inside the
-   * save window writes another identical copy: nine of them in three minutes, in
-   * the incident this was written for.
+   * A THIRD claim about content, with a third name, and that is I17's own lesson
+   * applied once more. `s` says THE WORKSPACE holds it. `contentHash` says THIS
+   * DISK holds it. This says THIS WORKSPACE'S DOCUMENT HELD THESE BYTES — it
+   * makes no claim about any disk, so it can never be misread as `contentHash`,
+   * whose whole amendment was that conflating the two put each vault's watermark
+   * on the other's file.
    *
-   * Keyed by node rather than path, so a rename cannot lose track of it, and
-   * never cleared: "these exact bytes are already preserved somewhere" does not
-   * stop being true, and a second copy of them would preserve nothing new.
+   * It exists for exactly one decision: whether a copy is owed when the buffer is
+   * about to be replaced. Notes are never rewritten from the CRDT while closed —
+   * the reconciler skips every bound node — so a stale disk copy is the NORMAL
+   * state of every note a collaborator has touched, and without a redundancy test
+   * every one of those opens files a recovery copy of this device's own past
+   * revision and tells the user their work differed.
+   *
+   * `contentHash` answers the same question for a note this device materialized
+   * or published, and it survives a restart. This covers the case it cannot: a
+   * divergent open deliberately DELETES the watermark (there are no bytes both in
+   * the workspace and on this disk at that moment), so the next divergence would
+   * otherwise fork the revision this very session put on screen.
    */
-  private readonly stashed = new Map<string, string>();
+  private readonly sharedSeen = new Map<string, string>();
 
   constructor(deps: WorkspaceSessionDeps) {
     this.deps = deps;
@@ -532,6 +542,7 @@ export class WorkspaceSession {
     // every peer reads.
     let mounted: MountResult | undefined;
     let buffer = '';
+    let preserved: string[] = [];
     for (let attempt = 0; attempt < 2; attempt++) {
       const B = this.deps.editor.bufferOf(notePath);
       if (B === null) { release(provider, doc); return; }      // arm 0: no bindable leaf
@@ -541,6 +552,28 @@ export class WorkspaceSession {
         release(provider, doc);
         this.localOnly(notePath, plan.reason);
         return;
+      }
+      if (plan.kind === 'take-shared') {
+        // PRESERVE FIRST, and this ordering is the whole of I1 on this arm. Both
+        // the buffer and the file are about to stop existing — the buffer is
+        // replaced with the shared text, and Obsidian then saves that over the
+        // file — so nothing is displaced until a copy of it is CONFIRMED on
+        // disk. The previous round preserved afterwards, on the strength of what
+        // the apply reported, which leaves a window between the replacement and
+        // a `vault.create` that throws in which the user's bytes are nowhere.
+        preserved = [];
+        for (const lost of await this.lostStrings(nodeId, B, localText, shared)) {
+          const dest = await this.preserveCopy(notePath, lost);
+          if (dest === null) {
+            // NO BIND. A bind after a failed preservation lets Obsidian save the
+            // shared text over bytes nothing holds. `preserveCopy` has already
+            // said so, naming the note and the reason (I15).
+            release(provider, doc);
+            return;
+          }
+          if (dest !== '') preserved.push(dest);
+        }
+        if (token !== this.token) { release(provider, doc); return; }
       }
       const planned: MountPlan = plan.kind === 'converge-up'
         ? { kind: 'converge-up', expect: B, edit: plan.edit }
@@ -554,23 +587,23 @@ export class WorkspaceSession {
     if (mounted.ok) this.active = { nodeId, notePath, doc, provider };
     else release(provider, doc);
 
-    // WHAT THIS OPEN DESTROYED, which is the only thing worth preserving (I1)
-    // and is NOT `localText`.
+    // BELT AND BRACES: what the apply ACTUALLY displaced, when that is not the
+    // buffer the decision was made about.
     //
-    // `localText` is what `vault.read` returned near the top of this method, and
-    // between there and here sits the provider's connect-and-sync round trip —
-    // up to eight seconds, and precisely the first seconds after a note opens,
-    // which is when people type. Obsidian's save of a dirty buffer is
-    // asynchronous and the plugin cannot make it happen, so from the user's first
-    // keystroke the EDITOR holds the newest copy of this note and the file does
-    // not. Only `apply` ever sees that copy, and only the `take-shared` arm
-    // displaces it — which is the point of there being five arms.
-    if (mounted.replaced !== undefined) {
-      await this.stashLocalCopy(nodeId, notePath, mounted.replaced);
+    // `take-shared` is the one arm with an await between reading the buffer and
+    // acting on it, and Obsidian's save of a dirty buffer is asynchronous — so
+    // from the user's first keystroke the EDITOR holds the newest copy of this
+    // note and the file does not, and only `apply` ever sees the copy it
+    // displaced. Owed on a REFUSAL too: the buffer is left holding the shared
+    // text either way, so those characters are exactly as gone as after a
+    // success.
+    if (mounted.replaced !== undefined && mounted.replaced !== buffer) {
+      const dest = await this.preserveCopy(notePath, mounted.replaced);
+      if (dest !== null && dest !== '') preserved.push(dest);
     }
 
     if (!mounted.ok) return;
-    void buffer;
+    if (mounted.replaced !== undefined) this.reportTakeShared(notePath, preserved);
 
     // I6 + I17: the workspace may be told this node is published only once the
     // round trip has come back AND there is something to publish. An empty
@@ -612,16 +645,21 @@ export class WorkspaceSession {
     // a watermark for a session that is already being torn down would claim this
     // device holds content it no longer has open.
     const finalText = text.toString();
+    const sha256 = await hashOf(finalText);
+    if (token !== this.token) return;
+
+    // "This workspace's document held these bytes." Recorded on EVERY bind,
+    // including the ones that record no watermark, because it makes no claim
+    // about any disk and so cannot go stale in the way `contentHash` can.
+    this.sharedSeen.set(nodeId, sha256);
+
     if (finalText !== localText) {
-      if (token !== this.token) return;
       if (this.deps.state.data.contentHash[nodeId] !== undefined) {
         delete this.deps.state.data.contentHash[nodeId];
         this.deps.state.schedulePersist();
       }
       return;
     }
-    const sha256 = await hashOf(finalText);
-    if (token !== this.token) return;
     if (this.deps.tree.get(nodeId)?.s === 1) {
       this.deps.state.data.contentHash[nodeId] = { sha256, len: finalText.length };
       this.deps.state.schedulePersist();
@@ -776,57 +814,133 @@ export class WorkspaceSession {
   }
 
   /**
-   * Preserve the local bytes under `ShadowLink Recovered/` (spec §2.3), which is
-   * at the vault root and outside the share by construction — so the watcher
-   * ignores it and no node is ever minted for a stashed copy.
+   * Which of the two strings about to stop existing are owed a copy (I1).
    *
-   * Called only once a mount has genuinely displaced something, and handed the
-   * string that was displaced — normally the editor's buffer, which is newer
-   * than the file. The file at the canonical path is not removed: Obsidian is
-   * about to write the editor's buffer over it, and a stash that deleted it
-   * first would leave the user staring at a missing note for as long as that
-   * save took.
+   * `B` is the buffer — replaced with the shared text. `f` is the file, which
+   * Obsidian then saves that same shared text over. Both are about to be gone,
+   * and a copy is owed for each one that is neither the shared text itself nor
+   * PROVABLY still held by the workspace.
    *
-   * Two things are deliberately not stashed, because a copy of them preserves
-   * nothing and the notice that goes with it is not true:
-   *  - bytes already preserved for this node in this session (see `stashed`);
-   *  - an empty document. Nine 0-byte "local copies" is what the incident looked
-   *    like from the user's side, and not one of them held anything.
+   * Provably held means the workspace can give those exact bytes back: it holds
+   * something (`R !== ''`), and this device has a record of those bytes having
+   * been in the workspace's document or on this disk. Notes are never rewritten
+   * from the CRDT while closed, so a stale disk copy is the ordinary state of
+   * every note a collaborator has touched — without this test, the single most
+   * common event in the product files a recovery copy and tells the user their
+   * work differed.
    *
-   * EVERY step is inside the try, including finding a free name. `uniquify`
-   * throws after 1000 collisions, and while it sat outside, that throw left
-   * `doOpen` through `open`'s catch-all — after the document had already been
-   * replaced — as a bare "ShadowLink: could not find a free name for …", naming
-   * neither the note nor the fact that its bytes are now nowhere. I15's rule is
-   * that a failed stash must not abort the open and must not be silent; a rule
-   * that only holds for the failures someone happened to wrap is neither.
+   * An EMPTIED document holds nothing to give back, so when `R === ''` nothing
+   * is ever provably held, whatever the watermarks say.
+   *
+   * `f` is skipped when `B` is being preserved and the buffer retains it: the
+   * buffer is then this device's own continuation of the file, so a second file
+   * for one note is noise rather than safety.
    */
-  private async stashLocalCopy(
-    nodeId: string,
-    notePath: string,
-    replaced: string,
-  ): Promise<void> {
-    if (replaced.length === 0) return;
-    try {
-      const digest = await hashOf(replaced);
-      if (this.stashed.get(nodeId) === digest) return;
-      const dest = await this.uniquify(`${RECOVERED_DIR}/${stashName(notePath, this.now())}`);
-      if (!assertInsideShare(this.deps.shareRoot(), dest, true)) return;
-      if (!(await this.exists(RECOVERED_DIR))) await this.deps.vault.createFolder(RECOVERED_DIR);
-      await this.deps.vault.create(dest, replaced);
-      // Recorded only once the bytes are genuinely on disk somewhere else. A
-      // stash that failed has preserved nothing and must be attempted again.
-      this.stashed.set(nodeId, digest);
-      this.deps.notice(
-        `Your local "${baseOf(notePath)}" differed from the shared copy. `
-        + `A copy was saved to ${RECOVERED_DIR}/.`,
-      );
-    } catch (err) {
-      // I15: a stash that failed must not abort the open, and must not be silent
-      // either — the shared copy IS what is on screen by now, and these are the
-      // only bytes the user had that nothing else holds.
-      this.deps.notice(`Could not save a local copy of "${baseOf(notePath)}": ${messageOf(err)}`);
+  private async lostStrings(nodeId: string, B: string, f: string, R: string): Promise<string[]> {
+    const held = async (x: string): Promise<boolean> => {
+      if (R === '') return false;
+      if (x === '') return true;
+      const h = await hashOf(x);
+      return this.sharedSeen.get(nodeId) === h
+        || this.deps.state.data.contentHash[nodeId]?.sha256 === h;
+    };
+    const out: string[] = [];
+    const keepB = B !== '' && B !== R && !(await held(B));
+    if (keepB) out.push(B);
+    if (f !== '' && f !== R && f !== B && !(keepB && retains(f, B)) && !(await held(f))) {
+      out.push(f);
     }
+    return out;
+  }
+
+  /**
+   * Put `lost` under `ShadowLink Recovered/` (spec §2.3), which is at the vault
+   * root and outside the share by construction — so the watcher ignores it and
+   * no node is ever minted for a preserved copy.
+   *
+   * Returns the destination path, `''` when there was nothing to preserve, or
+   * NULL when the copy could not be made. Null is not advisory: the caller must
+   * not bind after it, because a bind lets Obsidian save the shared text over
+   * bytes nothing holds.
+   *
+   * THE NAME IS DERIVED FROM THE CONTENT, and deliberately carries no timestamp.
+   * That, plus `VaultPort.create` refusing an occupied path, is what replaces the
+   * session-scoped map of "already preserved" digests the previous round used:
+   * nine `file-open`s inside Obsidian's save window land on ONE name and produce
+   * ONE file, structurally, and unlike a map it survives a plugin reload. It
+   * mirrors `Reconciler.forkPathFor`, which reached the same conclusion for
+   * attachments and for the same reason.
+   *
+   * The file at the canonical path is not removed: Obsidian is about to write the
+   * editor's buffer over it, and removing it first would leave the user staring
+   * at a missing note for as long as that save took.
+   *
+   * EVERY step is inside the try, hashing and name-finding included. I15's rule
+   * is that a failed preservation must not abort the open and must not be silent;
+   * a rule that only holds for the failures someone happened to wrap is neither.
+   */
+  private async preserveCopy(notePath: string, lost: string): Promise<string | null> {
+    // A copy of nothing preserves nothing, and the notice that goes with it is
+    // untrue. Nine 0-byte "local copies" is what the incident looked like from
+    // the user's side, and not one of them held anything.
+    if (lost.length === 0) return '';
+    try {
+      const dest = `${RECOVERED_DIR}/${this.forkNameFor(baseOf(notePath), await hashOf(lost))}`;
+      if (!assertInsideShare(this.deps.shareRoot(), dest, true)) {
+        throw new Error(`${dest} is not a destination this plugin may write`);
+      }
+      // The name names the content, so an occupied path already holds these
+      // exact bytes. Preserved, and nothing more to do.
+      if (await this.exists(dest)) return dest;
+      if (!(await this.exists(RECOVERED_DIR))) await this.deps.vault.createFolder(RECOVERED_DIR);
+      await this.deps.vault.create(dest, lost);
+      return dest;
+    } catch (err) {
+      this.deps.notice(
+        `Could not save a copy of "${baseOf(notePath)}": ${messageOf(err)}. `
+        + 'It is not syncing and the shared copy has not been applied — your text is untouched.',
+      );
+      return null;
+    }
+  }
+
+  /**
+   * `Plan.md` -> `Plan (conflicted copy — Ada, 3f9c1a02).md`, falling back to the
+   * undecorated form when the display name pushes the result past what
+   * `validateRel` accepts. Mirrors `Reconciler.forkPathFor`.
+   */
+  private forkNameFor(name: string, digest: string): string {
+    const who = this.deps.userName;
+    const decorated = who.trim() === ''
+      ? fallbackForkName(name, digest)
+      : forkName(name, digest, who);
+    if (validateRel(RECOVERED_DIR, decorated, 'f')) return decorated;
+    const plain = fallbackForkName(name, digest);
+    if (validateRel(RECOVERED_DIR, plain, 'f')) return plain;
+    throw new Error(`no valid name under ${RECOVERED_DIR}/ for ${name}`);
+  }
+
+  /**
+   * What the user is told after the one arm that displaces anything.
+   *
+   * The other three say NOTHING, and that is the point: they did not do anything
+   * the user needs to know about. This one names the note and, where there is
+   * one, the file — never "a copy was saved to ShadowLink Recovered/", which
+   * leaves them to work out which of the files in it is theirs.
+   */
+  private reportTakeShared(notePath: string, preserved: string[]): void {
+    const name = baseOf(notePath);
+    if (preserved.length === 0) {
+      this.deps.notice(`"${name}" was updated to the shared version.`);
+      return;
+    }
+    const where = preserved.length === 1
+      ? preserved[0]
+      : `${preserved.slice(0, -1).join(', ')} and ${preserved[preserved.length - 1]}`;
+    this.deps.notice(
+      `"${name}" now shows the shared version. `
+      + `What was on your screen is saved to ${where}.`,
+    );
   }
 
   private async exists(path: string): Promise<boolean> {
@@ -837,16 +951,6 @@ export class WorkspaceSession {
     }
   }
 
-  private async uniquify(candidate: string): Promise<string> {
-    if (!(await this.exists(candidate))) return candidate;
-    const ext = extOf(candidate);
-    const stem = ext === '' ? candidate : candidate.slice(0, candidate.length - ext.length);
-    for (let n = 2; n < 1000; n++) {
-      const next = `${stem} (${n})${ext}`;
-      if (!(await this.exists(next))) return next;
-    }
-    throw new Error(`could not find a free name for ${candidate}`);
-  }
 }
 
 // ============================================================ real ports
@@ -1155,19 +1259,6 @@ function toLF(text: string): string {
 function baseOf(path: string): string {
   const i = path.lastIndexOf('/');
   return i === -1 ? path : path.slice(i + 1);
-}
-
-/** Filesystem-safe wall-clock stamp for a stashed copy's name. */
-function stampOf(ms: number): string {
-  return new Date(ms).toISOString().replace(/:/g, '-').replace(/\.\d+Z$/, '');
-}
-
-/** `Notes/a.md` -> `a (local copy 2026-06-26T10-00-00).md`. Mirrors the reconciler. */
-function stashName(path: string, at: number): string {
-  const base = baseOf(path);
-  const ext = extOf(base);
-  const stem = ext === '' ? base : base.slice(0, base.length - ext.length);
-  return `${stem} (local copy ${stampOf(at)})${ext}`;
 }
 
 function messageOf(err: unknown): string {
