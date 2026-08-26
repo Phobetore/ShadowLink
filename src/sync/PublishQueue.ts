@@ -82,12 +82,18 @@ import type { VaultPort } from './VaultPort.ts';
 /**
  * Why a pending entry is not work.
  *
- * Two refusals, worded differently to the user because they call for different
- * things: `'empty'` ends when the author types, `'not-text'` ends when somebody
- * renames the file. Neither ends by waiting, which is why neither is "waiting to
- * upload".
+ * Three refusals, worded differently to the user because they call for different
+ * things: `'empty'` ends when the author types, `'empty-attachment'` when
+ * something writes bytes into the file, `'not-text'` when somebody renames it.
+ * None of them ends by waiting, which is why none of them is "waiting to upload".
+ *
+ * `'empty-attachment'` is I6 on the attachment arm, said rather than inferred.
+ * It used to be no refusal at all: a 0-byte attachment was rejected incidentally
+ * by the settle check reading `st.bytes === 0` as "the writer has not finished",
+ * so the rule held by accident, the diagnostic said something untrue, and the
+ * entry charged the ladder and stayed counted for ever.
  */
-export type ParkReason = 'empty' | 'not-text';
+export type ParkReason = 'empty' | 'empty-attachment' | 'not-text';
 
 export interface PublishQueueDeps {
   docs: DocPort;
@@ -378,11 +384,12 @@ export class PublishQueue {
       }
       if (st === null) continue;
       const was = this.parkedStat.get(id);
-      // An empty note needs a byte in it; a file that is not text needs to have
-      // been rewritten, and only its size and mtime can say so from out here.
-      const moved = reason === 'empty'
-        ? st.bytes > 0
-        : was === undefined || st.bytes !== was.bytes || st.mtime !== was.mtime;
+      // An empty note or attachment needs a byte in it; a file that is not text
+      // needs to have been rewritten, and only its size and mtime can say so
+      // from out here.
+      const moved = reason === 'not-text'
+        ? was === undefined || st.bytes !== was.bytes || st.mtime !== was.mtime
+        : st.bytes > 0;
       if (!moved) continue;
       this.unpark(id);
       woke = true;
@@ -743,8 +750,28 @@ export class PublishQueue {
       }
       await this.sleep(this.settleMs);
       const st = await this.deps.vault.stat(path);
-      if (st === null || st.bytes === 0 || st.bytes !== first.bytes || st.mtime !== first.mtime) {
+      if (st === null || st.bytes !== first.bytes || st.mtime !== first.mtime) {
         this.fail(id, new RetryLater(`${path} is still being written`));
+        return;
+      }
+
+      // I6 ON THIS ARM, SAID RATHER THAN INFERRED, and it is the first of the
+      // three writers of `s` to say it in its own words. A settled 0-byte file
+      // is not a file mid-write: two stats agreeing on size AND mtime is the
+      // evidence the writer has finished, and what it finished writing is
+      // nothing. There is no object to put in the store and nothing for `b` to
+      // name, so publishing one would announce content that does not exist —
+      // the attachment half of the 0-byte decoy the note arm refuses.
+      //
+      // It used to fall through the comparison above, which called it "still
+      // being written" for ever: the rule held by accident, the diagnostic was
+      // untrue, and the entry charged a rung of the ladder and stayed counted.
+      // PARKED, for exactly the reason a note is: waiting is not what fixes
+      // this, bytes arriving in the file are, and `repark` sees that with one
+      // `stat`.
+      if (st.bytes === 0) {
+        this.errors.set(id, new Error(`${path} is empty, so there is nothing to share`));
+        await this.park(id, 'empty-attachment', path);
         return;
       }
 
@@ -814,6 +841,18 @@ export class PublishQueue {
       // never re-offered.
       if (!(await this.deps.blobs.has(sha256)).present) {
         this.fail(id, new RetryLater(`the store did not confirm ${sha256}`));
+        return;
+      }
+
+      // I6 again, at the writer, and the two statements are not redundant. The
+      // one above is where the refusal is CHEAP — before a read, a hash and a
+      // dedup probe. This one is where `s` is actually set, and it is here so
+      // that the rule cannot be lost by somebody relaxing a comparison several
+      // screens away. `s` is the whole definition of "published" and it is never
+      // re-offered by anybody, so a wrong one is permanent.
+      if (bytes.length === 0) {
+        this.errors.set(id, new Error(`${path} is empty, so there is nothing to share`));
+        await this.park(id, 'empty-attachment', path);
         return;
       }
 

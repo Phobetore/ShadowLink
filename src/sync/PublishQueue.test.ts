@@ -1538,8 +1538,99 @@ test('B2: a zero-byte file is never published, however settled it looks', async 
   await h.queue.drain();
 
   assert.equal(h.blobs.calls.length, 0, 'not even a dedup probe');
-  assert.equal(h.tree.get(id)!.s, undefined, 'an empty attachment is a file mid-write (I6)');
+  assert.equal(h.tree.get(id)!.s, undefined, 'I6: nothing to publish is not published');
   assert.equal(h.state.data.publish[id].state, 'pending');
+});
+
+test('a settled 0-byte attachment is refused by I6, not by the settle check', async () => {
+  // The blob arm was the writer of `s: 1` that made NO I6 statement. A 0-byte
+  // attachment was rejected incidentally, by the settle check reading
+  // `st.bytes === 0` as "the writer has not finished" — so the rule held by
+  // accident, the diagnostic said something that was not true, and the entry
+  // charged a rung of the ladder and stayed counted for the lifetime of the
+  // vault. Relax that one comparison for zero-length files and `s: 1` lands on
+  // an empty blob with no guard anywhere.
+  const h = makeHarness();
+  const id = h.addBlob('clip.png', new Uint8Array(0));
+  h.queue.enqueue(id);
+
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['empty-attachment'],
+    'refused over the state of the user\'s own file, which is what a park is');
+  assert.equal(h.queue.pendingCount(), 0, 'so it is not an upload in progress');
+  assert.equal(h.state.data.publish[id].attempts, 0, 'and no rung of the ladder is charged');
+  assert.match(
+    String((h.queue.lastError(id) as Error).message), /empty/,
+    'the diagnostic says what is true, not "still being written"',
+  );
+
+  // And it is a park rather than a grave: bytes arriving lift it.
+  h.vault.seedBinary(`${SHARE}/clip.png`, png());
+  assert.equal(await h.queue.repark(), true);
+  assert.equal(h.queue.pendingCount(), 1);
+  await h.queue.drain();
+  assert.equal(h.tree.get(id)!.s, 1);
+  assert.deepEqual(h.queue.parked(), []);
+});
+
+test('a file still being written is still told apart from an empty one', async () => {
+  // The two used to be the same answer. They are different states: one ends by
+  // waiting and charges the ladder, the other never does and must not.
+  const h = makeHarness();
+  const id = h.addBlob('clip.png', png());
+  h.queue.enqueue(id);
+  h.settle.run = async (): Promise<void> => {
+    h.vault.seedBinary(`${SHARE}/clip.png`, new Uint8Array([...png(), 9, 9]));
+  };
+
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.deepEqual(h.queue.parked(), [], 'a growing file is not parked');
+  assert.equal(h.state.data.publish[id].attempts, 1, 'it waits, and the ladder says so');
+  assert.match(String((h.queue.lastError(id) as Error).message), /still being written/);
+});
+
+test('every writer of `s: 1` is one of the three, so a fourth cannot ship silently', () => {
+  // `s` is the whole definition of "published", it is never re-offered by
+  // anybody, and it has three writers that each have to make the same I6
+  // statement in their own words. Nothing anywhere greps for it, so a fourth
+  // would land with no guard and no test — which is the shape of the bug that
+  // started this whole investigation.
+  //
+  // This does not prove the three are right; the behavioural tests above and in
+  // WorkspaceSession.test.ts do that, one per writer. It proves that the set is
+  // the set, so adding to it is a decision somebody has to come here and make.
+  const root = fileURLToPath(new URL('../../', import.meta.url)).replace(/[\\/]$/, '');
+  const found: Record<string, number> = {};
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        // Not the dependencies, not the worktrees, not the build output.
+        if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue;
+      const hits = (readFileSync(full, 'utf8').match(/\bs:\s*1\b/g) ?? []).length;
+      if (hits > 0) found[full.slice(root.length + 1).replace(/\\/g, '/')] = hits;
+    }
+  };
+  walk(root);
+
+  assert.deepEqual(
+    found,
+    {
+      // the note arm and the attachment arm
+      'src/sync/PublishQueue.ts': 2,
+      // the editing session, which owns a node it holds open (I7)
+      'src/sync/WorkspaceSession.ts': 1,
+    },
+    'a new writer of `s: 1` must state I6 where it writes it, and be listed here',
+  );
 });
 
 // ⚠ B3, and the sharpest form of I17. `put` resolving true is OUR account of a

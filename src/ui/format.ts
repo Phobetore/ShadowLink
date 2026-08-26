@@ -115,19 +115,35 @@ export function statusLine(state: BarState): StatusLine {
 /**
  * The tooltip line for entries the publish queue parked.
  *
- * ONE LINE PER REASON, never a merged count, because the two ask the user for
- * different things: one ends when they type, the other when they rename the
- * file. "3 files are not being shared" would tell them to do neither, and
- * "waiting to upload" would be false for both.
+ * ONE LINE PER REASON, never a merged count, because the three ask the user for
+ * different things: one ends when they type, one when something writes bytes
+ * into a file, one when they rename it. "3 files are not being shared" would
+ * tell them to do none of it, and "waiting to upload" would be false for all
+ * three.
+ *
+ * An empty ATTACHMENT gets its own sentence rather than the note's. "It will be
+ * shared as soon as you type" is an instruction, and typing is not what puts
+ * bytes in a `.png`.
  */
 export function parkedLine(parked: ReadonlyArray<{ reason: ParkReason }>): string {
-  const empty = parked.filter((p) => p.reason === 'empty').length;
-  const notText = parked.length - empty;
+  const count = (reason: ParkReason): number => parked.filter((p) => p.reason === reason).length;
+  const empty = count('empty');
+  const emptyBlob = count('empty-attachment');
+  const notText = count('not-text');
   const lines: string[] = [];
   if (empty > 0) {
     lines.push(
       `${empty} ${empty === 1 ? 'note is' : 'notes are'} empty and ${empty === 1 ? 'has' : 'have'} `
       + `not been shared yet — ${empty === 1 ? 'it' : 'they'} will be shared as soon as you type.`,
+    );
+  }
+  if (emptyBlob > 0) {
+    lines.push(
+      `${emptyBlob} ${emptyBlob === 1 ? 'attachment is' : 'attachments are'} empty and `
+      + `${emptyBlob === 1 ? 'has' : 'have'} not been shared yet — `
+      + `${emptyBlob === 1 ? 'it' : 'they'} will be shared once `
+      + `${emptyBlob === 1 ? 'the file has' : 'the files have'} something in `
+      + `${emptyBlob === 1 ? 'it' : 'them'}.`,
     );
   }
   if (notText > 0) {

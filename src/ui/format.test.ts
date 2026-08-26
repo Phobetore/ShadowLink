@@ -330,6 +330,33 @@ test('the parked reasons are one line each, never one merged count', () => {
   assert.match(line, /\n1 file is named \.md/);
 });
 
+test('an empty attachment is not told to type into it', () => {
+  // I6 reaches the tooltip on the attachment arm too, and it asks for the thing
+  // that would actually end it. "It will be shared as soon as you type" is an
+  // instruction, and typing is not what puts bytes in a .png.
+  assert.equal(
+    parkedLine([{ reason: 'empty-attachment' }]),
+    '1 attachment is empty and has not been shared yet — it will be shared once the file '
+    + 'has something in it.',
+  );
+  assert.equal(
+    parkedLine([{ reason: 'empty-attachment' }, { reason: 'empty-attachment' }]),
+    '2 attachments are empty and have not been shared yet — they will be shared once the '
+    + 'files have something in them.',
+  );
+});
+
+test('the three parked reasons are three lines, in one fixed order', () => {
+  const line = parkedLine([
+    { reason: 'not-text' }, { reason: 'empty-attachment' }, { reason: 'empty' },
+  ]);
+  const lines = line.split('\n');
+  assert.equal(lines.length, 3, 'one instruction per reason, never a merged count');
+  assert.match(lines[0], /^1 note is empty/);
+  assert.match(lines[1], /^1 attachment is empty/);
+  assert.match(lines[2], /^1 file is named \.md/);
+});
+
 test('nothing parked is no line at all', () => {
   assert.equal(parkedLine([]), '');
 });
