@@ -2169,6 +2169,92 @@ test('B21: a markdown node whose bytes are not UTF-8 is never seeded', async () 
   assert.equal(h.tree.get(id)!.s, undefined);
 });
 
+test('a file cut mid-emoji is not text, and the byte count says it is', async () => {
+  // THE HOLE IN THE OLD GUARD, and it is the one shape a `.md` is most likely to
+  // arrive in: a file truncated in the middle of a four-byte character. Its
+  // comment claimed a lossy decode always fails the length check in the other
+  // direction because "U+FFFD is three bytes for every invalid one". That is not
+  // what the decoder does — it collapses a TRUNCATED multi-byte sequence into ONE
+  // U+FFFD, so three invalid bytes re-encode to exactly three and the round trip
+  // succeeds on bytes that are not text.
+  //
+  // What that cost: `s: 1` on mojibake, permanently, because `s` is never
+  // re-offered. The author's disk keeps `f0 9f 92`; every peer's `materialize`
+  // writes `ef bf bd`; and the author's own next open decodes lossily too, so
+  // both sides agree on the corruption.
+  const h = makeHarness();
+  const cut = new Uint8Array([0x68, 0x69, 0x20, 0xf0, 0x9f, 0x92]);   // "hi " + half an emoji
+  const id = h.tree.createNode({ k: 'f', d: '', n: 'notes.md' }, NOW);
+  h.vault.seedBinary(`${SHARE}/notes.md`, cut);
+  h.state.data.owned[id] = true;
+  h.state.data.materialized[id] = `${SHARE}/notes.md`;
+  h.queue.enqueue(id);
+
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined, 'the node is not published');
+  assert.equal(h.docs.text(`n_${id}`), '', 'and no mojibake reached the document');
+  assert.deepEqual(h.queue.parked(), [{ id, reason: 'not-text' }]);
+  assert.equal(h.notices.length, 1, h.notices.join(' | '));
+});
+
+test('a mid-file truncation is refused too, so this is not an end-of-file rule', async () => {
+  // 5 bytes in, 5 bytes out, and the invalid run is nowhere near the end. The
+  // family is `F0..F4` plus two continuation bytes, which is exactly what a file
+  // cut mid-emoji looks like wherever the cut happened.
+  const h = makeHarness();
+  const cut = new Uint8Array([0x41, 0xF0, 0x9F, 0x92, 0x42]);
+  const id = h.tree.createNode({ k: 'f', d: '', n: 'notes.md' }, NOW);
+  h.vault.seedBinary(`${SHARE}/notes.md`, cut);
+  h.state.data.owned[id] = true;
+  h.state.data.materialized[id] = `${SHARE}/notes.md`;
+  h.queue.enqueue(id);
+
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined);
+  assert.deepEqual(h.queue.parked(), [{ id, reason: 'not-text' }]);
+});
+
+test('every lead byte of the family that slipped through is refused', async () => {
+  // The escapees under the old byte-count rule were exactly `F0..F4` followed by
+  // two continuation bytes — one four-byte character cut after three. Each lead
+  // byte gets its own drain rather than one representative, because the family
+  // was named from a measurement and a guard that closed four fifths of it would
+  // look identical from any single case.
+  for (const lead of [0xF0, 0xF1, 0xF2, 0xF3, 0xF4]) {
+    const h = makeHarness();
+    const id = h.tree.createNode({ k: 'f', d: '', n: 'notes.md' }, NOW);
+    h.vault.seedBinary(`${SHARE}/notes.md`, new Uint8Array([0x68, 0x69, lead, 0x9f, 0x92]));
+    h.state.data.owned[id] = true;
+    h.state.data.materialized[id] = `${SHARE}/notes.md`;
+    h.queue.enqueue(id);
+
+    await h.queue.drain();
+
+    assert.equal(h.tree.get(id)!.s, undefined, `0x${lead.toString(16)} was published`);
+    assert.deepEqual(h.queue.parked(), [{ id, reason: 'not-text' }]);
+  }
+});
+
+test('a note that legitimately contains U+FFFD is still published', async () => {
+  // The other direction, and the reason the new guard reads the BYTES rather
+  // than refusing anything whose decode contains a replacement character:
+  // U+FFFD is an ordinary character and a note may hold one on purpose. Its
+  // three bytes are valid UTF-8, so they decode without loss and the file is
+  // text.
+  const h = makeHarness();
+  const id = h.add('notes.md', 'a replacement character, on purpose: �.');
+  h.queue.enqueue(id);
+
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, 1, 'published');
+  assert.equal(h.docs.text(`n_${id}`), 'a replacement character, on purpose: �.');
+  assert.deepEqual(h.queue.parked(), []);
+  assert.deepEqual(h.notices, []);
+});
+
 // The guard must not refuse ordinary notes. CRLF is the case that would break a
 // naive length check on the NORMALIZED text: `normLF` shortens it by one byte per
 // line, and the file on disk is the length the encoder sees, not the length after

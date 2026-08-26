@@ -683,15 +683,34 @@ export class PublishQueue {
    * §3.6. Did the text we just read actually come from this file, or is it what a
    * UTF-8 decoder made of bytes that are not text?
    *
-   * `vault.read` decodes as UTF-8 and every invalid byte becomes U+FFFD, so a
+   * `vault.read` decodes as UTF-8 and every invalid sequence becomes U+FFFD, so a
    * `'f'` node over a PNG yields mojibake that is a perfectly ordinary string —
    * and seeding THAT into a `Y.Text` is irreversible, because `s` is never
-   * re-offered and no later pass may touch a seeded doc. The check is one `stat`:
-   * re-encode what was read and compare its length with the file's real size.
+   * re-offered and no later pass may touch a seeded doc.
    *
    * It is reachable today rather than hypothetical: `publishUntracked` offers any
    * file named `.md` regardless of what is in it, and a kind-crossing rename
    * (§3.6) mints an `'f'` node over the bytes of a `.png` on purpose.
+   *
+   * THE CHECK USED TO BE A BYTE COUNT — re-encode what was read and compare with
+   * the file's size — under the claim that "a lossy decode fails the check in the
+   * other direction, U+FFFD is three bytes for every invalid one". That claim is
+   * false. The decoder collapses a TRUNCATED multi-byte sequence into ONE U+FFFD,
+   * so `68 69 20 f0 9f 92` — "hi " and the first three bytes of a four-byte
+   * character — re-encodes to exactly six bytes and passed. Measured end to end:
+   * the node published, the shared document holding `hi �`, the author's disk
+   * still holding the original bytes and every peer's `materialize` writing
+   * `ef bf bd` over them. Permanently, because `s` is never re-offered. A sweep
+   * of every lossy 1-3 byte run embedded in ASCII put 0.42% of them through the
+   * guard, and the family is exactly `F0..F4` plus two continuation bytes: a file
+   * cut mid-emoji, which is the likeliest way a `.md` arrives corrupted at all.
+   *
+   * WHAT IS TRUE IS SIMPLER, and it needs no size at all. The decoder emits
+   * U+FFFD for every error and for nothing else, so a decode containing none of
+   * them is lossless by construction and the bytes ARE UTF-8. Only a decode that
+   * does contain one is ambiguous — U+FFFD is a legitimate character a note may
+   * hold on purpose — and that is the one case worth a second read, which asks
+   * the bytes themselves with a decoder that refuses rather than replaces.
    *
    * REFUSING IS NOT FAILING — no rung of the backoff ladder is charged, because a
    * file that is not text will not become text by waiting; the entry stays
@@ -700,23 +719,27 @@ export class PublishQueue {
    * this, a rename by hand is, so there is no upload in progress for the status
    * bar to report and no honest way to count one.
    *
-   * A `stat` that cannot answer is a retry (I2): "I could not look" must not
-   * become "seed it anyway".
+   * A `stat` or a read that cannot answer is a retry (I2): "I could not look"
+   * must not become "seed it anyway".
    */
   private async roundTrips(id: string, path: string, raw: string): Promise<boolean> {
     const st = await this.deps.vault.stat(path);
     if (st === null) throw new RetryLater(`${path} is not on disk`);
-    const encoded = new TextEncoder().encode(raw).length;
-    // The BOM allowance: a UTF-8 decoder strips a leading byte-order mark, so a
-    // perfectly good note that carries one re-encodes exactly three bytes short.
-    // A lossy decode fails the check in the other direction — U+FFFD is three
-    // bytes for every invalid one — so this cannot let mojibake through.
-    if (encoded === st.bytes || encoded + BOM_BYTES === st.bytes) return true;
+    if (!raw.includes(REPLACEMENT)) return true;
+    // The decode lost something, or the note genuinely contains a replacement
+    // character. Nothing in the string can tell those apart; the bytes can.
+    const bytes = await this.deps.vault.readBinary(path);
+    try {
+      new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      return true;
+    } catch {
+      /* not UTF-8, and now it is proven rather than inferred from a length */
+    }
 
     this.parkedNodes.set(id, 'not-text');
     this.parkedStat.set(id, { bytes: st.bytes, mtime: st.mtime });
     this.errors.set(id, new Error(
-      `${path} is ${st.bytes} bytes on disk but decodes to ${encoded}: not UTF-8 text`,
+      `${path} is ${st.bytes} bytes on disk that are not valid UTF-8 text`,
     ));
     if (!this.seedRefused.has(id)) {
       this.seedRefused.add(id);
@@ -1163,8 +1186,13 @@ function mb(bytes: number): string {
   return value >= 10 ? String(Math.round(value)) : value.toFixed(1);
 }
 
-/** A UTF-8 byte-order mark, which a decoder strips and an encoder does not put back. */
-const BOM_BYTES = 3;
+/**
+ * U+FFFD, the only thing a UTF-8 decoder puts where it could not decode.
+ *
+ * Its presence is what makes a decode ambiguous rather than what makes it wrong:
+ * a note may hold one on purpose. Its ABSENCE is what proves a decode lossless.
+ */
+const REPLACEMENT = '�';
 
 /**
  * I18. Normalize on the way IN: the normalized form is the only form that exists
