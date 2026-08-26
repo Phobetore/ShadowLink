@@ -1086,7 +1086,11 @@ export class WorkspaceSession {
   private async awaitLocalBytes(notePath: string, ms: number): Promise<string | null> {
     const deadline = Date.now() + ms;
     for (;;) {
-      if (this.deps.editor.bufferOf(notePath) === '') return '';
+      const buffer = this.deps.editor.bufferOf(notePath);
+      // No bindable leaf: the open refuses at arm 0 whatever the disk says, so
+      // there is nothing here to wait for and a wait would only delay that.
+      if (buffer === null) return null;
+      if (buffer === '') return '';
       let bytes = 0;
       try {
         bytes = (await this.deps.vault.stat(notePath))?.bytes ?? 0;

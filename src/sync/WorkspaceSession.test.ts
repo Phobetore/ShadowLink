@@ -2289,6 +2289,23 @@ test('an open with no editor view for the target releases the provider', async (
   assert.equal(h.session.openNodeId(), null);
 });
 
+test('a brand-new note with no leaf at all does not sit through the seed wait', async () => {
+  // The wait exists to tell two states apart in the editor and on the disk. With
+  // no bindable leaf the open refuses at arm 0 whatever the disk says, so waiting
+  // for it would only delay a refusal that is already decided.
+  const h = makeHarness({ seedWaitMs: 60_000 });
+  const id = h.add('Untitled.md', '', { owned: true });
+  h.providers.configure(`n_${id}`, { remote: '' });
+  h.editor.missing.add(`${SHARE}/Untitled.md`);
+
+  const started = Date.now();
+  await h.session.open(`${SHARE}/Untitled.md`);
+
+  assert.ok(Date.now() - started < 1_000, `the open took ${Date.now() - started} ms`);
+  assert.equal(h.session.openNodeId(), null);
+  assert.equal(h.providers.created[0].destroyed, true);
+});
+
 test('opening a second note closes the first', async () => {
   const h = makeHarness();
   const a = h.add('a.md', 'body a', { s: 1, owned: true });
