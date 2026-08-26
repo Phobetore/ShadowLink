@@ -37,7 +37,10 @@ import { RECOVERED_DIR } from '../tree/constants.ts';
 import { forkName, hashOf } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
-import { FakeEditorBinding, FakeVault } from './fakes.ts';
+import {
+  DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeEditorBinding, FakeVault,
+} from './fakes.ts';
+import { PublishQueue } from './PublishQueue.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 import {
   CodeMirrorBinding,
@@ -1252,6 +1255,59 @@ test('a brand-new note nobody has typed into pays nothing for the wait', async (
   assert.equal(h.session.openNodeId(), id, 'it is bound');
   assert.equal(h.tree.get(id)?.s, undefined, 'and unpublished, because it is empty (I6)');
   assert.deepEqual(h.notices, []);
+});
+
+test('the note the seed arm refused still reaches the workspace, from the file', async () => {
+  // THE HANDOFF, end to end, because "the publish path takes it from here" is
+  // the load-bearing half of refusing to seed from a buffer and is worth nothing
+  // as an assertion about the session alone. One vault, one tree, one state
+  // file, a real session and a real queue.
+  //
+  // What it costs is a beat, and the beat is one retry interval — the queue
+  // parks the note `empty` while the file is 0 bytes, `repark` lifts the park on
+  // the first tick after Obsidian writes the buffer out, and the drain that
+  // follows seeds the document from the FILE. What it does not restore is the
+  // binding: nothing re-opens a note, so the note is shared but not
+  // collaborative until the next `file-open`.
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { remote: '' });
+  h.editor.openLeaf(path, 'the body of some other note entirely.');
+
+  const docs = new FakeDocs();
+  const queue = new PublishQueue({
+    docs, vault: h.vault, blobs: new FakeBlobs(), state: h.state, tree: h.tree,
+    openNodeId: h.session.openNodeId,
+    now: () => NOW, settleMs: 0, sleep: async () => undefined,
+    displayName: 'Ada', notice: () => { /* counted through the session's list */ },
+    ...DESKTOP_MEMORY_CAP,
+  });
+  queue.enqueue(id);
+
+  await h.session.open(path);
+  assert.equal(h.session.openNodeId(), null, 'the seed arm refused');
+  assert.equal(h.tree.get(id)?.s, undefined);
+
+  await queue.drain();
+  assert.deepEqual(queue.parked().map((p) => p.reason), ['empty'],
+    'while the file is empty the queue parks it, and the bar says so honestly');
+  assert.equal(queue.pendingCount(), 0);
+
+  // Obsidian persists the dirty buffer. It is the only writer of an open note's
+  // bytes: `VaultPort` has no `modify` and `VaultWatcher.onModify` returns early
+  // for a note by design (I7).
+  h.vault.seed(path, 'f', 'the first sentence the user typed');
+
+  assert.equal(await queue.repark(), true, 'ONE tick lifts the park');
+  await queue.drain();
+  assert.equal(h.tree.get(id)?.s, 1, 'and the note is published');
+  assert.equal(docs.text(`n_${id}`), 'the first sentence the user typed');
+  assert.deepEqual(queue.parked(), []);
+  assert.equal(queue.pendingCount(), 0, 'nothing is left owed');
+
+  // The residual, asserted rather than left to be discovered: still unbound.
+  assert.equal(h.session.openNodeId(), null);
 });
 
 test('a new note whose bytes never reach the disk binds nothing and loses nothing', async () => {

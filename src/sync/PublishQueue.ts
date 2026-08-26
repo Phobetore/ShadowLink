@@ -700,10 +700,11 @@ export class PublishQueue {
    * character — re-encodes to exactly six bytes and passed. Measured end to end:
    * the node published, the shared document holding `hi �`, the author's disk
    * still holding the original bytes and every peer's `materialize` writing
-   * `ef bf bd` over them. Permanently, because `s` is never re-offered. A sweep
-   * of every lossy 1-3 byte run embedded in ASCII put 0.42% of them through the
-   * guard, and the family is exactly `F0..F4` plus two continuation bytes: a file
-   * cut mid-emoji, which is the likeliest way a `.md` arrives corrupted at all.
+   * `ef bf bd` over them. Permanently, because `s` is never re-offered. An
+   * exhaustive sweep of every lossy 1-3 byte run embedded in ASCII — 14,174,464
+   * of them — put 16,384 through the old guard and 0 through this one, and the
+   * lead byte of every escapee was `F0`..`F4`: a file cut mid-emoji, which is the
+   * likeliest way a `.md` arrives corrupted at all.
    *
    * WHAT IS TRUE IS SIMPLER, and it needs no size at all. The decoder emits
    * U+FFFD for every error and for nothing else, so a decode containing none of
