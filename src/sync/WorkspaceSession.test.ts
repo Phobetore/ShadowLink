@@ -34,7 +34,7 @@ import type { Extension, TransactionSpec } from '@codemirror/state';
 import type { EditorView } from '@codemirror/view';
 
 import { RECOVERED_DIR } from '../tree/constants.ts';
-import { hashOf } from '../tree/paths.ts';
+import { forkName, hashOf } from '../tree/paths.ts';
 import { TreeDoc } from '../tree/TreeDoc.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { FakeEditorBinding, FakeVault } from './fakes.ts';
@@ -1427,6 +1427,60 @@ test('a preservation that fails AFTER the bind says what actually happened', asy
   // And the facts the notice is being checked against.
   assert.equal(h.session.openNodeId(), id, 'the note really is syncing');
   assert.equal(h.editor.document(path), SHARED, 'and the shared copy really was applied');
+});
+
+test('an occupied name holding OTHER bytes is not mistaken for a copy of these', async () => {
+  // The dedup rested on 32 bits. `forkName` embeds `hash.slice(0, 8)`, and an
+  // occupied destination was read as proof that it "already holds these exact
+  // bytes" — so a prefix collision between two revisions of one note meant the
+  // second was silently not written while the user was told it was saved there.
+  // `Reconciler.forkPathFor`, which the comment says this mirrors, pairs the
+  // deterministic name with `uniquify` for exactly this reason.
+  //
+  // A real 32-bit collision is not something a test can produce, so the file is
+  // put in the way directly. What is being checked is the inference, and the
+  // inference is wrong for every reason a name can be occupied.
+  const h = makeHarness();
+  const id = h.add('a.md', STALE, { s: 1 });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  const collided = `${RECOVERED_DIR}/${forkName('a.md', await hashOf(STALE), 'Ada')}`;
+  h.vault.seed(RECOVERED_DIR, 'd');
+  h.vault.seed(collided, 'f', 'a DIFFERENT revision that happens to share 32 bits');
+
+  await h.session.open(path);
+
+  assert.equal(
+    h.vault.snapshot()[collided], 'a DIFFERENT revision that happens to share 32 bits',
+    'the file already there is never overwritten',
+  );
+  const saved = h.stashes().filter(([, text]) => text === STALE);
+  assert.equal(saved.length, 1, `the displaced bytes are on disk: ${JSON.stringify(h.stashes())}`);
+  const report = h.notices.find((n) => n.startsWith('"a.md" now shows the shared version'));
+  assert.ok(report !== undefined, h.notices.join(' | '));
+  assert.ok(report.includes(saved[0][0]), `the notice names the file that holds them: ${report}`);
+});
+
+test('an occupied name that DOES hold these bytes is still one file, not nine', async () => {
+  // The other half, and the property the content-derived name exists for: nine
+  // `file-open`s inside Obsidian's save window produce ONE file, structurally,
+  // and it survives a plugin reload where a session-scoped map would not.
+  const h = makeHarness();
+  const id = h.add('a.md', STALE, { s: 1 });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+
+  await h.session.open(path);
+  const first = h.stashes();
+  assert.equal(first.length, 1);
+
+  // A second open of the same divergence, with the disk still stale.
+  h.editor.openLeaf(path, STALE);
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  await h.session.open(null);
+  await h.session.open(path);
+
+  assert.deepEqual(h.stashes(), first, 'the same bytes land on the same name, once');
 });
 
 test('a preservation that fails BEFORE the bind still says the text is untouched', async () => {

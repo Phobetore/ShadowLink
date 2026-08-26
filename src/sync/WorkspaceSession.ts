@@ -1118,6 +1118,23 @@ export class WorkspaceSession {
    * mirrors `Reconciler.forkPathFor`, which reached the same conclusion for
    * attachments and for the same reason.
    *
+   * BUT AN OCCUPIED NAME IS NOT PROOF, and treating it as proof rested on 32
+   * bits: `forkName` embeds `hash.slice(0, 8)`, so two distinct revisions of one
+   * note that share a 32-bit prefix land on one name — and the second was
+   * silently not written while the user was told it was saved there. Worse, a
+   * name can be occupied for reasons that are not a hash at all: the user made a
+   * file there. `Reconciler.forkPathFor`, which this mirrors, pairs the
+   * deterministic name with `uniquify` for exactly this reason, and reverting
+   * `uniquify` out of here dropped that half.
+   *
+   * So the destination is READ and COMPARED. A match is the ordinary case and
+   * costs one read; anything else moves to the next window of the same digest —
+   * still content-derived, still deterministic, so the nine-opens property
+   * survives intact: the second open recomputes the same digest, finds window 0
+   * occupied by other bytes, and lands on the same window 1 the first one did.
+   * Eight windows and then an honest failure, because sha256 is 64 hex
+   * characters and a claim nobody can satisfy is worse than a notice.
+   *
    * The file at the canonical path is not removed: Obsidian is about to write the
    * editor's buffer over it, and removing it first would leave the user staring
    * at a missing note for as long as that save took.
@@ -1146,16 +1163,34 @@ export class WorkspaceSession {
     // the user's side, and not one of them held anything.
     if (lost.length === 0) return '';
     try {
-      const dest = `${RECOVERED_DIR}/${this.forkNameFor(baseOf(notePath), await hashOf(lost))}`;
-      if (!assertInsideShare(this.deps.shareRoot(), dest, true)) {
-        throw new Error(`${dest} is not a destination this plugin may write`);
+      const digest = await hashOf(lost);
+      const name = baseOf(notePath);
+      for (let window = 0; window * 8 < digest.length; window++) {
+        const dest = `${RECOVERED_DIR}/${this.forkNameFor(name, digest.slice(window * 8))}`;
+        if (!assertInsideShare(this.deps.shareRoot(), dest, true)) {
+          throw new Error(`${dest} is not a destination this plugin may write`);
+        }
+        if (await this.exists(dest)) {
+          // ASK THE FILE, do not infer from the name. A destination that already
+          // holds these exact bytes is preserved and there is nothing to do; one
+          // that holds anything else — a prefix collision, or a file the user
+          // put there — is not this copy and must not be reported as one. A read
+          // that cannot answer takes the same branch: an extra file is the safe
+          // direction and a false claim is not.
+          let held: string | null;
+          try {
+            held = await this.deps.vault.read(dest);
+          } catch {
+            held = null;
+          }
+          if (held === lost) return dest;
+          continue;
+        }
+        if (!(await this.exists(RECOVERED_DIR))) await this.deps.vault.createFolder(RECOVERED_DIR);
+        await this.deps.vault.create(dest, lost);
+        return dest;
       }
-      // The name names the content, so an occupied path already holds these
-      // exact bytes. Preserved, and nothing more to do.
-      if (await this.exists(dest)) return dest;
-      if (!(await this.exists(RECOVERED_DIR))) await this.deps.vault.createFolder(RECOVERED_DIR);
-      await this.deps.vault.create(dest, lost);
-      return dest;
+      throw new Error(`no free name under ${RECOVERED_DIR}/ for ${name}`);
     } catch (err) {
       this.deps.notice(
         `Could not save a copy of "${baseOf(notePath)}": ${messageOf(err)}. `
