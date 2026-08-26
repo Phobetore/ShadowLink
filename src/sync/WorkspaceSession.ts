@@ -397,13 +397,9 @@ export function decide(
     //    note reaches the workspace a beat later with no guess made anywhere.
     //  - a file WITH bytes is this note's own content, and `retains(f, B)` is a
     //    real bound against it rather than a vacuous one: the buffer has to have
-    //    kept half of what the disk says this note is. That is what lets a user
-    //    who typed into a new note before it finished opening keep their typing,
-    //    and what lets Obsidian's "Make a copy" — whose file already holds the
-    //    bytes — seed and bind on the first open instead of being refused.
-    //
-    // `doOpen` gives the disk a bounded moment to answer before it asks, so the
-    // ordinary case of typing into a brand-new note is a beat, not a refusal.
+    //    kept half of what the disk says this note is. That is what lets
+    //    Obsidian's "Make a copy" — whose file already holds the bytes — seed
+    //    and bind on the first open instead of being refused.
     if (f !== '' && retains(f, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
     if (f === '') return unsaved;
     return { kind: 'take-shared' };
@@ -456,25 +452,17 @@ const elsewhere: Decision = {
  * the file on its next pass without being asked (§6.2). It is deliberately not
  * a `take-shared`: the shared document has never held anything, so "the shared
  * copy wins on screen" would mean emptying a note the user is writing.
+ *
+ * It is answered from the disk as it is AT THIS INSTANT, and not from a poll
+ * that gives Obsidian a few seconds to catch up. A wait cannot make this
+ * sentence truer: Obsidian's autosave debounce restarts on every keystroke, so
+ * the user who most needs the note bound is the one whose file is still empty
+ * when any window of any size expires.
  */
 const unsaved: Decision = {
   kind: 'local-only',
   reason: 'it has not been saved to disk yet — it will be shared on its own once Obsidian saves it.',
 };
-
-/**
- * How long the seed arm gives the disk to say what a brand-new note holds.
- *
- * Obsidian persists a dirty buffer on its own a couple of seconds after the last
- * keystroke, and this is that plus a margin. It is a TIMEOUT and not a threshold:
- * nothing is decided differently on either side of it, so it cannot be tuned into
- * a wrong answer — running out only means this open binds nothing, and the
- * publish queue still seeds the note from the file on its next pass.
- */
-const SEED_FILE_WAIT_MS = 3_000;
-
-/** How often that wait re-asks. One `stat`, and only while the answer is absent. */
-const SEED_POLL_MS = 100;
 
 // ============================================================ public surface
 
@@ -512,8 +500,6 @@ export interface WorkspaceSessionDeps {
   scheduleReconcile?: (cause: string) => void;
   /** Bound wait for the tree to name a node for the path (spec §6.1). */
   nodeWaitMs?: number;
-  /** Bound wait for a brand-new note's own bytes to reach the disk. */
-  seedWaitMs?: number;
   /** Bound wait for a GENUINE content-doc sync. */
   syncTimeoutMs?: number;
 }
@@ -528,7 +514,6 @@ interface ActiveSession {
 export class WorkspaceSession {
   private readonly deps: WorkspaceSessionDeps;
   private readonly nodeWaitMs: number;
-  private readonly seedWaitMs: number;
   private readonly syncTimeoutMs: number;
 
   private active: ActiveSession | null = null;
@@ -622,7 +607,6 @@ export class WorkspaceSession {
   constructor(deps: WorkspaceSessionDeps) {
     this.deps = deps;
     this.nodeWaitMs = deps.nodeWaitMs ?? NODE_WAIT_MS;
-    this.seedWaitMs = deps.seedWaitMs ?? SEED_FILE_WAIT_MS;
     this.syncTimeoutMs = deps.syncTimeoutMs ?? NOTE_SYNC_TIMEOUT_MS;
   }
 
@@ -685,8 +669,19 @@ export class WorkspaceSession {
       return;
     }
 
-    // The bytes of the file BEING OPENED, not whatever the active editor happens
-    // to hold. Reading the editor is how note B's body ends up seeding note A.
+    // `f`: THE BYTES OF THE FILE BEING OPENED, not whatever the active editor
+    // happens to hold. Reading the editor is how note B's body ends up seeding
+    // note A.
+    //
+    // Read HERE, before the connect, and deliberately not on the far side of the
+    // sync wait. Freshness sounds like the safer choice and is not: arm 4's whole
+    // condition is `R === f`, *"the workspace and this disk agree, so the buffer
+    // is the only thing that has moved"*, and Obsidian's save of the buffer lands
+    // inside the sync window often enough that a re-read would make `f` equal the
+    // BUFFER instead — which turns this device's own typing into arm 5, reverts
+    // it on screen and files it under `ShadowLink Recovered/` as a conflicted
+    // copy. `f` names the note as this device last knew it, which is the question
+    // arms 3 and 4 are both asking.
     let localText: string;
     try {
       localText = toLF(await this.deps.vault.read(notePath));
@@ -724,10 +719,8 @@ export class WorkspaceSession {
     this.repairLineEndings(text);
     const seeded = this.deps.tree.get(nodeId)?.s === 1;
     const own = this.deps.state.data.owned[nodeId] === true;
-    /** `R`: the shared document, after the repair. Read once, before the buffer. */
-    const shared = text.toString();
 
-    if (shared === '' && !seeded && !own) {
+    if (text.length === 0 && !seeded && !own) {
       // I5. Not an error and not a failure: the author simply has not uploaded
       // yet. Binding an empty document here would strand their content, because
       // the first keystroke would make this device's empty doc the shared truth.
@@ -739,26 +732,45 @@ export class WorkspaceSession {
       return;
     }
 
-    // THE SEED ARM WORKS FROM THE FILE, SO GIVE THE FILE A MOMENT TO EXIST.
+    /**
+     * `R`: the shared document, after the repair.
+     *
+     * FROM HERE TO `apply` THERE IS NO `await` ON ANY ARM THAT WRITES INTO THIS
+     * DOCUMENT, and that is a structural property this file is built around
+     * rather than a happy accident. A round that put a three-second poll between
+     * this read and the write measured the result: another writer landing in the
+     * window — a peer, or this device's own publish queue seeding the note from
+     * the file — left the converge-up edit computing `affixEdit('', B)` from an
+     * `R` that had stopped being empty, and inserted the buffer at position 0 of
+     * a document that already held content. That is the I5 concatenation, on a
+     * live provider, with `s` set and nothing said to the user.
+     */
+    const shared = text.toString();
+
+    // THE SEED ARM DOES NOT WAIT FOR THE DISK, AND THE ABSENCE IS THE DESIGN.
     //
-    // `shared === '' && !seeded && own` is arm 3, and with a 0-byte file it has
-    // no evidence at all: an empty file and a non-empty buffer is *either* a user
-    // who typed into a brand-new note before it finished opening *or* a leaf
-    // Obsidian has not repointed yet, and nothing in this process can tell those
-    // two apart. The DISK can, and it answers by itself within a couple of
-    // seconds — Obsidian saves the dirty buffer, and this note's file is the one
-    // place its own bytes are going to appear.
+    // A previous round put a bounded poll here — up to three seconds, one `stat`
+    // every hundred milliseconds — so that a user who had typed into a brand-new
+    // note before it finished opening would have their bytes on disk by the time
+    // arm 3 asked. Three separate failures came out of that one line and all
+    // three are properties of HAVING a wait rather than of how it was written:
     //
-    // It resolves as soon as EITHER side speaks, so the ordinary cases pay
-    // nothing: a brand-new note nobody has typed into has an empty buffer and
-    // returns on the first check (arm 1 agrees and the first-byte publisher takes
-    // it from there), and a leaf that has not caught up returns the instant it
-    // does. Only the genuinely ambiguous state waits, and it waits bounded.
-    if (shared === '' && !seeded && own && localText === '') {
-      const caught = await this.awaitLocalBytes(notePath, this.seedWaitMs);
-      if (token !== this.token) { release(provider, doc); return; }
-      if (caught !== null) localText = caught;
-    }
+    //  - it put an `await` between the read of the shared document and the write
+    //    into it, so `R` became a snapshot up to three seconds old and the
+    //    converge-up edit was computed from it (see `shared` above);
+    //  - it was the only wait in this file a newer `open()` could not interrupt,
+    //    because it slept on a bare timer instead of registering in `waiters`,
+    //    so switching notes stalled for the full window and so did `destroy()`;
+    //  - it made a promise it could not keep. Obsidian's autosave debounce
+    //    restarts on every keystroke, so a user who types for longer than the
+    //    window — the ordinary thing to do after Cmd-N — reached the expiry with
+    //    a 0-byte file anyway, and the refusal that followed was measured ending
+    //    in a published prefix and a rollback of everything typed after it.
+    //
+    // So arm 3 decides from ONE INSTANT. A file with bytes authorises the seed;
+    // an empty file is local-only, touching neither side, until Obsidian saves
+    // and the drain publishes from the file (§6.2). No timer, no polling, and no
+    // number to tune.
 
     // The target must still be the file the user is looking at. Between the first
     // await and here the user may have switched notes without a newer `open()`
@@ -1057,56 +1069,6 @@ export class WorkspaceSession {
       this.waiters.add(wake);
       const timer = setTimeout(() => finish(provider.synced), ms);
     });
-  }
-
-  /**
-   * Bounded wait for the DISK to say what a brand-new note holds, or for the
-   * editor to stop claiming it holds anything.
-   *
-   * Returns the file's LF text once it has some, `''` once the buffer is empty,
-   * and `null` when neither happened inside the window. The two exits are the
-   * two ways the ambiguity `doOpen` calls this for can end, and each of them
-   * leaves `decide` with a state it has a real answer for:
-   *
-   *  - bytes on disk  -> arm 3 has this note's own content to bound the buffer
-   *                      against, so a user who typed into a new note keeps their
-   *                      typing and the note binds.
-   *  - empty buffer   -> arm 1 agrees, an empty document is bound, and the
-   *                      first-byte publisher (I6) shares it on the first
-   *                      keystroke, which is the ordinary path for a new note.
-   *  - neither        -> nothing is bound this open. Nothing is lost either: the
-   *                      buffer is untouched, Obsidian saves it, and the publish
-   *                      queue seeds the document from the file on its next pass.
-   *
-   * `stat` rather than `read` while it polls, because the question is only
-   * whether there are any bytes at all; the one `read` happens once the answer is
-   * yes. A `stat` that throws is treated as "not yet" rather than as an answer
-   * (I2): "I could not look" must never become "there is nothing there".
-   */
-  private async awaitLocalBytes(notePath: string, ms: number): Promise<string | null> {
-    const deadline = Date.now() + ms;
-    for (;;) {
-      const buffer = this.deps.editor.bufferOf(notePath);
-      // No bindable leaf: the open refuses at arm 0 whatever the disk says, so
-      // there is nothing here to wait for and a wait would only delay that.
-      if (buffer === null) return null;
-      if (buffer === '') return '';
-      let bytes = 0;
-      try {
-        bytes = (await this.deps.vault.stat(notePath))?.bytes ?? 0;
-      } catch {
-        bytes = 0;                                          // I2: asked, not answered
-      }
-      if (bytes > 0) {
-        try {
-          return toLF(await this.deps.vault.read(notePath));
-        } catch {
-          return null;                                      // the caller keeps what it read
-        }
-      }
-      if (Date.now() >= deadline) return null;
-      await new Promise<void>((resolve) => { setTimeout(resolve, SEED_POLL_MS); });
-    }
   }
 
   /**

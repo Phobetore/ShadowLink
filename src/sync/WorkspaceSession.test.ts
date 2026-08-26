@@ -323,7 +323,6 @@ function makeHarness(
     // sit through the production 3 s / 8 s windows.
     nodeWaitMs: 20,
     syncTimeoutMs: 20,
-    seedWaitMs: 20,
     ...over,
   });
 
@@ -863,9 +862,12 @@ test('a brand-new note typed into while it opens keeps the typing, and shares it
   // copy" that this very device was about to seed and that was empty.
   //
   // `save()` is Obsidian persisting the dirty buffer, and it is what AUTHORISES
-  // the seed now: the file is where a new note's bytes come from, and until it
-  // has any there is nothing here that says whether the buffer is this note's
-  // first sentence or the previous note's whole body. The open waits for it.
+  // the seed: the file is where a new note's bytes come from, and until it has
+  // any there is nothing here that says whether the buffer is this note's first
+  // sentence or the previous note's whole body. The open does not WAIT for it —
+  // a wait cannot make that question answerable, because Obsidian's autosave
+  // debounce restarts on every keystroke — it simply refuses, changing nothing,
+  // and the open after the save does the work.
   const h = makeHarness({ syncTimeoutMs: 5_000 });
   const id = h.add('Untitled.md', '', { owned: true });
   const path = `${SHARE}/Untitled.md`;
@@ -874,17 +876,24 @@ test('a brand-new note typed into while it opens keeps the typing, and shares it
   const open = h.session.open(path);
   await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
   h.editor.type(path, 'the first sentence of a new note');
-  h.editor.save(path);
   h.providers.forRoom(`n_${id}`)[0].emitSync();
   await open;
 
   assert.equal(h.editor.document(path), 'the first sentence of a new note',
     'the typing is exactly where the user left it');
-  const text = h.providers.created[0].doc.getText('content');
-  assert.equal(text.toString(), 'the first sentence of a new note', 'and it is what got shared');
+  assert.equal(h.providers.created[0].doc.getText('content').toString(), '',
+    'nothing was published from a buffer no file vouches for');
+  assert.equal(mutations(h.vault), 0, 'and nothing was written anywhere else');
+
+  // Obsidian writes the buffer out, on its own, and the next open shares it.
+  h.editor.save(path);
+  h.providers.configure(`n_${id}`, { mode: 'immediate' });
+  await h.session.open(path);
+
+  const text = h.providers.forRoom(`n_${id}`)[1].doc.getText('content');
+  assert.equal(text.toString(), 'the first sentence of a new note', 'and now it is shared');
   assert.equal(h.editor.inStep(path), true);
-  assert.equal(mutations(h.vault), 0, 'nothing was written anywhere else');
-  assert.deepEqual(h.notices, [], 'and nothing was said, because nothing went wrong');
+  assert.equal(mutations(h.vault), 0, 'still nothing written anywhere else');
   assert.equal(h.tree.get(id)?.s, 1, 'the node is published, from content that exists');
 });
 
@@ -1011,14 +1020,11 @@ test('a brand-new note seeded with an emoji seeds the emoji', async () => {
   const h = makeHarness({ syncTimeoutMs: 5_000 });
   const id = h.add('Untitled.md', '', { owned: true });
   const path = `${SHARE}/Untitled.md`;
-  h.providers.configure(`n_${id}`, { mode: 'manual', remote: '' });
-
-  const open = h.session.open(path);
-  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
-  h.editor.type(path, typed);
+  h.providers.configure(`n_${id}`, { remote: '' });
+  h.editor.openLeaf(path, typed);
   h.editor.save(path);                         // Obsidian persists the dirty buffer
-  h.providers.forRoom(`n_${id}`)[0].emitSync();
-  await open;
+
+  await h.session.open(path);
 
   assert.equal(h.providers.created[0].doc.getText('content').toString(), typed);
   assert.equal(h.editor.inStep(path), true);
@@ -1210,10 +1216,11 @@ test('a duplicated note seeds from its own file instead of being refused', async
   assert.deepEqual(h.notices, [], 'with nothing said, because nothing went wrong');
 });
 
-test('a brand-new note is still seeded once its own bytes reach the disk', async () => {
-  // The other side of the rule: a note the user genuinely typed into is seeded
-  // from it, including one opened straight after another note — as soon as
-  // Obsidian has written the buffer out, which it does by itself.
+test('a brand-new note is seeded once its own bytes have reached the disk', async () => {
+  // The other side of the rule, and the whole promise the refusal makes. The
+  // first open is refused because nothing on this disk says what the note holds;
+  // Obsidian then writes the buffer out, which it does by itself, and the next
+  // open of the same note seeds and binds from those bytes with nothing said.
   const bodyA = 'note A, and several sentences of the user\'s own writing in it.';
   const h = makeHarness({ syncTimeoutMs: 5_000 });
   const idA = h.add('a.md', bodyA, { s: 1, owned: true });
@@ -1222,28 +1229,31 @@ test('a brand-new note is still seeded once its own bytes reach the disk', async
 
   const idB = h.add('new.md', '', { owned: true });
   const pathB = `${SHARE}/new.md`;
-  h.providers.configure(`n_${idB}`, { mode: 'manual', remote: '' });
+  h.providers.configure(`n_${idB}`, { remote: '' });
+  h.editor.openLeaf(pathB, 'the first sentence of a new note');   // typed, not saved
+  h.active.path = pathB;
 
-  const open = h.session.open(pathB);
-  await until(() => h.providers.forRoom(`n_${idB}`).length === 1, 'the room to be opened');
-  h.editor.type(pathB, 'the first sentence of a new note');
-  h.editor.save(pathB);
-  h.providers.forRoom(`n_${idB}`)[0].emitSync();
-  await open;
+  await h.session.open(pathB);
+  assert.equal(h.session.openNodeId(), null, 'refused while the disk says nothing');
+  assert.equal(h.tree.get(idB)?.s, undefined);
 
-  const shared = h.providers.forRoom(`n_${idB}`)[0].doc.getText('content');
+  h.editor.save(pathB);                                 // Obsidian, on its own
+  await h.session.open(pathB);
+
+  const shared = h.providers.forRoom(`n_${idB}`)[1].doc.getText('content');
   assert.equal(shared.toString(), 'the first sentence of a new note');
   assert.equal(h.tree.get(idB)?.s, 1);
   assert.equal(h.editor.inStep(pathB), true);
-  assert.deepEqual(h.notices, []);
+  assert.equal(h.notices.length, 1, 'the refusal, and nothing about the open that worked');
 });
 
-test('a brand-new note nobody has typed into pays nothing for the wait', async () => {
-  // The ordinary Cmd-N: a 0-byte file and an empty buffer. That is arm 1, the
-  // wait's first check answers immediately, an empty document is bound, and I6's
-  // first-byte publisher shares it on the first keystroke — which is the path
-  // that must not have acquired a three-second pause.
-  const h = makeHarness({ syncTimeoutMs: 5_000, seedWaitMs: 60_000 });
+test('the ordinary Cmd-N binds an empty document and pays nothing to do it', async () => {
+  // A 0-byte file and an empty buffer is arm 1: the two sides already agree, an
+  // empty document is bound, and I6's first-byte publisher shares it on the
+  // first keystroke. It is the commonest open in the plugin and it must stay
+  // instant — a round that put a three-second poll in front of arm 3 is the
+  // reason this is measured rather than assumed.
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
   const id = h.add('Untitled.md', '', { owned: true });
   const path = `${SHARE}/Untitled.md`;
   h.providers.configure(`n_${id}`, { remote: '' });
@@ -1254,6 +1264,123 @@ test('a brand-new note nobody has typed into pays nothing for the wait', async (
   assert.ok(Date.now() - started < 1_000, `the open took ${Date.now() - started} ms`);
   assert.equal(h.session.openNodeId(), id, 'it is bound');
   assert.equal(h.tree.get(id)?.s, undefined, 'and unpublished, because it is empty (I6)');
+  assert.deepEqual(h.notices, []);
+});
+
+// ================================================================ one instant
+//
+// `decide` compares four strings and two booleans, and the whole design rests on
+// them naming ONE moment. The three tests below are the mechanical statement of
+// that: no `await` may separate the read of the shared document from the write
+// into it, and no wait in this file may be one a newer `open()` cannot cut short.
+//
+// They are not hypotheticals. A round put a three-second poll between those two
+// points and all three went red at once.
+
+test('the seed arm writes the shared document in the turn that read it', async () => {
+  // THE PROBE IS THE EVENT LOOP ITSELF. A microtask queued from `bufferOf` — the
+  // last thing the session reads before it decides — runs at the FIRST await the
+  // code path reaches. If there is none between the read and the write, `apply`
+  // has already run when it fires; if there is one, it runs first, and the
+  // converge-up edit is then computed from an `R` that has stopped being empty.
+  //
+  // The two orders are distinguishable in the document rather than only in a log:
+  // `affixEdit('', B)` inserts at position 0, so seeding first gives
+  // `PEER + body` and seeding on a stale snapshot gives `body + PEER`. That is
+  // the I5 concatenation, and it was measured on a live provider with `s` set and
+  // nothing said to the user.
+  const body = 'the first sentence of a new note';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('Untitled.md', body, { owned: true });     // the file vouches for it
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { remote: '' });
+
+  const order: string[] = [];
+  const editor = h.editor as unknown as {
+    bufferOf: (p: string) => string | null;
+    apply: (...args: unknown[]) => MountResult;
+  };
+  const realBufferOf = editor.bufferOf.bind(h.editor);
+  const realApply = editor.apply.bind(h.editor);
+  editor.bufferOf = (p: string): string | null => {
+    queueMicrotask(() => {
+      order.push('another writer');
+      h.providers.forRoom(`n_${id}`)[0].doc.getText('content').insert(0, 'PEER');
+    });
+    return realBufferOf(p);
+  };
+  editor.apply = (...args: unknown[]): MountResult => {
+    order.push('apply');
+    return realApply(...(args as Parameters<typeof realApply>));
+  };
+
+  await h.session.open(path);
+  await tick();
+
+  assert.deepEqual(order, ['apply', 'another writer'],
+    'an await between the buffer read and the write would let the other writer in first');
+  assert.equal(
+    h.providers.forRoom(`n_${id}`)[0].doc.getText('content').toString(),
+    `PEER${body}`,
+    'the seed landed on the document it was decided about, and the peer edit after it',
+  );
+});
+
+test('switching notes is never stalled behind a brand-new note\'s open', async () => {
+  // Every wait in this file registers in `waiters`, so a newer `open()` cuts it
+  // short — except the one a round added, which slept on a bare timer. Measured
+  // at production numbers on that branch: switching away from a note whose bytes
+  // had not landed took 2920 ms, and `destroy()` blocked for the same.
+  const h = makeHarness();
+  const idA = h.add('Untitled.md', '', { owned: true });
+  const pathA = `${SHARE}/Untitled.md`;
+  h.editor.openLeaf(pathA, 'a sentence typed straight after Cmd-N');
+  h.active.path = pathA;
+  h.providers.configure(`n_${idA}`, { remote: '' });
+
+  const idB = h.add('b.md', 'body B', { s: 1, owned: true });
+  h.providers.configure(`n_${idB}`, { remote: 'body B' });
+
+  const first = h.session.open(pathA);
+  await tick(10);                       // let the first open reach the decision
+  h.active.path = `${SHARE}/b.md`;
+  const started = Date.now();
+  await h.session.open(`${SHARE}/b.md`);
+  const elapsed = Date.now() - started;
+  await first;
+
+  assert.ok(elapsed < 500, `the second note waited ${elapsed} ms for the first`);
+  assert.equal(h.session.openNodeId(), idB);
+});
+
+test('the file is read as this device last knew the note, not as the buffer saved it', async () => {
+  // ARM 4's WHOLE CONDITION IS `R === f`, and the temptation to re-read the file
+  // on the far side of the sync wait is what would destroy it. Obsidian saves the
+  // dirty buffer while the room is connecting, so a fresh `f` equals the BUFFER
+  // rather than the note as the workspace knows it — and this device's own typing
+  // during the open window stops being catch-up and becomes arm 5: reverted on
+  // screen, filed under `ShadowLink Recovered/` as a conflicted copy of a note
+  // nothing went wrong with.
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('a.md', 'the shared body.', { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: 'the shared body.' });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.type(path, ' And a sentence typed while it opened.');
+  h.editor.save(path);                                  // Obsidian, mid-connect
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  assert.equal(
+    h.providers.forRoom(`n_${id}`)[0].doc.getText('content').toString(),
+    'the shared body. And a sentence typed while it opened.',
+    'the CRDT came up to the buffer',
+  );
+  assert.equal(h.editor.document(path), 'the shared body. And a sentence typed while it opened.',
+    'and the buffer was never dispatched into');
+  assert.deepEqual(h.stashes(), [], 'nothing was displaced, so nothing is filed');
   assert.deepEqual(h.notices, []);
 });
 
@@ -2289,11 +2416,10 @@ test('an open with no editor view for the target releases the provider', async (
   assert.equal(h.session.openNodeId(), null);
 });
 
-test('a brand-new note with no leaf at all does not sit through the seed wait', async () => {
-  // The wait exists to tell two states apart in the editor and on the disk. With
-  // no bindable leaf the open refuses at arm 0 whatever the disk says, so waiting
-  // for it would only delay a refusal that is already decided.
-  const h = makeHarness({ seedWaitMs: 60_000 });
+test('a brand-new note with no leaf at all refuses at once and writes nothing', async () => {
+  // Arm 0. There is nothing to bind and therefore nothing to decide, so the open
+  // ends immediately, the provider is released, and neither side is touched.
+  const h = makeHarness();
   const id = h.add('Untitled.md', '', { owned: true });
   h.providers.configure(`n_${id}`, { remote: '' });
   h.editor.missing.add(`${SHARE}/Untitled.md`);
