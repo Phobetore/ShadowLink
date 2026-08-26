@@ -630,8 +630,12 @@ export class WorkspaceSession {
       if (dest !== null && dest !== '') preserved.push(dest);
     }
 
+    // Said on a REFUSAL too, and for the same reason the copy is made on one: the
+    // buffer holds the shared text either way, so what it held before is just as
+    // gone. Silence there would leave the user looking at a note that changed
+    // under them with nothing to explain it and no idea a copy exists.
+    if (mounted.replaced !== undefined) this.reportTakeShared(notePath, preserved, mounted.ok);
     if (!mounted.ok) return;
-    if (mounted.replaced !== undefined) this.reportTakeShared(notePath, preserved);
 
     // I6: the node goes live the moment it HAS content, and not before.
     if (!seeded && own) {
@@ -1037,10 +1041,13 @@ export class WorkspaceSession {
    * one, the file — never "a copy was saved to ShadowLink Recovered/", which
    * leaves them to work out which of the files in it is theirs.
    */
-  private reportTakeShared(notePath: string, preserved: string[]): void {
+  private reportTakeShared(notePath: string, preserved: string[], bound: boolean): void {
     const name = baseOf(notePath);
+    // A refusal leaves the buffer holding the shared text, so the same thing
+    // happened to the user's screen — what did not happen is the collaboration.
+    const tail = bound ? '' : ' It is not syncing yet; switch away and back to try again.';
     if (preserved.length === 0) {
-      this.deps.notice(`"${name}" was updated to the shared version.`);
+      this.deps.notice(`"${name}" was updated to the shared version.${tail}`);
       return;
     }
     const where = preserved.length === 1
@@ -1048,7 +1055,7 @@ export class WorkspaceSession {
       : `${preserved.slice(0, -1).join(', ')} and ${preserved[preserved.length - 1]}`;
     this.deps.notice(
       `"${name}" now shows the shared version. `
-      + `What was on your screen is saved to ${where}.`,
+      + `What was on your screen is saved to ${where}.${tail}`,
     );
   }
 

@@ -1050,6 +1050,12 @@ test('a mount that refuses AFTER replacing the buffer still preserves what it re
     [STALE, `${STALE} and what I typed`].sort(),
     'the buffer the plan was made about, and the one the apply says it displaced',
   );
+  // And the user is told, on the refusal as well: the same thing happened to
+  // their screen either way, so silence would leave them looking at a note that
+  // changed under them with nothing to explain it.
+  assert.equal(h.notices.length, 1, h.notices.join(' | '));
+  assert.ok(h.notices[0].includes(RECOVERED_DIR), h.notices[0]);
+  assert.ok(h.notices[0].includes('not syncing yet'), h.notices[0]);
 });
 
 test('a mount that replaced nothing and found no divergence stashes nothing', async () => {
