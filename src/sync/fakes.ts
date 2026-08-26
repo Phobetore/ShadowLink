@@ -601,10 +601,25 @@ class FakeLeaf {
  *     only route, and it is asynchronous. `save()` is that route, and it is
  *     explicit precisely so a test has to say when the disk caught up.
  *
- * What it does NOT model, deliberately: the editor -> `Y.Text` direction
- * (`YSyncPluginValue.update`). Local typing is not what corrupted the share, and
- * modelling it would mean re-implementing CodeMirror's change iteration here,
- * which is the kind of second copy that starts disagreeing with production.
+ *  5. THE EDITOR -> `Y.Text` DIRECTION. `type` and `cut` on a leaf that is
+ *     CURRENTLY BOUND write through into the bound `Y.Text`, as
+ *     `YSyncPluginValue.update` does, under an origin the observer above
+ *     ignores.
+ *
+ *     This used to be the declared omission — "local typing is not what
+ *     corrupted the share" — and the omission cost a round. It meant the harness
+ *     could not express *a bound leaf that has moved since it was bound*, which
+ *     is precisely and only the state the seed arm's `prior.text === B` guard
+ *     covered; every test written for that guard therefore used a leaf frozen at
+ *     bind time and the guard looked total, while one call to `type` before
+ *     switching notes defeated it and published the previous note's body under a
+ *     new node. A fake that cannot express the case a guard is about does not
+ *     test that guard.
+ *
+ *     It is a translation of ONE range rather than of CodeMirror's change
+ *     iteration, because `type` and `cut` each make one — which is the whole of
+ *     what a test needs to say and none of the second copy of `iterChanges` that
+ *     would start disagreeing with production.
  */
 export class FakeEditorBinding implements EditorBinding {
   /** Every successful mount, in order. */
@@ -617,7 +632,11 @@ export class FakeEditorBinding implements EditorBinding {
 
   private readonly binding: CodeMirrorBinding;
   private readonly leaves = new Map<string, FakeLeaf>();
-  private observed: { text: Y.Text; observer: (event: Y.YTextEvent, tr: Y.Transaction) => void } | null = null;
+  private observed: {
+    notePath: string;
+    text: Y.Text;
+    observer: (event: Y.YTextEvent, tr: Y.Transaction) => void;
+  } | null = null;
 
   /** The vault `save()` writes through. Omitted when a test never saves. */
   constructor(private readonly vault: FakeVault | null = null) {
@@ -666,19 +685,47 @@ export class FakeEditorBinding implements EditorBinding {
    * characters went is not what it turns on; that they were there is. `at` is
    * there for the ones where it does — a buffer whose edit is in the MIDDLE is
    * what tells a retention bound apart from a prefix check.
+   *
+   * On a leaf that is CURRENTLY BOUND the characters reach the bound `Y.Text`
+   * too. See point 5 of the class comment: without that, "the note the user was
+   * reading has moved since it was bound" is a sentence this harness could not
+   * say, and it is the only state some guards on the open path are about.
    */
   type(notePath: string, text: string, at?: number): void {
     const leaf = this.leaves.get(notePath);
     if (leaf === undefined) throw new Error(`no leaf is open for ${notePath}`);
     const pos = at ?? leaf.state.doc.length;
-    leaf.dispatch({ changes: { from: pos, to: pos, insert: text } });
+    this.localEdit(notePath, leaf, pos, pos, text);
   }
 
   /** The user deleting a range. The other half of `type`, for the same reason. */
   cut(notePath: string, from: number, to: number): void {
     const leaf = this.leaves.get(notePath);
     if (leaf === undefined) throw new Error(`no leaf is open for ${notePath}`);
-    leaf.dispatch({ changes: { from, to, insert: '' } });
+    this.localEdit(notePath, leaf, from, to, '');
+  }
+
+  /**
+   * `YSyncPluginValue.update`, for the one range `type` and `cut` each make.
+   *
+   * The editor moves first and the `Y.Text` follows, inside a transaction whose
+   * origin is this binding — which is exactly the guard the observer above
+   * already carries (`tr.origin === this`), so the edit does not echo back into
+   * the leaf it came from. A leaf that is not the bound one, or a session with
+   * nothing bound, changes only the editor: that is what an unbound note is.
+   */
+  private localEdit(
+    notePath: string, leaf: FakeLeaf, from: number, to: number, insert: string,
+  ): void {
+    leaf.dispatch({ changes: { from, to, insert } });
+    const bound = this.observed;
+    if (bound === null || bound.notePath !== notePath) return;
+    const doc = bound.text.doc;
+    if (doc === null) return;
+    doc.transact(() => {
+      if (to > from) bound.text.delete(from, to - from);
+      if (insert !== '') bound.text.insert(from, insert);
+    }, this);
   }
 
   /**
@@ -806,7 +853,7 @@ export class FakeEditorBinding implements EditorBinding {
       if (changes.length > 0) leaf.dispatch({ changes });
     };
     text.observe(observer);
-    this.observed = { text, observer };
+    this.observed = { notePath, text, observer };
   }
 }
 

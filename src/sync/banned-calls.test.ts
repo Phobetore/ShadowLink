@@ -316,7 +316,12 @@ const IN_MEMORY: Record<string, string[]> = {
   // shared document; no disk write can follow from it that Obsidian's own save
   // of the buffer would not have made anyway.
   'src/sync/WorkspaceSession.ts': ['this.waiters', 'text'],
-  'src/sync/fakes.ts': ['this.open', 'this.entries', 'this.byFold', 'this.liveHandles', 'this.objects'],
+  // `bound.text` is the bound content `Y.Text` — a CRDT in memory. The delete is
+  // the fake's editor -> `Y.Text` direction: a `cut` in a bound leaf, which
+  // `YSyncPluginValue.update` performs on exactly the same object in production.
+  'src/sync/fakes.ts': [
+    'this.open', 'this.entries', 'this.byFold', 'this.liveHandles', 'this.objects', 'bound.text',
+  ],
   'src/tree/TreeDoc.ts': ['m', 'this.subscribers'],
   'src/tree/TreeIndex.ts': ['derivedPath'],
   'src/ui/DeferredEmbeds.ts': ['node.classList'],
