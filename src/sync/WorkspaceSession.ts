@@ -751,16 +751,24 @@ export class WorkspaceSession {
     // displaced. Owed on a REFUSAL too: the buffer is left holding the shared
     // text either way, so those characters are exactly as gone as after a
     // success.
+    //
+    // `displaced` is true here and false at the pre-write, and that is not a
+    // detail of wording: by this line the buffer already holds the shared text,
+    // so the reassurance the other call gives would be false in both halves.
+    let unsaved = false;
     if (mounted.replaced !== undefined && mounted.replaced !== buffer) {
-      const dest = await this.preserveCopy(notePath, mounted.replaced);
-      if (dest !== null && dest !== '') preserved.push(dest);
+      const dest = await this.preserveCopy(notePath, mounted.replaced, true);
+      if (dest === null) unsaved = true;
+      else if (dest !== '') preserved.push(dest);
     }
 
     // Said on a REFUSAL too, and for the same reason the copy is made on one: the
     // buffer holds the shared text either way, so what it held before is just as
     // gone. Silence there would leave the user looking at a note that changed
     // under them with nothing to explain it and no idea a copy exists.
-    if (mounted.replaced !== undefined) this.reportTakeShared(notePath, preserved, mounted.ok);
+    if (mounted.replaced !== undefined) {
+      this.reportTakeShared(notePath, preserved, mounted.ok, unsaved);
+    }
     if (!mounted.ok) return;
 
     // I6: the node goes live the moment it HAS content, and not before.
@@ -1117,8 +1125,22 @@ export class WorkspaceSession {
    * EVERY step is inside the try, hashing and name-finding included. I15's rule
    * is that a failed preservation must not abort the open and must not be silent;
    * a rule that only holds for the failures someone happened to wrap is neither.
+   *
+   * `displaced` says whether the buffer has ALREADY been replaced by the time
+   * this runs, and it exists because one sentence cannot be true of both callers.
+   * The pre-write happens before anything is touched, so "the shared copy has not
+   * been applied — your text is untouched" is a fact there, and it is the
+   * sentence that tells the user they can still copy their work out by hand. The
+   * belt-and-braces call runs on the far side of the bind, and saying the same
+   * thing there was false in both halves and false in the direction that stops
+   * them looking: the note IS syncing, the shared copy IS on screen, and the
+   * characters typed during the preservation window are gone.
    */
-  private async preserveCopy(notePath: string, lost: string): Promise<string | null> {
+  private async preserveCopy(
+    notePath: string,
+    lost: string,
+    displaced = false,
+  ): Promise<string | null> {
     // A copy of nothing preserves nothing, and the notice that goes with it is
     // untrue. Nine 0-byte "local copies" is what the incident looked like from
     // the user's side, and not one of them held anything.
@@ -1137,7 +1159,12 @@ export class WorkspaceSession {
     } catch (err) {
       this.deps.notice(
         `Could not save a copy of "${baseOf(notePath)}": ${messageOf(err)}. `
-        + 'It is not syncing and the shared copy has not been applied — your text is untouched.',
+        + (displaced
+          // Said plainly, and with no promise of recovery: the replacement
+          // carries `addToHistory.of(false)`, so undo does not reach past it.
+          ? `"${baseOf(notePath)}" now shows the shared version, and what was on `
+            + 'your screen a moment ago could not be saved anywhere.'
+          : 'It is not syncing and the shared copy has not been applied — your text is untouched.'),
       );
       return null;
     }
@@ -1167,7 +1194,12 @@ export class WorkspaceSession {
    * one, the file — never "a copy was saved to ShadowLink Recovered/", which
    * leaves them to work out which of the files in it is theirs.
    */
-  private reportTakeShared(notePath: string, preserved: string[], bound: boolean): void {
+  private reportTakeShared(
+    notePath: string,
+    preserved: string[],
+    bound: boolean,
+    unsaved: boolean,
+  ): void {
     const name = baseOf(notePath);
     // A refusal leaves the buffer holding the shared text, so the same thing
     // happened to the user's screen — what did not happen is the collaboration.
@@ -1179,10 +1211,17 @@ export class WorkspaceSession {
     const where = preserved.length === 1
       ? preserved[0]
       : `${preserved.slice(0, -1).join(', ')} and ${preserved[preserved.length - 1]}`;
-    this.deps.notice(
-      `"${name}" now shows the shared version. `
-      + `What was on your screen is saved to ${where}.${tail}`,
-    );
+    // WHAT THESE FILES ACTUALLY HOLD. When the belt-and-braces copy failed, the
+    // files that DID land are earlier revisions — the buffer the decision was
+    // made about, and the file — and the newest one, what was on the screen a
+    // moment ago, is nowhere. Calling those "what was on your screen" sends the
+    // user to open a file and conclude their last paragraph is in it. The
+    // failure itself has already been named by `preserveCopy`; this only stops
+    // contradicting it.
+    const what = unsaved
+      ? `${preserved.length === 1 ? 'An earlier copy is' : 'Earlier copies are'} saved to ${where}`
+      : `What was on your screen is saved to ${where}`;
+    this.deps.notice(`"${name}" now shows the shared version. ${what}.${tail}`);
   }
 
   private async exists(path: string): Promise<boolean> {

@@ -1370,6 +1370,83 @@ test('typing during the preservation is preserved too, rather than replacing it'
   assert.equal(h.editor.document(path), SHARED);
 });
 
+test('a preservation that fails AFTER the bind says what actually happened', async () => {
+  // The pre-write's notice is true where it is said: nothing has been displaced,
+  // so "your text is untouched" is a fact. The belt-and-braces call runs on the
+  // far side of the bind — the buffer already holds the shared text — and it was
+  // saying the same sentence. Both halves of it were false, in the direction
+  // that stops the user looking: the note IS syncing, the shared copy HAS been
+  // applied, and the characters typed during the preservation window are gone
+  // with no copy anywhere.
+  let gated: GatedVault | null = null;
+  const h = makeHarness({}, {
+    wrapVault: (inner) => { gated = new GatedVault(inner); return gated; },
+  });
+  const id = h.add('a.md', STALE, { s: 1 });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+  const vault = gated!;
+  vault.gates.add('create');
+
+  const open = h.session.open(path);
+  await until(() => vault.parked, 'the open to park writing the first copy');
+  h.editor.type(path, ' and one more thought');
+  vault.release();                                   // the FIRST create succeeds
+  await until(() => vault.parked === false, 'the first copy to land');
+  vault.gates.add('create');
+  vault.rejectOnRelease = true;
+  await until(() => vault.parked, 'the open to park writing the second copy');
+  vault.release();                                   // the SECOND create throws
+  await open;
+
+  const failure = h.notices.find((n) => n.startsWith('Could not save a copy of "a.md"'));
+  assert.ok(failure !== undefined, h.notices.join(' | '));
+  assert.equal(
+    failure.includes('your text is untouched'), false,
+    'the buffer holds the shared text by now: that sentence is false',
+  );
+  assert.equal(
+    failure.includes('has not been applied'), false,
+    'and so is that one — the bind already landed',
+  );
+  assert.ok(
+    failure.includes('could not be saved'),
+    `it has to say the characters are gone: ${failure}`,
+  );
+  // The FOLLOW-UP notice must not contradict it. The file that did land holds
+  // the buffer the decision was made about, not the one that was on screen a
+  // moment ago — "what was on your screen is saved to" would send the user to
+  // open it and conclude their last sentence is in it.
+  const report = h.notices.find((n) => n.startsWith('"a.md" now shows the shared version'));
+  assert.ok(report !== undefined, h.notices.join(' | '));
+  assert.equal(report.includes('What was on your screen is saved'), false, report);
+  assert.ok(report.includes('An earlier copy is saved to'), report);
+  assert.ok(report.includes(RECOVERED_DIR), report);
+  assert.deepEqual(h.stashes().map(([, t]) => t), [STALE], 'and that is what it holds');
+
+  // And the facts the notice is being checked against.
+  assert.equal(h.session.openNodeId(), id, 'the note really is syncing');
+  assert.equal(h.editor.document(path), SHARED, 'and the shared copy really was applied');
+});
+
+test('a preservation that fails BEFORE the bind still says the text is untouched', async () => {
+  // The other half of the same split, kept as a rule rather than an accident.
+  // Here nothing has been displaced, so the reassurance is a fact — and it is
+  // the sentence that tells the user they can copy their work out by hand.
+  const h = makeHarness({}, { wrapVault: (inner) => new RefusingCreate(inner) });
+  const id = h.add('a.md', STALE, { s: 1 });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { remote: SHARED });
+
+  await h.session.open(path);
+
+  assert.ok(
+    h.notices.some((n) => n.includes('your text is untouched')),
+    h.notices.join(' | '),
+  );
+  assert.equal(h.editor.document(path), STALE);
+});
+
 // ================================================================ I17 — the watermark
 
 test('a divergent open records no watermark, and removes the one it finds (I17)', async () => {
