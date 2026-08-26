@@ -361,7 +361,6 @@ export interface WorkspaceSessionDeps {
    * unpublished for up to half a minute for no reason.
    */
   scheduleReconcile?: (cause: string) => void;
-  now?: () => number;
   /** Bound wait for the tree to name a node for the path (spec §6.1). */
   nodeWaitMs?: number;
   /** Bound wait for a GENUINE content-doc sync. */
@@ -377,7 +376,6 @@ interface ActiveSession {
 
 export class WorkspaceSession {
   private readonly deps: WorkspaceSessionDeps;
-  private readonly now: () => number;
   private readonly nodeWaitMs: number;
   private readonly syncTimeoutMs: number;
 
@@ -435,7 +433,6 @@ export class WorkspaceSession {
 
   constructor(deps: WorkspaceSessionDeps) {
     this.deps = deps;
-    this.now = deps.now ?? ((): number => Date.now());
     this.nodeWaitMs = deps.nodeWaitMs ?? NODE_WAIT_MS;
     this.syncTimeoutMs = deps.syncTimeoutMs ?? NOTE_SYNC_TIMEOUT_MS;
   }

@@ -316,7 +316,6 @@ function makeHarness(
     userName: 'Ada',
     userColor: '#ff0000',
     notice: (msg) => { notices.push(msg); },
-    now: () => NOW,
     // Short waits: every timeout below is a real timer, so the suite must not
     // sit through the production 3 s / 8 s windows.
     nodeWaitMs: 20,
