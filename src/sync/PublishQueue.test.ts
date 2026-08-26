@@ -2572,7 +2572,7 @@ test('a parked note whose node is still live keeps its park, and says what it is
   assert.equal(h.queue.pendingCount(), 0, 'and it still promises no upload');
   assert.doesNotMatch(parkedLine(h.queue.parked()), /as soon as you type/,
     'the one thing that cannot lift this park is the one thing it used to ask for');
-  assert.match(parkedLine(h.queue.parked()), /no file on this device/);
+  assert.match(parkedLine(h.queue.parked()), /is not on this device/);
 });
 
 test('a parked note takes its own reason back the moment its file is bound again', async () => {

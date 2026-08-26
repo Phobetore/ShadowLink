@@ -244,8 +244,6 @@ class SyncRuntime {
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null;
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private retryTimer: ReturnType<typeof setInterval> | null = null;
-  /** One re-open at a time: a tick must not cancel the open the last tick started. */
-  private reopening = false;
   private reconcileRunning = false;
   private reconcileDirty = false;
   private nextCause: ReconcileCause = 'sync';
@@ -595,8 +593,7 @@ class SyncRuntime {
   }
 
   /**
-   * THREE questions, and each of them exists because the one before it left a
-   * state nothing else in the plugin could reach.
+   * TWO questions, deliberately, and this is what the park got wrong.
    *
    * `pendingCount()` is the STATUS BAR's number and excludes parked entries — an
    * empty note, a `.md` file that is not text — because no upload is owed for
@@ -609,55 +606,10 @@ class SyncRuntime {
    * `repark()` is a `stat` per parked entry, typically zero, rather than a full
    * pass — an idle vault holding one permanently empty note would otherwise pay
    * a tree derivation and a stat per attachment every 30 seconds for ever.
-   *
-   * `reopenUnbound()` is R18, and it is the same shape of gap one layer up:
-   * publishing recovers by itself and BINDING did not. A note the session
-   * declined — a brand-new one whose bytes had not reached the disk, one whose
-   * room had not synced, one whose author had not published it yet — stayed
-   * shared-but-not-collaborative for as long as it stayed open, because the only
-   * things that ever open a note are `file-open` and start-up. The user's remedy
-   * was to switch away and back, which is a remedy the plugin can perform.
-   *
-   * IT IS ASKED FIRST, and the order is not a preference — it is measured. Ask
-   * it last and the queue publishes the brand-new note from the file first, so
-   * the re-open arrives at a shared document holding the first paragraph and a
-   * file holding everything since: genuine divergence, take-shared, the note
-   * visibly snapping back to its first paragraph while the user is still typing
-   * into it and the rest filed as a "conflicted copy" of a note no second device
-   * has ever opened. Asked first, the same timeline reaches a shared document
-   * that is still EMPTY and a file that vouches for the buffer, which is the
-   * seed arm: it publishes what the user has written and binds, and everything
-   * typed afterwards flows through the CRDT. Both measured end to end.
    */
   private async drainTick(): Promise<void> {
-    this.reopenUnbound();
     if (this.queue.pendingCount() > 0) { this.scheduleReconcile('retry'); return; }
     if (await this.queue.repark()) this.scheduleReconcile('retry');
-  }
-
-  /**
-   * Ask the session for the active note again, when nothing is bound.
-   *
-   * The refusals this recovers from are all "not yet" states — I2's whole
-   * position — and every one of them ends without the user doing anything: the
-   * disk gains the note's bytes, the room syncs, the author publishes. Re-asking
-   * is what turns "not yet" back into a binding instead of leaving it at "not
-   * until you switch tabs".
-   *
-   * Cheap by construction: it returns on the first line for an ordinary vault
-   * with a note open, which is every tick of every session where nothing is
-   * wrong. `WorkspaceSession.localOnly` says each refusal once per path per
-   * reason, so a note that genuinely cannot bind produces one notice rather than
-   * one every thirty seconds — and says something again the moment its answer
-   * changes, or the moment it binds and breaks again.
-   */
-  private reopenUnbound(): void {
-    if (this.reopening) return;
-    if (this.session.openNodeId() !== null) return;
-    const active = this.plugin.app.workspace.getActiveFile();
-    if (active === null || !this.isSharedNote(active.path)) return;
-    this.reopening = true;
-    void this.session.open(active.path).finally(() => { this.reopening = false; });
   }
 
   async dispose(): Promise<void> {

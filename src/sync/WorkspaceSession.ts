@@ -664,34 +664,6 @@ export class WorkspaceSession {
    */
   private lastBound: { nodeId: string; text: string } | null = null;
 
-  /**
-   * What this session has already told the user about each path's local-only
-   * open, so a note that cannot bind is explained ONCE rather than every time
-   * somebody asks.
-   *
-   * It exists because something now asks repeatedly. Nothing in the plugin used
-   * to re-open a note, which is what made a refusal a delay with no end (R18);
-   * `main.ts`'s interval closes that by re-opening a shared note nothing is
-   * bound to. A note that is genuinely offline, or whose author has not
-   * published it, then takes the same refusal every thirty seconds — and a
-   * popup every thirty seconds is not information, it is a thing the user
-   * learns to dismiss without reading.
-   *
-   * KEYED BY PATH **AND REASON**, which is one step finer than "say it once per
-   * path". The loop this exists to silence repeats one reason, so both rules are
-   * equally quiet for it; the difference is a note whose refusal CHANGES —
-   * "not synced yet" becoming "offline", or a refusal becoming "waiting for the
-   * author to upload this note" — where a path-keyed rule would swallow the
-   * second sentence for the rest of the session and leave the user with a
-   * diagnosis that has stopped being true.
-   *
-   * CLEARED FOR A PATH THE MOMENT IT BINDS, so a note that recovers and then
-   * breaks again says so again. It is per session, in memory, and deliberately
-   * not persisted: it is a statement about what the user has been told, and a
-   * reload is a new conversation.
-   */
-  private readonly explained = new Map<string, string>();
-
   /** Disposes the first-byte publisher's observer, or null when none is armed. */
   private publisherOff: (() => void) | null = null;
 
@@ -937,9 +909,6 @@ export class WorkspaceSession {
       // The gate has just proved the editor holds exactly this, so it is the
       // one string this session knows a leaf is displaying. See `lastBound`.
       this.lastBound = { nodeId, text: text.toString() };
-      // This note works now, so whatever was said about it last time has been
-      // answered. If it breaks again the user is told again.
-      this.explained.delete(notePath);
     } else release(provider, doc);
 
     // BELT AND BRACES: what the apply ACTUALLY displaced, when that is not the
@@ -1262,11 +1231,6 @@ export class WorkspaceSession {
    * of them into something destructive.
    */
   private localOnly(notePath: string, reason: string): void {
-    // Said once per path per reason. See `explained`: something re-asks for a
-    // binding every thirty seconds now, and a note that is offline or whose
-    // author has not published it would otherwise produce a popup every time.
-    if (this.explained.get(notePath) === reason) return;
-    this.explained.set(notePath, reason);
     this.deps.notice(`${baseOf(notePath)}: ${reason}`);
   }
 

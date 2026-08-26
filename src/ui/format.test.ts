@@ -353,11 +353,11 @@ test('a note with no file on this device is not asked for a keystroke', () => {
   // will be shared as soon as you type" is an instruction pointing at nothing.
   assert.equal(
     parkedLine([{ reason: 'unbound' }]),
-    '1 note has no file on this device — it will be shared once the file is back.',
+    '1 file in the share is not on this device — nothing is being shared for it from here.',
   );
   assert.equal(
     parkedLine([{ reason: 'unbound' }, { reason: 'unbound' }]),
-    '2 notes have no file on this device — they will be shared once the files are back.',
+    '2 files in the share are not on this device — nothing is being shared for them from here.',
   );
 });
 
@@ -371,7 +371,7 @@ test('the four parked reasons are four lines, in one fixed order', () => {
   assert.match(lines[0], /^1 note is empty/);
   assert.match(lines[1], /^1 attachment is empty/);
   assert.match(lines[2], /^1 file is named \.md/);
-  assert.match(lines[3], /^1 note has no file on this device/);
+  assert.match(lines[3], /^1 file in the share is not on this device/);
 });
 
 test('nothing parked is no line at all', () => {

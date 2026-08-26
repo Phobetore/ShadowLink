@@ -125,10 +125,18 @@ export function statusLine(state: BarState): StatusLine {
  * shared as soon as you type" is an instruction, and typing is not what puts
  * bytes in a `.png`.
  *
- * `'unbound'` gets one for the same reason, one step further out: it is a note
- * this device has no file for, so every other sentence here asks for something
- * that cannot be done. It is the only line that asks for nothing, because there
- * is nothing to ask for — the entry lifts itself when the file arrives.
+ * `'unbound'` gets one for the same reason, one step further out: it is a file
+ * this device has no copy of, so every other sentence here asks for something
+ * that cannot be done. It is the only line that asks for nothing, and the only
+ * one that PROMISES nothing either.
+ *
+ * That second part is load-bearing. `PublishQueue.parked()` reports ANY parked
+ * entry with no materialized path as `'unbound'`, whatever parked it, so a
+ * `.md` that is not text and an empty attachment both arrive here once their
+ * file leaves the vault behind Obsidian's back. "It will be shared once the file
+ * is back" was true for one of the three: for the other two the file coming back
+ * re-parks the entry under its own reason and shares nothing. A sentence that
+ * names an outcome the named event will not produce is worse than a short one.
  */
 export function parkedLine(parked: ReadonlyArray<{ reason: ParkReason }>): string {
   const count = (reason: ParkReason): number => parked.filter((p) => p.reason === reason).length;
@@ -161,9 +169,9 @@ export function parkedLine(parked: ReadonlyArray<{ reason: ParkReason }>): strin
   }
   if (unbound > 0) {
     lines.push(
-      `${unbound} ${unbound === 1 ? 'note has' : 'notes have'} no file on this device — `
-      + `${unbound === 1 ? 'it' : 'they'} will be shared once `
-      + `${unbound === 1 ? 'the file is' : 'the files are'} back.`,
+      `${unbound} ${unbound === 1 ? 'file in the share is' : 'files in the share are'} not on `
+      + `this device — nothing is being shared for `
+      + `${unbound === 1 ? 'it' : 'them'} from here.`,
     );
   }
   return lines.join('\n');
