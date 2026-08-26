@@ -314,8 +314,10 @@ const IN_MEMORY: Record<string, string[]> = {
   // `text` is the content `Y.Text` — a CRDT in memory, not a file. The one
   // `text.delete` is the line-ending repair, which removes a `\r` from the
   // shared document; no disk write can follow from it that Obsidian's own save
-  // of the buffer would not have made anyway.
-  'src/sync/WorkspaceSession.ts': ['this.waiters', 'text'],
+  // of the buffer would not have made anyway. `explained` is an in-memory Map of
+  // what the user has already been told about each path's local-only open, and
+  // the delete is a path being forgotten because it has just bound.
+  'src/sync/WorkspaceSession.ts': ['this.waiters', 'text', 'this.explained'],
   // `bound.text` is the bound content `Y.Text` — a CRDT in memory. The delete is
   // the fake's editor -> `Y.Text` direction: a `cut` in a bound leaf, which
   // `YSyncPluginValue.update` performs on exactly the same object in production.

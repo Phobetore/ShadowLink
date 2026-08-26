@@ -509,9 +509,41 @@ test('the retry interval asks about parked entries as well as pending ones (§6.
     tick.includes('queue.repark()'),
     'and it MUST ask whether a parked entry\'s file has moved — nothing else ever will',
   );
+  assert.ok(
+    tick.includes('reopenUnbound()'),
+    'and whether the active note is bound at all — nothing else re-opens one either (R18)',
+  );
   assert.equal(
     (tick.match(/scheduleReconcile\(/g) ?? []).length, 2,
     'each question that answers yes asks for a pass',
+  );
+});
+
+// R18. Publishing recovered by itself and BINDING did not: a note the session
+// declined stayed shared-but-not-collaborative for as long as it stayed open,
+// because `file-open` and start-up are the only two openers in the plugin. The
+// remedy the user was given — switch away and back — is one the plugin can
+// perform, and the interval above is where it performs it.
+test('the retry interval re-opens a shared note nothing is bound to (§9 R18)', () => {
+  const reopen = block(
+    '\n  private reopenUnbound(): void {',
+    'main.ts no longer defines reopenUnbound',
+  );
+  assert.ok(
+    reopen.includes('this.session.openNodeId() !== null'),
+    'it must only act when NOTHING is bound; re-opening a live session would tear it down',
+  );
+  assert.ok(
+    reopen.includes('this.isSharedNote('),
+    'and only for a note an editing session applies to at all',
+  );
+  assert.ok(
+    reopen.includes('this.session.open('),
+    'the re-open is the session\'s own open, so every arm and every refusal is unchanged',
+  );
+  assert.ok(
+    reopen.includes('this.reopening'),
+    'and one at a time: a tick must not cancel the open the last tick started',
   );
 });
 

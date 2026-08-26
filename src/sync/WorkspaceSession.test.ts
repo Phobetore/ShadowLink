@@ -1579,6 +1579,134 @@ test('the note the seed arm refused still reaches the workspace, from the file',
     'and the session added no second copy of it');
 });
 
+// ================================================================ R18
+//
+// A note the session declined is shared but NOT COLLABORATIVE until something
+// opens it again, and until this round nothing ever did: `file-open` and
+// start-up are the only two openers in the plugin, so the user's remedy was to
+// switch tabs. `main.ts`'s retry interval now asks a third question — if nothing
+// is bound and the active file is a shared note, re-open it — and the tick below
+// is that method, verbatim, so these tests drive what the product drives.
+
+async function drainTick(
+  queue: PublishQueue,
+  session: WorkspaceSession,
+  activePath: () => string | null,
+): Promise<'drain' | 'repark-drain' | 'reopen' | 'nothing'> {
+  if (queue.pendingCount() > 0) { await queue.drain(); return 'drain'; }
+  if (await queue.repark()) { await queue.drain(); return 'repark-drain'; }
+  if (session.openNodeId() !== null) return 'nothing';
+  const active = activePath();
+  if (active === null) return 'nothing';
+  await session.open(active);
+  return 'reopen';
+}
+
+test('a note the seed arm refused becomes collaborative without the user doing anything', async () => {
+  // R18, END TO END, and the measurement it used to be. The whole arc: the seed
+  // arm refuses because nothing on this disk says what the note holds; Obsidian
+  // writes the buffer out; one tick lifts the park and publishes from the file;
+  // the next tick re-opens the note and it binds. Nothing was asked of the user
+  // and nothing of theirs was touched at any point.
+  const rooms = new Rooms();
+  const h = makeHarness({ syncTimeoutMs: 5_000 }, { rooms });
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.editor.openLeaf(path, 'the first sentence the user typed');
+
+  const queue = new PublishQueue({
+    docs: rooms, vault: h.vault, blobs: new FakeBlobs(), state: h.state, tree: h.tree,
+    openNodeId: h.session.openNodeId,
+    now: () => NOW, settleMs: 0, sleep: async () => undefined,
+    displayName: 'Ada', notice: () => { /* through the session's list */ },
+    ...DESKTOP_MEMORY_CAP,
+  });
+  queue.enqueue(id);
+  const tick = (): Promise<string> => drainTick(queue, h.session, () => h.active.path);
+
+  await h.session.open(path);
+  assert.equal(h.session.openNodeId(), null, 'refused: the disk says nothing yet');
+  assert.equal(await tick(), 'drain');
+  assert.deepEqual(queue.parked().map((p) => p.reason), ['empty']);
+
+  h.editor.save(path);                                  // Obsidian, on its own
+  assert.equal(await tick(), 'repark-drain', 'the park lifts and the note publishes');
+  assert.equal(h.tree.get(id)?.s, 1);
+  assert.equal(h.session.openNodeId(), null, 'and this is where it used to stop');
+
+  assert.equal(await tick(), 'reopen');
+  assert.equal(h.session.openNodeId(), id, 'bound, with nothing asked of the user');
+  assert.equal(h.editor.inStep(path), true);
+  assert.equal(rooms.text(`n_${id}`), 'the first sentence the user typed');
+  assert.deepEqual(h.stashes(), [], 'and nothing of theirs was displaced on the way');
+  assert.equal(await tick(), 'nothing', 'and it stops asking once it is bound');
+});
+
+test('a note that cannot bind at all is explained once, not once per tick', async () => {
+  // THE COST OF ASKING REPEATEDLY, and the rule that pays it. A colleague's note
+  // nobody has published is refused by I5 for as long as that stays true, so a
+  // thirty-second re-open would be a popup every thirty seconds. Measured
+  // without the rule: 30 ticks, 30 notices.
+  const h = makeHarness({ syncTimeoutMs: 20 });
+  const id = h.add('theirs.md', '');                    // not owned, never published
+  const path = `${SHARE}/theirs.md`;
+  h.providers.configure(`n_${id}`, { remote: '' });
+
+  for (let i = 0; i < 30; i++) {
+    if (h.session.openNodeId() === null) await h.session.open(path);
+  }
+
+  assert.deepEqual(h.notices, ['theirs.md: Waiting for the author to upload this note.']);
+});
+
+test('a note whose refusal changes says the new one', async () => {
+  // Once per path per REASON, not once per path. The loop above repeats one
+  // reason and is silenced either way; what a path-keyed rule would swallow is a
+  // diagnosis that has stopped being true, leaving the user with the old one for
+  // the rest of the session.
+  const h = makeHarness({ syncTimeoutMs: 20 });
+  const id = h.add('a.md', 'body', { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: 'body' });
+
+  await h.session.open(path);
+  await h.session.open(path);
+  assert.deepEqual(h.notices, ['a.md: Offline — this note is not syncing.']);
+
+  // The room comes back, but the leaf has not loaded its document.
+  h.providers.configure(`n_${id}`, { mode: 'immediate' });
+  h.editor.openLeaf(path, '');
+  await h.session.open(path);
+
+  assert.deepEqual(h.notices, [
+    'a.md: Offline — this note is not syncing.',
+    'a.md: its editor had not finished loading — switch away and back to try again.',
+  ]);
+});
+
+test('a note that binds and then breaks again is explained again', async () => {
+  // The reset. "Once per session" would leave a note that worked, broke, and now
+  // shows nothing on screen with no explanation for the rest of the session.
+  const h = makeHarness({ syncTimeoutMs: 20 });
+  const id = h.add('a.md', 'body', { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: 'body' });
+
+  await h.session.open(path);
+  assert.deepEqual(h.notices, ['a.md: Offline — this note is not syncing.']);
+
+  h.providers.configure(`n_${id}`, { mode: 'immediate' });
+  await h.session.open(path);
+  assert.equal(h.session.openNodeId(), id, 'it recovered');
+
+  h.providers.configure(`n_${id}`, { mode: 'manual' });
+  await h.session.open(path);
+  assert.deepEqual(h.notices, [
+    'a.md: Offline — this note is not syncing.',
+    'a.md: Offline — this note is not syncing.',
+  ], 'the same sentence again, because the binding in between answered the first');
+});
+
 test('a drain landing inside an open publishes once, and the session adds no copy', async () => {
   // THE ORDERING THE OLD TEST COULD NOT ASK ABOUT. `publishOne` defers on a node
   // the session holds OPEN (I7), and `openNodeId()` is null for the whole of
