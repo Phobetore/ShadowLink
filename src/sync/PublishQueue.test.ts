@@ -2423,6 +2423,59 @@ test('and it takes exactly one tick, so the wait is one retry interval', async (
   assert.equal(ticks, 1, `published after ${ticks} tick(s) of the retry interval`);
 });
 
+test('a parked empty note the user deleted stops advertising itself', async () => {
+  // The park's own scenario, made worse by the fix that introduced the park:
+  // Obsidian's "New note" is a 0-byte file and is parked `empty` (correct), the
+  // user changes their mind, and the watcher tombstones the node and unbinds it
+  // inside a LOCAL tree transaction — which the tree observer deliberately does
+  // not follow with a reconcile.
+  //
+  // From there `drainTick` never drains again: `pendingCount()` is 0 because the
+  // entry is parked, and `repark` used to skip an entry with no bound path. So
+  // `publishOne` was never called, `blockOf` never saw the tombstone, and the
+  // tooltip told the user for the rest of the session to type into a file that
+  // does not exist — one line per untitled note they ever thought better of.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['empty']);
+
+  await h.vault.trashLocal(`${SHARE}/Sans titre.md`);
+  h.tree.patchNode(id, { x: h.clock.now });
+  delete h.state.data.materialized[id];
+
+  const outcomes = new Set<string>();
+  for (let i = 0; i < 48; i++) {
+    h.clock.now += 30_000;
+    outcomes.add(await drainTick(h));
+  }
+  assert.deepEqual([...outcomes], ['nothing'], 'no drain is ever scheduled, then or later');
+  assert.deepEqual(h.queue.parked(), [], 'and nothing advertises a file that is gone');
+  assert.equal(h.queue.pendingCount(), 0, 'the bar still reads synced');
+  assert.deepEqual(h.queue.blocked().map((b) => b.id), [id],
+    'the entry is blocked: nothing can lift it');
+  assert.match(String(h.queue.lastError(id)), /has been deleted/,
+    'and it says so where a developer can read it, rather than disappearing');
+});
+
+test('a parked note whose node is still live keeps its park', async () => {
+  // The other side of the same question. Unbound but LIVE is not a state nothing
+  // can lift — the file may come back — so `blockOf` answers null and the park
+  // stays. Making the missing path itself the reason would have silenced a note
+  // that is still owed an upload.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  delete h.state.data.materialized[id];
+  await drainTick(h);
+
+  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['empty']);
+  assert.deepEqual(h.queue.blocked(), []);
+});
+
 test('an open note is published by the drain too, so a refused bind strands nothing', async () => {
   // The queue defers on a node the SESSION holds open (I7) — and a seed the
   // session refused is a node it does not hold open, so the deferral does not

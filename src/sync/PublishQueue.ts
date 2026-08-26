@@ -375,7 +375,33 @@ export class PublishQueue {
         continue;
       }
       const path = this.deps.state.data.materialized[id];
-      if (path === undefined || path === '') continue;
+      if (path === undefined || path === '') {
+        // NOTHING TO `stat`, WHICH IS NOT THE SAME AS NOTHING TO SAY.
+        //
+        // Skipping outright is what left the status bar telling the user, for
+        // the rest of the session, to type into a note they had deleted:
+        // Obsidian's "New note" is parked `empty` (correctly), the user changes
+        // their mind, and `VaultWatcher.writeTombstones` tombstones the node and
+        // unbinds it inside a LOCAL tree transaction — which the tree observer
+        // deliberately does not follow with a reconcile. From there `drainTick`
+        // finds `pendingCount()` 0, falls to `repark()`, and `repark` skipped the
+        // entry for want of a path: no drain is ever scheduled again, so
+        // `publishOne` never runs, so `blockOf` never sees the tombstone, and the
+        // park stayed — with "1 note is empty and has not been shared yet — it
+        // will be shared as soon as you type" pointing at a file that does not
+        // exist. Measured over 48 ticks: zero drains, and it accumulates one line
+        // per untitled note the user ever thought better of.
+        //
+        // The question that needs no path is the one to ask here. `blockOf`
+        // reads only the tree and the state file, both in memory, and answers
+        // for exactly the states nothing can lift; `block()` unparks, so the
+        // entry leaves the tooltip and takes `lastError` with it instead of
+        // vanishing from diagnostics as well. An entry whose node is still live
+        // stays parked, which is right: there the file may yet come back.
+        const why = this.blockOf(id);
+        if (why !== null) this.block(id, why);
+        continue;
+      }
       let st: Awaited<ReturnType<VaultPort['stat']>>;
       try {
         st = await this.deps.vault.stat(path);
