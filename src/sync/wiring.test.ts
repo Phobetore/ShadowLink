@@ -194,6 +194,18 @@ function blockOf(src: string, anchor: string, missing: string): string {
   const start = code.indexOf(anchor);
   assert.notEqual(start, -1, missing);
   assert.equal(code.indexOf(anchor, start + 1), -1, `"${anchor.trim()}" is not unique in main.ts`);
+  // THE FAIL-OPEN SHAPE, REFUSED RATHER THAN TRUSTED. A `{` inside the anchor —
+  // an object-literal return type, a destructured parameter — means the first
+  // brace after `start` belongs to that and its match ends the "block" before
+  // the body has begun, so every assertion about the body passes by looking at
+  // nothing. `bodyOf` is the reader for those. Fixing the one anchor somebody
+  // noticed left the SHAPE accepted, and a guard that fails open is worse than
+  // no guard at all.
+  const inner = anchor.indexOf('{');
+  assert.ok(
+    inner === -1 || inner === anchor.length - 1,
+    `"${anchor.trim()}" carries a brace before its end — use bodyOf, not blockOf`,
+  );
 
   let depth = 0;
   for (let i = skeleton.indexOf('{', start); i < skeleton.length; i += 1) {
@@ -293,9 +305,13 @@ test('a signature whose return type carries braces is read to the end of its BOD
   const src = '\nfunction shaped(): { a: string; b: string } {\n  return { a: BODY, b: \'x\' };\n}\n';
   const anchor = '\nfunction shaped(): { a: string; b: string } {';
 
-  assert.equal(
-    fixtureBlock(src, anchor).includes('BODY'), false,
-    'blockOf stops at the return type — which is why bodyOf exists',
+  // And the SHAPE is refused, not merely handled where somebody remembered to.
+  // Fixing the one anchor that had it left every future one free to reintroduce
+  // it silently, which is the same fail-open one layer up.
+  assert.throws(
+    () => fixtureBlock(src, anchor),
+    /use bodyOf, not blockOf/,
+    'blockOf would stop at the return type, so it refuses the anchor instead',
   );
   assert.ok(
     bodyOf(src, anchor, 'no such block').includes('BODY'),
