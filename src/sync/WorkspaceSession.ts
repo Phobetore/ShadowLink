@@ -129,6 +129,10 @@ export interface ProviderPort {
  * replaced, which is the only edit shape this file needs — the two strings it is
  * ever computed over are one revision of a note and the same revision with the
  * user's last few seconds of typing in it.
+ *
+ * The indices are UTF-16 CODE UNITS and must stay code units: `Y.Text` indexes
+ * in code units and nothing else addresses the same positions. What they must
+ * never be is the MIDDLE of a surrogate pair — see `affixEdit`.
  */
 export interface AffixEdit {
   readonly from: number;
@@ -136,13 +140,68 @@ export interface AffixEdit {
   readonly insert: string;
 }
 
-/** The single contiguous change turning `from` into `to`. */
+function isHighSurrogate(unit: number): boolean {
+  return unit >= 0xD800 && unit <= 0xDBFF;
+}
+
+function isLowSurrogate(unit: number): boolean {
+  return unit >= 0xDC00 && unit <= 0xDFFF;
+}
+
+/**
+ * The single contiguous change turning `from` into `to`.
+ *
+ * THE SCAN IS PER CODE UNIT AND THE RESULT IS PER CHARACTER, and the difference
+ * between those two sentences was a corruption. Applying these indices as a
+ * string splice is exact for any boundary at all; applying them to a `Y.Text` is
+ * not. Yjs's `ContentString.splice` REFUSES to split a surrogate pair — it
+ * rewrites both halves as U+FFFD rather than cut between them — so a boundary
+ * inside a pair destroys the character on the way into the CRDT, and the
+ * corruption is broadcast before the bind gate ever compares the two sides.
+ *
+ * It is not an exotic input. Every codepoint in one 1024-point block shares its
+ * leading unit, so swapping any emoji for its neighbour — 🔴 for 🔵, 👍 for 👎,
+ * 📅 for 📆 — makes the prefix scan stop exactly between the two halves. Blocks
+ * whose codepoints are 1024 apart share their TRAILING unit in the same way, so
+ * the suffix scan can stop there too.
+ *
+ * So both boundaries are pulled back off a pair before they are returned. That
+ * is one code unit each, in the direction that WIDENS the replaced range, so the
+ * edit stays exact as a string and stays a single contiguous change — and
+ * `Array.from` is not the fix here, because codepoint indices would address
+ * positions the `Y.Text` does not have.
+ */
 export function affixEdit(from: string, to: string): AffixEdit {
   const max = Math.min(from.length, to.length);
   let p = 0;
   while (p < max && from[p] === to[p]) p += 1;
   let s = 0;
   while (s < max - p && from[from.length - 1 - s] === to[to.length - 1 - s]) s += 1;
+
+  // The prefix boundary. The unit before it is common to both strings, so it is
+  // high in both or neither; the unit AFTER it may be a low surrogate in either.
+  // One step back clears it in both, because a high surrogate is not a low one
+  // and so `p - 1` cannot itself be mid-pair.
+  if (
+    p > 0 && isHighSurrogate(from.charCodeAt(p - 1))
+    && (isLowSurrogate(from.charCodeAt(p)) || isLowSurrogate(to.charCodeAt(p)))
+  ) {
+    p -= 1;
+  }
+
+  // The suffix boundary, mirrored. The first unit of the common suffix is shared,
+  // so it is low in both or neither; what precedes it may be high in either. One
+  // step forward — a shorter common suffix — puts that low surrogate inside the
+  // replaced range on both sides, and the new boundary follows a low surrogate,
+  // which cannot be mid-pair either.
+  if (
+    s > 0 && isLowSurrogate(from.charCodeAt(from.length - s))
+    && (isHighSurrogate(from.charCodeAt(from.length - s - 1))
+      || isHighSurrogate(to.charCodeAt(to.length - s - 1)))
+  ) {
+    s -= 1;
+  }
+
   return { from: p, to: from.length - s, insert: to.slice(p, to.length - s) };
 }
 

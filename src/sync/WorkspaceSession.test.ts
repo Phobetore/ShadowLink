@@ -929,6 +929,91 @@ test('the catch-up produces genuine ops, so a peer\'s edit after it still lands'
   assert.equal(h.editor.inStep(path), true);
 });
 
+test('swapping one emoji for another during the open window shares the emoji', async () => {
+  // The catch-up computes its edit over JavaScript strings and applies it to a
+  // `Y.Text`, and the two index spaces agree on every value except the one that
+  // matters. `todo 🔴 urgent` -> `todo 🔵 urgent` put the boundary between the
+  // high and the low surrogate; Yjs replaced BOTH halves with U+FFFD, wrote the
+  // mojibake into the CRDT, broadcast it, and only THEN did the bind gate notice
+  // the two sides were unequal — by which time the peers had it and the local
+  // user had been told nothing.
+  const before = 'todo \u{1F534} urgent';
+  const after = 'todo \u{1F535} urgent';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('a.md', before, { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: before });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.cut(path, 5, 7);                                  // the pair, both units
+  h.editor.type(path, '\u{1F535}', 5);
+  assert.equal(h.editor.document(path), after, 'the buffer really did swap the character');
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  const text = h.providers.created[0].doc.getText('content');
+  assert.equal(text.toString(), after, 'the shared document holds the emoji, not U+FFFD');
+  assert.equal(h.editor.document(path), after, 'and the buffer was never touched');
+  assert.equal(h.editor.inStep(path), true, 'so the note is genuinely bound');
+  assert.equal(mutations(h.vault), 0, 'nothing was filed');
+  assert.deepEqual(h.notices, []);
+});
+
+test('an astral catch-up whose boundaries both land mid-pair still binds', async () => {
+  // The prefix boundary AND the suffix boundary inside a pair, in one edit.
+  // U+1F534 and U+1F535 share their LEADING unit, so the prefix scan stops after
+  // it; U+1F134 and U+1F534 share their TRAILING one, so the common suffix
+  // begins on a low surrogate whose partner differs.
+  const head = 'head that is long and unchanged ';
+  const tail = ' tail that is long and unchanged';
+  const before = `${head}\u{1F534}X\u{1F134}${tail}`;
+  const after = `${head}\u{1F535}X\u{1F534}${tail}`;
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('a.md', before, { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: before });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.cut(path, head.length, head.length + 5);          // both pairs and the X
+  h.editor.type(path, '\u{1F535}X\u{1F534}', head.length);
+  assert.equal(h.editor.document(path), after, 'the buffer really is the both-sides case');
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  const text = h.providers.created[0].doc.getText('content');
+  assert.equal(text.toString(), after);
+  assert.equal(h.editor.inStep(path), true);
+
+  // And it is still an EDIT: a peer's delta after it lands where it aimed.
+  h.editor.remoteDelta(path, (t) => { t.insert(0, 'x '); });
+  assert.equal(h.editor.document(path), `x ${after}`);
+  assert.equal(h.editor.inStep(path), true);
+});
+
+test('a brand-new note seeded with an emoji seeds the emoji', async () => {
+  // The SEED arm runs the same `affixEdit`, from the empty string. Nothing here
+  // can land mid-pair — the whole buffer is the insert — but the arm publishes
+  // under a new node's name, so it is the one where a U+FFFD would be the note's
+  // only revision anywhere.
+  const typed = 'ship it \u{1F680}';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: '' });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.type(path, typed);
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  assert.equal(h.providers.created[0].doc.getText('content').toString(), typed);
+  assert.equal(h.editor.inStep(path), true);
+  assert.equal(h.tree.get(id)?.s, 1);
+});
+
 test('a buffer that is not a continuation of this note never enters the CRDT', async () => {
   // The one hazard master did not have and none of the three designs closed.
   // `viewFor` resolves a leaf by `view.file.path` while reading `view.editor.cm`,
@@ -1933,6 +2018,75 @@ test('affixEdit is exact: applying it reproduces the target', () => {
     assert.equal(applied, to, `${JSON.stringify(from)} -> ${JSON.stringify(to)}`);
     assert.ok(edit.from <= edit.to, 'the range is never inverted');
     assert.ok(edit.to <= from.length, 'and never runs past the source');
+  }
+});
+
+/** Does index `i` fall between the two halves of one surrogate pair in `s`? */
+function splitsAPair(s: string, i: number): boolean {
+  if (i <= 0 || i >= s.length) return false;
+  const before = s.charCodeAt(i - 1);
+  const after = s.charCodeAt(i);
+  return before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF;
+}
+
+test('affixEdit never lands a boundary inside a surrogate pair', () => {
+  // The indices stay UTF-16 CODE UNITS — `Y.Text` indexes in code units and
+  // nothing else would address the same positions. What must never happen is a
+  // boundary in the MIDDLE of a pair: Yjs's `ContentString.splice` refuses to
+  // split one and rewrites BOTH halves as U+FFFD instead. Every emoji in a
+  // 1024-point block shares its leading unit, so swapping one for another put
+  // the prefix boundary exactly there.
+  const cases: Array<[string, string]> = [
+    ['todo \u{1F534} urgent', 'todo \u{1F535} urgent'],   // measured: 🔴 -> 🔵
+    ['\u{1F44D}', '\u{1F44E}'],                           // 👍 -> 👎
+    ['due \u{1F4C5}', 'due \u{1F4C6}'],                   // 📅 -> 📆
+    ['a \u{1D11E} b', 'a \u{1D11F} b'],                   // 𝄞 -> 𝄟
+    // The SUFFIX boundary on its own: U+1F134 and U+1F534 share their TRAILING
+    // unit, so the common suffix starts on a low surrogate.
+    ['x\u{1F134}', 'x\u{1F534}'],
+    // BOTH boundaries mid-pair in one edit: the leading unit matches at the
+    // front and the trailing unit matches at the back.
+    ['\u{1F534}A\u{1F134}', '\u{1F535}A\u{1F534}'],
+    ['\u{1F534}\u{1F134}', '\u{1F535}\u{1F534}'],
+  ];
+  for (const [from, to] of cases) {
+    const edit = affixEdit(from, to);
+    const applied = from.slice(0, edit.from) + edit.insert + from.slice(edit.to);
+    assert.equal(applied, to, `still exact: ${JSON.stringify(from)} -> ${JSON.stringify(to)}`);
+    for (const [s, i, where] of [
+      [from, edit.from, 'from.from'], [from, edit.to, 'from.to'],
+      [to, edit.from, 'to.from'], [to, edit.from + edit.insert.length, 'to.end'],
+    ] as Array<[string, number, string]>) {
+      assert.equal(splitsAPair(s, i), false,
+        `${where} = ${i} splits a pair in ${JSON.stringify(s)}`);
+    }
+  }
+});
+
+test('a Y.Text moved by affixEdit ends up holding exactly the target', () => {
+  // The assertion above is about indices; this one is about what Yjs does with
+  // them, because the two disagree and that disagreement IS the defect. A string
+  // splice at a mid-pair index splits the character; `ContentString.splice`
+  // replaces both halves with U+FFFD, and the mojibake is what gets broadcast.
+  const cases: Array<[string, string]> = [
+    ['todo \u{1F534} urgent', 'todo \u{1F535} urgent'],
+    ['\u{1F44D} ok', '\u{1F44E} ok'],
+    ['x\u{1F134}', 'x\u{1F534}'],
+    ['\u{1F534}A\u{1F134}', '\u{1F535}A\u{1F534}'],
+    ['plain ascii', 'plain ASCII'],
+  ];
+  for (const [from, to] of cases) {
+    const doc = new Y.Doc();
+    const text = doc.getText('content');
+    text.insert(0, from);
+    const edit = affixEdit(from, to);
+    doc.transact(() => {
+      if (edit.to > edit.from) text.delete(edit.from, edit.to - edit.from);
+      if (edit.insert !== '') text.insert(edit.from, edit.insert);
+    });
+    assert.equal(text.toString(), to, `${JSON.stringify(from)} -> ${JSON.stringify(to)}`);
+    assert.equal(text.toString().includes('�'), false, 'and nothing became U+FFFD');
+    doc.destroy();
   }
 });
 
