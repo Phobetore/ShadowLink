@@ -722,6 +722,41 @@ test('a park is not a grave: repark is what lets the drain reach one again', asy
   assert.deepEqual(h.queue.parked(), []);
 });
 
+test('an ordinary drain does not destroy a park it cannot lift', async () => {
+  // The two halves this round built disagreed, and the drain won. `publishOne`
+  // unparked BEFORE it looked at the path, so an entry whose file has gone —
+  // the exact case the park exists for, a note created and deleted before its
+  // first character — was unparked, failed, left pending, and counted for ever.
+  // `repark` gets the same case right: it skips an entry with no bound path.
+  //
+  // The drain is not hypothetical. Every reconcile pass ends in one.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  assert.deepEqual(h.queue.parked().map((p) => p.id), [id]);
+  assert.equal(h.queue.pendingCount(), 0, 'the bar reads "synced"');
+
+  // The user deletes the empty note: the watcher tombstones it and unbinds it.
+  await h.vault.trashLocal(`${SHARE}/Sans titre.md`);
+  delete h.state.data.materialized[id];
+
+  assert.equal(await h.queue.repark(), false, 'repark leaves an entry it cannot look at');
+  assert.equal(h.queue.pendingCount(), 0, 'and the bar is still honest');
+
+  await h.queue.drain();
+  assert.equal(h.queue.pendingCount(), 0, 'ONE ordinary drain must not contradict repark');
+
+  // And it stays that way however long the vault runs.
+  for (let i = 0; i < 6; i++) {
+    h.clock.now += 3_600_000;
+    await h.queue.drain();
+    await h.queue.repark();
+  }
+  assert.equal(h.queue.pendingCount(), 0,
+    'nothing is owed for a note that does not exist, at any point');
+});
+
 test('a stat that cannot answer leaves the entry parked (I2)', async () => {
   // "I could not look" must never become "assume it changed": an unparked entry
   // that is still empty is a drain that publishes nothing and re-parks, on a

@@ -467,19 +467,28 @@ export class PublishQueue {
     // closed the tab — so nothing at all is touched, not even the disk.
     if (this.deps.openNodeId() === id) return;
 
-    // Past every deferral, so this attempt is genuinely going to look at the
-    // file. Whatever the last drain concluded about it stops being current here,
-    // and is re-established below only if this attempt reaches the same refusal.
-    this.unpark(id);
-
     const path = data.materialized[id];
     if (path === undefined || path === '') {
       // The reconciler has not bound this node to a file yet (or the binding was
-      // dropped because the file went missing). Genuinely "not now": kept, behind
-      // a backoff so it cannot hot-loop once per pass for ever.
+      // dropped because the file went missing).
+      //
+      // THE PARK IS LEFT EXACTLY WHERE IT IS, and the order of these two
+      // statements is the whole of it. Unparking first meant an entry whose
+      // file had gone — a note created and deleted before its first character,
+      // which is the case this park's own comment names — was unparked, failed,
+      // left pending and counted for ever, and no later `repark()` could reach
+      // it because `repark` skips an entry with no bound path (correctly: there
+      // is nothing to `stat`). The two halves this round built contradicted each
+      // other and the drain won, on a code path every reconcile pass runs.
       this.fail(id, new RetryLater(`no local file is bound to ${id}`));
       return;
     }
+
+    // Past every deferral AND past the path, so this attempt is genuinely going
+    // to look at the file. Whatever the last drain concluded about it stops
+    // being current here, and is re-established below only if this attempt
+    // reaches the same refusal.
+    this.unpark(id);
 
     let handle: DocHandle | null = null;
     try {
