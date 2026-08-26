@@ -516,6 +516,24 @@ test('the status bar reads the count that excludes parked entries (§6.2)', () =
     'and a parked entry still reaches the tooltip: a bare "synced" beside a note that '
     + 'is not being shared is false in the direction that stops the user looking',
   );
+  // THE WORDING IS NOT HERE ANY MORE, and this half is what makes the assertions
+  // above worth having. A text-reading guard can check that a method mentions a
+  // call; it cannot check a sentence, and these sentences — the plural forms,
+  // the branch between the two parked reasons — went unverified for as long as
+  // they lived in a file that imports `obsidian`. They are in
+  // `src/ui/format.ts` now, and `src/ui/format.test.ts` reads them for real.
+  assert.ok(
+    status.includes('statusLine({'),
+    'main.ts must state the bar rather than compose it',
+  );
+  assert.equal(
+    /['`][^'`]*file\(s\) waiting to upload/.test(status), false,
+    'a string built here is a string no test can hold',
+  );
+  assert.equal(
+    MAIN.includes('function parkedLine('), false,
+    'the parked sentences moved to format.ts, where the suite can read them',
+  );
 });
 
 // §6.2's other handoff. `publishOne` defers on a node the session holds open,

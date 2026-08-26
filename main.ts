@@ -53,7 +53,7 @@ import {
   warnAttachmentFolder,
 } from './src/ui/modals';
 import { deferredEmbedProcessor, matchDeferred } from './src/ui/DeferredEmbeds';
-import { formatBytes, nothingToDownload, syncedStatus } from './src/ui/format';
+import { formatBytes, nothingToDownload, statusLine, syncedStatus } from './src/ui/format';
 import { DEFAULT_SETTINGS, ShadowLinkSettings } from './src/types';
 
 import {
@@ -78,7 +78,7 @@ import { ObsidianBlobPort } from './src/sync/ObsidianBlobPort';
 import { ObsidianDocPort } from './src/sync/ObsidianDocPort';
 import { ObsidianStatePort, treeSnapshotKey } from './src/sync/ObsidianStatePort';
 import { ObsidianVaultPort } from './src/sync/ObsidianVaultPort';
-import { PublishQueue, type ParkReason } from './src/sync/PublishQueue';
+import { PublishQueue } from './src/sync/PublishQueue';
 import { Reconciler } from './src/sync/Reconciler';
 import type { DeferredAttachment, ReconcileCause } from './src/sync/Reconciler';
 import { Tickets } from './src/sync/Tickets';
@@ -191,34 +191,6 @@ function toCause(reason: string): ReconcileCause {
   return reason === 'remote' || reason === 'sync' || reason === 'bootstrap' || reason === 'retry'
     ? reason
     : 'sync';
-}
-
-/**
- * The tooltip line for entries the publish queue parked.
- *
- * Two refusals, two sentences, because they ask the user for different things:
- * one ends when they type, the other when they rename the file. "Waiting to
- * upload" would be false for both, and "synced" alone is false in the direction
- * that stops them looking.
- */
-function parkedLine(parked: ReadonlyArray<{ reason: ParkReason }>): string {
-  const empty = parked.filter((p) => p.reason === 'empty').length;
-  const notText = parked.length - empty;
-  const lines: string[] = [];
-  if (empty > 0) {
-    lines.push(
-      `${empty} ${empty === 1 ? 'note is' : 'notes are'} empty and ${empty === 1 ? 'has' : 'have'} `
-      + `not been shared yet — ${empty === 1 ? 'it' : 'they'} will be shared as soon as you type.`,
-    );
-  }
-  if (notText > 0) {
-    lines.push(
-      `${notText} ${notText === 1 ? 'file is' : 'files are'} named .md but `
-      + `${notText === 1 ? 'is' : 'are'} not text — rename `
-      + `${notText === 1 ? 'it' : 'them'} to share ${notText === 1 ? 'it' : 'them'}.`,
-    );
-  }
-  return lines.join('\n');
 }
 
 /** Resolves TRUE only on a genuine provider `sync` event. A timeout is not a sync (I3). */
@@ -716,65 +688,48 @@ class SyncRuntime {
   // ---------------------------------------------------------- status
 
   /**
-   * What the status bar should say right now.
+   * What the status bar should say right now — the STATE of it. The wording is
+   * `statusLine`'s, in `src/ui/format.ts`, where the suite can read it.
+   *
+   * That split is the point. This file imports `obsidian`, so nothing in it is
+   * reachable from a unit test, and the only thing that could ever check these
+   * sentences was a guard reading the file as text — which is not a test of a
+   * sentence, and which was itself failing open until this round. Plural forms,
+   * the branch between the two parked sentences and whether a parked entry
+   * reached the tooltip at all were verified by nothing.
    *
    * Both read-only reasons are POLLED rather than latched from an event, because
    * one of the two kinds heals by itself: the reconciler re-derives a pause it
    * diagnosed on its own evidence at the top of every pass, so a one-shot listener
    * would keep showing a state that stopped being true several passes ago.
+   *
+   * `pendingCount()` is every entry the queue will act on by itself, and it
+   * deliberately EXCLUDES the ones it parked or blocked. Counting those is what
+   * pinned this bar on "syncing…" for the lifetime of a vault holding one empty
+   * note.
+   *
+   * ALL FOUR ATTACHMENT BUCKETS into `syncedStatus`, never just the fetchable
+   * one: §7.5's refusal leaves a file off this disk exactly as §7.2's does, and
+   * §7.4's local half has no remedy and so reaches the tooltip and stops. Passed
+   * as a THUNK because three of the four branches never look at it.
    */
   status(): { text: string; tooltip: string } {
-    const paused = this.bootstrap.readOnlyReason ?? this.reconciler.readOnlyReason;
-    if (paused !== null) return { text: 'ShadowLink: paused', tooltip: paused };
-    if (this.bootstrap.phase !== 'ready') {
-      return { text: 'ShadowLink: starting…', tooltip: 'ShadowLink is joining the workspace.' };
-    }
-    // `pendingCount()` is every entry the queue will act on by itself, and it
-    // deliberately EXCLUDES the ones it parked — an empty note, a `.md` file that
-    // is not text. Those stay queued and are retried every pass, because nothing
-    // else will ever re-offer a note, but no upload is owed for them and no
-    // amount of waiting changes that. Counting them here is what pinned this bar
-    // on "syncing…" for the lifetime of a vault holding one empty note.
-    const pending = this.queue.pendingCount();
-    if (this.reconciler.reconciling || this.reconcileRunning || this.reconcileTimer !== null
-        || pending > 0) {
-      return {
-        text: 'ShadowLink: syncing…',
-        tooltip: pending > 0 ? `${pending} file(s) waiting to upload` : 'Reconciling the vault',
-      };
-    }
-    // §7.3. The wording is in `syncedStatus` rather than inline here because it is
-    // the one string in this plugin that is load-bearing: the tree can agree on
-    // every peer that a path holds hash H while exactly one peer has the bytes, so
-    // a bare "synced" beside twelve undownloaded attachments is false — and false
-    // in the direction that stops the user looking for the file.
-    //
-    // ALL THREE BUCKETS, never just the fetchable one. §7.5's refusal leaves a
-    // file that is not on this disk exactly as §7.2's does, so a status bar
-    // counting only `deferred` says "synced" beside it — the same falsehood,
-    // now about the one bucket the user can do nothing about.
-    //
-    // FOUR buckets into the call and three into the visible count. §7.4's local
-    // half — a file that IS on this disk and that this device cannot hash — has no
-    // remedy, nothing to download, and no honest place in a count of what is
-    // outstanding, because nothing about it is outstanding for anybody else. It
-    // reaches the tooltip and stops there.
-    const synced = syncedStatus(
-      this.shareRoot,
-      this.reconciler.deferredAttachments,
-      this.reconciler.tooLargeAttachments,
-      this.reconciler.unavailableAttachments,
-      blobMemoryCap(),
-      this.reconciler.uncheckableAttachments,
-    );
-    // The same principle one more time. A parked entry is not "waiting to
-    // upload" — waiting is not what fixes either of these — but a bare "synced"
-    // beside a note that is not being shared is false in the direction that
-    // stops the user looking. So it stays out of the count and reaches the
-    // tooltip, worded as what would actually end it.
-    const parked = this.queue.parked();
-    if (parked.length === 0) return synced;
-    return { text: synced.text, tooltip: `${synced.tooltip}\n${parkedLine(parked)}` };
+    return statusLine({
+      paused: this.bootstrap.readOnlyReason ?? this.reconciler.readOnlyReason,
+      ready: this.bootstrap.phase === 'ready',
+      busy: this.reconciler.reconciling || this.reconcileRunning
+        || this.reconcileTimer !== null,
+      pending: this.queue.pendingCount(),
+      parked: this.queue.parked(),
+      synced: () => syncedStatus(
+        this.shareRoot,
+        this.reconciler.deferredAttachments,
+        this.reconciler.tooLargeAttachments,
+        this.reconciler.unavailableAttachments,
+        blobMemoryCap(),
+        this.reconciler.uncheckableAttachments,
+      ),
+    });
   }
 
   // ---------------------------------------------------------- §7.3 downloads

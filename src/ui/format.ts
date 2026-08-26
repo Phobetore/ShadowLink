@@ -10,9 +10,21 @@
 // that is load-bearing rather than cosmetic (§7.3), and a string built inline in
 // `main.ts` is a string no test can hold.
 //
+// THE WHOLE BAR now, not just the synced half, and that is why `statusLine` and
+// `parkedLine` moved here. They were built inline in `main.ts`, `main.ts` imports
+// `obsidian`, and the only thing in the suite that could reach them was a guard
+// reading the file as TEXT — which is not a test of a sentence, and which had a
+// fail-open bug of its own for as long as it existed. Plural forms, the branch
+// between the two parked sentences and whether a parked entry reached the tooltip
+// at all were unverified by anything, and every one of them is a sentence a user
+// acts on.
+//
 // No `obsidian` import: the status bar's copy of this runs in `main.ts`, the
 // button's copy runs inside a markdown post-processor, and neither should have to
-// reach into the modal module to get it.
+// reach into the modal module to get it. `ParkReason` arrives as a TYPE import, so
+// nothing of the publish queue is pulled in at runtime.
+
+import type { ParkReason } from '../sync/PublishQueue.ts';
 
 /**
  * A size with one significant decimal where that helps and none where it does
@@ -44,6 +56,89 @@ export interface NamedAttachment {
 
 /** Longest sample the tooltip lists before it starts counting instead. */
 const MAX_NAMED = 3;
+
+/**
+ * Everything the status bar depends on, as data.
+ *
+ * `synced` is a THUNK rather than a value because building it walks three
+ * attachment buckets, and three of the four branches below never look at it —
+ * which was true of the inline version too, and is worth keeping true rather
+ * than paying for on every poll.
+ */
+export interface BarState {
+  /** Why the plugin has stopped writing, or null. Outranks everything. */
+  paused: string | null;
+  /** Has the workspace been joined? */
+  ready: boolean;
+  /** A reconcile pass is running or scheduled. */
+  busy: boolean;
+  /** Entries the queue will act on by itself. NEVER the parked ones. */
+  pending: number;
+  /** Entries refused over the state of the user's own file. */
+  parked: ReadonlyArray<{ reason: ParkReason }>;
+  /** What §7.3 says once a pass has finished and nothing is pending. */
+  synced: () => StatusLine;
+}
+
+/**
+ * What the status bar should say right now.
+ *
+ * Four states in order, and the order is the design: a share that has stopped
+ * writing says so first; one that has not joined yet is not "synced"; work owed
+ * is named as a count; and only then does §7.3's wording get a say.
+ *
+ * `pending` EXCLUDES parked entries, and that exclusion is the whole of §6.2.6:
+ * an empty note and a `.md` file that is not text are refused over the state of
+ * the user's own file, no amount of waiting changes either, and counting them
+ * pinned this bar on "syncing…" for the lifetime of a vault. They reach the
+ * tooltip instead — a bare "synced" beside a note that is not being shared is
+ * false in the direction that stops the user looking.
+ */
+export function statusLine(state: BarState): StatusLine {
+  if (state.paused !== null) return { text: 'ShadowLink: paused', tooltip: state.paused };
+  if (!state.ready) {
+    return { text: 'ShadowLink: starting…', tooltip: 'ShadowLink is joining the workspace.' };
+  }
+  if (state.busy || state.pending > 0) {
+    return {
+      text: 'ShadowLink: syncing…',
+      tooltip: state.pending > 0
+        ? `${state.pending} file(s) waiting to upload`
+        : 'Reconciling the vault',
+    };
+  }
+  const synced = state.synced();
+  if (state.parked.length === 0) return synced;
+  return { text: synced.text, tooltip: `${synced.tooltip}\n${parkedLine(state.parked)}` };
+}
+
+/**
+ * The tooltip line for entries the publish queue parked.
+ *
+ * ONE LINE PER REASON, never a merged count, because the two ask the user for
+ * different things: one ends when they type, the other when they rename the
+ * file. "3 files are not being shared" would tell them to do neither, and
+ * "waiting to upload" would be false for both.
+ */
+export function parkedLine(parked: ReadonlyArray<{ reason: ParkReason }>): string {
+  const empty = parked.filter((p) => p.reason === 'empty').length;
+  const notText = parked.length - empty;
+  const lines: string[] = [];
+  if (empty > 0) {
+    lines.push(
+      `${empty} ${empty === 1 ? 'note is' : 'notes are'} empty and ${empty === 1 ? 'has' : 'have'} `
+      + `not been shared yet — ${empty === 1 ? 'it' : 'they'} will be shared as soon as you type.`,
+    );
+  }
+  if (notText > 0) {
+    lines.push(
+      `${notText} ${notText === 1 ? 'file is' : 'files are'} named .md but `
+      + `${notText === 1 ? 'is' : 'are'} not text — rename `
+      + `${notText === 1 ? 'it' : 'them'} to share ${notText === 1 ? 'it' : 'them'}.`,
+    );
+  }
+  return lines.join('\n');
+}
 
 /**
  * What the status bar says once a pass has finished and nothing is pending.

@@ -7,7 +7,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { formatBytes, nothingToDownload, syncedStatus } from './format.ts';
+import type { ParkReason } from '../sync/PublishQueue.ts';
+import {
+  formatBytes, nothingToDownload, parkedLine, statusLine, syncedStatus, type StatusLine,
+} from './format.ts';
 
 test('sizes read the way a person reads them', () => {
   assert.equal(formatBytes(0), '0 KB');
@@ -285,4 +288,138 @@ test('main.ts hands the unchecked bucket to both surfaces', () => {
     '§7.5\'s local half would otherwise reach no surface at all',
   );
   assert.match(MAIN, /uncheckableAttachments/, 'and the reconciler getter has to be read');
+});
+
+// ---------------------------------------------------------------- §6.2.6, the bar
+//
+// This wording had NO test at all until it moved here, and the reason is on
+// record: it lived in `main.ts`, `main.ts` imports `obsidian`, and so the only
+// thing that could check it was a guard that reads the file as text. That guard
+// had a fail-open bug of its own. Plural forms, the branch between the two
+// parked sentences, and whether a parked entry reaches the tooltip at all were
+// all invisible — and every one of them is a sentence a user acts on.
+
+test('a parked note asks for the thing that would actually end it', () => {
+  assert.equal(
+    parkedLine([{ reason: 'empty' }]),
+    '1 note is empty and has not been shared yet — it will be shared as soon as you type.',
+  );
+  assert.equal(
+    parkedLine([{ reason: 'not-text' }]),
+    '1 file is named .md but is not text — rename it to share it.',
+  );
+});
+
+test('the parked line counts, and agrees with itself in the plural', () => {
+  assert.equal(
+    parkedLine([{ reason: 'empty' }, { reason: 'empty' }]),
+    '2 notes are empty and have not been shared yet — they will be shared as soon as you type.',
+  );
+  assert.equal(
+    parkedLine([{ reason: 'not-text' }, { reason: 'not-text' }]),
+    '2 files are named .md but are not text — rename them to share them.',
+  );
+});
+
+test('the parked reasons are one line each, never one merged count', () => {
+  // They ask the user for different things, so a single "3 files are not being
+  // shared" would tell them to do neither.
+  const line = parkedLine([{ reason: 'not-text' }, { reason: 'empty' }, { reason: 'empty' }]);
+  assert.equal(line.split('\n').length, 2);
+  assert.match(line, /^2 notes are empty/, 'the empty case comes first, in either order');
+  assert.match(line, /\n1 file is named \.md/);
+});
+
+test('nothing parked is no line at all', () => {
+  assert.equal(parkedLine([]), '');
+});
+
+// ---------------------------------------------------------------- the whole line
+
+const SYNCED: StatusLine = { text: 'ShadowLink: synced', tooltip: 'Sharing Shared' };
+const bar = {
+  paused: null as string | null,
+  ready: true,
+  busy: false,
+  pending: 0,
+  parked: [] as ReadonlyArray<{ reason: ParkReason }>,
+  synced: (): StatusLine => SYNCED,
+};
+
+test('a paused share says so and says why, before anything else', () => {
+  assert.deepEqual(
+    statusLine({ ...bar, paused: 'the workspace id changed', busy: true, pending: 4 }),
+    { text: 'ShadowLink: paused', tooltip: 'the workspace id changed' },
+  );
+});
+
+test('a share that has not joined yet says starting, not synced', () => {
+  assert.deepEqual(statusLine({ ...bar, ready: false }), {
+    text: 'ShadowLink: starting…',
+    tooltip: 'ShadowLink is joining the workspace.',
+  });
+});
+
+test('work owed reads as work owed, and names the count', () => {
+  assert.deepEqual(statusLine({ ...bar, pending: 3 }), {
+    text: 'ShadowLink: syncing…',
+    tooltip: '3 file(s) waiting to upload',
+  });
+});
+
+test('a pass in flight with nothing owed says what it is doing', () => {
+  assert.deepEqual(statusLine({ ...bar, busy: true }), {
+    text: 'ShadowLink: syncing…',
+    tooltip: 'Reconciling the vault',
+  });
+});
+
+test('a parked entry never reads as waiting to upload', () => {
+  // §6.2.6. Waiting is not what fixes either park, so neither may be counted —
+  // and a bare "synced" beside a note that is not being shared is false in the
+  // direction that stops the user looking. It reaches the tooltip and stops.
+  const line = statusLine({ ...bar, parked: [{ reason: 'empty' }] });
+  assert.equal(line.text, 'ShadowLink: synced', 'the count is untouched');
+  assert.equal(
+    line.tooltip,
+    'Sharing Shared\n1 note is empty and has not been shared yet — '
+    + 'it will be shared as soon as you type.',
+  );
+});
+
+test('a parked entry stays out of the count while a real upload is owed', () => {
+  assert.deepEqual(statusLine({ ...bar, pending: 1, parked: [{ reason: 'empty' }] }), {
+    text: 'ShadowLink: syncing…',
+    tooltip: '1 file(s) waiting to upload',
+  });
+});
+
+test('nothing parked leaves the synced line exactly as it was', () => {
+  assert.deepEqual(statusLine(bar), SYNCED);
+});
+
+test('the synced line is not built unless it is going to be shown', () => {
+  // It walks three attachment buckets. A paused or syncing bar has no use for it
+  // and never asked for it before this moved; the thunk keeps that true.
+  let built = 0;
+  const synced = (): StatusLine => { built += 1; return SYNCED; };
+  statusLine({ ...bar, paused: 'stopped', synced });
+  statusLine({ ...bar, ready: false, synced });
+  statusLine({ ...bar, pending: 2, synced });
+  assert.equal(built, 0);
+  statusLine({ ...bar, synced });
+  assert.equal(built, 1);
+});
+
+test('main.ts states the bar rather than composing it', () => {
+  // The point of the move: the strings are gone from the file no test can load.
+  assert.match(MAIN, /statusLine\(/, 'main.ts must call the tested function');
+  assert.equal(
+    MAIN.includes('file(s) waiting to upload'), false,
+    'the wording lives where the suite can read it',
+  );
+  assert.equal(
+    MAIN.includes('has not been shared yet'), false,
+    'and so does the parked sentence',
+  );
 });
