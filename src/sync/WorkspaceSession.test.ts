@@ -48,6 +48,7 @@ import {
   affixEdit,
   decide,
   retains,
+  vouches,
   type MountResult,
   type ProviderPort,
   type SessionAwareness,
@@ -1187,6 +1188,65 @@ test('a colleague\'s note this session never bound is not laundered under our no
 
   assert.equal(h.providers.forRoom(`n_${idB}`)[0].doc.getText('content').toString(), '');
   assert.equal(h.tree.get(idB)?.s, undefined);
+});
+
+test('a one-byte stub file never authorises the previous note\'s body', async () => {
+  // THE BOUND WAS STILL VACUOUS WHERE IT MATTERED MOST. `retains(f, B)` scales
+  // its evidence requirement with `|f|`, and on the seed arm `f` is a brand-new
+  // note's file — for `|f| <= 2` one coincidentally shared character satisfies
+  // it. A template stub, or a note whose first keystroke was Return, is exactly
+  // that file.
+  //
+  // Measured on the branch this replaces: `standup.md`'s shared document became
+  // `salary.md`'s entire body, published and flagged, bound, with zero notices
+  // and zero copies filed. `s` is never re-offered, so it was permanent.
+  const body = 'Salary review notes.\n\nAsked for 12%. M said the band tops out at 9.\n';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('salary.md', body, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: body });
+  await h.session.open(`${SHARE}/salary.md`);
+
+  const idB = h.add('standup.md', '\n', { owned: true });   // the stub a template made
+  const pathB = `${SHARE}/standup.md`;
+  h.providers.configure(`n_${idB}`, { remote: '' });
+  h.editor.openLeaf(pathB, body);                          // the leaf has not caught up
+
+  await h.session.open(pathB);
+
+  assert.equal(h.providers.forRoom(`n_${idB}`)[0].doc.getText('content').toString(), '',
+    'salary.md\'s body did not become standup.md\'s content');
+  assert.equal(h.tree.get(idB)?.s, undefined, 'and nothing was published under its name');
+  assert.equal(h.editor.document(pathB), body, 'the buffer is not touched either');
+  assert.deepEqual(h.stashes(), [], 'nothing is displaced, so nothing is filed');
+  assert.equal(h.session.openNodeId(), null);
+});
+
+test('the seed arm never empties a note it will not seed', async () => {
+  // The refusal's SHAPE, and the reason it is not a `take-shared`. `R === ''` on
+  // this arm, so falling through would replace the buffer with nothing: the
+  // user's note cleared on screen, their text filed under ShadowLink Recovered/
+  // as a conflicted copy of a note no second device has ever opened, and
+  // Obsidian's next save writing the empty string over the note's own bytes.
+  const file = 'a file this note really does hold, and quite a lot of it.\n';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('new.md', file, { owned: true });
+  const path = `${SHARE}/new.md`;
+  h.providers.configure(`n_${id}`, { remote: '' });
+  h.editor.openLeaf(path, 'a buffer with none of it in');
+
+  await h.session.open(path);
+
+  assert.equal(h.editor.document(path), 'a buffer with none of it in',
+    'the buffer is exactly where the user left it');
+  assert.equal(h.providers.forRoom(`n_${id}`)[0].doc.getText('content').toString(), '');
+  assert.equal(h.vault.snapshot()[path], file, 'and the file is untouched');
+  assert.deepEqual(h.stashes(), [], 'no conflicted copy of a note with no conflict');
+  assert.equal(mutations(h.vault), 0);
+  assert.equal(
+    h.notices[0],
+    'new.md: the file does not account for what is on screen yet — it will be shared from the '
+    + 'file, and nothing on screen has been changed.',
+  );
 });
 
 test('a duplicated note seeds from its own file instead of being refused', async () => {
@@ -2745,6 +2805,24 @@ test('retains bounds the claim that a buffer was built from this note', () => {
   assert.equal(retains(base, 'x'.repeat(200)), true, 'exactly half is the boundary, and passes');
 });
 
+test('vouches refuses a short file that cannot account for a long buffer', () => {
+  // `retains` scales its requirement with the BASE, which on the seed arm is a
+  // brand-new note's file — the shortest string it will ever see. A twelve-stub
+  // by eight-body sweep put 16 of 96 pairs through it. `vouches` asks the other
+  // half of the question as well, and the sweep goes to 0.
+  const body = 'Salary review notes.\n\nAsked for 12%. M said the band tops out at 9.\n';
+  for (const stub of ['\n', '\n\n', '#', '# ', '---\n', ' ', '-']) {
+    assert.equal(vouches(stub, body), false, `${JSON.stringify(stub)} vouches for a whole note`);
+  }
+  assert.equal(vouches('', 'anything at all'), false, 'an empty file vouches for nothing');
+  assert.equal(vouches(body, body), true, 'a duplicate\'s file holds exactly its bytes');
+  assert.equal(vouches(body, `${body}and one more line\n`), true, 'typing since the save');
+  assert.equal(vouches(body, `${body}${body}${body}`), false,
+    'but not three times more of it than the file has ever held');
+  assert.equal(vouches('x'.repeat(400), 'x'.repeat(200)), true, 'half is still the boundary');
+  assert.equal(vouches('x'.repeat(400), 'x'.repeat(100)), false);
+});
+
 test('decide covers every arm of I19', () => {
   const D = (B: string, R: string, f: string, own: boolean, seeded: boolean): string =>
     decide(B, R, f, own, seeded).kind;
@@ -2767,6 +2845,8 @@ test('decide covers every arm of I19', () => {
   );
   assert.equal(F('typed', '', '', true, false), 'local-only',
     'and an empty file refuses them however little');
+  assert.equal(F('typed', '', '\n', true, false), 'local-only',
+    'and so does a stub too short to account for them');
 
   // 1. AGREE, whatever else is true — including two empty strings, which is a
   //    brand-new note nobody has typed into yet.
@@ -2782,12 +2862,16 @@ test('decide covers every arm of I19', () => {
   //    thing that may authorise a first publish under a new node's name.
   assert.equal(D('typed', '', '', false, false), 'local-only', 'I5: not ours to seed');
   assert.equal(D('typed', '', 'typed', true, false), 'converge-up', 'SEED, authorised by the file');
-  assert.equal(D('typed a bit more', '', 'typed', true, false), 'converge-up',
-    'including the typing done since, which the file still bounds');
+  assert.equal(D('typed a', '', 'typed', true, false), 'converge-up',
+    'including the typing done since, as far as the file accounts for it');
+  assert.equal(D('typed a lot more than that', '', 'typed', true, false), 'local-only',
+    'and no further: the same one half, applied to the buffer as well as the file');
   assert.equal(D('typed', '', '', true, false), 'local-only',
     'a 0-byte file authorises nothing — Obsidian saves the buffer and the queue publishes it');
   assert.equal(D('typed', '', 'a long file the buffer does not resemble at all', true, false),
-    'take-shared', 'a file that does exist, and that the buffer kept none of');
+    'local-only', 'nor does a file that exists and that the buffer kept none of');
+  assert.equal(D('the previous note\'s entire body, several sentences of it', '', '\n', true, false),
+    'local-only', 'and nor does a one-byte stub, which is what the old bound let through');
   assert.equal(D('typed', '', '', true, true), 'take-shared', 'a SEEDED empty doc is a deletion');
 
   // 4. The workspace and this disk agree, so only the buffer has moved.

@@ -230,6 +230,44 @@ export function retains(base: string, buf: string): boolean {
 }
 
 /**
+ * Does the FILE account for what the buffer holds? The seed arm's bound, and it
+ * is `retains` plus the half `retains` cannot have.
+ *
+ * `retains(base, buf)` scales its evidence requirement with `|base|`, which is
+ * right on the catch-up arm — there the base is the shared document, a whole
+ * note. On the SEED arm the base is a brand-new note's FILE, which is the
+ * shortest string this predicate will ever be handed, so the requirement scales
+ * down to nothing: for `|base| <= 2` one coincidentally shared character at
+ * either end satisfies it. Measured against the shipped session: a file holding
+ * a single `"\n"` — a template stub, or a note whose first keystroke was Return
+ * — authorised the previous note's ENTIRE body as a brand-new node's first
+ * publish, published and flagged, with no notice and no copy. (The literal flag
+ * is not spelled here: a source guard counts its occurrences to keep the set of
+ * writers a decision somebody has to come and make.) A sweep of twelve stubs
+ * against eight realistic bodies seeded 16 of the 96 pairs.
+ *
+ * So the bound is two-sided: the buffer must keep half of the file AND the file
+ * must account for half of the buffer. Both halves are the same sentence —
+ * *"a short file cannot authorise a long buffer"* — and neither is a new tuned
+ * number, because the one half already there is reused rather than replaced.
+ *
+ * WHAT IT COSTS, named. A user who typed a paragraph, had it saved, and then
+ * typed three more paragraphs before the queue got round to publishing has this
+ * open refused. Nothing is lost: the buffer is untouched, the queue publishes
+ * the note from the file, and the NEXT open is arm 4 — where the base is the
+ * published text, `retains` is meaningful again, and the CRDT catches up to the
+ * buffer. What it buys is that no stub file can ever authorise a first publish
+ * of something else, which is the one mistake on this arm that cannot be taken
+ * back.
+ */
+export function vouches(file: string, buf: string): boolean {
+  if (file === '') return false;                     // an empty file vouches for nothing
+  const edit = affixEdit(file, buf);
+  const kept = edit.from + (file.length - edit.to);
+  return kept * 2 >= file.length && kept * 2 >= buf.length;
+}
+
+/**
  * What `apply` is being asked to do, decided BEFORE it is called and from four
  * strings and two booleans (see `decide`).
  *
@@ -395,14 +433,24 @@ export function decide(
     //    and `PublishQueue.publishOne` seeds the document from those bytes on the
     //    next drain. The publish path already does exactly that (§6.2), so the
     //    note reaches the workspace a beat later with no guess made anywhere.
-    //  - a file WITH bytes is this note's own content, and `retains(f, B)` is a
-    //    real bound against it rather than a vacuous one: the buffer has to have
-    //    kept half of what the disk says this note is. That is what lets
-    //    Obsidian's "Make a copy" — whose file already holds the bytes — seed
-    //    and bind on the first open instead of being refused.
-    if (f !== '' && retains(f, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
+    //  - a file WITH bytes vouches for the buffer only as far as it goes. See
+    //    `vouches`: the buffer must have kept half of what the disk says this
+    //    note is AND the disk must account for half of what the buffer holds.
+    //    That is what lets Obsidian's "Make a copy" — whose file already holds
+    //    the bytes — seed and bind on its first open, and what stops a one-byte
+    //    stub from authorising the previous note's whole body.
+    //
+    // NOTHING ON THIS ARM FALLS THROUGH TO TAKE-SHARED, and that is deliberate.
+    // `R === ''` here, so "the shared copy wins on screen" means EMPTYING the
+    // buffer: a note the user is writing is cleared, their text is filed under
+    // `ShadowLink Recovered/` as a conflicted copy of a note no second device has
+    // ever opened, and Obsidian's next save writes the empty string over the
+    // note's own bytes. Measured, on a file the buffer happened to retain none
+    // of. Refusing costs nothing by comparison — neither side is touched, and
+    // the queue publishes the note from the file either way.
     if (f === '') return unsaved;
-    return { kind: 'take-shared' };
+    if (vouches(f, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
+    return unvouched;
   }
 
   // 4. The workspace and this disk agree, so the buffer is the only thing that
@@ -462,6 +510,27 @@ const elsewhere: Decision = {
 const unsaved: Decision = {
   kind: 'local-only',
   reason: 'it has not been saved to disk yet — it will be shared on its own once Obsidian saves it.',
+};
+
+/**
+ * The seed arm's other refusal: the file exists but does not account for what
+ * the editor is showing.
+ *
+ * It covers two states this device cannot tell apart, and says something true of
+ * both rather than guessing which one it is: a leaf still holding the previous
+ * note, and a user who has typed a great deal more than the last save caught. In
+ * neither case is a first publish under a brand-new node's name defensible, and
+ * in neither case is anything owed a copy — nothing is displaced.
+ *
+ * It promises what actually happens next and nothing else. The queue publishes
+ * the note from the file on its next pass whatever the editor holds, and the
+ * open after that one is arm 4, where the shared text is a real base and the
+ * buffer's extra paragraphs converge up into it.
+ */
+const unvouched: Decision = {
+  kind: 'local-only',
+  reason: 'the file does not account for what is on screen yet — it will be shared from the file, '
+    + 'and nothing on screen has been changed.',
 };
 
 // ============================================================ public surface
