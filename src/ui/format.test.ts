@@ -346,15 +346,32 @@ test('an empty attachment is not told to type into it', () => {
   );
 });
 
-test('the three parked reasons are three lines, in one fixed order', () => {
+test('a note with no file on this device is not asked for a keystroke', () => {
+  // Every other sentence here names something about a file on this device, and
+  // for a parked entry whose binding has gone there is no such file — the node
+  // is still live, so the park stays and the file may yet come back, but "it
+  // will be shared as soon as you type" is an instruction pointing at nothing.
+  assert.equal(
+    parkedLine([{ reason: 'unbound' }]),
+    '1 note has no file on this device — it will be shared once the file is back.',
+  );
+  assert.equal(
+    parkedLine([{ reason: 'unbound' }, { reason: 'unbound' }]),
+    '2 notes have no file on this device — they will be shared once the files are back.',
+  );
+});
+
+test('the four parked reasons are four lines, in one fixed order', () => {
   const line = parkedLine([
-    { reason: 'not-text' }, { reason: 'empty-attachment' }, { reason: 'empty' },
+    { reason: 'unbound' }, { reason: 'not-text' }, { reason: 'empty-attachment' },
+    { reason: 'empty' },
   ]);
   const lines = line.split('\n');
-  assert.equal(lines.length, 3, 'one instruction per reason, never a merged count');
+  assert.equal(lines.length, 4, 'one instruction per reason, never a merged count');
   assert.match(lines[0], /^1 note is empty/);
   assert.match(lines[1], /^1 attachment is empty/);
   assert.match(lines[2], /^1 file is named \.md/);
+  assert.match(lines[3], /^1 note has no file on this device/);
 });
 
 test('nothing parked is no line at all', () => {

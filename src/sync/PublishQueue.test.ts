@@ -31,6 +31,7 @@ import type { DocHandle, DocPort } from './DocPort.ts';
 import {
   DESKTOP_MEMORY_CAP, DESKTOP_PASS_LIMITS, FakeBlobs, FakeDocs, FakeVault,
 } from './fakes.ts';
+import { parkedLine } from '../ui/format.ts';
 import { PublishQueue, type PublishQueueDeps } from './PublishQueue.ts';
 import { Reconciler, type DeletionContext, type ReconcileFailure } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
@@ -2545,21 +2546,56 @@ test('a parked empty note the user deleted stops advertising itself', async () =
     'and it says so where a developer can read it, rather than disappearing');
 });
 
-test('a parked note whose node is still live keeps its park', async () => {
+test('a parked note whose node is still live keeps its park, and says what it is', async () => {
   // The other side of the same question. Unbound but LIVE is not a state nothing
   // can lift — the file may come back — so `blockOf` answers null and the park
-  // stays. Making the missing path itself the reason would have silenced a note
+  // stays. Making the missing path itself a BLOCK would have silenced a note
   // that is still owed an upload.
+  //
+  // But the park's own sentence stopped being true there, and a shipped test
+  // blessed the state by asserting only the stored reason. `'empty'` promises
+  // "it will be shared as soon as you type", and there is nothing on this device
+  // to type into: measured over 48 ticks with the file given bytes, all 48 did
+  // nothing, the note stayed unpublished, and the tooltip kept asking. So
+  // `parked()` reports what is actually true of the entry.
   const h = makeHarness();
   const id = h.add('Sans titre.md', '');
   h.queue.enqueue(id);
   await h.queue.drain();
+  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['empty']);
 
   delete h.state.data.materialized[id];
   await drainTick(h);
 
-  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['empty']);
+  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['unbound']);
   assert.deepEqual(h.queue.blocked(), []);
+  assert.equal(h.queue.pendingCount(), 0, 'and it still promises no upload');
+  assert.doesNotMatch(parkedLine(h.queue.parked()), /as soon as you type/,
+    'the one thing that cannot lift this park is the one thing it used to ask for');
+  assert.match(parkedLine(h.queue.parked()), /no file on this device/);
+});
+
+test('a parked note takes its own reason back the moment its file is bound again', async () => {
+  // `'unbound'` is a REPORT, not a refusal: nothing overwrites what parked the
+  // entry, so when a path reappears `repark` asks that reason's own question
+  // about it and the drain behind it publishes.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  const path = h.state.data.materialized[id];
+  delete h.state.data.materialized[id];
+  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['unbound']);
+
+  h.state.data.materialized[id] = path;
+  await drainTick(h);
+  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['empty'],
+    'still empty, and now it can say so again');
+
+  h.vault.seed(path, 'f', 'and then the user typed');
+  assert.equal(await drainTick(h), 'repark-drain');
+  assert.equal(h.tree.get(id)?.s, 1);
+  assert.deepEqual(h.queue.parked(), []);
 });
 
 test('an open note is published by the drain too, so a refused bind strands nothing', async () => {

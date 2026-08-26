@@ -82,18 +82,26 @@ import type { VaultPort } from './VaultPort.ts';
 /**
  * Why a pending entry is not work.
  *
- * Three refusals, worded differently to the user because they call for different
+ * Four refusals, worded differently to the user because they call for different
  * things: `'empty'` ends when the author types, `'empty-attachment'` when
- * something writes bytes into the file, `'not-text'` when somebody renames it.
- * None of them ends by waiting, which is why none of them is "waiting to upload".
+ * something writes bytes into the file, `'not-text'` when somebody renames it,
+ * `'unbound'` when the file appears on this device at all. None of them ends by
+ * waiting, which is why none of them is "waiting to upload".
  *
  * `'empty-attachment'` is I6 on the attachment arm, said rather than inferred.
  * It used to be no refusal at all: a 0-byte attachment was rejected incidentally
  * by the settle check reading `st.bytes === 0` as "the writer has not finished",
  * so the rule held by accident, the diagnostic said something untrue, and the
  * entry charged the ladder and stayed counted for ever.
+ *
+ * `'unbound'` is not a refusal any drain records. It is what `parked()` REPORTS
+ * for an entry whose node is still live but which has no materialized path, and
+ * it exists because the sentence the other reasons carry stops being true there:
+ * there is no file on this device to type into, to write bytes into or to
+ * rename. The entry keeps whichever reason parked it, so the moment a path
+ * appears `repark` applies that reason's own rule to it.
  */
-export type ParkReason = 'empty' | 'empty-attachment' | 'not-text';
+export type ParkReason = 'empty' | 'empty-attachment' | 'not-text' | 'unbound';
 
 export interface PublishQueueDeps {
   docs: DocPort;
@@ -322,14 +330,27 @@ export class PublishQueue {
    *
    * They are still retried; this is what keeps them from being invisible now
    * that they are out of `pendingCount()`. THE REASON TRAVELS WITH THEM because
-   * the status bar words the two cases differently, and it has to: "it will be
+   * the status bar words the cases differently, and it has to: "it will be
    * shared as soon as you type in it" and "rename it to share it" are different
    * instructions to the user, and neither is "waiting to upload".
+   *
+   * AN ENTRY WITH NO MATERIALIZED PATH IS REPORTED AS `'unbound'`, whatever
+   * parked it. Every other reason names something about a file on this device,
+   * and there is no such file here — the binding went while the node stayed
+   * live, which `repark` deliberately keeps parked because the file may come
+   * back. Reporting the stored reason there produced a tooltip reading "it will
+   * be shared as soon as you type" about a note with nothing to type into:
+   * measured over 48 ticks with the file given bytes, all 48 did nothing, the
+   * note stayed unpublished, and the sentence stayed on screen. The stored
+   * reason is untouched, so the moment a path reappears `repark` asks that
+   * reason's own question about it.
    */
   parked(): Array<{ id: string; reason: ParkReason }> {
     const out: Array<{ id: string; reason: ParkReason }> = [];
     for (const [id, reason] of this.parkedNodes) {
-      if (this.deps.state.data.publish[id]?.state === 'pending') out.push({ id, reason });
+      if (this.deps.state.data.publish[id]?.state !== 'pending') continue;
+      const path = this.deps.state.data.materialized[id];
+      out.push({ id, reason: path === undefined || path === '' ? 'unbound' : reason });
     }
     return out.sort((a, b) => compare(a.id, b.id));
   }

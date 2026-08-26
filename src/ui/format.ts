@@ -115,21 +115,27 @@ export function statusLine(state: BarState): StatusLine {
 /**
  * The tooltip line for entries the publish queue parked.
  *
- * ONE LINE PER REASON, never a merged count, because the three ask the user for
+ * ONE LINE PER REASON, never a merged count, because the four ask the user for
  * different things: one ends when they type, one when something writes bytes
- * into a file, one when they rename it. "3 files are not being shared" would
- * tell them to do none of it, and "waiting to upload" would be false for all
- * three.
+ * into a file, one when they rename it, one when the file turns up on this
+ * device at all. "4 files are not being shared" would tell them to do none of
+ * it, and "waiting to upload" would be false for all four.
  *
  * An empty ATTACHMENT gets its own sentence rather than the note's. "It will be
  * shared as soon as you type" is an instruction, and typing is not what puts
  * bytes in a `.png`.
+ *
+ * `'unbound'` gets one for the same reason, one step further out: it is a note
+ * this device has no file for, so every other sentence here asks for something
+ * that cannot be done. It is the only line that asks for nothing, because there
+ * is nothing to ask for — the entry lifts itself when the file arrives.
  */
 export function parkedLine(parked: ReadonlyArray<{ reason: ParkReason }>): string {
   const count = (reason: ParkReason): number => parked.filter((p) => p.reason === reason).length;
   const empty = count('empty');
   const emptyBlob = count('empty-attachment');
   const notText = count('not-text');
+  const unbound = count('unbound');
   const lines: string[] = [];
   if (empty > 0) {
     lines.push(
@@ -151,6 +157,13 @@ export function parkedLine(parked: ReadonlyArray<{ reason: ParkReason }>): strin
       `${notText} ${notText === 1 ? 'file is' : 'files are'} named .md but `
       + `${notText === 1 ? 'is' : 'are'} not text — rename `
       + `${notText === 1 ? 'it' : 'them'} to share ${notText === 1 ? 'it' : 'them'}.`,
+    );
+  }
+  if (unbound > 0) {
+    lines.push(
+      `${unbound} ${unbound === 1 ? 'note has' : 'notes have'} no file on this device — `
+      + `${unbound === 1 ? 'it' : 'they'} will be shared once `
+      + `${unbound === 1 ? 'the file is' : 'the files are'} back.`,
     );
   }
   return lines.join('\n');
