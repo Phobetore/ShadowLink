@@ -2364,3 +2364,78 @@ test('a 507 re-reads the ceiling too, and is still a retry rather than a refusal
   );
   assert.deepEqual(h.notices, []);
 });
+
+// ================================================================ the tick
+
+/**
+ * `main.ts`'s `drainTick`, verbatim, and every test below drives THIS rather
+ * than `drain()`.
+ *
+ * The difference is the whole of the last defect this file records. `drainTick`
+ * asks two questions and drains only if one of them says yes; a test that calls
+ * `drain()` unconditionally every iteration is draining where the product never
+ * does, and it will report a state as reachable that in the plugin is not.
+ */
+async function drainTick(h: Harness): Promise<'drain' | 'repark-drain' | 'nothing'> {
+  if (h.queue.pendingCount() > 0) { await h.queue.drain(); return 'drain'; }
+  if (await h.queue.repark()) { await h.queue.drain(); return 'repark-drain'; }
+  return 'nothing';
+}
+
+test('the drain alone publishes a note that was empty when it was first offered', async () => {
+  // THIS IS WHAT CARRIES A BRAND-NEW NOTE now that the session's seed arm refuses
+  // to publish a buffer the disk has not vouched for. The session may bind
+  // nothing at all for that open; the note still has to reach the workspace, and
+  // this is the path that takes it there — from the FILE, which is where a new
+  // note's bytes appear once Obsidian persists the dirty buffer.
+  //
+  // Nothing else in the plugin notices that write: `VaultWatcher.onModify`
+  // returns early for a note by design (I7), so this interval is the only thing
+  // that will ever ask again.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  assert.deepEqual(h.queue.parked().map((p) => p.reason), ['empty'], 'parked, not counted');
+  assert.equal(h.queue.pendingCount(), 0);
+
+  h.clock.now += 1_000;
+  h.vault.seed(`${SHARE}/Sans titre.md`, 'f', 'the first sentence the user typed');
+
+  assert.equal(await drainTick(h), 'repark-drain', 'ONE tick lifts the park and drains');
+  assert.equal(h.tree.get(id)?.s, 1, 'and the note is published from the file');
+  assert.equal(h.docs.text(`n_${id}`), 'the first sentence the user typed');
+  assert.deepEqual(h.queue.parked(), [], 'with nothing left advertising it as empty');
+});
+
+test('and it takes exactly one tick, so the wait is one retry interval', async () => {
+  // The size of the gap, as a number rather than as a claim. A note the session
+  // did not seed is published on the FIRST tick after its bytes land, not after
+  // a ladder or a full pass — so the worst case is one `PUBLISH_RETRY_MS`.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  h.vault.seed(`${SHARE}/Sans titre.md`, 'f', 'typed');
+  let ticks = 0;
+  while (h.tree.get(id)?.s !== 1 && ticks < 10) { await drainTick(h); ticks += 1; }
+  assert.equal(ticks, 1, `published after ${ticks} tick(s) of the retry interval`);
+});
+
+test('an open note is published by the drain too, so a refused bind strands nothing', async () => {
+  // The queue defers on a node the SESSION holds open (I7) — and a seed the
+  // session refused is a node it does not hold open, so the deferral does not
+  // apply and the note publishes while the user is still typing into it. Without
+  // this, "the publish path takes it from here" would be false for exactly the
+  // case the seed arm now hands to it.
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  h.vault.seed(`${SHARE}/Sans titre.md`, 'f', 'still being written into');
+  assert.equal(h.open.id, null, 'the session bound nothing');
+  await drainTick(h);
+  assert.equal(h.tree.get(id)?.s, 1);
+});

@@ -320,6 +320,7 @@ function makeHarness(
     // sit through the production 3 s / 8 s windows.
     nodeWaitMs: 20,
     syncTimeoutMs: 20,
+    seedWaitMs: 20,
     ...over,
   });
 
@@ -857,6 +858,11 @@ test('a brand-new note typed into while it opens keeps the typing, and shares it
   // replaced it with the empty shared document and filed the user's first
   // sentence under ShadowLink Recovered/, beside a notice about "the shared
   // copy" that this very device was about to seed and that was empty.
+  //
+  // `save()` is Obsidian persisting the dirty buffer, and it is what AUTHORISES
+  // the seed now: the file is where a new note's bytes come from, and until it
+  // has any there is nothing here that says whether the buffer is this note's
+  // first sentence or the previous note's whole body. The open waits for it.
   const h = makeHarness({ syncTimeoutMs: 5_000 });
   const id = h.add('Untitled.md', '', { owned: true });
   const path = `${SHARE}/Untitled.md`;
@@ -865,6 +871,7 @@ test('a brand-new note typed into while it opens keeps the typing, and shares it
   const open = h.session.open(path);
   await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
   h.editor.type(path, 'the first sentence of a new note');
+  h.editor.save(path);
   h.providers.forRoom(`n_${id}`)[0].emitSync();
   await open;
 
@@ -1006,6 +1013,7 @@ test('a brand-new note seeded with an emoji seeds the emoji', async () => {
   const open = h.session.open(path);
   await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
   h.editor.type(path, typed);
+  h.editor.save(path);                         // Obsidian persists the dirty buffer
   h.providers.forRoom(`n_${id}`)[0].emitSync();
   await open;
 
@@ -1047,16 +1055,19 @@ test('a buffer that is not a continuation of this note never enters the CRDT', a
 });
 
 test('the note the user just left never seeds the note the leaf now answers for', async () => {
-  // THE SEED ARM IS WHERE A FOREIGN BUFFER BECOMES A SHARED NOTE, and the
-  // retention bound did nothing about it. `retains(base, buf)` answers true
-  // unconditionally for `base === ''`, and arm 3 hands it the FILE's bytes —
-  // which for Obsidian's "New note" is a 0-byte file. So every buffer passed.
+  // THE SEED ARM IS WHERE A FOREIGN BUFFER BECOMES A SHARED NOTE, and for five
+  // rounds nothing stopped it. `retains(base, buf)` answers true unconditionally
+  // for `base === ''`, and arm 3 hands it the FILE's bytes — which for Obsidian's
+  // "New note" is a 0-byte file. So every buffer passed.
   //
   // The window is R15: `viewFor` matches on `view.file.path` while reading
   // `view.editor.cm`, and Obsidian sets the file before it loads the document.
   // Obsidian reuses the leaf, so the document still in it is the note the user
-  // just left — which this session bound a moment ago and can therefore
-  // recognise by its exact bytes.
+  // just left.
+  //
+  // The answer is not a comparison against that note. It is that a 0-byte file
+  // authorises nothing at all, whatever the buffer holds and wherever it came
+  // from.
   const bodyA = 'note A, and several sentences of the user\'s own writing in it.';
   const h = makeHarness({ syncTimeoutMs: 5_000 });
   const idA = h.add('a.md', bodyA, { s: 1, owned: true });
@@ -1078,12 +1089,128 @@ test('the note the user just left never seeds the note the leaf now answers for'
   assert.deepEqual(h.stashes(), [], 'nothing is displaced, so nothing is filed');
   assert.equal(h.session.openNodeId(), null, 'the open is local-only');
   assert.equal(h.notices.length, 1, h.notices.join(' | '));
+  assert.equal(
+    h.notices[0],
+    'new.md: it has not been saved to disk yet — it will be shared on its own once Obsidian saves it.',
+    'and the sentence says nothing about the editor, because the editor was not consulted',
+  );
 });
 
-test('a brand-new note is still seeded from a buffer that is genuinely its own', async () => {
-  // The other side of the same bound: the proof is an exact match against the
-  // note this session last bound, so a note the user actually typed into is
-  // unaffected — including one opened straight after another note.
+test('ONE keystroke into the previous note no longer opens the seed arm', async () => {
+  // The guard this replaces was `prior.text === B` — an exact match against the
+  // text the previous note held AT BIND TIME. `yCollab` carries every local
+  // keystroke into the `Y.Text`, so one character typed into note A before
+  // switching away left it naming a revision no leaf was showing, and note A's
+  // whole body was published under the new node with `s: 1` and no notice.
+  //
+  // Measured on the branch this replaces, and only measurable at all once
+  // `FakeEditorBinding` grew the editor -> `Y.Text` direction: the shipped test
+  // above and this one differ by one call to `type`.
+  const bodyA = 'note A, and several sentences of the user\'s own writing in it.';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('a.md', bodyA, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: bodyA });
+  await h.session.open(`${SHARE}/a.md`);
+  h.editor.type(`${SHARE}/a.md`, '!');
+  assert.equal(h.editor.inStep(`${SHARE}/a.md`), true, 'the keystroke reached the Y.Text');
+
+  const idB = h.add('new.md', '', { owned: true });
+  const pathB = `${SHARE}/new.md`;
+  h.providers.configure(`n_${idB}`, { remote: '' });
+  h.editor.openLeaf(pathB, `${bodyA}!`);              // the leaf has not caught up
+
+  await h.session.open(pathB);
+
+  assert.equal(h.providers.forRoom(`n_${idB}`)[0].doc.getText('content').toString(), '');
+  assert.equal(h.tree.get(idB)?.s, undefined, 'nothing was published under B\'s name');
+});
+
+test('a collaborator typing into the open note does not open it either', async () => {
+  // The same defeat with NO user action at all, which is what makes it the
+  // ordinary state of a real-time collaboration plugin rather than an edge case:
+  // a co-editor appends a word to the note you have open, and the previous
+  // guard's remembered string stops matching what the leaf holds.
+  const bodyA = 'note A, and several sentences of the user\'s own writing in it.';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('a.md', bodyA, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: bodyA });
+  await h.session.open(`${SHARE}/a.md`);
+  h.editor.remoteDelta(`${SHARE}/a.md`, (t) => { t.insert(t.length, ' PEER'); });
+  assert.equal(h.editor.document(`${SHARE}/a.md`), `${bodyA} PEER`);
+
+  const idB = h.add('new.md', '', { owned: true });
+  const pathB = `${SHARE}/new.md`;
+  h.providers.configure(`n_${idB}`, { remote: '' });
+  h.editor.openLeaf(pathB, `${bodyA} PEER`);
+
+  await h.session.open(pathB);
+
+  assert.equal(h.providers.forRoom(`n_${idB}`)[0].doc.getText('content').toString(), '');
+  assert.equal(h.tree.get(idB)?.s, undefined);
+});
+
+test('a colleague\'s note this session never bound is not laundered under our node', async () => {
+  // I5 is what this arm exists to protect, and this is the shape that walked
+  // straight through it: note C is a COLLEAGUE's, its room never syncs, so
+  // nothing binds and no remembered string names it. Obsidian then reuses C's
+  // leaf for a brand-new note this device owns, and C's whole body is published
+  // under a node every peer will attribute to us.
+  //
+  // No comparison against a previously bound note could have caught this. The
+  // file could, and does: the new note's file is 0 bytes.
+  const bodyC = 'a colleague\'s note, published by them and materialised here.';
+  const h = makeHarness({ syncTimeoutMs: 5 });
+  const idA = h.add('a.md', 'note A.', { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: 'note A.' });
+  await h.session.open(`${SHARE}/a.md`);
+
+  const idC = h.add('c.md', bodyC, { s: 1 });
+  h.providers.configure(`n_${idC}`, { mode: 'manual', remote: bodyC });
+  await h.session.open(`${SHARE}/c.md`);
+  assert.equal(h.session.openNodeId(), null, 'C never bound, so nothing remembers it');
+
+  const idB = h.add('new.md', '', { owned: true });
+  const pathB = `${SHARE}/new.md`;
+  h.providers.configure(`n_${idB}`, { remote: '' });
+  h.editor.openLeaf(pathB, bodyC);                    // the leaf still shows C
+
+  await h.session.open(pathB);
+
+  assert.equal(h.providers.forRoom(`n_${idB}`)[0].doc.getText('content').toString(), '');
+  assert.equal(h.tree.get(idB)?.s, undefined);
+});
+
+test('a duplicated note seeds from its own file instead of being refused', async () => {
+  // The false-positive direction, and it was permanent. Obsidian's "Make a copy"
+  // is one click, and it produces a brand-new owned node whose buffer legitimately
+  // equals the note this session last bound. The guard this replaces refused it,
+  // told the user its editor was showing another note, and advised switching away
+  // and back — which re-bound the source and re-armed the comparison with the same
+  // string, so following the instruction reproduced the refusal for ever.
+  //
+  // The file is the whole answer here too: a copy's file already holds the bytes.
+  const bodyA = 'note A, and several sentences of the user\'s own writing in it.';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('a.md', bodyA, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: bodyA });
+  await h.session.open(`${SHARE}/a.md`);
+
+  const idD = h.add('a 1.md', bodyA, { owned: true });
+  const pathD = `${SHARE}/a 1.md`;
+  h.providers.configure(`n_${idD}`, { remote: '' });
+
+  await h.session.open(pathD);
+
+  assert.equal(h.providers.forRoom(`n_${idD}`)[0].doc.getText('content').toString(), bodyA);
+  assert.equal(h.tree.get(idD)?.s, 1, 'it is published on the first open');
+  assert.equal(h.editor.inStep(pathD), true, 'and it is bound, so it collaborates');
+  assert.deepEqual(h.notices, [], 'with nothing said, because nothing went wrong');
+});
+
+test('a brand-new note is still seeded once its own bytes reach the disk', async () => {
+  // The other side of the rule: a note the user genuinely typed into is seeded
+  // from it, including one opened straight after another note — as soon as
+  // Obsidian has written the buffer out, which it does by itself.
   const bodyA = 'note A, and several sentences of the user\'s own writing in it.';
   const h = makeHarness({ syncTimeoutMs: 5_000 });
   const idA = h.add('a.md', bodyA, { s: 1, owned: true });
@@ -1097,19 +1224,68 @@ test('a brand-new note is still seeded from a buffer that is genuinely its own',
   const open = h.session.open(pathB);
   await until(() => h.providers.forRoom(`n_${idB}`).length === 1, 'the room to be opened');
   h.editor.type(pathB, 'the first sentence of a new note');
+  h.editor.save(pathB);
   h.providers.forRoom(`n_${idB}`)[0].emitSync();
   await open;
 
   const shared = h.providers.forRoom(`n_${idB}`)[0].doc.getText('content');
   assert.equal(shared.toString(), 'the first sentence of a new note');
   assert.equal(h.tree.get(idB)?.s, 1);
+  assert.equal(h.editor.inStep(pathB), true);
   assert.deepEqual(h.notices, []);
 });
 
+test('a brand-new note nobody has typed into pays nothing for the wait', async () => {
+  // The ordinary Cmd-N: a 0-byte file and an empty buffer. That is arm 1, the
+  // wait's first check answers immediately, an empty document is bound, and I6's
+  // first-byte publisher shares it on the first keystroke — which is the path
+  // that must not have acquired a three-second pause.
+  const h = makeHarness({ syncTimeoutMs: 5_000, seedWaitMs: 60_000 });
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { remote: '' });
+
+  const started = Date.now();
+  await h.session.open(path);
+
+  assert.ok(Date.now() - started < 1_000, `the open took ${Date.now() - started} ms`);
+  assert.equal(h.session.openNodeId(), id, 'it is bound');
+  assert.equal(h.tree.get(id)?.s, undefined, 'and unpublished, because it is empty (I6)');
+  assert.deepEqual(h.notices, []);
+});
+
+test('a new note whose bytes never reach the disk binds nothing and loses nothing', async () => {
+  // The refusal, and everything it must leave alone. This is the cost of the
+  // rule and it is stated rather than hidden: the buffer is untouched, no copy is
+  // filed, nothing is published, and the sentence the user gets promises only
+  // what the publish queue will actually do.
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: '' });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.type(path, 'the first sentence of a new note');   // and Obsidian never saves
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  assert.equal(h.editor.document(path), 'the first sentence of a new note',
+    'the typing is exactly where the user left it');
+  assert.equal(h.providers.forRoom(`n_${id}`)[0].doc.getText('content').toString(), '');
+  assert.equal(h.tree.get(id)?.s, undefined, 'nothing published');
+  assert.equal(h.session.openNodeId(), null, 'nothing bound');
+  assert.deepEqual(h.stashes(), [], 'and nothing filed under Recovered/');
+  assert.deepEqual(h.notices, [
+    'Untitled.md: it has not been saved to disk yet — it will be shared on its own once Obsidian saves it.',
+  ]);
+});
+
 test('the previous note\'s body does not reach the CRDT on the catch-up arm either', async () => {
-  // Same proof, the other arm that writes the buffer into the shared document.
-  // Here the retention bound would let it through: the stale buffer keeps most
-  // of what the shared text holds, because it IS most of it.
+  // The other arm that writes the buffer into the shared document, and the one
+  // arm `foreign` is still consulted on. Here the retention bound would let the
+  // stale buffer through: it keeps most of what the shared text holds, because
+  // it IS most of it.
   const shared = 'a shared body that both notes happen to be built from, at length.';
   const bodyA = `${shared} And note A's own last line.`;
   const h = makeHarness({ syncTimeoutMs: 5_000 });
@@ -1127,6 +1303,58 @@ test('the previous note\'s body does not reach the CRDT on the catch-up arm eith
   const text = h.providers.forRoom(`n_${idB}`)[0].doc.getText('content');
   assert.equal(text.toString(), shared, 'the workspace still holds note B');
   assert.equal(h.editor.document(pathB), bodyA, 'and note A\'s view was not dispatched into');
+  assert.equal(h.session.openNodeId(), null);
+});
+
+test('the catch-up arm still refuses it after the previous note has MOVED', async () => {
+  // The test above only ever ran against a leaf frozen at bind time, because the
+  // harness could not express anything else — which is exactly the state
+  // `foreign` is about, so the guard looked total while one keystroke defeated
+  // it. Measured with the fake's editor -> `Y.Text` direction: note A's own last
+  // line reached note B's shared document.
+  //
+  // What closes it is WHEN the comparison's string is taken. Read at RELEASE
+  // rather than at bind, it is what the leaf actually holds when Obsidian reuses
+  // it, and no further delta can arrive to age it — the room is gone.
+  const shared = 'a shared body that both notes happen to be built from, at length.';
+  const bodyA = `${shared} And note A's own last line.`;
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('a.md', bodyA, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: bodyA });
+  await h.session.open(`${SHARE}/a.md`);
+  h.editor.type(`${SHARE}/a.md`, '!');                 // one keystroke, after the bind
+
+  const idB = h.add('b.md', shared, { s: 1, owned: true });
+  const pathB = `${SHARE}/b.md`;
+  h.providers.configure(`n_${idB}`, { remote: shared });
+  h.editor.openLeaf(pathB, `${bodyA}!`);               // the leaf has not caught up
+
+  await h.session.open(pathB);
+
+  const text = h.providers.forRoom(`n_${idB}`)[0].doc.getText('content');
+  assert.equal(text.toString(), shared, 'the workspace still holds note B');
+  assert.equal(h.session.openNodeId(), null);
+});
+
+test('a peer\'s edit to the open note ages the comparison the same way', async () => {
+  // The same defeat with no user action at all: a collaborator typing into the
+  // note you have open is the ordinary state of this plugin, not an edge case.
+  const shared = 'a shared body that both notes happen to be built from, at length.';
+  const bodyA = `${shared} And note A's own last line.`;
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('a.md', bodyA, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: bodyA });
+  await h.session.open(`${SHARE}/a.md`);
+  h.editor.remoteDelta(`${SHARE}/a.md`, (t) => { t.insert(t.length, ' PEER'); });
+
+  const idB = h.add('b.md', shared, { s: 1, owned: true });
+  const pathB = `${SHARE}/b.md`;
+  h.providers.configure(`n_${idB}`, { remote: shared });
+  h.editor.openLeaf(pathB, `${bodyA} PEER`);
+
+  await h.session.open(pathB);
+
+  assert.equal(h.providers.forRoom(`n_${idB}`)[0].doc.getText('content').toString(), shared);
   assert.equal(h.session.openNodeId(), null);
 });
 
@@ -2325,15 +2553,21 @@ test('decide covers every arm of I19', () => {
     decide(B, R, f, own, seeded, true).kind;
 
   // 2b. A buffer this device can SHOW belongs to another note is refused on the
-  //     two arms that would publish it, and only there — nothing is written to
-  //     either side. On the arms that never publish the buffer it changes
-  //     nothing, because the shared copy wins on screen anyway.
+  //     CATCH-UP arm, and only there — nothing is written to either side. The
+  //     SEED arm does not consult it at all: the file decides there, so the flag
+  //     changes nothing on that arm in either direction.
   assert.equal(F('same', 'same', 'other', false, true), 'agree', 'arm 1 still wins');
-  assert.equal(F('foreign', '', '', true, false), 'local-only', 'the SEED arm');
   assert.equal(F('foreign', 'body', 'body', false, true), 'local-only', 'the CATCH-UP arm');
   assert.equal(F('foreign', '', '', false, false), 'local-only', 'I5 answers first, and says so');
   assert.equal(F('foreign', 'shared', 'local', false, true), 'take-shared',
     'genuine divergence is unaffected: the buffer is not published on that arm');
+  assert.equal(
+    F('typed', '', 'typed', true, false), 'converge-up',
+    'the SEED arm never asks: a file holding these bytes authorises them however '
+    + 'much they resemble the note the user just left',
+  );
+  assert.equal(F('typed', '', '', true, false), 'local-only',
+    'and an empty file refuses them however little');
 
   // 1. AGREE, whatever else is true — including two empty strings, which is a
   //    brand-new note nobody has typed into yet.
@@ -2345,11 +2579,16 @@ test('decide covers every arm of I19', () => {
   assert.equal(D('', 'body', 'body', true, true), 'local-only');
   assert.equal(D('', 'body', '', true, true), 'take-shared', 'an empty FILE is not that case');
 
-  // 3. The shared document has never held anything.
+  // 3. The shared document has never held anything, so the FILE is the only
+  //    thing that may authorise a first publish under a new node's name.
   assert.equal(D('typed', '', '', false, false), 'local-only', 'I5: not ours to seed');
-  assert.equal(D('typed', '', '', true, false), 'converge-up', 'SEED, from the buffer');
+  assert.equal(D('typed', '', 'typed', true, false), 'converge-up', 'SEED, authorised by the file');
+  assert.equal(D('typed a bit more', '', 'typed', true, false), 'converge-up',
+    'including the typing done since, which the file still bounds');
+  assert.equal(D('typed', '', '', true, false), 'local-only',
+    'a 0-byte file authorises nothing — Obsidian saves the buffer and the queue publishes it');
   assert.equal(D('typed', '', 'a long file the buffer does not resemble at all', true, false),
-    'take-shared', 'unless the buffer cannot be shown to belong to this note');
+    'take-shared', 'a file that does exist, and that the buffer kept none of');
   assert.equal(D('typed', '', '', true, true), 'take-shared', 'a SEEDED empty doc is a deletion');
 
   // 4. The workspace and this disk agree, so only the buffer has moved.

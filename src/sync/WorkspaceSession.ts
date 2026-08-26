@@ -318,14 +318,18 @@ export interface EditorBinding {
  * `B` — what the editor holds. Always LF: CodeMirror cannot hold a `\r`.
  * `R` — the shared document, after the line-ending repair.
  * `f` — `toLF` of what `vault.read` returned at the top of this open.
- * `foreign` — this device can SHOW that `B` is a different note's body. See
- *   `WorkspaceSession.lastBound`; it is a proof and never a guess.
+ * `foreign` — this device can SHOW that `B` is a different note's body: it is
+ *   exactly the text the previous leaf was holding when this session released
+ *   it. See `WorkspaceSession.lastBound`. It is consulted on the CATCH-UP arm
+ *   only, as an extra refusal on top of a bound that already applies there; the
+ *   SEED arm used to lean its whole weight on it and no longer asks at all.
  *
  * The order of the arms is the design. Read it as: agree if the two sides are
  * already the same string; refuse if the buffer is not there to be believed;
- * move the CRDT up to the buffer when this device can SHOW the buffer is its own
- * continuation of that note; otherwise the shared copy wins on screen and
- * whatever it displaces is preserved first.
+ * seed a brand-new note only from what is on the disk; move the CRDT up to the
+ * buffer when this device can SHOW the buffer is its own continuation of that
+ * note; otherwise the shared copy wins on screen and whatever it displaces is
+ * preserved first.
  *
  * Nothing here normalises anything. Both writers into a content document
  * normalise on the way in and the document is repaired before this is called, so
@@ -369,19 +373,39 @@ export function decide(
     // `doOpen` as well, before the editor is touched at all — kept here so this
     // function is total and the table is the whole rule.
     if (!own) return { kind: 'local-only', reason: 'Waiting for the author to upload this note.' };
-    if (foreign) return elsewhere;
-    // SEED: the degenerate converge-up, from nothing to the buffer. The buffer
-    // is the only copy of a brand-new note in existence, so the one thing this
-    // arm must never do is replace it.
+    // SEED, AND THE FILE IS THE ONLY THING THAT MAY AUTHORISE IT.
     //
-    // `retains(f, B)` IS VACUOUS HERE whenever the file is empty, and a 0-byte
-    // file is exactly what Obsidian's "New note" is — so on the arm that
-    // publishes a buffer under a NEW node's name the bound proved nothing at
-    // all, and any buffer seeded. `foreign` above is what carries the weight
-    // instead: not a bound on how much of something the buffer kept, but a
-    // proof that these exact bytes are a different note's. What is left
-    // unproven is stated plainly rather than papered over — see §6.1b.3.
-    if (retains(f, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
+    // This arm publishes a buffer under a BRAND-NEW node's name, to every peer,
+    // irreversibly — `s` is never re-offered. It is the arm I5 exists to protect,
+    // and for five rounds the only thing standing in front of it was the buffer
+    // itself: `retains(f, B)` is unconditionally true for `f === ''`, and a
+    // 0-byte file is exactly what Obsidian's "New note" is, so the bound proved
+    // nothing at all and any buffer seeded. The round that noticed replaced it
+    // with `prior.text === B` — an exact match against the text this session last
+    // bound — which is defeated by ONE keystroke into the previous note, by a
+    // collaborator typing into it, and by a note this session never bound at all,
+    // and which refuses a legitimate duplicate for ever. Measured, all four.
+    //
+    // So there is no proof to be had from the buffer, and this arm stops asking
+    // it for one. A note's first bytes come from the FILE:
+    //
+    //  - an EMPTY file authorises nothing. There is no evidence here about what
+    //    this note holds, so nothing is published and nothing is bound; the note
+    //    stays local for this open, Obsidian saves the buffer to disk by itself,
+    //    and `PublishQueue.publishOne` seeds the document from those bytes on the
+    //    next drain. The publish path already does exactly that (§6.2), so the
+    //    note reaches the workspace a beat later with no guess made anywhere.
+    //  - a file WITH bytes is this note's own content, and `retains(f, B)` is a
+    //    real bound against it rather than a vacuous one: the buffer has to have
+    //    kept half of what the disk says this note is. That is what lets a user
+    //    who typed into a new note before it finished opening keep their typing,
+    //    and what lets Obsidian's "Make a copy" — whose file already holds the
+    //    bytes — seed and bind on the first open instead of being refused.
+    //
+    // `doOpen` gives the disk a bounded moment to answer before it asks, so the
+    // ordinary case of typing into a brand-new note is a beat, not a refusal.
+    if (f !== '' && retains(f, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
+    if (f === '') return unsaved;
     return { kind: 'take-shared' };
   }
 
@@ -402,19 +426,55 @@ export function decide(
 /**
  * The refusal for a buffer this device can show belongs to a DIFFERENT note.
  *
- * It touches neither side, and that is the whole difference between it and the
- * other refusals on those two arms. Falling through to take-shared is right when
+ * ARM 4 ONLY. It touches neither side, and that is the whole difference between
+ * it and the other refusals there. Falling through to take-shared is right when
  * the question is *"can this buffer be shown to belong here?"* — the shared copy
  * wins on screen and whatever it displaces is preserved. It is wrong when the
  * answer is not "unknown" but "it belongs somewhere else": the view is showing
  * ANOTHER note, so a replacement would take that note's body off the user's
  * screen, and a preserved copy of it would be a recovery file for a note nothing
- * happened to. One open costs nothing; the next `file-open` heals it.
+ * happened to.
+ *
+ * "Switch away and back" is honest HERE and was not on the seed arm. Here the
+ * buffer really is the previous note's document, and Obsidian loads this note's
+ * own document into the leaf a moment later, so the second open agrees. On the
+ * seed arm the same sentence was shown to a legitimate DUPLICATE, whose buffer
+ * equals the previous note's for ever — following the instruction re-bound the
+ * source and re-armed the comparison with the same string, so the advice was a
+ * loop. That arm no longer consults the buffer at all.
  */
 const elsewhere: Decision = {
   kind: 'local-only',
   reason: 'its editor was still showing another note — switch away and back to try again.',
 };
+
+/**
+ * The seed arm's refusal: nothing on this disk says what this note holds yet.
+ *
+ * Says nothing about the editor, because the editor is not what was consulted,
+ * and promises nothing the user has to do — the queue publishes the note from
+ * the file on its next pass without being asked (§6.2). It is deliberately not
+ * a `take-shared`: the shared document has never held anything, so "the shared
+ * copy wins on screen" would mean emptying a note the user is writing.
+ */
+const unsaved: Decision = {
+  kind: 'local-only',
+  reason: 'it has not been saved to disk yet — it will be shared on its own once Obsidian saves it.',
+};
+
+/**
+ * How long the seed arm gives the disk to say what a brand-new note holds.
+ *
+ * Obsidian persists a dirty buffer on its own a couple of seconds after the last
+ * keystroke, and this is that plus a margin. It is a TIMEOUT and not a threshold:
+ * nothing is decided differently on either side of it, so it cannot be tuned into
+ * a wrong answer — running out only means this open binds nothing, and the
+ * publish queue still seeds the note from the file on its next pass.
+ */
+const SEED_FILE_WAIT_MS = 3_000;
+
+/** How often that wait re-asks. One `stat`, and only while the answer is absent. */
+const SEED_POLL_MS = 100;
 
 // ============================================================ public surface
 
@@ -452,6 +512,8 @@ export interface WorkspaceSessionDeps {
   scheduleReconcile?: (cause: string) => void;
   /** Bound wait for the tree to name a node for the path (spec §6.1). */
   nodeWaitMs?: number;
+  /** Bound wait for a brand-new note's own bytes to reach the disk. */
+  seedWaitMs?: number;
   /** Bound wait for a GENUINE content-doc sync. */
   syncTimeoutMs?: number;
 }
@@ -466,6 +528,7 @@ interface ActiveSession {
 export class WorkspaceSession {
   private readonly deps: WorkspaceSessionDeps;
   private readonly nodeWaitMs: number;
+  private readonly seedWaitMs: number;
   private readonly syncTimeoutMs: number;
 
   private active: ActiveSession | null = null;
@@ -512,22 +575,26 @@ export class WorkspaceSession {
   private readonly sharedSeen = new Map<string, string>();
 
   /**
-   * The node this session last bound, and the EXACT text it was bound to.
+   * The node this session last bound, and the EXACT text the leaf was holding
+   * when it was RELEASED — not when it was bound.
    *
-   * The proof behind `decide`'s `foreign`, and it exists because the two arms
-   * that write the buffer into the shared document had nothing to check on the
-   * one that matters most. `retains(f, B)` is vacuous when the file is empty,
-   * and a 0-byte file is precisely what Obsidian's "New note" is — so the arm
-   * that publishes a buffer under a brand-new node's name accepted any buffer at
-   * all, including another note's entire body.
+   * The evidence behind `decide`'s `foreign`, on the catch-up arm. `viewFor`
+   * resolves a leaf by `view.file.path` while reading `view.editor.cm`, and
+   * Obsidian sets the file before it loads the document; Obsidian also REUSES
+   * the leaf, so the document sitting in it during that window is the note the
+   * user just left. This is what that note held at the instant this session let
+   * go of it.
    *
-   * WHY THIS IS THE RIGHT EVIDENCE, and not a heuristic. `viewFor` resolves a
-   * leaf by `view.file.path` while reading `view.editor.cm`, and Obsidian sets
-   * the file before it loads the document. Obsidian also REUSES the leaf, so the
-   * document sitting in it during that window is the note the user just left —
-   * which this session bound a moment ago, and at bind time the gate proved the
-   * editor held exactly the shared text. So the bytes are known, exactly, and a
-   * match is a proof rather than a resemblance.
+   * AT RELEASE, AND THAT IS THE WHOLE OF IT. Captured at BIND time it was a
+   * claim about a string that had already stopped being true: `yCollab` carries
+   * every local keystroke into the `Y.Text`, and every remote delta as well, so
+   * one character typed into the previous note — or one word appended by a
+   * collaborator, which is the ordinary state of a real-time collaboration
+   * plugin — left the comparison naming a revision no leaf was showing.
+   * Measured: the previous note's body went into the next note's document with
+   * the guard installed and one keystroke in between. Reading it at close costs
+   * one `toString()` and cannot go stale, because the room is released in the
+   * same breath and no further delta can arrive.
    *
    * The whole string rather than a digest, because the comparison happens
    * between `bufferOf` and `apply`, where there must be no `await` — hashing is
@@ -535,11 +602,11 @@ export class WorkspaceSession {
    * in the wrong direction. One note's text, not a map of them: the leaf can
    * only be showing the note it showed last.
    *
-   * WHAT IT DOES NOT COVER, said plainly: a buffer the user has typed into since
-   * it was bound no longer matches, and neither does a note this session never
-   * bound. There is no local evidence that tells "the user typed this into the
-   * new note" apart from "the leaf has not caught up" in general; this closes the
-   * mechanism that produces it, and §6.1b.3 says so rather than claiming more.
+   * WHAT IT DOES NOT COVER, said plainly: a note this session never bound —
+   * one whose room never synced, or one Obsidian restored into the leaf at
+   * launch — is not in here at all. That is why the SEED arm, where a wrong
+   * answer is published irreversibly under a new node's name, no longer consults
+   * it and works from the file instead.
    */
   private lastBound: { nodeId: string; text: string } | null = null;
 
@@ -555,6 +622,7 @@ export class WorkspaceSession {
   constructor(deps: WorkspaceSessionDeps) {
     this.deps = deps;
     this.nodeWaitMs = deps.nodeWaitMs ?? NODE_WAIT_MS;
+    this.seedWaitMs = deps.seedWaitMs ?? SEED_FILE_WAIT_MS;
     this.syncTimeoutMs = deps.syncTimeoutMs ?? NOTE_SYNC_TIMEOUT_MS;
   }
 
@@ -669,6 +737,27 @@ export class WorkspaceSession {
       release(provider, doc);
       this.localOnly(notePath, 'Waiting for the author to upload this note.');
       return;
+    }
+
+    // THE SEED ARM WORKS FROM THE FILE, SO GIVE THE FILE A MOMENT TO EXIST.
+    //
+    // `shared === '' && !seeded && own` is arm 3, and with a 0-byte file it has
+    // no evidence at all: an empty file and a non-empty buffer is *either* a user
+    // who typed into a brand-new note before it finished opening *or* a leaf
+    // Obsidian has not repointed yet, and nothing in this process can tell those
+    // two apart. The DISK can, and it answers by itself within a couple of
+    // seconds — Obsidian saves the dirty buffer, and this note's file is the one
+    // place its own bytes are going to appear.
+    //
+    // It resolves as soon as EITHER side speaks, so the ordinary cases pay
+    // nothing: a brand-new note nobody has typed into has an empty buffer and
+    // returns on the first check (arm 1 agrees and the first-byte publisher takes
+    // it from there), and a leaf that has not caught up returns the instant it
+    // does. Only the genuinely ambiguous state waits, and it waits bounded.
+    if (shared === '' && !seeded && own && localText === '') {
+      const caught = await this.awaitLocalBytes(notePath, this.seedWaitMs);
+      if (token !== this.token) { release(provider, doc); return; }
+      if (caught !== null) localText = caught;
     }
 
     // The target must still be the file the user is looking at. Between the first
@@ -971,6 +1060,52 @@ export class WorkspaceSession {
   }
 
   /**
+   * Bounded wait for the DISK to say what a brand-new note holds, or for the
+   * editor to stop claiming it holds anything.
+   *
+   * Returns the file's LF text once it has some, `''` once the buffer is empty,
+   * and `null` when neither happened inside the window. The two exits are the
+   * two ways the ambiguity `doOpen` calls this for can end, and each of them
+   * leaves `decide` with a state it has a real answer for:
+   *
+   *  - bytes on disk  -> arm 3 has this note's own content to bound the buffer
+   *                      against, so a user who typed into a new note keeps their
+   *                      typing and the note binds.
+   *  - empty buffer   -> arm 1 agrees, an empty document is bound, and the
+   *                      first-byte publisher (I6) shares it on the first
+   *                      keystroke, which is the ordinary path for a new note.
+   *  - neither        -> nothing is bound this open. Nothing is lost either: the
+   *                      buffer is untouched, Obsidian saves it, and the publish
+   *                      queue seeds the document from the file on its next pass.
+   *
+   * `stat` rather than `read` while it polls, because the question is only
+   * whether there are any bytes at all; the one `read` happens once the answer is
+   * yes. A `stat` that throws is treated as "not yet" rather than as an answer
+   * (I2): "I could not look" must never become "there is nothing there".
+   */
+  private async awaitLocalBytes(notePath: string, ms: number): Promise<string | null> {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      if (this.deps.editor.bufferOf(notePath) === '') return '';
+      let bytes = 0;
+      try {
+        bytes = (await this.deps.vault.stat(notePath))?.bytes ?? 0;
+      } catch {
+        bytes = 0;                                          // I2: asked, not answered
+      }
+      if (bytes > 0) {
+        try {
+          return toLF(await this.deps.vault.read(notePath));
+        } catch {
+          return null;                                      // the caller keeps what it read
+        }
+      }
+      if (Date.now() >= deadline) return null;
+      await new Promise<void>((resolve) => { setTimeout(resolve, SEED_POLL_MS); });
+    }
+  }
+
+  /**
    * Spec §6.1's `tree.awaitNodeForPath`. Bounded, and it resolves against the
    * DERIVED path (collision suffixes applied), because that is where the file
    * actually sits on disk. A stored-path lookup would hand back the node that
@@ -1037,6 +1172,10 @@ export class WorkspaceSession {
     const session = this.active;
     this.active = null;
     if (session === null) return;
+    // BEFORE the release, and before the unmount: this is the last instant at
+    // which what the leaf holds is knowable, and it is the string the NEXT open
+    // may find still sitting in the reused leaf. See `lastBound`.
+    this.lastBound = { nodeId: session.nodeId, text: session.doc.getText('content').toString() };
     try {
       this.deps.editor.unmount();
     } catch {
