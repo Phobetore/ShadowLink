@@ -273,6 +273,27 @@ test('the owner publishes: the doc is seeded, `s` is set and the hash is recorde
   assert.deepEqual(h.queue.stalled(), []);
 });
 
+test('a file holding a lone \\r seeds a document that holds none (I18)', async () => {
+  // The queue is one of only two writers that put disk bytes into a content
+  // document, so it is one of the two places the "a content document contains no
+  // `\r`, ever" guarantee is made. The normalizer here handled `\r\n` and not a
+  // lone `\r`, so a classic-Mac file seeded a document that could never afterwards
+  // be bound into an editor: CodeMirror normalizes both, the two sides never
+  // compared equal, and the note refused to mount for the rest of its life.
+  const h = makeHarness();
+  const id = h.add('mac.md', 'one\rtwo\r\nthree');
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.docs.text(`n_${id}`), 'one\ntwo\nthree');
+  assert.equal(h.tree.get(id)!.s, 1);
+  assert.deepEqual(h.state.data.contentHash[id], {
+    sha256: await hashOf('one\ntwo\nthree'),
+    len: 'one\ntwo\nthree'.length,
+  }, 'and the base names the normalized form, which is the only form there is');
+});
+
 // I5 is the invariant with the worst failure mode in P1: two devices seeding one
 // content doc do not conflict, they CONCATENATE, and every peer's note ends up
 // holding both copies. The gate is therefore checked at both ends of the queue.

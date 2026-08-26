@@ -306,7 +306,11 @@ const IN_MEMORY: Record<string, string[]> = {
   'src/sync/Reconciler.ts': ['ctx.disk', 'ctx.boundAtFold', 'ctx.have', 'this.localHashes'],
   'src/sync/Tickets.ts': ['this.store'],
   'src/sync/VaultWatcher.ts': ['this.decisionPending'],
-  'src/sync/WorkspaceSession.ts': ['this.waiters'],
+  // `text` is the content `Y.Text` — a CRDT in memory, not a file. The one
+  // `text.delete` is the line-ending repair, which removes a `\r` from the
+  // shared document; no disk write can follow from it that Obsidian's own save
+  // of the buffer would not have made anyway.
+  'src/sync/WorkspaceSession.ts': ['this.waiters', 'text'],
   'src/sync/fakes.ts': ['this.open', 'this.entries', 'this.byFold', 'this.liveHandles', 'this.objects'],
   'src/tree/TreeDoc.ts': ['m', 'this.subscribers'],
   'src/tree/TreeIndex.ts': ['derivedPath'],

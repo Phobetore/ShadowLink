@@ -307,7 +307,7 @@ export class WorkspaceSession {
     // to hold. Reading the editor is how note B's body ends up seeding note A.
     let localText: string;
     try {
-      localText = normLF(await this.deps.vault.read(notePath));
+      localText = toLF(await this.deps.vault.read(notePath));
     } catch {
       if (token !== this.token) return;
       this.localOnly(notePath, 'This note could not be read — editing locally only.');
@@ -335,6 +335,11 @@ export class WorkspaceSession {
     }
 
     const text = doc.getText('content');
+    // (L) I18. Before ANY comparison, and before the mount can be asked to make
+    // an equality no configuration can satisfy. A document written by an older
+    // build can hold `\r`; both writers that put disk bytes into one normalize
+    // now, so this is a repair of history rather than an ongoing hazard.
+    this.repairLineEndings(text);
     const seeded = this.deps.tree.get(nodeId)?.s === 1;
 
     /**
@@ -362,7 +367,7 @@ export class WorkspaceSession {
       if (token !== this.token) { release(provider, doc); return; }
       if (confirmed) this.deps.tree.patchNode(nodeId, { s: 1 });
       else this.deps.notice('This note has not reached the server yet; it will retry.');
-    } else if (normLF(text.toString()) !== localText) {
+    } else if (text.toString() !== localText) {
       // The shared document wins on disk (spec §8 item 15: there is no merge UI).
       // WHO WRITES: not this class. `VaultPort` has no `modify` and `create`
       // refuses an occupied path, precisely because writing a note that is live
@@ -443,7 +448,7 @@ export class WorkspaceSession {
     // above can supersede this session before the digest resolves, and recording
     // a watermark for a session that is already being torn down would claim this
     // device holds content it no longer has open.
-    const finalText = normLF(text.toString());
+    const finalText = text.toString();
     if (finalText !== localText) {
       if (token !== this.token) return;
       if (this.deps.state.data.contentHash[nodeId] !== undefined) {
@@ -458,6 +463,44 @@ export class WorkspaceSession {
       this.deps.state.data.contentHash[nodeId] = { sha256, len: finalText.length };
       this.deps.state.schedulePersist();
     }
+  }
+
+  /**
+   * I18. Make the content document LF-only, in place, before anything compares
+   * it. Returns whether it had to do anything.
+   *
+   * WHY IT EXISTS AT ALL. CodeMirror cannot hold a `\r`:
+   * `EditorState.create({ doc: 'a\r\nb' })` yields `"a\nb"`, `{ doc: 'a\rb' }`
+   * yields `"a\nb"`, `EditorState.lineSeparator` does not change it, and
+   * `y-codemirror.next` sends `sliceString(0, len, '\n')`. So a `Y.Text` holding
+   * `\r` can never equal a buffer, and I19's gate would refuse such a note for
+   * ever. Repairing is the only answer that lets the note be edited again.
+   *
+   * BACKWARDS, so an index that has already been visited stays valid, and in ONE
+   * transaction, so no remote update can interleave and no peer sees a half-fixed
+   * document.
+   *
+   * DELETE-THEN-INSERT for a lone `\r`, and this was measured rather than
+   * reasoned about. Delete-only is idempotent and converges, but for a lone `\r`
+   * it removes the break entirely — `"one\rtwo\rthree"` becomes `"onetwothree"`
+   * on every device, with one repairer or ten, which is destroying structure the
+   * user typed. Delete-then-insert is lossless with one repairer; two peers
+   * repairing inside one sync window converge on one extra blank line per site,
+   * which is convergent, cosmetic, and confined to classic-Mac line endings.
+   * For `\r\n` the two rules are identical. Three peers repairing CRLF
+   * independently all reach the LF text, and repairing twice is a no-op.
+   */
+  private repairLineEndings(text: Y.Text): boolean {
+    const before = text.toString();
+    if (!before.includes('\r')) return false;
+    text.doc?.transact(() => {
+      for (let i = before.length - 1; i >= 0; i--) {
+        if (before[i] !== '\r') continue;
+        text.delete(i, 1);
+        if (before[i + 1] !== '\n') text.insert(i, '\n');
+      }
+    });
+    return true;
   }
 
   // ============================================================ waits
@@ -682,16 +725,25 @@ export class CodeMirrorBinding implements EditorBinding {
     // also means a mount that cannot bind has not thrown the user's buffer away.
     if (this.compartment.get(view.state) === undefined) return { ok: false };
 
-    // I18: compare on normalized line endings, in BOTH directions. A peer on
-    // Windows can seed a document holding CRLF, and CodeMirror normalizes line
-    // endings on the way in — so `view.state.doc.toString()` can never be equal
-    // to such a `shared` string, and an exact comparison would replace the
-    // document on every single open and then refuse the mount it just performed.
-    // (A CRLF `Y.Text` remains a hazard of its own: its offsets are not the
-    // editor's, so a remote delta lands one position out per line ending. That
-    // is not this method's to fix — it is upstream of anything the editor can
-    // see — but it is worth knowing that this comparison hides it rather than
-    // solving it.)
+    // I19. RAW `===`, here and at the gate below, and never a normalized
+    // comparison.
+    //
+    // This used to normalize both sides, on the argument that CodeMirror cannot
+    // hold a CRLF so an exact comparison would replace the document on every
+    // open and then refuse the mount it just performed. The first half is true
+    // and the conclusion was wrong: `yCollab` indexes the RAW text, so a
+    // normalized comparison answers "equal" for a `Y.Text` that is two
+    // characters out per line ending, binds it, and every later remote delta
+    // addresses a position the editor does not have. Measured: 21 characters
+    // bound into a 19-character buffer, then
+    // `Invalid change range 22 to 22 (in doc of length 20)`.
+    //
+    // The equality is made ACHIEVABLE instead of asserted away: the session
+    // repairs the document (`repairLineEndings`) before anything compares it, so
+    // by the time a well-formed document reaches here both sides are LF-only and
+    // an exact comparison succeeds. One that still holds a `\r` is refused, which
+    // is the honest answer — there is no configuration in which such a document
+    // and a buffer are equal.
     const shared = text.toString();
 
     // WHAT WAS ON SCREEN, captured before anything can change it. It is not
@@ -702,7 +754,7 @@ export class CodeMirrorBinding implements EditorBinding {
     const before = view.state.doc.toString();
 
     let replaced: string | undefined;
-    if (normLF(before) !== normLF(shared)) {
+    if (before !== shared) {
       replaced = before;
       // WHAT THIS COSTS, deliberately. Replacing the whole document is the
       // bluntest possible convergence: the user's selection is remapped through
@@ -741,7 +793,7 @@ export class CodeMirrorBinding implements EditorBinding {
 
     if (
       this.compartment.get(view.state) === undefined
-      || normLF(view.state.doc.toString()) !== normLF(shared)
+      || view.state.doc.toString() !== shared
     ) {
       // Belt and braces: the two claims `ok` makes are that the binding is
       // installed and that the editor holds the shared text. If either is false
@@ -874,9 +926,25 @@ function release(provider: SessionProvider, doc: Y.Doc): void {
   }
 }
 
-/** I18: compare and hash on normalized line endings; never write the result to disk. */
-function normLF(text: string): string {
-  return text.replace(/\r\n/g, '\n');
+/**
+ * I18. Normalize on the way IN: the normalized form is the only form that
+ * exists inside ShadowLink, and it is what gets written.
+ *
+ * `\r\n?` and not `\r\n`. The missing `?` is blocker 5. CodeMirror normalizes a
+ * LONE `\r` as well — `EditorState.create({ doc: 'a\rb' })` yields `"a\nb"`,
+ * length 3 — so a half-normalizer makes a lone `\r` compare unequal to its own
+ * normalization, for ever: the buffer holds `one\ntwo`, the document holds
+ * `one\rtwo`, the mount refuses, and every launch manufactures another recovery
+ * file for a note nothing was wrong with.
+ *
+ * NEVER normalize a comparison that decides a BINDING. `yCollab` indexes the raw
+ * text, so a normalized comparison of an unnormalized document is how a note
+ * ends up one position out per line ending — which is blocker 6, and the
+ * incident. The bind gate compares raw, and `repairLineEndings` is what makes
+ * that equality achievable rather than unsatisfiable.
+ */
+function toLF(text: string): string {
+  return text.replace(/\r\n?/g, '\n');
 }
 
 function baseOf(path: string): string {

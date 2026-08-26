@@ -400,13 +400,13 @@ export class PublishQueue {
     try {
       const raw = await this.deps.vault.read(path);
       if (!(await this.roundTrips(id, path, raw))) return;
-      const text = normLF(raw);
+      const text = toLF(raw);
       const opened = await this.deps.docs.openHeadless(`n_${id}`);
       handle = opened.handle;
 
       if (!opened.synced) throw new RetryLater(`content doc n_${id} did not sync`);
 
-      const remote = normLF(opened.text);
+      const remote = toLF(opened.text);
       if (remote.length === 0 && text.length > 0) {
         const inserted = await this.deps.docs.insertIfEmpty(handle, text);
         if (!inserted) {
@@ -873,7 +873,18 @@ function mb(bytes: number): string {
 /** A UTF-8 byte-order mark, which a decoder strips and an encoder does not put back. */
 const BOM_BYTES = 3;
 
-/** I18: compare and hash on normalized line endings; never write the result to disk. */
-function normLF(text: string): string {
-  return text.replace(/\r\n/g, '\n');
+/**
+ * I18. Normalize on the way IN: the normalized form is the only form that exists
+ * inside ShadowLink, and it is what gets written into a content document.
+ *
+ * `\r\n?` and not `\r\n`. This is one of exactly two writers that put a file's
+ * bytes into a content `Y.Text`, so it is one of the two places the guarantee
+ * "a content document contains no `\r`, ever" is made. A half-normalizer seeded
+ * a classic-Mac file's lone `\r` straight into the document — and CodeMirror
+ * normalizes a lone `\r` too, so that note could never afterwards be bound into
+ * an editor: no configuration makes the two sides equal, and every launch
+ * refused the mount and filed another recovery copy.
+ */
+function toLF(text: string): string {
+  return text.replace(/\r\n?/g, '\n');
 }

@@ -660,14 +660,55 @@ export class FakeEditorBinding implements EditorBinding {
    * people type. From that point the editor's buffer, not the file, is the
    * newest copy of the note, and it is the thing a mount replaces.
    *
-   * Appended at the end rather than at a caret, because where the characters
-   * went is not what any of this turns on; that they were there is.
+   * Appended at the end by default, because for most of these tests where the
+   * characters went is not what it turns on; that they were there is. `at` is
+   * there for the ones where it does — a buffer whose edit is in the MIDDLE is
+   * what tells a retention bound apart from a prefix check.
    */
-  type(notePath: string, text: string): void {
+  type(notePath: string, text: string, at?: number): void {
     const leaf = this.leaves.get(notePath);
     if (leaf === undefined) throw new Error(`no leaf is open for ${notePath}`);
-    const at = leaf.state.doc.length;
-    leaf.dispatch({ changes: { from: at, to: at, insert: text } });
+    const pos = at ?? leaf.state.doc.length;
+    leaf.dispatch({ changes: { from: pos, to: pos, insert: text } });
+  }
+
+  /** The user deleting a range. The other half of `type`, for the same reason. */
+  cut(notePath: string, from: number, to: number): void {
+    const leaf = this.leaves.get(notePath);
+    if (leaf === undefined) throw new Error(`no leaf is open for ${notePath}`);
+    leaf.dispatch({ changes: { from, to, insert: '' } });
+  }
+
+  /**
+   * A PEER's edit, delivered the way `y-codemirror.next` delivers one.
+   *
+   * `fn` runs inside a `Y.Doc` transaction whose origin is not this binding, so
+   * the observer installed at bind time translates the resulting delta into
+   * CodeMirror changes at `Y.Text` offsets — which is where a document that was
+   * not equal at bind time raises the production `RangeError`.
+   */
+  remoteDelta(notePath: string, fn: (text: Y.Text) => void): void {
+    const bound = this.observed;
+    if (bound === null) throw new Error(`nothing is bound for ${notePath}`);
+    const doc = bound.text.doc;
+    if (doc === null) throw new Error(`the text bound for ${notePath} has no document`);
+    doc.transact(() => { fn(bound.text); }, 'a peer');
+  }
+
+  /**
+   * I19, as an assertion: does the editor hold EXACTLY what the bound `Y.Text`
+   * holds?
+   *
+   * This is the watchdog the design considered and dropped. A permanent `Y.Text`
+   * observer that re-enters `open()` from inside a Yjs callback guards a case
+   * for which no mechanism could be constructed once both writers normalise; as
+   * a test helper it costs nothing in production and still fails loudly the
+   * moment a bind leaves the two sides one position apart per line ending.
+   */
+  inStep(notePath: string): boolean {
+    const leaf = this.leaves.get(notePath);
+    if (leaf === undefined || this.observed === null) return false;
+    return this.observed.text.toString() === leaf.doc;
   }
 
   /** Every transaction that reached this leaf, in order. */

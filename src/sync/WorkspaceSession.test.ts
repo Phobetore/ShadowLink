@@ -887,18 +887,92 @@ test('once the disk has caught up, the next open records what is on it (I17)', a
   );
 });
 
-test('a shared document holding CRLF is not a difference either (I18)', async () => {
-  // The normalization has to be applied to BOTH sides. A peer on Windows can
-  // seed a document with CRLF, and stashing a copy of every note on every open
-  // is exactly the kind of noise that trains users to ignore the folder.
+// ================================================================ line endings
+//
+// This section replaces a test that asserted a CRLF `Y.Text` bound into an LF
+// buffer was "not a difference" and that the mount succeeded. It did succeed —
+// with 21 characters in the document and 19 in the editor — and that is the
+// incident. A test that pins a bug is worse than no test, so it is inverted
+// rather than adjusted.
+//
+// CodeMirror cannot hold a `\r` AT ALL. `EditorState.create({doc:'a\r\nb'})`
+// gives "a\nb"; `{doc:'a\rb'}` gives "a\nb"; `lineSeparator` does not change it,
+// and `y-sync.js` sends `sliceString(0, len, '\n')`. There is therefore no
+// configuration in which a `Y.Text` holding `\r` and a buffer are equal — so a
+// comparison that decides a BINDING cannot be normalised into agreement, and the
+// document has to be repaired instead.
+
+test('a note containing a lone \\r is repaired, bound, and forks nothing', async () => {
+  // Blocker 5. `normLF` handled `\r\n` and not `\r`, and CodeMirror normalises
+  // both — so the buffer was 'one\ntwo' for ever, the document was 'one\rtwo'
+  // for ever, the two never compared equal, and every launch refused the mount
+  // and manufactured another recovery file for a note nothing was wrong with.
   const h = makeHarness();
-  const id = h.add('a.md', 'same\nbytes', { s: 1, owned: true });
-  h.providers.configure(`n_${id}`, { remote: 'same\r\nbytes' });
+  const id = h.add('mac.md', 'one\rtwo', { s: 1, owned: true });
+  h.providers.configure(`n_${id}`, { remote: 'one\rtwo' });
+  const path = `${SHARE}/mac.md`;
 
-  await h.session.open(`${SHARE}/a.md`);
+  await h.session.open(path);
 
+  const text = h.providers.created[0].doc.getText('content');
+  assert.equal(text.toString(), 'one\ntwo', 'the break the user typed survives as a break');
+  assert.equal(h.session.openNodeId(), id, 'and the note binds');
+  assert.equal(h.editor.inStep(path), true);
+  assert.deepEqual(h.stashes(), [], 'nothing was displaced, so nothing was preserved');
+
+  for (let i = 0; i < 3; i++) {
+    await h.session.open(null);
+    await h.session.open(path);
+  }
+  assert.deepEqual(h.stashes(), [], 'and three more launches manufacture nothing');
   assert.equal(mutations(h.vault), 0);
-  assert.equal(h.editor.current?.notePath, `${SHARE}/a.md`);
+});
+
+test('a CRLF document is repaired before it is bound, so a peer\'s edit lands where it aimed', async () => {
+  // Blocker 6, and the incident's own error class. Measured on the shipped
+  // binding: a `Y.Text` holding 'alpha\r\nbravo\r\ncharlie' (21) bound into a
+  // 19-character buffer returned ok, a peer's insert after `bravo` showed up
+  // before `charlie`, and the next append raised
+  // `Invalid change range 22 to 22 (in doc of length 20)`.
+  const h = makeHarness();
+  const id = h.add('win.md', 'alpha\nbravo\ncharlie', { s: 1, owned: true });
+  h.providers.configure(`n_${id}`, { remote: 'alpha\r\nbravo\r\ncharlie' });
+  const path = `${SHARE}/win.md`;
+
+  await h.session.open(path);
+
+  const text = h.providers.created[0].doc.getText('content');
+  assert.equal(text.toString().includes('\r'), false, 'no \\r reaches a bound document');
+  assert.equal(text.length, h.editor.document(path)?.length, 'and the two sides are one length');
+  assert.equal(h.editor.inStep(path), true);
+
+  h.editor.remoteDelta(path, (t) => { t.insert('alpha\nbravo'.length, '!'); });
+
+  assert.equal(h.editor.document(path), 'alpha\nbravo!\ncharlie');
+  assert.equal(h.editor.inStep(path), true, 'a peer\'s insert past the first break stays in step');
+  assert.deepEqual(h.stashes(), [], 'and a repair is not a divergence');
+});
+
+test('binding an UNREPAIRED CRLF document is what raised the incident\'s RangeError', () => {
+  // The half that has to stay red if the repair is ever deleted. The shipped
+  // binding, a real `EditorState`, and a `Y.Text` nobody repaired: the gate now
+  // refuses it, and the observer shows why refusing is the only honest answer.
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf('alpha\nbravo\ncharlie', binding.editorExtension());
+  const text = ytextOf('alpha\r\nbravo\r\ncharlie');
+
+  const result = binding.mount('Shared/win.md', text, new FakeAwareness());
+
+  assert.equal(result.ok, false, 'the two sides cannot be made equal, so nothing is bound');
+  assert.equal(text.length, 21);
+  assert.equal(leaf.view.state.doc.length, 19, 'CodeMirror will not hold the \\r, ever');
+
+  // And this is what a bind would have cost, run by hand at the offsets the
+  // observer would have used.
+  assert.throws(
+    () => leaf.view.dispatch({ changes: { from: 21, to: 21, insert: '!' } }),
+    /Invalid change range 21 to 21 \(in doc of length 19\)/,
+  );
 });
 
 // ================================================================ I7 — cancellation
