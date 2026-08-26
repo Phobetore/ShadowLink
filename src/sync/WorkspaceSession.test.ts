@@ -73,6 +73,17 @@ interface RoomConfig {
   mode: 'immediate' | 'manual';
   /** What the server already holds, applied to the doc when the room syncs. */
   remote: string;
+  /**
+   * The same thing as the UPDATE it actually is, for the tests where the shared
+   * history matters.
+   *
+   * `remote` inserts a string locally, so two rooms configured with one string
+   * hold two disjoint Yjs insertions — which is the right model for "two devices
+   * seeded the same doc" (I5) and the wrong one for "two devices received the
+   * same doc". Convergence after a concurrent repair is only a question at all in
+   * the second case.
+   */
+  remoteUpdate: Uint8Array | null;
   /** What `flush()` resolves to. False models "the update never came back". */
   flushConfirmed: boolean;
   /** When set, `flush()` blocks until the test releases it. */
@@ -129,7 +140,9 @@ class FakeProvider implements SessionProvider {
 
   /** Deliver the server's state and announce a GENUINE sync. */
   emitSync(): void {
-    if (this.config.remote.length > 0 && this.doc.getText('content').length === 0) {
+    if (this.config.remoteUpdate !== null) {
+      Y.applyUpdate(this.doc, this.config.remoteUpdate);
+    } else if (this.config.remote.length > 0 && this.doc.getText('content').length === 0) {
       this.doc.getText('content').insert(0, this.config.remote);
     }
     this.synced = true;
@@ -173,7 +186,9 @@ class FakeProviders implements ProviderPort {
 
   private configOf(room: string): RoomConfig {
     return this.configs.get(room)
-      ?? { mode: 'immediate', remote: '', flushConfirmed: true, gateFlush: false };
+      ?? {
+        mode: 'immediate', remote: '', remoteUpdate: null, flushConfirmed: true, gateFlush: false,
+      };
   }
 }
 
@@ -1295,6 +1310,47 @@ test('a CRLF document is repaired before it is bound, so a peer\'s edit lands wh
   assert.equal(h.editor.document(path), 'alpha\nbravo!\ncharlie');
   assert.equal(h.editor.inStep(path), true, 'a peer\'s insert past the first break stays in step');
   assert.deepEqual(h.stashes(), [], 'and a repair is not a divergence');
+});
+
+test('the repair converges however many peers run it at once', async () => {
+  // The design rests on this and it was measured rather than reasoned about, so
+  // it is pinned. The session's repair is driven through a real open on each
+  // simulated peer, and the resulting documents are merged pairwise.
+  const repaired = async (seed: string, peers: number): Promise<string[]> => {
+    // ONE history, handed to every peer — which is what `remoteUpdate` is for.
+    // Seeding each of them from the same STRING would give disjoint insertions,
+    // and their merge would concatenate rather than converge.
+    const origin = new Y.Doc();
+    origin.getText('content').insert(0, seed);
+    const snapshot = Y.encodeStateAsUpdate(origin);
+    const docs: Y.Doc[] = [];
+    for (let i = 0; i < peers; i++) {
+      const h = makeHarness();
+      const id = h.add('mac.md', seed, { s: 1, owned: true });
+      h.providers.configure(`n_${id}`, { remoteUpdate: snapshot });
+      await h.session.open(`${SHARE}/mac.md`);
+      docs.push(h.providers.created[0].doc);
+    }
+    for (const a of docs) for (const b of docs) if (a !== b) Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    return docs.map((d) => d.getText('content').toString());
+  };
+
+  for (const peers of [1, 2, 3]) {
+    const out = await repaired('one\r\ntwo\r\nthree', peers);
+    assert.ok(out.every((x) => x === out[0]), `CRLF diverged with ${peers} peers`);
+    assert.equal(out[0], 'one\ntwo\nthree', `CRLF costs nothing with ${peers} peers`);
+  }
+
+  // A LONE `\r` is the case with a price, and it is N-1 extra breaks per site.
+  // Convergent and cosmetic. The alternative rule — delete without inserting —
+  // is idempotent, but it JOINS those lines on every device with no concurrency
+  // required at all, which is destroying structure the user typed.
+  const two = await repaired('one\rtwo\rthree', 2);
+  assert.ok(two.every((x) => x === two[0]));
+  assert.equal(two[0], 'one\n\ntwo\n\nthree');
+  const three = await repaired('one\rtwo\rthree', 3);
+  assert.ok(three.every((x) => x === three[0]));
+  assert.equal(three[0], 'one\n\n\ntwo\n\n\nthree');
 });
 
 test('binding an UNREPAIRED CRLF document is what raised the incident\'s RangeError', () => {

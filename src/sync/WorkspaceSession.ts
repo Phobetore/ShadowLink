@@ -783,12 +783,14 @@ export class WorkspaceSession {
    * DELETE-THEN-INSERT for a lone `\r`, and this was measured rather than
    * reasoned about. Delete-only is idempotent and converges, but for a lone `\r`
    * it removes the break entirely — `"one\rtwo\rthree"` becomes `"onetwothree"`
-   * on every device, with one repairer or ten, which is destroying structure the
-   * user typed. Delete-then-insert is lossless with one repairer; two peers
-   * repairing inside one sync window converge on one extra blank line per site,
-   * which is convergent, cosmetic, and confined to classic-Mac line endings.
-   * For `\r\n` the two rules are identical. Three peers repairing CRLF
-   * independently all reach the LF text, and repairing twice is a no-op.
+   * on every device, with one repairer or ten, which destroys structure the user
+   * typed. Delete-then-insert is lossless with one repairer; N peers repairing
+   * inside one sync window converge on N-1 EXTRA breaks per site (two peers give
+   * `"one\n\ntwo\n\nthree"`, three give `"one\n\n\ntwo…"`), which is convergent,
+   * cosmetic, and confined to classic-Mac line endings — and it needs every one
+   * of those devices to bind the same document for the first time inside one
+   * window. For `\r\n` the two rules are IDENTICAL: one, two and three peers
+   * repairing independently all reach the LF text. Repairing twice is a no-op.
    */
   private repairLineEndings(text: Y.Text): boolean {
     const before = text.toString();
