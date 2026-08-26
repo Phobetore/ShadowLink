@@ -305,6 +305,12 @@ class SyncRuntime {
       userName: plugin.settings.displayName,
       userColor: plugin.settings.cursorColor,
       notice: (msg) => { new Notice(msg); },
+      // The session is the one writer of `s` that is not the queue: it publishes
+      // a brand-new note the moment it has a byte in it, because the queue may
+      // not touch a document it holds open (I7). Without this the queue keeps
+      // deferring on that node for as long as the note stays open — a full
+      // reconcile pass every 30 seconds, and a status bar that never says synced.
+      markPublished: (nodeId) => { this.queue.markPublished(nodeId); },
     });
 
     this.queue = new PublishQueue({

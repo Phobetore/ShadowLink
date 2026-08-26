@@ -342,6 +342,17 @@ export interface WorkspaceSessionDeps {
   userName: string;
   userColor: string;
   notice: (msg: string) => void;
+  /**
+   * Tell the publish queue this session has published a node itself.
+   *
+   * `publishOne` DEFERS on a node the session holds open (I7), and a deferral is
+   * "not now" rather than "not ever", so the entry stays pending and stays
+   * counted — which means an unpublished note held open asks the reconciler for
+   * a full pass every 30 seconds for as long as it is open. This is the one
+   * writer of `s` that is not the queue, so it is the one that owes the queue an
+   * answer.
+   */
+  markPublished?: (nodeId: string) => void;
   now?: () => number;
   /** Bound wait for the tree to name a node for the path (spec §6.1). */
   nodeWaitMs?: number;
@@ -404,6 +415,15 @@ export class WorkspaceSession {
    * otherwise fork the revision this very session put on screen.
    */
   private readonly sharedSeen = new Map<string, string>();
+
+  /** Disposes the first-byte publisher's observer, or null when none is armed. */
+  private publisherOff: (() => void) | null = null;
+
+  /**
+   * Whether this session has already said an update did not reach the server.
+   * Once is information; once per keystroke is noise the user learns to ignore.
+   */
+  private publishNoticed = false;
 
   constructor(deps: WorkspaceSessionDeps) {
     this.deps = deps;
@@ -605,16 +625,11 @@ export class WorkspaceSession {
     if (!mounted.ok) return;
     if (mounted.replaced !== undefined) this.reportTakeShared(notePath, preserved);
 
-    // I6 + I17: the workspace may be told this node is published only once the
-    // round trip has come back AND there is something to publish. An empty
-    // document flushes and confirms perfectly and confirms nothing, and `s` is
-    // the whole definition of "published" for a note — set it here and every peer
-    // materializes a 0-byte file on the canonical path.
+    // I6: the node goes live the moment it HAS content, and not before.
     if (!seeded && own) {
-      const confirmed = await provider.flush();
+      if (text.length > 0) await this.publishFirstBytes(nodeId, text, provider, token);
+      else this.armPublisher(nodeId, text, provider, token);
       if (token !== this.token) return;
-      if (confirmed && text.length > 0) this.deps.tree.patchNode(nodeId, { s: 1 });
-      else if (!confirmed) this.deps.notice('This note has not reached the server yet; it will retry.');
     }
 
     // I17. A watermark names bytes that are simultaneously in the workspace and
@@ -664,6 +679,82 @@ export class WorkspaceSession {
       this.deps.state.data.contentHash[nodeId] = { sha256, len: finalText.length };
       this.deps.state.schedulePersist();
     }
+  }
+
+  /**
+   * I6, and blocker 4's other half: publish this node the moment its document
+   * HAS content, rather than when the note closes.
+   *
+   * Obsidian's "New note" is a 0-byte file that Obsidian then opens, so the
+   * session reaches such a node before the publish queue can. The queue in turn
+   * DEFERS on a node the session holds open (I7), and a deferral is "not now"
+   * rather than "not ever" — so without a publisher here the note is invisible
+   * to every peer for as long as it is open, and its still-pending entry asks
+   * the reconciler for a full pass every 30 seconds meanwhile.
+   *
+   * A one-shot observer on the document, disposed by `closeActive`. In
+   * production the user's own typing reaches the `Y.Text` through `yCollab`, so
+   * this fires on the first keystroke.
+   */
+  private armPublisher(
+    nodeId: string,
+    text: Y.Text,
+    provider: SessionProvider,
+    token: number,
+  ): void {
+    this.disarmPublisher();
+    const observer = (): void => {
+      if (text.length === 0) return;
+      this.disarmPublisher();
+      void this.publishFirstBytes(nodeId, text, provider, token);
+    };
+    text.observe(observer);
+    this.publisherOff = (): void => { text.unobserve(observer); };
+  }
+
+  private disarmPublisher(): void {
+    const off = this.publisherOff;
+    this.publisherOff = null;
+    off?.();
+  }
+
+  /**
+   * I17: confirm, then advance. `s` is never re-offered by anybody, so a
+   * premature one is permanent content loss rather than a retry.
+   *
+   * `contentHash` is deliberately NOT recorded alongside it. A watermark names
+   * bytes that are simultaneously in the workspace and ON THIS DISK, and at this
+   * moment the disk still holds whatever it held before the user typed —
+   * Obsidian's save is asynchronous and this method performs no disk write. Such
+   * a note is "unproven" until its next converged open, which means a remote
+   * tombstone rescues it rather than trashing it: the safe direction.
+   */
+  private async publishFirstBytes(
+    nodeId: string,
+    text: Y.Text,
+    provider: SessionProvider,
+    token: number,
+  ): Promise<void> {
+    let confirmed = false;
+    try {
+      confirmed = await provider.flush();
+    } catch {
+      confirmed = false;                                 // transport, not a publish
+    }
+    if (token !== this.token) return;
+    if (confirmed && text.length > 0) {
+      this.deps.tree.patchNode(nodeId, { s: 1 });
+      this.deps.markPublished?.(nodeId);
+      return;
+    }
+    // An unconfirmed flush is a retry. Re-armed on the NEXT change rather than
+    // immediately, because retrying in a tight loop is not retrying — and said
+    // once rather than once per keystroke.
+    if (!this.publishNoticed) {
+      this.publishNoticed = true;
+      this.deps.notice('This note has not reached the server yet; it will retry.');
+    }
+    this.armPublisher(nodeId, text, provider, token);
   }
 
   /**
@@ -792,6 +883,9 @@ export class WorkspaceSession {
   // ============================================================ teardown + notices
 
   private closeActive(): void {
+    // Before anything else: an observer left on a released document would keep
+    // this session publishing a node it no longer holds.
+    this.disarmPublisher();
     const session = this.active;
     this.active = null;
     if (session === null) return;

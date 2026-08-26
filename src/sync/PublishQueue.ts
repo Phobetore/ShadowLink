@@ -284,6 +284,25 @@ export class PublishQueue {
   }
 
   /**
+   * Close an entry on behalf of the ONE writer of `s` that is not this queue:
+   * the editing session, which owns a node it holds open (I7).
+   *
+   * `publishOne` DEFERS on such a node rather than failing, because a deferral
+   * is "not now" and closing the tab is all it takes — so the entry stays
+   * pending and stays counted. When the session publishes the note itself, that
+   * stops being true, and nothing else can tell: the queue is forbidden from
+   * touching a live document, so it would keep deferring, keep asking the
+   * reconciler for a pass every 30 seconds, and keep the status bar on "1 file
+   * waiting to upload", for as long as the note stays open.
+   */
+  markPublished(nodeId: string): void {
+    if (this.deps.state.data.publish[nodeId] === undefined) return;
+    this.markDone(nodeId);
+    this.errors.delete(nodeId);
+    this.deps.state.schedulePersist();
+  }
+
+  /**
    * Publish everything that is pending and due. Called by the reconciler's step 7.
    *
    * Single-flight: a call arriving while a drain is running joins it instead of

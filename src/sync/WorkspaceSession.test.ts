@@ -141,6 +141,11 @@ class FakeProvider implements SessionProvider {
     this.flushGate = null;
   }
 
+  /** The server coming back: every later `flush()` confirms. */
+  confirmFlushes(): void {
+    this.config.flushConfirmed = true;
+  }
+
   get flushPending(): boolean {
     return this.flushGate !== null;
   }
@@ -574,6 +579,98 @@ test('an already-seeded empty document is never re-seeded, and the empty doc win
   // next open finding the same divergence and stashing again.
   assert.equal(h.editor.document(`${SHARE}/a.md`), '', 'the shared (empty) doc wins in the editor');
   assert.deepEqual(h.stashes().map(([, text]) => text), ['local leftovers'], 'and the bytes are kept');
+});
+
+// ================================================================ I6 — publishing
+//
+// `s` is the whole definition of "published" for a note, and it had three
+// writers. This one was the unguarded one, and it was also the one that ran
+// first: Obsidian's "New note" is a 0-byte file that Obsidian then OPENS, so the
+// session reached it before the queue could refuse it, flushed an empty
+// document — which round-trips and confirms perfectly, and confirms nothing —
+// and told every peer to materialize content that does not exist. A 0-byte file
+// on the canonical path looks correct, gets deleted by hand, and that hand
+// deletion is a tombstone that propagates to everybody, the author included.
+
+test('an empty new note is not published just because Obsidian opened it (I6)', async () => {
+  const h = makeHarness();
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { remote: '' });
+
+  await h.session.open(path);
+  await h.session.open(null);
+  await h.session.open(path);
+
+  assert.equal(h.tree.get(id)?.s, undefined, 'nothing has been published, because nothing exists');
+  assert.equal(h.state.data.contentHash[id], undefined, 'and no watermark names 0 bytes');
+  assert.equal(h.session.openNodeId(), id, 'the note is perfectly editable meanwhile');
+  assert.deepEqual(h.notices, []);
+});
+
+test('the same note goes live the moment it has a byte in it', async () => {
+  // Not when it closes. `publishOne` DEFERS on a node this session holds open
+  // (I7), and a deferral is "not now" rather than "not ever", so without this the
+  // note is invisible to every peer for as long as it is open and the entry keeps
+  // asking the reconciler to look at it.
+  //
+  // The first byte arrives through the document rather than through `type()`,
+  // because the editor -> Y.Text direction is `yCollab`'s and the fake
+  // deliberately does not re-implement it. What is being tested is the observer
+  // on the document, which is where that direction lands in production too.
+  const published: string[] = [];
+  const h = makeHarness({ markPublished: (nodeId) => { published.push(nodeId); } });
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { remote: '' });
+
+  await h.session.open(path);
+  assert.equal(h.tree.get(id)?.s, undefined);
+
+  h.editor.remoteDelta(path, (t) => { t.insert(0, 'A'); });
+  await until(() => h.tree.get(id)?.s === 1, 'the node to be published');
+
+  assert.deepEqual(published, [id], 'and the queue is told, so its entry stops asking');
+  assert.equal(
+    h.state.data.contentHash[id], undefined,
+    'but no watermark: the disk still holds the old bytes until Obsidian saves (I17)',
+  );
+  assert.equal(h.editor.document(path), 'A');
+});
+
+test('an unconfirmed first flush retries on the next byte rather than giving up', async () => {
+  const h = makeHarness();
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { remote: '', flushConfirmed: false });
+
+  await h.session.open(path);
+  h.editor.remoteDelta(path, (t) => { t.insert(0, 'A'); });
+  await until(() => h.notices.length > 0, 'the retry notice');
+
+  assert.equal(h.tree.get(id)?.s, undefined, 'an unconfirmed flush is a retry, never a completion');
+  assert.deepEqual(h.notices, ['This note has not reached the server yet; it will retry.']);
+
+  h.providers.forRoom(`n_${id}`)[0].confirmFlushes();
+  h.editor.remoteDelta(path, (t) => { t.insert(1, 'B'); });
+  await until(() => h.tree.get(id)?.s === 1, 'the retry to land');
+
+  assert.equal(h.notices.length, 1, 'and it is not said twice');
+});
+
+test('closing the note disarms the publisher', async () => {
+  const h = makeHarness();
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { remote: '' });
+
+  await h.session.open(path);
+  const text = h.providers.created[0].doc.getText('content');
+  await h.session.open(null);
+  text.insert(0, 'typed after the session closed');
+  await tick();
+
+  assert.equal(h.tree.get(id)?.s, undefined, 'a closed session publishes nothing');
 });
 
 // ================================================================ divergence

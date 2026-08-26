@@ -556,6 +556,31 @@ test('an empty note is not published, and no peer writes a 0-byte decoy (I6)', a
   assert.deepEqual(ben.notices, [], 'and the peer is told nothing about a note being written');
 });
 
+test('a node the session published itself stops being work the queue owes (I7)', async () => {
+  // `publishOne` defers on a node the session holds open, and a deferral is "not
+  // now" rather than "not ever", so the entry stays pending and stays counted.
+  // The session publishes a brand-new note the moment it has a byte in it — it
+  // has to, because the queue may not touch a live document — so it is the one
+  // writer of `s` that owes the queue an answer. Without one, a note held open
+  // asks the reconciler for a full pass every 30 seconds for as long as it is
+  // open, and the status bar says "1 file waiting to upload" the whole time.
+  const h = makeHarness();
+  const id = h.add('Untitled.md', 'the author started typing');
+  h.queue.enqueue(id);
+  h.open.id = id;
+
+  await h.queue.drain();
+  assert.equal(h.queue.pendingCount(), 1, 'a deferral is still an upload this device owes');
+
+  h.tree.patchNode(id, { s: 1 });                        // what the session does
+  h.queue.markPublished(id);
+
+  assert.deepEqual(h.state.data.publish[id], { state: 'done', attempts: 0, nextAt: 0 });
+  assert.equal(h.queue.pendingCount(), 0);
+  assert.deepEqual(h.queue.parked(), []);
+  assert.equal(h.queue.lastError(id), undefined);
+});
+
 /**
  * The other half of the refusal, and the regression it would be easy to ship.
  *
