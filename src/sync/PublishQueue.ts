@@ -22,6 +22,15 @@
 // round trip, because a node whose `s` is set is never offered for publication
 // again by anybody — a premature `s` is permanent content loss, not a retry.
 //
+// I6 — AN EMPTY DOCUMENT IS NOT CONTENT. A flush of an empty doc round-trips
+// perfectly and confirms nothing, and `s` is the whole definition of "published"
+// for a note, so setting it there makes every peer materialize a 0-BYTE FILE on
+// the canonical path — which looks correct, gets deleted by hand, and the hand
+// deletion is a tombstone that propagates. Obsidian's "New note" is a 0-byte file,
+// so this is the ordinary state of every note until its author types. Refusing to
+// publish it is not refusing to have it: the node stays, peers list it as pending,
+// and the entry stays queued for the drain after its first byte lands.
+//
 // P2 adds a second arm, `publishBlobOne` (spec §3.2), which publishes an
 // ATTACHMENT's bytes into the content-addressed store instead of a note's text
 // into a content doc. The same three invariants govern it, in a different shape:
@@ -122,6 +131,37 @@ export class PublishQueue {
   private readonly seedRefused = new Set<string>();
 
   /**
+   * Nodes the last drain REFUSED for a reason only the user's file can change.
+   *
+   * Refusing is not failing, so the entry stays `pending` and no rung of the
+   * ladder is charged — and that has to stay true, because nothing else will
+   * ever re-offer a note: `VaultWatcher.onModify` returns early for one, so the
+   * 30-second retry cadence IS how an empty note publishes itself after the
+   * first keystroke. Take the entry away and the note is never published again.
+   *
+   * But an entry in that state is not WORK. Nothing is uploading, nothing is
+   * queued to upload, and nothing will change until the user types into the note
+   * or renames the file. `pendingCount()` is what the status bar turns into
+   * "ShadowLink: syncing… / N file(s) waiting to upload", and it never falls
+   * back to `syncedStatus()` while that number is above zero — so counting these
+   * pinned the bar on "syncing…" for the lifetime of the vault over one
+   * permanently empty note, and publish entries are never pruned, so a note
+   * created and deleted before its first character pinned it with nothing left
+   * to look at.
+   *
+   * IN MEMORY, and re-decided by every drain rather than persisted. It is a
+   * conclusion about a file, and a conclusion about a file goes stale the moment
+   * the file changes; the only honest place to reach it is where the file is
+   * read. The status bar therefore reports what the last pass found, which is
+   * exactly what every other number on it reports.
+   *
+   * The line this must not cross: a note DEFERRED because the user has it open
+   * (I7) is "not now", not "not ever" — closing the tab is all it takes, and the
+   * file is full of the user's words meanwhile. That one stays counted.
+   */
+  private readonly parkedNodes = new Set<string>();
+
+  /**
    * The server's per-file ceiling, once this session has managed to ask for it.
    *
    * Cached rather than re-fetched per item, and NOT cached as a failure: `limits()`
@@ -185,16 +225,44 @@ export class PublishQueue {
     // running for these bytes, done means they are already published.
     if (entry !== undefined && entry.intent === intent) return;
     data.publish[nodeId] = { state: 'pending', attempts: 0, nextAt: 0, intent };
+    // New bytes. Whatever the last drain refused was about the old ones, so the
+    // entry counts as work again from this moment rather than from the drain
+    // that re-examines it — this path HAS an event behind it (`onModify` for an
+    // attachment), which is exactly what a note does not have.
+    this.parkedNodes.delete(nodeId);
     this.deps.state.schedulePersist();
   }
 
-  /** Entries still owed work, whether or not they are due yet. */
+  /**
+   * Entries still owed work by THIS DEVICE, whether or not they are due yet.
+   *
+   * The status bar's number, and therefore a promise: every one of these is a
+   * file that is going to be uploaded without the user doing anything. A parked
+   * entry is not one — see `parkedNodes` — so it is excluded here and reported
+   * by `parked()` instead.
+   */
   pendingCount(): number {
     let n = 0;
-    for (const entry of Object.values(this.deps.state.data.publish)) {
-      if (entry.state === 'pending') n += 1;
+    for (const [id, entry] of Object.entries(this.deps.state.data.publish)) {
+      if (entry.state === 'pending' && !this.parkedNodes.has(id)) n += 1;
     }
     return n;
+  }
+
+  /**
+   * Pending ids the last drain refused over the state of the file itself — an
+   * empty note (I6), or a `.md` node whose bytes are not text (§3.6).
+   *
+   * They are still retried on every drain; this is what keeps them from being
+   * invisible now that they are out of `pendingCount()`. The reason for each is
+   * in `lastError`, and the ones that warrant it have already said so by Notice.
+   */
+  parked(): string[] {
+    const out: string[] = [];
+    for (const id of this.parkedNodes) {
+      if (this.deps.state.data.publish[id]?.state === 'pending') out.push(id);
+    }
+    return out.sort(compare);
   }
 
   /**
@@ -314,6 +382,11 @@ export class PublishQueue {
     // closed the tab — so nothing at all is touched, not even the disk.
     if (this.deps.openNodeId() === id) return;
 
+    // Past every deferral, so this attempt is genuinely going to look at the
+    // file. Whatever the last drain concluded about it stops being current here,
+    // and is re-established below only if this attempt reaches the same refusal.
+    this.parkedNodes.delete(id);
+
     const path = data.materialized[id];
     if (path === undefined || path === '') {
       // The reconciler has not bound this node to a file yet (or the binding was
@@ -349,12 +422,61 @@ export class PublishQueue {
         throw new RetryLater(`content doc n_${id} was not confirmed`);
       }
 
-      this.deps.tree.patchNode(id, { s: 1 });
-      // Whatever is actually in the document is what this device has confirmed —
-      // the local text when we seeded it, the remote text when a peer had already
-      // published. Never the local copy in the second case.
+      // What the WORKSPACE is confirmed to hold: the local text where we seeded
+      // it, the remote text where a peer had already published. Never the local
+      // copy in the second case — the doc was not ours to overwrite (I5).
       const published = remote.length === 0 ? text : remote;
-      data.contentHash[id] = { sha256: await hashOf(published), len: published.length };
+
+      // I6, and the same refusal the attachment arm already makes for a zero-byte
+      // file. A confirmed flush of an EMPTY document confirms nothing: `s` is the
+      // whole definition of "published" for a note, so setting it here tells every
+      // peer to materialize content that does not exist, and `Reconciler` obliges
+      // by writing a 0-byte file on the canonical path — the thing its own comment
+      // calls worse than no file, because it looks correct and gets deleted by
+      // hand. That hand deletion is a tombstone, and it propagates to everybody,
+      // the author included.
+      //
+      // Obsidian's "New note" IS a 0-byte file, so an empty note is the ordinary
+      // state of every note for as long as it takes its author to start typing.
+      // This refuses to PUBLISH one, not to have one: the node stays in the tree
+      // under its own name, peers list it as pending, and the entry left `pending`
+      // here publishes it on the next drain after its first byte lands. Refusing
+      // is not failing, so no rung of the ladder is charged and nothing is said to
+      // the user about a note they are still writing.
+      //
+      // PARKED as it is kept, because those two facts are both needed and they
+      // pull opposite ways. The entry has to stay, or the note is never offered
+      // again; the STATUS BAR must not read it as an upload in progress, or one
+      // permanently empty note reports "1 file waiting to upload" for the
+      // lifetime of the vault and the bar never says "synced" again. There is no
+      // upload owed here: there is nothing to upload.
+      if (published.length === 0) {
+        this.parkedNodes.add(id);
+        return;
+      }
+
+      this.deps.tree.patchNode(id, { s: 1 });
+
+      // I17, second half: a base names bytes that are simultaneously in the
+      // WORKSPACE and on THIS DISK, and it is recorded only when both are true.
+      // When the document already held a peer's text, `published` is the
+      // workspace's copy and `text` is this disk's; if they differ there are no
+      // such bytes, and both available answers are lies with different victims.
+      // The remote's hash names a file this disk does not hold, so every reader of
+      // the base reasons about content that is not there. The local's hash is
+      // worse: `Deletions.isProvenNote` compares the base with the disk, finds
+      // they agree, and lets a remote tombstone TRASH unpublished local work that
+      // no peer can give back.
+      //
+      // So nothing is recorded, and any stale base is dropped rather than left to
+      // speak for bytes it no longer describes. Every reader defaults to rescue on
+      // ignorance, which is the answer that keeps the user's file; the divergence
+      // itself is the reconciler's to resolve, not the publisher's.
+      if (published === text) {
+        data.contentHash[id] = { sha256: await hashOf(published), len: published.length };
+      } else {
+        delete data.contentHash[id];
+      }
       data.publish[id] = { state: 'done', attempts: 0, nextAt: 0 };
       this.errors.delete(id);
     } catch (err) {
@@ -381,6 +503,9 @@ export class PublishQueue {
    * REFUSING IS NOT FAILING — no rung of the backoff ladder is charged, because a
    * file that is not text will not become text by waiting; the entry stays
    * pending, the reason reaches diagnostics, and the user is told exactly once.
+   * It is PARKED for the same reason an empty note is: waiting is not what fixes
+   * this, a rename by hand is, so there is no upload in progress for the status
+   * bar to report and no honest way to count one.
    *
    * A `stat` that cannot answer is a retry (I2): "I could not look" must not
    * become "seed it anyway".
@@ -395,6 +520,7 @@ export class PublishQueue {
     // bytes for every invalid one — so this cannot let mojibake through.
     if (encoded === st.bytes || encoded + BOM_BYTES === st.bytes) return true;
 
+    this.parkedNodes.add(id);
     this.errors.set(id, new Error(
       `${path} is ${st.bytes} bytes on disk but decodes to ${encoded}: not UTF-8 text`,
     ));
@@ -700,6 +826,10 @@ export class PublishQueue {
     };
     if (intent !== undefined) entry.intent = intent;
     this.deps.state.data.publish[id] = entry;
+    // Nothing owed, nothing refused. `parked()` already filters on the entry's
+    // state, so this is hygiene rather than correctness — but a set that only
+    // ever grows is how the next reader is misled.
+    this.parkedNodes.delete(id);
   }
 
   /**

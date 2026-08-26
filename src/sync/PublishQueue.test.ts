@@ -28,9 +28,11 @@ import { Deletions } from './Deletions.ts';
 import { DeviceState, type StatePort } from './DeviceState.ts';
 import { DiskIndex } from './DiskIndex.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
-import { DESKTOP_MEMORY_CAP, FakeBlobs, FakeDocs, FakeVault } from './fakes.ts';
+import {
+  DESKTOP_MEMORY_CAP, DESKTOP_PASS_LIMITS, FakeBlobs, FakeDocs, FakeVault,
+} from './fakes.ts';
 import { PublishQueue, type PublishQueueDeps } from './PublishQueue.ts';
-import type { DeletionContext, ReconcileFailure } from './Reconciler.ts';
+import { Reconciler, type DeletionContext, type ReconcileFailure } from './Reconciler.ts';
 import { Tickets } from './Tickets.ts';
 import type { VaultPort } from './VaultPort.ts';
 
@@ -178,6 +180,74 @@ function portOf(inner: FakeVault): VaultPort {
     trashLocal: (p) => inner.trashLocal(p),
     isOpenInLeaf: (p) => inner.isOpenInLeaf(p),
   };
+}
+
+/**
+ * I17, asserted against the two places the invariant actually names.
+ *
+ * A base is a claim that these exact bytes are simultaneously in the WORKSPACE and
+ * on THIS DISK. A test that spells the expected sha256 out as a literal cannot
+ * tell the two apart — it passes just as happily when the literal is the remote
+ * document's text and the disk holds something else, which is precisely the bug
+ * this file used to assert. So the expectation is read back from the disk and from
+ * the content doc rather than written down.
+ */
+async function assertBaseIsOnDisk(h: Harness, id: string): Promise<void> {
+  const path = h.state.data.materialized[id];
+  const onDisk = normLF(await h.vault.read(path));
+  const inWorkspace = normLF(h.docs.text(`n_${id}`));
+  const base = h.state.data.contentHash[id];
+  assert.ok(base !== undefined, `no base was recorded for ${path}`);
+  assert.equal(base.sha256, await hashOf(onDisk), `the base does not name what is on disk (${path})`);
+  assert.equal(base.len, onDisk.length, `the base's length is not the disk's (${path})`);
+  assert.equal(onDisk, inWorkspace, `the disk and the workspace differ, so there is no base to name`);
+}
+
+/** I18, exactly as the engine applies it: compare and hash on normalized endings. */
+function normLF(text: string): string {
+  return text.replace(/\r\n/g, '\n');
+}
+
+/** What a peer's reconcile pass left in its own vault. */
+interface PeerVault {
+  /** Every file the peer holds, path -> text. Folders are not files. */
+  files: Record<string, string>;
+  notices: string[];
+}
+
+/**
+ * Run the REAL reconciler on a second device against the tree this harness's queue
+ * just wrote — its own vault, its own device state, and the SAME `FakeDocs`,
+ * because one workspace has one content document and the peer opens the very room
+ * the publish arm just touched.
+ *
+ * A queue test can only assert what the tree says. What `s` MEANS happens on the
+ * other machine, and for a note it means exactly one thing: `Reconciler.materialize`
+ * writes the document's text to the canonical path. That is the assertion worth
+ * having, because a 0-byte file there is the harm — not the bit in the tree.
+ */
+async function peerReconcile(h: Harness): Promise<PeerVault> {
+  const vault = new FakeVault();
+  vault.seed(SHARE, 'd');
+  const now = (): number => h.clock.now;
+  const state = new DeviceState(new MemoryStatePort(), 'device-2', 'ws-1', now, 0);
+  const notices: string[] = [];
+
+  const reconciler = new Reconciler({
+    ...DESKTOP_PASS_LIMITS,
+    vault,
+    docs: h.docs,
+    blobs: h.blobs,
+    state,
+    tickets: new Tickets(now),
+    shareRoot: SHARE,
+    entries: () => h.tree.entries(),
+    notice: (m) => { notices.push(m); },
+    now,
+  });
+  await reconciler.reconcile('remote');
+
+  return { files: vault.snapshot(), notices };
 }
 
 // ---------------------------------------------------------------- I5: only the creator publishes
@@ -368,13 +438,22 @@ test('a content doc that already holds text is never overwritten', async () => {
     h.docs.calls.filter((c) => c.op === 'insertIfEmpty').length, 0,
     'insertIfEmpty is not even attempted against a non-empty doc',
   );
-  // The node IS published — by the other device — so the watermark is the remote
-  // text, never the local text this device happened to be holding.
+  // The node IS published — by the other device.
   assert.equal(h.tree.get(id)!.s, 1);
-  assert.deepEqual(h.state.data.contentHash[id], {
-    sha256: await hashOf('someone else got here first'),
-    len: 'someone else got here first'.length,
-  });
+  // ⚠ CHANGED, deliberately. This used to read "so the watermark is the remote
+  // text, never the local text this device happened to be holding", and assert
+  // `contentHash = hash('someone else got here first')`. That is the second site
+  // of the lying watermark: I17 says a base names bytes simultaneously in the
+  // WORKSPACE and on THIS DISK, and here the disk holds 'my local copy'. Recording
+  // the remote's hash makes the base describe a file that is not there — and
+  // recording the local's would let `isProvenNote` trash unpublished work. Neither
+  // is true, so neither is written. The full argument, with the deletion pass that
+  // measures the cost, is in "a base is not recorded for a remote text this disk
+  // does not hold (I17)" below.
+  assert.equal(
+    h.state.data.contentHash[id], undefined,
+    'no bytes are in the workspace and on this disk at once, so there is no base',
+  );
   assert.equal(h.state.data.publish[id].state, 'done');
 });
 
@@ -402,6 +481,232 @@ test('a doc seeded concurrently between the open and the insert is retried, not 
   assert.equal(h.docs.text(`n_${id}`), 'a peer won the race', 'nothing was concatenated (I5)');
   assert.equal(h.tree.get(id)!.s, undefined, 'and no watermark from a guess');
   assert.equal(h.state.data.publish[id].state, 'pending', 'it is retried instead');
+});
+
+// ------------------------------------------------ I6: an empty note is a note mid-write
+
+/**
+ * ⚠ The defect that corrupted the first real share, and the reason `s` may not
+ * mean "a flush came back".
+ *
+ * Obsidian's "New note" writes a ZERO-BYTE file and opens it, so for as long as it
+ * takes the author to reach for the keyboard the vault holds a real, ordinary,
+ * empty note. A drain in that window seeds nothing — `remote.length === 0 &&
+ * text.length > 0` is false — flushes an empty document, which round-trips
+ * perfectly, and marks the node published anyway.
+ *
+ * `s === 1` is the WHOLE definition of "published" for a note (`isPublished`), so
+ * every peer promotes the node out of `pending` and materializes it, and
+ * materializing a document that holds nothing writes a 0-byte file on the
+ * canonical path. `Reconciler`'s own comment states the rule that breaks: a
+ * zero-byte file there is "worse than no file, because it looks correct and gets
+ * deleted by hand". The hand deletion is a tombstone, and the tombstone propagates
+ * to everyone — including the author, who was still typing.
+ *
+ * The attachment arm has refused exactly this since P2 ("a zero-byte file is never
+ * published, however settled it looks"). This is the same refusal, for the arm
+ * where the consequence is worse: a 0-byte attachment is obviously broken, a
+ * 0-byte note looks like a note the user emptied.
+ */
+test('an empty note is not published, and no peer writes a 0-byte decoy (I6)', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');                  // Obsidian's "New note"
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined, 'an empty document is not published content');
+  assert.equal(h.state.data.contentHash[id], undefined, 'and names no bytes anybody could hold');
+  // Refusing is not failing. A rung of the ladder would park the note for minutes
+  // after the author's first keystroke, over a condition their next keystroke ends.
+  assert.equal(h.state.data.publish[id].state, 'pending', 'the publish is still owed');
+  assert.equal(h.state.data.publish[id].attempts, 0, 'and no rung of the ladder was charged');
+  assert.deepEqual(h.notices, [], 'an empty note is ordinary; nobody is warned about one');
+
+  // Refusing to PUBLISH is not refusing to EXIST. The node keeps its id, its name
+  // and its place in the tree; what a peer sees is a node under Pending.
+  const derived = deriveTree(h.tree.entries());
+  assert.deepEqual(derived.pending, [id], 'peers list it as pending, not as a file');
+  assert.equal(derived.files.has(id), false, 'so nothing is ever materialized for it');
+
+  // And the real reconciler on the other device, over the tree this drain wrote.
+  const ben = await peerReconcile(h);
+  assert.deepEqual(ben.files, {}, 'nothing at the canonical path — not even 0 bytes');
+  assert.deepEqual(ben.notices, [], 'and the peer is told nothing about a note being written');
+});
+
+/**
+ * The other half of the refusal, and the regression it would be easy to ship.
+ *
+ * A note that is empty when it is created is the NORMAL case, not an edge one, so
+ * "an empty note is never published" must not mean "a note created empty is never
+ * published". Nothing re-admits the node — `enqueue` is a deliberate no-op for a
+ * node that already has an entry — so the pending entry the refusal leaves behind
+ * is the entire mechanism, and the next drain must be all it takes.
+ */
+test('the same note publishes itself as soon as it has a byte in it', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  assert.equal(h.tree.get(id)!.s, undefined, 'refused while it was empty');
+
+  // The author types. `enqueue` refuses the node — it already has an entry — so
+  // what publishes it is the entry the refusal kept, and nothing else.
+  h.vault.seed(`${SHARE}/Sans titre.md`, 'f', 'the first line');
+  h.queue.enqueue(id);
+  assert.equal(h.state.data.publish[id].attempts, 0, 're-admission changed nothing');
+  await h.queue.drain();
+
+  assert.equal(h.docs.text(`n_${id}`), 'the first line', 'the document is seeded now');
+  assert.equal(h.tree.get(id)!.s, 1, 'and the node is published');
+  await assertBaseIsOnDisk(h, id);
+  assert.equal(h.state.data.publish[id].state, 'done');
+  assert.equal(h.docs.totalOpens(`n_${id}`), 2, 'one open per drain, and no seed was lost');
+
+  const ben = await peerReconcile(h);
+  assert.deepEqual(
+    ben.files, { [`${SHARE}/Sans titre.md`]: 'the first line' },
+    'and the peer materializes the note the author wrote, not a decoy',
+  );
+});
+
+/**
+ * ⚠ The regression the refusal above ships on its own, and the reason `parked`
+ * exists.
+ *
+ * A refused entry stays `pending` on purpose — nothing else will ever re-offer
+ * the node, because `VaultWatcher.onModify` returns early for notes, so the
+ * 30-second retry IS the mechanism that publishes it after the first keystroke.
+ * But the status bar reads `pendingCount()` and says "ShadowLink: syncing…" /
+ * "N file(s) waiting to upload" for as long as it is above zero, and never
+ * reaches `syncedStatus()`.
+ *
+ * So one permanently-empty note in the share pins the status bar on "syncing…"
+ * for the lifetime of the vault. A note created and deleted before its first
+ * character is worse: publish entries are never pruned, so nothing can ever
+ * clear it.
+ *
+ * An empty note is not waiting to upload. There is nothing to upload.
+ */
+test('an empty note does not pin the status bar on "syncing…" for ever', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  // Both halves matter, and they point in opposite directions.
+  assert.equal(h.state.data.publish[id].state, 'pending', 'the entry stays: it is the retry');
+  assert.equal(h.queue.pendingCount(), 0, 'and nothing is reported as waiting to upload');
+  assert.deepEqual(h.queue.parked(), [id], 'it is not invisible either');
+});
+
+test('a parked note rejoins the count the moment a drain sees content in it', async () => {
+  const h = makeHarness();
+  const id = h.add('Sans titre.md', '');
+  h.queue.enqueue(id);
+  await h.queue.drain();
+  assert.deepEqual(h.queue.parked(), [id]);
+
+  h.vault.seed(`${SHARE}/Sans titre.md`, 'f', 'the first line');
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, 1, 'the note published on the retry, as designed');
+  assert.deepEqual(h.queue.parked(), [], 'and the park went with it');
+  assert.equal(h.queue.pendingCount(), 0);
+});
+
+test('a note that is not text is parked too, and stops pinning the bar as well', async () => {
+  // The same permanent shape, and it predates the empty-note refusal: a `.md`
+  // node over bytes that are not UTF-8 is refused on every drain for ever, and
+  // the file has to be renamed by hand before that can change. The user is told
+  // once, by Notice. The status bar has nothing to add and no business claiming
+  // an upload is in progress.
+  const h = makeHarness();
+  const notText = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0xc0, 0x80]);
+  const id = h.tree.createNode({ k: 'f', d: '', n: 'notes.md' }, NOW);
+  h.vault.seedBinary(`${SHARE}/notes.md`, notText);
+  h.state.data.owned[id] = true;
+  h.state.data.materialized[id] = `${SHARE}/notes.md`;
+  h.queue.enqueue(id);
+
+  await h.queue.drain();
+
+  assert.equal(h.state.data.publish[id].state, 'pending', 'still retried');
+  assert.deepEqual(h.queue.parked(), [id]);
+  assert.equal(h.queue.pendingCount(), 0, 'and not counted as an upload in progress');
+  assert.ok(h.queue.lastError(id) !== undefined, 'the reason is still in diagnostics');
+});
+
+test('a note deferred because it is open is still an upload this device owes', async () => {
+  // The line the park must not cross. Deferring a note the user has open (I7) is
+  // "not now", not "not ever": closing the tab is all it takes, and the file is
+  // full of the user's words in the meantime. That IS a file waiting to upload.
+  const h = makeHarness();
+  const id = h.add('open.md', 'a note the user is looking at');
+  h.open.id = id;
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.tree.get(id)!.s, undefined, 'nothing was published under the binding');
+  assert.deepEqual(h.queue.parked(), [], 'and it was not parked');
+  assert.equal(h.queue.pendingCount(), 1, 'the status bar is right to say so');
+});
+
+/**
+ * ⚠ I17's second site, and the sharper half of it: a base is a claim that these
+ * exact bytes are simultaneously IN THE WORKSPACE and ON THIS DISK.
+ *
+ * When the content doc already holds a peer's text, the queue publishes nothing
+ * and marks the node `s: 1` — correctly, the workspace really does hold published
+ * content. But the disk still holds this device's own copy, so there are no bytes
+ * that satisfy both halves, and there is therefore no base to record. Both
+ * available answers are lies with different victims:
+ *
+ *  * the REMOTE's hash names bytes this disk does not hold — every reader of the
+ *    base is then reasoning about a file that is not there;
+ *  * the LOCAL's hash names bytes the workspace does not hold — and that one has
+ *    teeth, because `isProvenNote` compares the base with the disk, finds they
+ *    agree, and lets the deletion pass TRASH unpublished local work that no peer
+ *    can give back.
+ *
+ * So: no base. Ignorance is the answer that keeps the file, and the pass below is
+ * the real `Deletions` proving it.
+ */
+test('a base is not recorded for a remote text this disk does not hold (I17)', async () => {
+  const h = makeHarness();
+  const local = 'my own unpublished draft';                       // 24
+  const remote = 'the body a peer published first, which is longer';  // 48
+  const id = h.add('todo.md', local);
+  h.docs.setText(`n_${id}`, remote);
+
+  h.queue.enqueue(id);
+  await h.queue.drain();
+
+  assert.equal(h.docs.text(`n_${id}`), remote, 'the remote copy stands (I5)');
+  assert.equal(h.tree.get(id)!.s, 1, 'and the node IS published — by the other device');
+  assert.equal(
+    h.state.data.contentHash[id], undefined,
+    'but no bytes are in the workspace and on this disk at once, so no base is recorded',
+  );
+  assert.equal(h.state.data.publish[id].state, 'done');
+
+  // What the missing base is worth. Somebody deletes the node; this device's copy
+  // is 24 bytes of work that is in no content doc anywhere.
+  const f = h.tree.get(id)!;
+  h.tree.patchNode(id, { x: f.g, xa: h.clock.now, xb: 'Ben' });
+  const verdict = await deletionPassHere(h, `${SHARE}/todo.md`);
+
+  assert.equal(verdict.batch, 1, 'the tombstone is acted on');
+  assert.equal(verdict.trashed, false, 'the unpublished draft is not trashed');
+  assert.equal(verdict.rescued, true, 'it is moved aside into ShadowLink Recovered/ instead');
+  const rescued = Object.entries(h.vault.snapshot())
+    .filter(([p]) => p.startsWith(`${RECOVERED_DIR}/`))
+    .map(([, text]) => text);
+  assert.deepEqual(rescued, [local], 'with the bytes the user actually had');
 });
 
 // ---------------------------------------------------------------- backoff
@@ -699,10 +1004,7 @@ interface PeerVerdict {
  * A queue test can only assert what the tree says; the harm a bad tombstone does
  * happens on the other machine, so this builds Ben: his own vault holding the
  * last published version, his own device state with the node bound and its base
- * recorded, and the SAME content-addressed store Ada uploaded to. The context is
- * assembled the way `Reconciler.describeDesiredState` assembles it, deliberately
- * spelled out rather than shared with a helper, so a change to either one shows
- * up here as a difference instead of as a silently agreeing abstraction.
+ * recorded, and the SAME content-addressed store Ada uploaded to.
  */
 async function peerDeletionPass(
   h: Harness, id: string, name: string, bytes: Uint8Array,
@@ -714,7 +1016,6 @@ async function peerDeletionPass(
 
   const now = (): number => h.clock.now;
   const state = new DeviceState(new MemoryStatePort(), 'device-2', 'ws-1', now, 0);
-  const tickets = new Tickets(now);
   const notices: string[] = [];
   state.data.materialized[id] = path;                      // Ben materialized it (§3.3)
   const st = (await vault.stat(path))!;
@@ -722,6 +1023,36 @@ async function peerDeletionPass(
     sha256: await hashOfBytes(bytes), len: bytes.length, mtime: st.mtime,
   };
   vault.resetCalls();
+
+  return await runDeletionPass(h, vault, state, path, notices);
+}
+
+/**
+ * The same pass, on THIS device, over the vault and device state the queue has
+ * just been publishing from.
+ *
+ * The queue writes the base a later deletion reads, so "what does a tombstone do
+ * to the file this device is holding?" is a question about the queue's own output
+ * and not only about a peer's. `isProvenNote` is three clauses — `s`, the recorded
+ * base, and the disk — and the queue writes two of them.
+ */
+async function deletionPassHere(h: Harness, path: string): Promise<PeerVerdict> {
+  h.vault.resetCalls();
+  return await runDeletionPass(h, h.vault, h.state, path, h.notices);
+}
+
+/**
+ * The `DeletionContext` a reconcile pass assembles, spelled out here the way
+ * `Reconciler.describeDesiredState` spells it out rather than shared with it, so a
+ * change to either one shows up as a difference instead of as a silently agreeing
+ * abstraction. Shared between the two callers ABOVE, which are the same pass on
+ * two devices and must not drift apart from each other.
+ */
+async function runDeletionPass(
+  h: Harness, vault: FakeVault, state: DeviceState, path: string, notices: string[],
+): Promise<PeerVerdict> {
+  const now = (): number => h.clock.now;
+  const tickets = new Tickets(now);
 
   const entries = h.tree.entries();
   const derived = deriveTree(entries);
@@ -788,7 +1119,7 @@ async function peerDeletionPass(
 
   const batch = deletions.collectDeletable(ctx).length;
   await deletions.apply(ctx);
-  assert.deepEqual(failures, [], "the peer's pass ran cleanly");
+  assert.deepEqual(failures, [], 'the deletion pass ran cleanly');
 
   const after = vault.binarySnapshot();
   return {
@@ -1473,6 +1804,19 @@ test('B21: a markdown node whose bytes are not UTF-8 is never seeded', async () 
 // naive length check on the NORMALIZED text: `normLF` shortens it by one byte per
 // line, and the file on disk is the length the encoder sees, not the length after
 // normalization.
+//
+// ⚠ `empty.md` CHANGED, deliberately. It used to be asserted alongside the others,
+// `s === 1` — an EMPTY note publishing — which is the defect the I6 tests above
+// describe: `s` is the whole definition of "published" for a note, so a peer
+// materializes it and writes a 0-byte file on the canonical path. That assertion
+// and "an empty attachment is a file mid-write (I6)" three hundred lines below it
+// were the same question answered two opposite ways; this is the arm that was
+// wrong, and it is the arm where the consequence is worse.
+//
+// It stays in the table rather than being removed, because it is a genuine case
+// for the guard THIS test is about: 0 bytes on disk re-encode to 0 bytes, so an
+// empty file must not be mistaken for a lossy decode. What changes is only the
+// expectation — the guard passes it, and it is refused one step later, by I6.
 test('the seed guard passes ordinary text, including CRLF and non-ASCII', async () => {
   const h = makeHarness();
   const cases: Array<[string, string]> = [
@@ -1487,7 +1831,13 @@ test('the seed guard passes ordinary text, including CRLF and non-ASCII', async 
   await h.queue.drain();
 
   for (const [i, id] of ids.entries()) {
-    assert.equal(h.tree.get(id)!.s, 1, `${cases[i][0]} was refused`);
+    const [name, text] = cases[i];
+    if (text.length === 0) {
+      assert.equal(h.tree.get(id)!.s, undefined, `${name} is refused by I6, not published`);
+      assert.equal(h.queue.lastError(id), undefined, `${name} was not refused by the seed guard`);
+      continue;
+    }
+    assert.equal(h.tree.get(id)!.s, 1, `${name} was refused`);
   }
   assert.deepEqual(h.notices, [], 'and nobody was warned about a note that is fine');
 });

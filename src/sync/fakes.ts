@@ -1,5 +1,6 @@
 // src/sync/fakes.ts
-// In-memory implementations of VaultPort and DocPort (spec §4.0).
+// In-memory implementations of VaultPort, DocPort, BlobPort and EditorBinding
+// (spec §4.0).
 //
 // These are not scaffolding. Every reconciler test in Group B runs against them,
 // so a fake that is wrong in an interesting way does not fail loudly — it makes
@@ -21,8 +22,20 @@
 //  - `stat` reports a MONOTONIC mtime that bumps on every write, so the
 //    "size and mtime still agree" cache branch is genuinely exercised rather than
 //    always missing.
+//  - The EDITOR has a document. `FakeEditorBinding` keeps a real `EditorState`
+//    per leaf and runs the SHIPPED `CodeMirrorBinding` over it, because the fake
+//    it replaced modelled a mount as total success — which is exactly how a
+//    binding that never made the editor equal the document it bound survived
+//    three phases and 879 tests, and then corrupted a live share.
 //
-// No `obsidian` import, no node builtins.
+// No `obsidian` import, no node builtins. `@codemirror/state` is imported for
+// real: `EditorState` needs no DOM, so the one seam this suite used to declare
+// untestable is not one.
+
+import * as Y from 'yjs';
+import { EditorState } from '@codemirror/state';
+import type { Extension, Transaction, TransactionSpec } from '@codemirror/state';
+import type { EditorView } from '@codemirror/view';
 
 import { extOf, fold, hashOfBytes } from '../tree/paths.ts';
 import {
@@ -42,6 +55,8 @@ import {
 } from './BlobPort.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
+import { CodeMirrorBinding } from './WorkspaceSession.ts';
+import type { EditorBinding, MountResult, SessionAwareness } from './WorkspaceSession.ts';
 
 export type { BlobLimits } from './BlobPort.ts';
 
@@ -518,6 +533,228 @@ export class FakeVault implements VaultPort {
       const candidate = `${stem} (${n})${ext}`;
       if (!this.trashed.has(candidate)) return candidate;
     }
+  }
+}
+
+// ============================================================ FakeEditorBinding
+
+/**
+ * One leaf: a REAL CodeMirror document, and the transactions dispatched into it.
+ *
+ * `EditorState` needs no DOM, so this is the genuine article — `state.update`
+ * applies changes and raises the genuine `RangeError` when one addresses a
+ * position the document does not have. It stands in for `EditorView` because
+ * `CodeMirrorBinding` only ever uses `view.state` and `view.dispatch`.
+ */
+class FakeLeaf {
+  state: EditorState;
+  readonly transactions: Transaction[] = [];
+
+  constructor(doc: string, compartment: Extension | null) {
+    this.state = EditorState.create({
+      doc,
+      // `null` models a leaf whose state Obsidian has built WITHOUT the plugin's
+      // compartment — a not-yet-initialised editor, or one Obsidian rebuilt after
+      // the extension was registered. A `reconfigure` aimed at it is inert.
+      extensions: compartment === null ? [] : [compartment],
+    });
+  }
+
+  dispatch(spec: TransactionSpec): void {
+    const tr = this.state.update(spec);
+    this.transactions.push(tr);
+    this.state = tr.state;
+  }
+
+  get doc(): string {
+    return this.state.doc.toString();
+  }
+}
+
+/**
+ * An editor that has its own document.
+ *
+ * The fake this replaces recorded `{ notePath, text }` and returned true. It had
+ * no document, so "mounted a 184-character `Y.Text` into an editor showing 166
+ * characters" and "mounted correctly" were the same assertion, and 879 tests
+ * could not see a defect that corrupted a live share in twenty minutes. A fake
+ * that models a port as total success is not a fake of that port.
+ *
+ * What this one models that the old one did not:
+ *
+ *  1. A DOCUMENT PER LEAF, seeded from the FILE's bytes, which may differ from
+ *     the `Y.Text` — the whole failure. It is a real `EditorState`.
+ *  2. THE SHIPPED MOUNT. `mount` delegates to the production `CodeMirrorBinding`
+ *     over these leaves, so nothing here decides what a mount does to a
+ *     document; `CodeMirrorBinding` does, exactly as it does in Obsidian. A test
+ *     therefore cannot pass because the fake was generous.
+ *  3. `y-codemirror.next`'s ACTUAL BEHAVIOUR after the mount: it never seeds an
+ *     editor from its `Y.Text`, it applies FUTURE deltas only. The observer
+ *     below is `YSyncPluginValue._observer`'s delta -> `{from,to,insert}`
+ *     translation, verbatim, dispatched into a real `EditorState` — so a delta
+ *     that outruns a diverged document raises the production `RangeError` in a
+ *     headless test instead of only in a user's console.
+ *  4. WHO WRITES THE FILE. For an open note the plugin may not (I7) and
+ *     `VaultPort` has no `modify`; Obsidian's save of the dirty buffer is the
+ *     only route, and it is asynchronous. `save()` is that route, and it is
+ *     explicit precisely so a test has to say when the disk caught up.
+ *
+ * What it does NOT model, deliberately: the editor -> `Y.Text` direction
+ * (`YSyncPluginValue.update`). Local typing is not what corrupted the share, and
+ * modelling it would mean re-implementing CodeMirror's change iteration here,
+ * which is the kind of second copy that starts disagreeing with production.
+ */
+export class FakeEditorBinding implements EditorBinding {
+  /** Every successful mount, in order. */
+  readonly mounts: Array<{ notePath: string; text: Y.Text }> = [];
+  /** Refused mounts, in order — a leaf that is missing or not initialised. */
+  readonly refused: string[] = [];
+  unmounts = 0;
+  /** Paths that have no editor view — `mount` refuses them, as a closed leaf would. */
+  readonly missing = new Set<string>();
+
+  private readonly binding: CodeMirrorBinding;
+  private readonly leaves = new Map<string, FakeLeaf>();
+  private observed: { text: Y.Text; observer: (event: Y.YTextEvent, tr: Y.Transaction) => void } | null = null;
+
+  /** The vault `save()` writes through. Omitted when a test never saves. */
+  constructor(private readonly vault: FakeVault | null = null) {
+    this.binding = new CodeMirrorBinding((path) => {
+      if (this.missing.has(path)) return null;
+      const leaf = this.leaves.get(path);
+      // `FakeLeaf` is an `EditorView` as far as `CodeMirrorBinding` is concerned:
+      // it uses `view.state` and `view.dispatch` and nothing else.
+      return leaf === undefined ? null : (leaf as unknown as EditorView);
+    });
+  }
+
+  // ---------------------------------------------------------- test helpers
+
+  /**
+   * A leaf is showing `notePath` with `doc` in its buffer — normally the file's
+   * own bytes, because that is what Obsidian puts there.
+   *
+   * `initialized: false` models an editor whose state does not carry the
+   * plugin's compartment, which is the case where a `reconfigure` is inert and
+   * silent and a naive mount reports success having bound nothing.
+   */
+  openLeaf(notePath: string, doc: string, opts: { initialized?: boolean } = {}): void {
+    const initialized = opts.initialized ?? true;
+    this.leaves.set(
+      notePath,
+      new FakeLeaf(doc, initialized ? this.binding.editorExtension() : null),
+    );
+  }
+
+  /** What the editor is showing for `notePath`, or undefined when no leaf is open. */
+  document(notePath: string): string | undefined {
+    return this.leaves.get(notePath)?.doc;
+  }
+
+  /**
+   * The user typing into the open note.
+   *
+   * Modelled because the interesting moment is BETWEEN the session's
+   * `vault.read` and its `mount` — the provider's connect-and-sync round trip,
+   * which is the first second after opening a note and therefore exactly when
+   * people type. From that point the editor's buffer, not the file, is the
+   * newest copy of the note, and it is the thing a mount replaces.
+   *
+   * Appended at the end rather than at a caret, because where the characters
+   * went is not what any of this turns on; that they were there is.
+   */
+  type(notePath: string, text: string): void {
+    const leaf = this.leaves.get(notePath);
+    if (leaf === undefined) throw new Error(`no leaf is open for ${notePath}`);
+    const at = leaf.state.doc.length;
+    leaf.dispatch({ changes: { from: at, to: at, insert: text } });
+  }
+
+  /** Every transaction that reached this leaf, in order. */
+  transactions(notePath: string): readonly Transaction[] {
+    return this.leaves.get(notePath)?.transactions ?? [];
+  }
+
+  /**
+   * Obsidian persisting a dirty buffer.
+   *
+   * The plugin cannot write an open note's bytes (I7) and `VaultPort` has no
+   * `modify`, so in production this is the ONLY way an open note's file changes
+   * — and it happens whenever Obsidian gets round to it, not when the plugin
+   * would like. Calling it explicitly is how a test states that the disk has
+   * caught up; not calling it is how a test states that it has not.
+   */
+  save(notePath: string): void {
+    if (this.vault === null) throw new Error('this FakeEditorBinding has no vault to save through');
+    const leaf = this.leaves.get(notePath);
+    if (leaf === undefined) return;
+    // `seed`, not `create`: this is a writer OUTSIDE the plugin, and the port the
+    // plugin is given deliberately cannot overwrite an occupied path.
+    this.vault.seed(notePath, 'f', leaf.doc);
+  }
+
+  /** The last successful mount. */
+  get current(): { notePath: string; text: Y.Text } | undefined {
+    return this.mounts[this.mounts.length - 1];
+  }
+
+  // ---------------------------------------------------------- EditorBinding
+
+  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): MountResult {
+    // The shipped binding's result is passed through UNTOUCHED, `replaced`
+    // included: what a mount displaced is the one thing the session cannot find
+    // out for itself afterwards, so a fake that summarised it away would hide
+    // exactly the defect this class exists to expose.
+    const result = this.binding.mount(notePath, text, awareness);
+    if (!result.ok) {
+      this.refused.push(notePath);
+      return result;
+    }
+    this.mounts.push({ notePath, text });
+    this.observe(notePath, text);
+    return result;
+  }
+
+  unmount(): void {
+    this.unmounts += 1;
+    if (this.observed !== null) {
+      this.observed.text.unobserve(this.observed.observer);
+      this.observed = null;
+    }
+    this.binding.unmount();
+  }
+
+  // ---------------------------------------------------------- y-sync's observer
+
+  private observe(notePath: string, text: Y.Text): void {
+    // The leaf is resolved on every delta rather than captured at mount, so
+    // `openLeaf` can put the editor back out of step afterwards. Production's
+    // observer closes over one `EditorView`; a test needs to be able to say "and
+    // then the editor was showing something else", because that is the state a
+    // mount that equalises nothing leaves behind.
+    const observer = (event: Y.YTextEvent, tr: Y.Transaction): void => {
+      const leaf = this.leaves.get(notePath);
+      if (leaf === undefined) return;
+      // `YSyncPluginValue._observer`, y-sync.js:107-123. Note what is NOT here:
+      // any check that the editor's document is the length these offsets assume.
+      // That absence is the production defect, and it belongs in the fake.
+      if (tr.origin === this) return;
+      const changes: Array<{ from: number; to: number; insert: string }> = [];
+      let pos = 0;
+      for (const d of event.delta) {
+        if (d.insert !== undefined) {
+          changes.push({ from: pos, to: pos, insert: String(d.insert) });
+        } else if (d.delete !== undefined) {
+          changes.push({ from: pos, to: pos + d.delete, insert: '' });
+          pos += d.delete;
+        } else if (d.retain !== undefined) {
+          pos += d.retain;
+        }
+      }
+      if (changes.length > 0) leaf.dispatch({ changes });
+    };
+    text.observe(observer);
+    this.observed = { text, observer };
   }
 }
 
