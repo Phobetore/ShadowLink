@@ -1046,6 +1046,90 @@ test('a buffer that is not a continuation of this note never enters the CRDT', a
   assert.ok(h.notices.some((n) => n.includes(RECOVERED_DIR)), h.notices.join(' | '));
 });
 
+test('the note the user just left never seeds the note the leaf now answers for', async () => {
+  // THE SEED ARM IS WHERE A FOREIGN BUFFER BECOMES A SHARED NOTE, and the
+  // retention bound did nothing about it. `retains(base, buf)` answers true
+  // unconditionally for `base === ''`, and arm 3 hands it the FILE's bytes —
+  // which for Obsidian's "New note" is a 0-byte file. So every buffer passed.
+  //
+  // The window is R15: `viewFor` matches on `view.file.path` while reading
+  // `view.editor.cm`, and Obsidian sets the file before it loads the document.
+  // Obsidian reuses the leaf, so the document still in it is the note the user
+  // just left — which this session bound a moment ago and can therefore
+  // recognise by its exact bytes.
+  const bodyA = 'note A, and several sentences of the user\'s own writing in it.';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('a.md', bodyA, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: bodyA });
+  await h.session.open(`${SHARE}/a.md`);
+  assert.equal(h.editor.inStep(`${SHARE}/a.md`), true, 'A really was bound');
+
+  const idB = h.add('new.md', '', { owned: true });
+  const pathB = `${SHARE}/new.md`;
+  h.providers.configure(`n_${idB}`, { remote: '' });
+  h.editor.openLeaf(pathB, bodyA);                    // the leaf has not caught up
+
+  await h.session.open(pathB);
+
+  const shared = h.providers.forRoom(`n_${idB}`)[0].doc.getText('content');
+  assert.equal(shared.toString(), '', 'note A\'s body did not become note B\'s content');
+  assert.equal(h.tree.get(idB)?.s, undefined, 'and nothing was published under B\'s name');
+  assert.equal(h.editor.document(pathB), bodyA, 'the buffer is not touched either');
+  assert.deepEqual(h.stashes(), [], 'nothing is displaced, so nothing is filed');
+  assert.equal(h.session.openNodeId(), null, 'the open is local-only');
+  assert.equal(h.notices.length, 1, h.notices.join(' | '));
+});
+
+test('a brand-new note is still seeded from a buffer that is genuinely its own', async () => {
+  // The other side of the same bound: the proof is an exact match against the
+  // note this session last bound, so a note the user actually typed into is
+  // unaffected — including one opened straight after another note.
+  const bodyA = 'note A, and several sentences of the user\'s own writing in it.';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('a.md', bodyA, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: bodyA });
+  await h.session.open(`${SHARE}/a.md`);
+
+  const idB = h.add('new.md', '', { owned: true });
+  const pathB = `${SHARE}/new.md`;
+  h.providers.configure(`n_${idB}`, { mode: 'manual', remote: '' });
+
+  const open = h.session.open(pathB);
+  await until(() => h.providers.forRoom(`n_${idB}`).length === 1, 'the room to be opened');
+  h.editor.type(pathB, 'the first sentence of a new note');
+  h.providers.forRoom(`n_${idB}`)[0].emitSync();
+  await open;
+
+  const shared = h.providers.forRoom(`n_${idB}`)[0].doc.getText('content');
+  assert.equal(shared.toString(), 'the first sentence of a new note');
+  assert.equal(h.tree.get(idB)?.s, 1);
+  assert.deepEqual(h.notices, []);
+});
+
+test('the previous note\'s body does not reach the CRDT on the catch-up arm either', async () => {
+  // Same proof, the other arm that writes the buffer into the shared document.
+  // Here the retention bound would let it through: the stale buffer keeps most
+  // of what the shared text holds, because it IS most of it.
+  const shared = 'a shared body that both notes happen to be built from, at length.';
+  const bodyA = `${shared} And note A's own last line.`;
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const idA = h.add('a.md', bodyA, { s: 1, owned: true });
+  h.providers.configure(`n_${idA}`, { remote: bodyA });
+  await h.session.open(`${SHARE}/a.md`);
+
+  const idB = h.add('b.md', shared, { s: 1, owned: true });
+  const pathB = `${SHARE}/b.md`;
+  h.providers.configure(`n_${idB}`, { remote: shared });
+  h.editor.openLeaf(pathB, bodyA);                    // the leaf has not caught up
+
+  await h.session.open(pathB);
+
+  const text = h.providers.forRoom(`n_${idB}`)[0].doc.getText('content');
+  assert.equal(text.toString(), shared, 'the workspace still holds note B');
+  assert.equal(h.editor.document(pathB), bodyA, 'and note A\'s view was not dispatched into');
+  assert.equal(h.session.openNodeId(), null);
+});
+
 test('a one-word deletion inside a long note is still a catch-up, not a refusal', async () => {
   // The other side of the bound, and the reason it is one HALF rather than
   // anything tighter: an ordinary edit made during the open window has to pass.
@@ -2106,6 +2190,19 @@ test('retains bounds the claim that a buffer was built from this note', () => {
 test('decide covers every arm of I19', () => {
   const D = (B: string, R: string, f: string, own: boolean, seeded: boolean): string =>
     decide(B, R, f, own, seeded).kind;
+  const F = (B: string, R: string, f: string, own: boolean, seeded: boolean): string =>
+    decide(B, R, f, own, seeded, true).kind;
+
+  // 2b. A buffer this device can SHOW belongs to another note is refused on the
+  //     two arms that would publish it, and only there — nothing is written to
+  //     either side. On the arms that never publish the buffer it changes
+  //     nothing, because the shared copy wins on screen anyway.
+  assert.equal(F('same', 'same', 'other', false, true), 'agree', 'arm 1 still wins');
+  assert.equal(F('foreign', '', '', true, false), 'local-only', 'the SEED arm');
+  assert.equal(F('foreign', 'body', 'body', false, true), 'local-only', 'the CATCH-UP arm');
+  assert.equal(F('foreign', '', '', false, false), 'local-only', 'I5 answers first, and says so');
+  assert.equal(F('foreign', 'shared', 'local', false, true), 'take-shared',
+    'genuine divergence is unaffected: the buffer is not published on that arm');
 
   // 1. AGREE, whatever else is true — including two empty strings, which is a
   //    brand-new note nobody has typed into yet.

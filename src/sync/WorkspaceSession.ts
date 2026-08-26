@@ -318,6 +318,8 @@ export interface EditorBinding {
  * `B` — what the editor holds. Always LF: CodeMirror cannot hold a `\r`.
  * `R` — the shared document, after the line-ending repair.
  * `f` — `toLF` of what `vault.read` returned at the top of this open.
+ * `foreign` — this device can SHOW that `B` is a different note's body. See
+ *   `WorkspaceSession.lastBound`; it is a proof and never a guess.
  *
  * The order of the arms is the design. Read it as: agree if the two sides are
  * already the same string; refuse if the buffer is not there to be believed;
@@ -342,6 +344,7 @@ export function decide(
   f: string,
   own: boolean,
   seeded: boolean,
+  foreign = false,
 ): Decision {
   // 1. AGREE. Nothing is written to either side and nothing is ever preserved
   //    on this arm — which, with a content-derived preservation name, is what
@@ -366,9 +369,18 @@ export function decide(
     // `doOpen` as well, before the editor is touched at all — kept here so this
     // function is total and the table is the whole rule.
     if (!own) return { kind: 'local-only', reason: 'Waiting for the author to upload this note.' };
+    if (foreign) return elsewhere;
     // SEED: the degenerate converge-up, from nothing to the buffer. The buffer
     // is the only copy of a brand-new note in existence, so the one thing this
     // arm must never do is replace it.
+    //
+    // `retains(f, B)` IS VACUOUS HERE whenever the file is empty, and a 0-byte
+    // file is exactly what Obsidian's "New note" is — so on the arm that
+    // publishes a buffer under a NEW node's name the bound proved nothing at
+    // all, and any buffer seeded. `foreign` above is what carries the weight
+    // instead: not a bound on how much of something the buffer kept, but a
+    // proof that these exact bytes are a different note's. What is left
+    // unproven is stated plainly rather than papered over — see §6.1b.3.
     if (retains(f, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
     return { kind: 'take-shared' };
   }
@@ -377,6 +389,7 @@ export function decide(
   //    has moved — this device's own typing during the open window. CATCH-UP:
   //    the CRDT comes up to the buffer, and the buffer is never touched.
   if (R !== '' && R === f) {
+    if (foreign) return elsewhere;
     if (retains(R, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
     return { kind: 'take-shared' };
   }
@@ -385,6 +398,23 @@ export function decide(
   //    of this note and there is no merge UI (spec §8 item 15).
   return { kind: 'take-shared' };
 }
+
+/**
+ * The refusal for a buffer this device can show belongs to a DIFFERENT note.
+ *
+ * It touches neither side, and that is the whole difference between it and the
+ * other refusals on those two arms. Falling through to take-shared is right when
+ * the question is *"can this buffer be shown to belong here?"* — the shared copy
+ * wins on screen and whatever it displaces is preserved. It is wrong when the
+ * answer is not "unknown" but "it belongs somewhere else": the view is showing
+ * ANOTHER note, so a replacement would take that note's body off the user's
+ * screen, and a preserved copy of it would be a recovery file for a note nothing
+ * happened to. One open costs nothing; the next `file-open` heals it.
+ */
+const elsewhere: Decision = {
+  kind: 'local-only',
+  reason: 'its editor was still showing another note — switch away and back to try again.',
+};
 
 // ============================================================ public surface
 
@@ -480,6 +510,38 @@ export class WorkspaceSession {
    * otherwise fork the revision this very session put on screen.
    */
   private readonly sharedSeen = new Map<string, string>();
+
+  /**
+   * The node this session last bound, and the EXACT text it was bound to.
+   *
+   * The proof behind `decide`'s `foreign`, and it exists because the two arms
+   * that write the buffer into the shared document had nothing to check on the
+   * one that matters most. `retains(f, B)` is vacuous when the file is empty,
+   * and a 0-byte file is precisely what Obsidian's "New note" is — so the arm
+   * that publishes a buffer under a brand-new node's name accepted any buffer at
+   * all, including another note's entire body.
+   *
+   * WHY THIS IS THE RIGHT EVIDENCE, and not a heuristic. `viewFor` resolves a
+   * leaf by `view.file.path` while reading `view.editor.cm`, and Obsidian sets
+   * the file before it loads the document. Obsidian also REUSES the leaf, so the
+   * document sitting in it during that window is the note the user just left —
+   * which this session bound a moment ago, and at bind time the gate proved the
+   * editor held exactly the shared text. So the bytes are known, exactly, and a
+   * match is a proof rather than a resemblance.
+   *
+   * The whole string rather than a digest, because the comparison happens
+   * between `bufferOf` and `apply`, where there must be no `await` — hashing is
+   * asynchronous, and reopening that window to close this one would be a trade
+   * in the wrong direction. One note's text, not a map of them: the leaf can
+   * only be showing the note it showed last.
+   *
+   * WHAT IT DOES NOT COVER, said plainly: a buffer the user has typed into since
+   * it was bound no longer matches, and neither does a note this session never
+   * bound. There is no local evidence that tells "the user typed this into the
+   * new note" apart from "the leaf has not caught up" in general; this closes the
+   * mechanism that produces it, and §6.1b.3 says so rather than claiming more.
+   */
+  private lastBound: { nodeId: string; text: string } | null = null;
 
   /** Disposes the first-byte publisher's observer, or null when none is armed. */
   private publisherOff: (() => void) | null = null;
@@ -631,7 +693,11 @@ export class WorkspaceSession {
       const B = this.deps.editor.bufferOf(notePath);
       if (B === null) { release(provider, doc); return; }      // arm 0: no bindable leaf
       buffer = B;
-      const plan = decide(B, shared, localText, own, seeded);
+      // A string comparison, deliberately: this sits between `bufferOf` and
+      // `apply`, where there is no `await` to be raced.
+      const prior = this.lastBound;
+      const foreign = B !== '' && prior !== null && prior.nodeId !== nodeId && prior.text === B;
+      const plan = decide(B, shared, localText, own, seeded, foreign);
       if (plan.kind === 'local-only') {
         release(provider, doc);
         this.localOnly(notePath, plan.reason);
@@ -668,8 +734,12 @@ export class WorkspaceSession {
       if (mounted.stale !== true) break;
     }
     if (mounted === undefined) { release(provider, doc); return; }
-    if (mounted.ok) this.active = { nodeId, notePath, doc, provider };
-    else release(provider, doc);
+    if (mounted.ok) {
+      this.active = { nodeId, notePath, doc, provider };
+      // The gate has just proved the editor holds exactly this, so it is the
+      // one string this session knows a leaf is displaying. See `lastBound`.
+      this.lastBound = { nodeId, text: text.toString() };
+    } else release(provider, doc);
 
     // BELT AND BRACES: what the apply ACTUALLY displaced, when that is not the
     // buffer the decision was made about.
