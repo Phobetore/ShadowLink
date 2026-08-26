@@ -1592,24 +1592,29 @@ async function drainTick(
   queue: PublishQueue,
   session: WorkspaceSession,
   activePath: () => string | null,
-): Promise<'drain' | 'repark-drain' | 'reopen' | 'nothing'> {
-  if (queue.pendingCount() > 0) { await queue.drain(); return 'drain'; }
-  if (await queue.repark()) { await queue.drain(); return 'repark-drain'; }
-  if (session.openNodeId() !== null) return 'nothing';
+): Promise<string> {
   const active = activePath();
-  if (active === null) return 'nothing';
-  await session.open(active);
-  return 'reopen';
+  let did = '';
+  if (session.openNodeId() === null && active !== null) {
+    await session.open(active);
+    did = 'reopen';
+  }
+  if (queue.pendingCount() > 0) { await queue.drain(); return `${did}+drain`; }
+  if (await queue.repark()) { await queue.drain(); return `${did}+repark-drain`; }
+  return did === '' ? 'nothing' : did;
 }
 
 test('a note the seed arm refused becomes collaborative without the user doing anything', async () => {
   // R18, END TO END, and the measurement it used to be. The whole arc: the seed
   // arm refuses because nothing on this disk says what the note holds; Obsidian
-  // writes the buffer out; one tick lifts the park and publishes from the file;
-  // the next tick re-opens the note and it binds. Nothing was asked of the user
-  // and nothing of theirs was touched at any point.
+  // writes the buffer out; the next tick re-opens the note, seeds it from the
+  // file and binds it. Nothing was asked of the user and nothing of theirs was
+  // touched at any point.
   const rooms = new Rooms();
-  const h = makeHarness({ syncTimeoutMs: 5_000 }, { rooms });
+  const h = makeHarness(
+    { syncTimeoutMs: 5_000, markPublished: (nodeId) => { queue.markPublished(nodeId); } },
+    { rooms },
+  );
   const id = h.add('Untitled.md', '', { owned: true });
   const path = `${SHARE}/Untitled.md`;
   h.editor.openLeaf(path, 'the first sentence the user typed');
@@ -1626,20 +1631,72 @@ test('a note the seed arm refused becomes collaborative without the user doing a
 
   await h.session.open(path);
   assert.equal(h.session.openNodeId(), null, 'refused: the disk says nothing yet');
-  assert.equal(await tick(), 'drain');
+  assert.equal(await tick(), 'reopen+drain', 'the re-open refuses again, and the queue parks it');
+  assert.equal(h.session.openNodeId(), null, 'and this is where it used to stop for ever');
   assert.deepEqual(queue.parked().map((p) => p.reason), ['empty']);
 
   h.editor.save(path);                                  // Obsidian, on its own
-  assert.equal(await tick(), 'repark-drain', 'the park lifts and the note publishes');
-  assert.equal(h.tree.get(id)?.s, 1);
-  assert.equal(h.session.openNodeId(), null, 'and this is where it used to stop');
-
   assert.equal(await tick(), 'reopen');
   assert.equal(h.session.openNodeId(), id, 'bound, with nothing asked of the user');
   assert.equal(h.editor.inStep(path), true);
+  assert.equal(h.tree.get(id)?.s, 1, 'and published, by the session that bound it');
   assert.equal(rooms.text(`n_${id}`), 'the first sentence the user typed');
   assert.deepEqual(h.stashes(), [], 'and nothing of theirs was displaced on the way');
   assert.equal(await tick(), 'nothing', 'and it stops asking once it is bound');
+});
+
+test('the re-open is asked before the queue, so a note re-binds on the FIRST tick', async () => {
+  // THE ORDER INSIDE THE TICK IS A MEASUREMENT, not a preference. Asking the
+  // queue first means a tick that finds an upload owed schedules the pass and
+  // RETURNS, so a note nothing is bound to waits another whole interval — and
+  // an interval is a long time to type into a buffer nothing is watching.
+  //
+  // What it costs when that happens, measured end to end: the drain publishes
+  // the note from the file as it was, the user keeps writing, Obsidian saves
+  // again, and the NEXT tick's re-open finds a shared document behind the file.
+  // That is arm 5 — the note snapping back on screen to what was published and
+  // everything since filed as a "conflicted copy" of a note no second device has
+  // ever opened. Re-binding a tick earlier is what keeps the ordinary case out
+  // of that arm, so this pins the tick count, not just the eventual outcome.
+  const para = 'The first paragraph, typed straight after pressing Cmd-N. ';
+  const rooms = new Rooms();
+  const h = makeHarness(
+    { syncTimeoutMs: 5_000, markPublished: (nodeId) => { queue.markPublished(nodeId); } },
+    { rooms },
+  );
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.editor.openLeaf(path, '');
+
+  const queue = new PublishQueue({
+    docs: rooms, vault: h.vault, blobs: new FakeBlobs(), state: h.state, tree: h.tree,
+    openNodeId: h.session.openNodeId,
+    now: () => NOW, settleMs: 0, sleep: async () => undefined,
+    displayName: 'Ada', notice: () => { /* through the session's list */ },
+    ...DESKTOP_MEMORY_CAP,
+  });
+  queue.enqueue(id);
+
+  await h.session.open(path);                     // Cmd-N: arm 1, an empty document binds
+  h.editor.type(path, para);
+  await h.session.open(null);                     // and then nothing is bound to it
+  h.editor.save(path);                            // Obsidian writes the buffer out
+
+  // ONE tick, and an upload is owed on it — which is precisely the tick that
+  // would have returned early.
+  assert.ok(queue.pendingCount() > 0, 'there is work, so the order is under test');
+  assert.equal(await drainTick(queue, h.session, () => h.active.path), 'reopen',
+    'the session bound and published it itself, so the queue had nothing left to drain');
+
+  assert.equal(h.session.openNodeId(), id, 'bound on the first tick, not the second');
+  assert.equal(h.editor.inStep(path), true);
+  assert.equal(h.editor.document(path), para, 'nothing was taken off the screen');
+  assert.deepEqual(h.stashes(), []);
+  assert.deepEqual(h.notices, []);
+
+  // And from here the user's typing is watched again, which is the whole point.
+  h.editor.type(path, 'and everything typed after it.');
+  assert.equal(rooms.text(`n_${id}`), `${para}and everything typed after it.`);
 });
 
 test('a note that cannot bind at all is explained once, not once per tick', async () => {

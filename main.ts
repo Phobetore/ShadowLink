@@ -616,14 +616,23 @@ class SyncRuntime {
    * room had not synced, one whose author had not published it yet — stayed
    * shared-but-not-collaborative for as long as it stayed open, because the only
    * things that ever open a note are `file-open` and start-up. The user's remedy
-   * was to switch away and back, which is a remedy the plugin can perform. It is
-   * asked LAST and only when the queue is idle, so a tick that has just found
-   * work lets the pass it asked for finish first.
+   * was to switch away and back, which is a remedy the plugin can perform.
+   *
+   * IT IS ASKED FIRST, and the order is not a preference — it is measured. Ask
+   * it last and the queue publishes the brand-new note from the file first, so
+   * the re-open arrives at a shared document holding the first paragraph and a
+   * file holding everything since: genuine divergence, take-shared, the note
+   * visibly snapping back to its first paragraph while the user is still typing
+   * into it and the rest filed as a "conflicted copy" of a note no second device
+   * has ever opened. Asked first, the same timeline reaches a shared document
+   * that is still EMPTY and a file that vouches for the buffer, which is the
+   * seed arm: it publishes what the user has written and binds, and everything
+   * typed afterwards flows through the CRDT. Both measured end to end.
    */
   private async drainTick(): Promise<void> {
-    if (this.queue.pendingCount() > 0) { this.scheduleReconcile('retry'); return; }
-    if (await this.queue.repark()) { this.scheduleReconcile('retry'); return; }
     this.reopenUnbound();
+    if (this.queue.pendingCount() > 0) { this.scheduleReconcile('retry'); return; }
+    if (await this.queue.repark()) this.scheduleReconcile('retry');
   }
 
   /**
@@ -635,9 +644,9 @@ class SyncRuntime {
    * is what turns "not yet" back into a binding instead of leaving it at "not
    * until you switch tabs".
    *
-   * Cheap by construction: it runs only when the queue has nothing owed and
-   * nothing bound, so an ordinary vault with a note open never reaches it at
-   * all. `WorkspaceSession.localOnly` says each refusal once per path per
+   * Cheap by construction: it returns on the first line for an ordinary vault
+   * with a note open, which is every tick of every session where nothing is
+   * wrong. `WorkspaceSession.localOnly` says each refusal once per path per
    * reason, so a note that genuinely cannot bind produces one notice rather than
    * one every thirty seconds — and says something again the moment its answer
    * changes, or the moment it binds and breaks again.

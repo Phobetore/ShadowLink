@@ -513,6 +513,12 @@ test('the retry interval asks about parked entries as well as pending ones (§6.
     tick.includes('reopenUnbound()'),
     'and whether the active note is bound at all — nothing else re-opens one either (R18)',
   );
+  assert.ok(
+    tick.indexOf('reopenUnbound()') < tick.indexOf('pendingCount()'),
+    'and it must be asked FIRST: the pending branch returns, so a note nothing is bound to '
+    + 'would wait another whole interval — measured, that is the interval in which the drain '
+    + 'publishes the file, the user keeps typing, and the next re-open takes take-shared',
+  );
   assert.equal(
     (tick.match(/scheduleReconcile\(/g) ?? []).length, 2,
     'each question that answers yes asks for a pass',
