@@ -42,6 +42,9 @@ import type { Kind, VaultPort } from './VaultPort.ts';
 import {
   CodeMirrorBinding,
   WorkspaceSession,
+  affixEdit,
+  decide,
+  retains,
   type MountResult,
   type ProviderPort,
   type SessionAwareness,
@@ -689,18 +692,25 @@ test('a remote edit after a divergent open lands in the editor instead of raisin
   assert.equal(h.editor.document(path), `${SHARED} and one more sentence.`);
 });
 
-test('a mount into an editor whose state has no compartment is refused, not assumed', async () => {
+test('an editor whose state has no compartment is refused before anything is decided', async () => {
   // `Compartment.reconfigure` aimed at a state that does not contain the
   // compartment is inert and SILENT. Without a liveness check the session is
   // told a binding exists when none does — so it defers the reconciler's repairs
   // for that node and records a watermark, for a note nothing is bound to.
+  //
+  // The check now lives in `bufferOf`, which is the first thing the session
+  // asks: there is no buffer to decide about, so no plan is made, no arm runs,
+  // and nothing is dispatched at the editor at all.
   const h = makeHarness();
   const id = h.add('a.md', 'body', { s: 1, owned: true, initialized: false });
+  const path = `${SHARE}/a.md`;
   h.providers.configure(`n_${id}`, { remote: 'body' });
 
-  await h.session.open(`${SHARE}/a.md`);
+  await h.session.open(path);
 
-  assert.deepEqual(h.editor.refused, [`${SHARE}/a.md`], 'the mount reported failure');
+  assert.equal(h.editor.bufferOf(path), null, 'there is no bindable leaf');
+  assert.deepEqual(h.editor.mounts, [], 'so nothing was bound');
+  assert.deepEqual(h.editor.transactions(path), [], 'and nothing was dispatched at it');
   assert.equal(h.session.openNodeId(), null, 'so nothing claims to be bound');
   assert.equal(h.providers.created[0].destroyed, true, 'and the provider was released');
   assert.equal(h.state.data.contentHash[id], undefined, 'and no watermark was recorded');
@@ -721,20 +731,51 @@ test('a local copy matching the shared document is not stashed', async () => {
 //
 // Everything above reasons about two strings — the file's bytes and the shared
 // document — and treats the editor as showing the first of them. Between the
-// `vault.read` that starts an open and the `mount` that ends it there is a third
+// `vault.read` that starts an open and the bind that ends it there is a third
 // string, and it is the newest: the buffer the user is typing into. That window
 // is the provider's connect-and-sync round trip, i.e. the first second after
 // opening a note, i.e. when people type.
 //
-// `mount` replaces the whole document to establish the equality
-// `y-codemirror.next` requires, so whatever is in that buffer is what an open
-// destroys — and the file read seconds earlier is not it.
+// The previous round answered that with "preserve it elsewhere before you throw
+// it away". These two say the answer is not to throw it away: on both arms below
+// the buffer is PROVABLY this device's own continuation of the shared text, so
+// it goes into the CRDT and the editor is never dispatched into at all. The
+// cursor, the selection and the undo history all survive with it.
 
-test('keystrokes typed while a healthy note is opening are preserved, not destroyed', async () => {
-  // Nothing is wrong with this note. The file and the shared document agree, so
-  // the open has no divergence to resolve and takes no stash branch at all — and
-  // the mount still throws the user's characters away, because the buffer stopped
-  // being the file's bytes the moment they typed.
+test('a brand-new note typed into while it opens keeps the typing, and shares it', async () => {
+  // Blocker 1, and the worst of the six, because this is the SEEDING arm: the
+  // shared document is empty by definition, the file is a 0-byte "New note", and
+  // the buffer is the ONLY copy of that note in existence anywhere. The open
+  // replaced it with the empty shared document and filed the user's first
+  // sentence under ShadowLink Recovered/, beside a notice about "the shared
+  // copy" that this very device was about to seed and that was empty.
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('Untitled.md', '', { owned: true });
+  const path = `${SHARE}/Untitled.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: '' });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.type(path, 'the first sentence of a new note');
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  assert.equal(h.editor.document(path), 'the first sentence of a new note',
+    'the typing is exactly where the user left it');
+  const text = h.providers.created[0].doc.getText('content');
+  assert.equal(text.toString(), 'the first sentence of a new note', 'and it is what got shared');
+  assert.equal(h.editor.inStep(path), true);
+  assert.equal(mutations(h.vault), 0, 'nothing was written anywhere else');
+  assert.deepEqual(h.notices, [], 'and nothing was said, because nothing went wrong');
+  assert.equal(h.tree.get(id)?.s, 1, 'the node is published, from content that exists');
+});
+
+test('keystrokes typed while a healthy note is opening stay in the editor', async () => {
+  // Blocker 2. Nothing is wrong with this note: the file and the shared document
+  // agree, so the open had no divergence to resolve and took no stash branch at
+  // all — and it still threw the user's characters away, with no copy and no
+  // notice, because the buffer stopped being the file's bytes the moment they
+  // typed and the mount replaced the buffer unconditionally.
   const h = makeHarness({ syncTimeoutMs: 5_000 });
   const id = h.add('a.md', 'shared body', { s: 1, owned: true });
   const path = `${SHARE}/a.md`;
@@ -746,13 +787,113 @@ test('keystrokes typed while a healthy note is opening are preserved, not destro
   h.providers.forRoom(`n_${id}`)[0].emitSync();
   await open;
 
-  assert.equal(h.editor.document(path), 'shared body', 'the shared document wins on screen');
-  assert.deepEqual(
-    h.stashes().map(([, text]) => text),
-    ['shared body plus what I just typed'],
-    'and what it replaced is on disk somewhere, not gone',
-  );
+  assert.equal(h.editor.document(path), 'shared body plus what I just typed');
+  const text = h.providers.created[0].doc.getText('content');
+  assert.equal(text.toString(), 'shared body plus what I just typed',
+    'the workspace caught up to the buffer, not the other way round');
+  assert.deepEqual(h.stashes(), [], 'nothing was displaced, so nothing was filed');
+  assert.deepEqual(h.notices, []);
+
+  // The editor was never dispatched into: one transaction, and it is the bind.
+  const dispatched = h.editor.transactions(path).slice(1);   // [0] is the user's own typing
+  assert.deepEqual(dispatched.map((tr) => tr.docChanged), [false],
+    'the cursor, the selection and the undo history all survive');
+});
+
+test('the catch-up produces genuine ops, so a peer\'s edit after it still lands', async () => {
+  // A converge-up that "worked" by replacing the Y.Text wholesale would pass the
+  // assertion above and desynchronise every peer. This is the check that it is an
+  // edit rather than a string.
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('a.md', 'one two three', { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: 'one two three' });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.type(path, ' four', 'one two three'.length);
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  h.editor.remoteDelta(path, (t) => { t.insert(0, 'zero '); });
+
+  assert.equal(h.editor.document(path), 'zero one two three four');
+  assert.equal(h.editor.inStep(path), true);
+});
+
+test('a buffer that is not a continuation of this note never enters the CRDT', async () => {
+  // The one hazard master did not have and none of the three designs closed.
+  // `viewFor` resolves a leaf by `view.file.path` while reading `view.editor.cm`,
+  // and Obsidian sets the file before it loads the document — so the buffer this
+  // arm is about to broadcast can belong to a different note. It shares a prefix
+  // and a suffix with the shared text, so an affix check alone accepts it.
+  //
+  // The retention bound refuses it: an edit may not delete more than half of the
+  // shared text. Nothing is lost — the buffer is preserved and the user is told —
+  // and the CRDT is untouched.
+  const shared = `# Notes\n${'the workspace\'s own paragraph. '.repeat(12)}\nend`;
+  const foreign = '# Notes\na line from another note entirely.\nend';
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('a.md', shared, { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: shared });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.cut(path, '# Notes\n'.length, shared.length - '\nend'.length);
+  h.editor.type(path, 'a line from another note entirely.', '# Notes\n'.length);
+  assert.equal(h.editor.document(path), foreign, 'the fixture really is prefix- and suffix-sharing');
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  const text = h.providers.created[0].doc.getText('content');
+  assert.equal(text.toString(), shared, 'nothing entered the CRDT');
+  assert.equal(h.editor.document(path), shared, 'and the editor shows the workspace\'s copy');
+  assert.deepEqual(h.stashes().map(([, t]) => t), [foreign], 'the buffer was preserved first');
   assert.ok(h.notices.some((n) => n.includes(RECOVERED_DIR)), h.notices.join(' | '));
+});
+
+test('a one-word deletion inside a long note is still a catch-up, not a refusal', async () => {
+  // The other side of the bound, and the reason it is one HALF rather than
+  // anything tighter: an ordinary edit made during the open window has to pass.
+  const shared = `# Notes\n${'the workspace\'s own paragraph. '.repeat(12)}\nend`;
+  const h = makeHarness({ syncTimeoutMs: 5_000 });
+  const id = h.add('a.md', shared, { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.providers.configure(`n_${id}`, { mode: 'manual', remote: shared });
+
+  const open = h.session.open(path);
+  await until(() => h.providers.forRoom(`n_${id}`).length === 1, 'the room to be opened');
+  h.editor.cut(path, 20, 30);
+  const kept = h.editor.document(path)!;
+  h.providers.forRoom(`n_${id}`)[0].emitSync();
+  await open;
+
+  assert.equal(h.providers.created[0].doc.getText('content').toString(), kept);
+  assert.equal(h.editor.document(path), kept, 'the buffer was never touched');
+  assert.deepEqual(h.stashes(), [], 'and no conflict file was invented');
+});
+
+test('an empty buffer against a non-empty file is refused, never taken as a deletion', async () => {
+  // A leaf Obsidian has not populated looks exactly like a select-all-delete. One
+  // of those two is the user emptying a shared note and the other is a note that
+  // has not loaded, and from inside the plugin they are the same state — so the
+  // open goes local-only for this turn rather than emptying a shared note on the
+  // strength of a transient editor state. It costs one open and heals on the next.
+  const h = makeHarness();
+  const id = h.add('a.md', 'a body that exists', { s: 1, owned: true });
+  const path = `${SHARE}/a.md`;
+  h.editor.openLeaf(path, '');
+  h.providers.configure(`n_${id}`, { remote: 'a body that exists' });
+
+  await h.session.open(path);
+
+  assert.equal(h.session.openNodeId(), null, 'nothing was bound');
+  assert.deepEqual(h.editor.mounts, [], 'and nothing was dispatched at the editor');
+  assert.equal(h.providers.created[0].doc.getText('content').toString(), 'a body that exists',
+    'the shared document is exactly as it was found');
+  assert.deepEqual(h.stashes(), [], 'a copy of nothing preserves nothing');
+  assert.equal(h.notices.length, 1, h.notices.join(' | '));
 });
 
 test('a divergent open preserves what was on screen, not the revision read off disk', async () => {
@@ -789,7 +930,7 @@ test('a mount that refuses AFTER replacing the buffer still preserves what it re
   const id = h.add('a.md', STALE, { s: 1 });
   const path = `${SHARE}/a.md`;
   h.providers.configure(`n_${id}`, { remote: SHARED });
-  h.editor.mount = () => ({ ok: false, replaced: `${STALE} and what I typed` });
+  h.editor.apply = () => ({ ok: false, replaced: `${STALE} and what I typed` });
 
   await h.session.open(path);
 
@@ -961,7 +1102,7 @@ test('binding an UNREPAIRED CRLF document is what raised the incident\'s RangeEr
   const leaf = leafOf('alpha\nbravo\ncharlie', binding.editorExtension());
   const text = ytextOf('alpha\r\nbravo\r\ncharlie');
 
-  const result = binding.mount('Shared/win.md', text, new FakeAwareness());
+  const result = takeShared(binding, 'Shared/win.md', text, new FakeAwareness());
 
   assert.equal(result.ok, false, 'the two sides cannot be made equal, so nothing is bound');
   assert.equal(text.length, 21);
@@ -1031,7 +1172,7 @@ test('a sync that lands in the same turn as a newer open still loses to the newe
   assert.deepEqual(h.notices, []);
 });
 
-test('an open superseded at the flush await neither mounts nor marks its node seeded', async () => {
+test('an open superseded at the flush await marks no node seeded and keeps no session', async () => {
   const h = makeHarness();
   const a = h.add('a.md', 'body a', { owned: true });
   const b = h.add('b.md', 'body b', { s: 1, owned: true });
@@ -1052,7 +1193,11 @@ test('an open superseded at the flush await neither mounts nor marks its node se
   assert.equal(h.tree.get(a)?.s, undefined, 'a superseded open advances no watermark');
   assert.equal(h.state.data.contentHash[a], undefined);
   assert.equal(providerA.destroyed, true);
-  assert.equal(h.editor.mounts.length, 1);
+  // The seeding arm binds FIRST and publishes after, because the buffer is the
+  // only copy of a brand-new note and the way to keep it is to keep it where it
+  // is. So `a` did bind, and losing the token is what unbinds it again.
+  assert.deepEqual(h.editor.mounts.map((m) => m.notePath), [`${SHARE}/a.md`, `${SHARE}/b.md`]);
+  assert.equal(h.editor.unmounts, 1, 'and the superseded session was torn down');
   assert.equal(h.editor.current?.notePath, `${SHARE}/b.md`);
   assert.equal(h.session.openNodeId(), b);
 });
@@ -1254,10 +1399,10 @@ test('a session superseded by its own mount records no content watermark (I17)',
   h.providers.configure(`n_${b}`, { remote: 'body b' });
 
   const editor = h.editor;
-  const mount = editor.mount.bind(editor);
+  const apply = editor.apply.bind(editor);
   let follow: Promise<void> | null = null;
-  editor.mount = (path, text, awareness): MountResult => {
-    const result = mount(path, text, awareness);
+  editor.apply = (path, text, awareness, plan): MountResult => {
+    const result = apply(path, text, awareness, plan);
     if (follow === null) {
       h.active.path = `${SHARE}/b.md`;
       follow = h.session.open(`${SHARE}/b.md`);
@@ -1349,11 +1494,28 @@ function ytextOf(content: string): Y.Text {
   return text;
 }
 
-test('mount makes the editor hold the shared document before it binds anything', () => {
+/**
+ * `bufferOf` + `apply` on the `take-shared` arm — which is what the single
+ * `mount` these tests used to call always did, and is now one arm of three. It
+ * is spelled out rather than hidden behind a helper on the binding, because
+ * choosing the arm is the whole of what the session decides.
+ */
+function takeShared(
+  binding: CodeMirrorBinding,
+  notePath: string,
+  text: Y.Text,
+  awareness: SessionAwareness,
+): MountResult {
+  const expect = binding.bufferOf(notePath);
+  if (expect === null) return { ok: false };
+  return binding.apply(notePath, text, awareness, { kind: 'take-shared', expect });
+}
+
+test('take-shared makes the editor hold the shared document before it binds anything', () => {
   const binding = new CodeMirrorBinding(() => leaf.view);
   const leaf = leafOf(STALE, binding.editorExtension());
 
-  const result = binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+  const result = takeShared(binding, 'Shared/a.md', ytextOf(SHARED), new FakeAwareness());
 
   assert.equal(result.ok, true);
   assert.equal(leaf.doc(), SHARED, 'the editor holds the workspace\'s text');
@@ -1369,7 +1531,7 @@ test('the replacement is kept out of the undo history', () => {
   const binding = new CodeMirrorBinding(() => leaf.view);
   const leaf = leafOf(STALE, binding.editorExtension());
 
-  binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+  takeShared(binding, 'Shared/a.md', ytextOf(SHARED), new FakeAwareness());
 
   assert.equal(leaf.transactions[0].annotation(Transaction.addToHistory), false);
 });
@@ -1381,7 +1543,7 @@ test('mount reports the text it replaced, so the caller can preserve it', () => 
   const binding = new CodeMirrorBinding(() => leaf.view);
   const leaf = leafOf(`${STALE} and what I typed`, binding.editorExtension());
 
-  const result = binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+  const result = takeShared(binding, 'Shared/a.md', ytextOf(SHARED), new FakeAwareness());
 
   assert.deepEqual(result, { ok: true, replaced: `${STALE} and what I typed` });
 });
@@ -1405,22 +1567,48 @@ test('mount reports what it replaced even when it then refuses', () => {
   };
   rebuildOnNextDispatch();
 
-  const result = binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+  const result = takeShared(binding, 'Shared/a.md', ytextOf(SHARED), new FakeAwareness());
 
   assert.equal(result.ok, false, 'no binding was installed');
   assert.equal(result.replaced, STALE, 'and it says what it cost to find that out');
   assert.equal(leaf.doc(), SHARED, 'the buffer is not re-dirtied with the stale revision');
 });
 
-test('mount leaves a document that already matches completely alone', () => {
+test('the agree arm leaves a document that already matches completely alone', () => {
+  // Arm 1, and the only arm `decide` can return for a buffer that already equals
+  // the shared text. Nothing is written to either side, so nothing is reported
+  // and nothing is ever preserved here — which is half of why nine `file-open`s
+  // on one note no longer produce nine files.
   const binding = new CodeMirrorBinding(() => leaf.view);
   const leaf = leafOf(SHARED, binding.editorExtension());
 
-  const result = binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+  const result = binding.apply(
+    'Shared/a.md', ytextOf(SHARED), new FakeAwareness(), { kind: 'agree', expect: SHARED },
+  );
 
   assert.equal(result.ok, true);
   assert.equal(result.replaced, undefined, 'nothing was replaced, so nothing is reported');
   assert.deepEqual(leaf.transactions.map((tr) => tr.docChanged), [false], 'one dispatch, no change');
+});
+
+test('a plan made about a buffer that has since moved is refused, not executed', () => {
+  // The can't-happen guard. On the two arms that write the buffer INTO the CRDT
+  // there is no await between reading it and acting on it — but what this would
+  // otherwise write is a string nobody looked at, into a document every peer
+  // reads, so it costs one comparison.
+  const binding = new CodeMirrorBinding(() => leaf.view);
+  const leaf = leafOf('what the editor holds now', binding.editorExtension());
+  const text = ytextOf('the shared text');
+
+  const result = binding.apply('Shared/a.md', text, new FakeAwareness(), {
+    kind: 'converge-up',
+    expect: 'what the editor held a moment ago',
+    edit: { from: 0, to: 'the shared text'.length, insert: 'what the editor held a moment ago' },
+  });
+
+  assert.deepEqual(result, { ok: false, stale: true });
+  assert.equal(text.toString(), 'the shared text', 'the CRDT is untouched');
+  assert.deepEqual(leaf.transactions, [], 'and so is the editor');
 });
 
 test('mount into a state without the compartment is refused, and writes nothing', () => {
@@ -1432,7 +1620,7 @@ test('mount into a state without the compartment is refused, and writes nothing'
   const leaf = leafOf(STALE, null);
 
   assert.deepEqual(
-    binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()),
+    takeShared(binding, 'Shared/a.md', ytextOf(SHARED), new FakeAwareness()),
     { ok: false },
     'refused, and with nothing to preserve: the buffer was never touched',
   );
@@ -1443,18 +1631,100 @@ test('mount into a state without the compartment is refused, and writes nothing'
 
 test('mount with no view for the path is refused', () => {
   const binding = new CodeMirrorBinding(() => null);
-  assert.deepEqual(binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness()), { ok: false });
+  assert.deepEqual(takeShared(binding, 'Shared/a.md', ytextOf(SHARED), new FakeAwareness()), { ok: false });
 });
 
 test('unmount removes the binding and leaves the document where it is', () => {
   const binding = new CodeMirrorBinding(() => leaf.view);
   const leaf = leafOf(STALE, binding.editorExtension());
-  binding.mount('Shared/a.md', ytextOf(SHARED), new FakeAwareness());
+  takeShared(binding, 'Shared/a.md', ytextOf(SHARED), new FakeAwareness());
 
   binding.unmount();
 
   assert.equal(leaf.doc(), SHARED, 'the shared text stays: it is what the file will hold');
   binding.unmount();                                  // idempotent
+});
+
+// ================================================================ I19, as a table
+//
+// `decide` is pure, so the whole of I19 is a table rather than a set of
+// scenarios. Every arm of it is here, including the ones the session's own
+// early checks make unreachable — a rule with a hole in the table is a rule
+// somebody will re-derive differently next time.
+
+test('affixEdit is exact: applying it reproduces the target', () => {
+  const cases: Array<[string, string]> = [
+    ['', ''],
+    ['', 'inserted'],
+    ['removed', ''],
+    ['abc', 'abc'],
+    ['abc', 'abXc'],
+    ['abcdef', 'abef'],
+    ['one two three', 'one TWO three'],
+    ['aaa', 'aa'],
+    ['aa', 'aaa'],
+    ['prefix middle suffix', 'prefix entirely different suffix'],
+  ];
+  for (const [from, to] of cases) {
+    const edit = affixEdit(from, to);
+    const applied = from.slice(0, edit.from) + edit.insert + from.slice(edit.to);
+    assert.equal(applied, to, `${JSON.stringify(from)} -> ${JSON.stringify(to)}`);
+    assert.ok(edit.from <= edit.to, 'the range is never inverted');
+    assert.ok(edit.to <= from.length, 'and never runs past the source');
+  }
+});
+
+test('retains bounds the claim that a buffer was built from this note', () => {
+  assert.equal(retains('', 'anything at all'), true, 'nothing to retain, nothing to prove');
+  assert.equal(retains('a body', 'a body'), true);
+  assert.equal(retains('a body', 'a body plus more'), true, 'appending keeps all of it');
+  assert.equal(retains('a body', ''), false, 'emptying keeps none of it');
+
+  const base = 'x'.repeat(400);
+  assert.equal(retains(base, `${base}extra`), true);
+  assert.equal(retains(base, `${'x'.repeat(390)}y`), true, 'a small edit inside a long note');
+  assert.equal(retains(base, 'x'.repeat(100)), false, 'three quarters of it gone');
+  assert.equal(retains(base, 'x'.repeat(200)), true, 'exactly half is the boundary, and passes');
+});
+
+test('decide covers every arm of I19', () => {
+  const D = (B: string, R: string, f: string, own: boolean, seeded: boolean): string =>
+    decide(B, R, f, own, seeded).kind;
+
+  // 1. AGREE, whatever else is true — including two empty strings, which is a
+  //    brand-new note nobody has typed into yet.
+  assert.equal(D('same', 'same', 'other', false, true), 'agree');
+  assert.equal(D('', '', '', true, false), 'agree');
+
+  // 2. The buffer is empty and the file is not: a leaf that has not loaded and a
+  //    select-all-delete are the same state from in here.
+  assert.equal(D('', 'body', 'body', true, true), 'local-only');
+  assert.equal(D('', 'body', '', true, true), 'take-shared', 'an empty FILE is not that case');
+
+  // 3. The shared document has never held anything.
+  assert.equal(D('typed', '', '', false, false), 'local-only', 'I5: not ours to seed');
+  assert.equal(D('typed', '', '', true, false), 'converge-up', 'SEED, from the buffer');
+  assert.equal(D('typed', '', 'a long file the buffer does not resemble at all', true, false),
+    'take-shared', 'unless the buffer cannot be shown to belong to this note');
+  assert.equal(D('typed', '', '', true, true), 'take-shared', 'a SEEDED empty doc is a deletion');
+
+  // 4. The workspace and this disk agree, so only the buffer has moved.
+  assert.equal(D('body plus typing', 'body', 'body', false, true), 'converge-up');
+  assert.equal(D('x', 'a much longer shared body', 'a much longer shared body', false, true),
+    'take-shared', 'the retention bound refuses a buffer that kept almost none of it');
+
+  // 5. Genuine divergence.
+  assert.equal(D('the local revision', 'the shared revision', 'the local revision', false, true),
+    'take-shared');
+});
+
+test('nothing in the decision is normalised, at any point', () => {
+  // I18's second clause, as a guard rather than a comment: a `\r` reaching
+  // `decide` must NOT be smoothed into agreement with its own normalisation.
+  // The repair upstream is what makes the equality achievable; a normaliser here
+  // would make it a lie again.
+  assert.equal(decide('a\nb', 'a\r\nb', 'a\nb', true, true).kind, 'take-shared');
+  assert.equal(decide('a\nb', 'a\nb', 'a\r\nb', true, true).kind, 'agree');
 });
 
 // ================================================================ source guards

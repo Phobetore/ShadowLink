@@ -56,7 +56,9 @@ import {
 import type { DocHandle, DocPort } from './DocPort.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 import { CodeMirrorBinding } from './WorkspaceSession.ts';
-import type { EditorBinding, MountResult, SessionAwareness } from './WorkspaceSession.ts';
+import type {
+  EditorBinding, MountPlan, MountResult, SessionAwareness,
+} from './WorkspaceSession.ts';
 
 export type { BlobLimits } from './BlobPort.ts';
 
@@ -584,10 +586,10 @@ class FakeLeaf {
  *
  *  1. A DOCUMENT PER LEAF, seeded from the FILE's bytes, which may differ from
  *     the `Y.Text` — the whole failure. It is a real `EditorState`.
- *  2. THE SHIPPED MOUNT. `mount` delegates to the production `CodeMirrorBinding`
- *     over these leaves, so nothing here decides what a mount does to a
- *     document; `CodeMirrorBinding` does, exactly as it does in Obsidian. A test
- *     therefore cannot pass because the fake was generous.
+ *  2. THE SHIPPED BIND. `bufferOf` and `apply` delegate to the production
+ *     `CodeMirrorBinding` over these leaves, so nothing here decides what a bind
+ *     does to a document; `CodeMirrorBinding` does, exactly as it does in
+ *     Obsidian. A test therefore cannot pass because the fake was generous.
  *  3. `y-codemirror.next`'s ACTUAL BEHAVIOUR after the mount: it never seeds an
  *     editor from its `Y.Text`, it applies FUTURE deltas only. The observer
  *     below is `YSyncPluginValue._observer`'s delta -> `{from,to,insert}`
@@ -741,12 +743,21 @@ export class FakeEditorBinding implements EditorBinding {
 
   // ---------------------------------------------------------- EditorBinding
 
-  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): MountResult {
-    // The shipped binding's result is passed through UNTOUCHED, `replaced`
-    // included: what a mount displaced is the one thing the session cannot find
-    // out for itself afterwards, so a fake that summarised it away would hide
-    // exactly the defect this class exists to expose.
-    const result = this.binding.mount(notePath, text, awareness);
+  bufferOf(notePath: string): string | null {
+    return this.binding.bufferOf(notePath);
+  }
+
+  apply(
+    notePath: string,
+    text: Y.Text,
+    awareness: SessionAwareness,
+    plan: MountPlan,
+  ): MountResult {
+    // The shipped binding's result is passed through UNTOUCHED, `replaced` and
+    // `stale` included: what an apply displaced is the one thing the session
+    // cannot find out for itself afterwards, so a fake that summarised it away
+    // would hide exactly the defect this class exists to expose.
+    const result = this.binding.apply(notePath, text, awareness, plan);
     if (!result.ok) {
       this.refused.push(notePath);
       return result;

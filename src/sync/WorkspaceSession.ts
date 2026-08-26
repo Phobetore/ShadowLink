@@ -36,6 +36,23 @@
 //        workspace and in this device's own file — never the CRDT's text on the
 //        strength of a mount, which is how one vault came to record another
 //        vault's file as its own base.
+//  I18 — a content document contains no `\r`, EVER. Both writers of disk bytes
+//        into one normalize with `\r\n?`, and a document written by an older
+//        build is repaired in place before anything compares it. CodeMirror
+//        cannot hold a `\r` at all, so a document that holds one can never equal
+//        a buffer, and I19 would refuse such a note for the rest of its life.
+//  I19 — a `Y.Text` is bound into an editor only when it EQUALS what that editor
+//        holds, raw `===`, re-read after every dispatch. The two sides are made
+//        equal beforehand by moving whichever one is PROVABLY stale, and the
+//        buffer may be moved into the CRDT only where this device can show it is
+//        its own continuation of that note. See `decide`.
+//
+// I19 is why this file has five arms instead of one. The version before it
+// replaced the editor's buffer whenever it differed from the shared document,
+// which is right on exactly one of them: it destroyed a brand-new note's only
+// copy on the arm that was about to seed from it, and destroyed a healthy note's
+// keystrokes with no copy and no notice on the arm where the workspace and the
+// disk agreed and only the user's own typing had moved.
 //
 // TESTABILITY. Everything that does not need a running Obsidian is behind a port:
 // the vault (`VaultPort`), the network (`ProviderPort`) and the editor
@@ -103,15 +120,69 @@ export interface ProviderPort {
 }
 
 /**
- * The editor mount, isolated so everything else in this file is testable.
+ * The single contiguous change that turns one string into another.
  *
- * `mount` takes the target PATH rather than a view: it is the binding's job to
- * find the leaf showing that file, and its job to report honestly when there is
- * none, so the session can release the document instead of holding a session
- * nothing is looking at.
+ * Exact, not approximate: applying it to `from` yields `to`, always. It is the
+ * common prefix and the common suffix held fixed and everything between them
+ * replaced, which is the only edit shape this file needs — the two strings it is
+ * ever computed over are one revision of a note and the same revision with the
+ * user's last few seconds of typing in it.
  */
+export interface AffixEdit {
+  readonly from: number;
+  readonly to: number;
+  readonly insert: string;
+}
+
+/** The single contiguous change turning `from` into `to`. */
+export function affixEdit(from: string, to: string): AffixEdit {
+  const max = Math.min(from.length, to.length);
+  let p = 0;
+  while (p < max && from[p] === to[p]) p += 1;
+  let s = 0;
+  while (s < max - p && from[from.length - 1 - s] === to[to.length - 1 - s]) s += 1;
+  return { from: p, to: from.length - s, insert: to.slice(p, to.length - s) };
+}
+
 /**
- * What a mount did, which is two facts and not one.
+ * Does `buf` keep at least half of `base` untouched at its two ends?
+ *
+ * THIS IS NOT A MERGE HEURISTIC. It is a sanity bound on the claim *"this buffer
+ * was built from this note"*, and it exists because `viewFor` resolves a leaf by
+ * `view.file.path` while reading `view.editor.cm`, and Obsidian sets the file
+ * before it loads the document. A foreign buffer that happens to share a prefix
+ * and a suffix with the shared text passes an affix check and would then be
+ * broadcast to every peer as this note's new body.
+ *
+ * One half is the only tuned number in this design, and it was picked rather
+ * than derived: comfortably above any realistic eight seconds of typing, and
+ * comfortably below any realistic foreign buffer. What it costs is named: a user
+ * who deletes more than half a note inside the open window has that edit refused,
+ * the buffer preserved, and the cursor reset. Nothing is lost and they are told —
+ * and the alternative, on a state genuinely indistinguishable from inside the
+ * plugin, is broadcasting another note's body to everybody.
+ */
+export function retains(base: string, buf: string): boolean {
+  if (base === '') return true;
+  const edit = affixEdit(base, buf);
+  return edit.from + (base.length - edit.to) >= base.length / 2;
+}
+
+/**
+ * What `apply` is being asked to do, decided BEFORE it is called and from four
+ * strings and two booleans (see `decide`).
+ *
+ * `expect` is the buffer the decision was made from. `apply` re-reads the live
+ * document and refuses if it has moved, so a plan can never be executed against
+ * a buffer nobody looked at.
+ */
+export type MountPlan =
+  | { kind: 'agree'; expect: string }
+  | { kind: 'converge-up'; expect: string; edit: AffixEdit }
+  | { kind: 'take-shared'; expect: string };
+
+/**
+ * What a mount did, which is three facts and not one.
  *
  * It used to be a boolean, and the missing half cost the user their keystrokes:
  * a mount that establishes an equality by REPLACING a document has destroyed
@@ -120,11 +191,10 @@ export interface ProviderPort {
  * by then the buffer holds the shared text.
  */
 export interface MountResult {
-  /** Whether a binding is installed AND the editor holds the shared text. */
+  /** A binding is installed AND the editor holds the shared text, EXACTLY. */
   readonly ok: boolean;
   /**
-   * The text the mount removed from the editor, present only when it removed
-   * any.
+   * The buffer `apply` actually displaced, present only when it displaced any.
    *
    * This is the newest copy of the note in existence at that instant: newer
    * than the file, because Obsidian's save of a dirty buffer is asynchronous
@@ -138,13 +208,26 @@ export interface MountResult {
    * as they are after a success.
    */
   readonly replaced?: string;
+  /** The buffer moved between `bufferOf` and `apply`; NOTHING was written. */
+  readonly stale?: boolean;
 }
 
 export interface EditorBinding {
   /**
-   * Make the editor showing `notePath` HOLD `text`, then bind it.
+   * What the editor showing `notePath` HOLDS right now, or null when there is no
+   * bindable leaf for it — no view, or a view whose state does not carry the
+   * compartment. Never writes. Never dispatches.
    *
-   * The ordering in that sentence is the contract, and it is not decorative.
+   * Split out of `mount` deliberately. On the three arms that do not displace
+   * anything there is now no `await` between reading the buffer and acting on
+   * it, so the window in which a keystroke could be decided about and then
+   * destroyed does not exist to be raced rather than merely being narrower.
+   */
+  bufferOf(notePath: string): string | null;
+  /**
+   * Execute `plan` against the editor showing `notePath`, then bind `text` into
+   * it. Synchronous from the first read to the gate.
+   *
    * `y-codemirror.next` never reconciles an editor with the `Y.Text` it is
    * handed: `YSyncPluginValue`'s constructor installs an observer and nothing
    * else, so its documented usage is `EditorState.create({ doc: ytext.toString(),
@@ -155,16 +238,91 @@ export interface EditorBinding {
    * whose content never appears and whose file is never rewritten.
    *
    * So `ok` is a claim about what the editor now CONTAINS, not about a dispatch
-   * having been issued. Callers rely on it: for an open note the editor is the
-   * only writer of the file's bytes (I7), so "the shared document wins on disk"
-   * is delivered by this method or not at all.
-   *
-   * `ok: false` means no binding was installed. `replaced` says what the attempt
-   * cost regardless — see `MountResult`.
+   * having been issued, and the gate that decides it compares raw `===` (I19).
    */
-  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): MountResult;
+  apply(
+    notePath: string,
+    text: Y.Text,
+    awareness: SessionAwareness,
+    plan: MountPlan,
+  ): MountResult;
   /** Remove any binding. Idempotent, and safe once the view is gone. */
   unmount(): void;
+}
+
+/**
+ * I19, entire, and pure so that every case of it is a table rather than a
+ * scenario.
+ *
+ * `B` — what the editor holds. Always LF: CodeMirror cannot hold a `\r`.
+ * `R` — the shared document, after the line-ending repair.
+ * `f` — `toLF` of what `vault.read` returned at the top of this open.
+ *
+ * The order of the arms is the design. Read it as: agree if the two sides are
+ * already the same string; refuse if the buffer is not there to be believed;
+ * move the CRDT up to the buffer when this device can SHOW the buffer is its own
+ * continuation of that note; otherwise the shared copy wins on screen and
+ * whatever it displaces is preserved first.
+ *
+ * Nothing here normalises anything. Both writers into a content document
+ * normalise on the way in and the document is repaired before this is called, so
+ * every string reaching it is already LF-only — and a comparison that decides a
+ * binding must never be normalised (I18).
+ */
+export type Decision =
+  | { kind: 'agree' }
+  | { kind: 'converge-up'; edit: AffixEdit }
+  | { kind: 'take-shared' }
+  | { kind: 'local-only'; reason: string };
+
+export function decide(
+  B: string,
+  R: string,
+  f: string,
+  own: boolean,
+  seeded: boolean,
+): Decision {
+  // 1. AGREE. Nothing is written to either side and nothing is ever preserved
+  //    on this arm — which, with a content-derived preservation name, is what
+  //    leaves the nine-copies failure no path at all.
+  if (B === R) return { kind: 'agree' };
+
+  // 2. The buffer is empty and the file is not. A leaf Obsidian has not
+  //    populated and a select-all-delete are the same state from in here, and
+  //    one of them is "empty a shared note on the strength of a transient
+  //    editor state". Costs one open; the next `file-open` heals it.
+  if (B === '' && f !== '') {
+    return {
+      kind: 'local-only',
+      reason: 'its editor had not finished loading — switch away and back to try again.',
+    };
+  }
+
+  // 3. The shared document has never held anything.
+  if (R === '' && !seeded) {
+    // I5. Only the creator writes a content doc's first bytes; two devices
+    // seeding one concatenates both copies into every peer's note. Checked in
+    // `doOpen` as well, before the editor is touched at all — kept here so this
+    // function is total and the table is the whole rule.
+    if (!own) return { kind: 'local-only', reason: 'Waiting for the author to upload this note.' };
+    // SEED: the degenerate converge-up, from nothing to the buffer. The buffer
+    // is the only copy of a brand-new note in existence, so the one thing this
+    // arm must never do is replace it.
+    if (retains(f, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
+    return { kind: 'take-shared' };
+  }
+
+  // 4. The workspace and this disk agree, so the buffer is the only thing that
+  //    has moved — this device's own typing during the open window. CATCH-UP:
+  //    the CRDT comes up to the buffer, and the buffer is never touched.
+  if (R !== '' && R === f) {
+    if (retains(R, B)) return { kind: 'converge-up', edit: affixEdit(R, B) };
+    return { kind: 'take-shared' };
+  }
+
+  // 5. Genuine divergence: the file and the workspace hold different revisions
+  //    of this note and there is no merge UI (spec §8 item 15).
+  return { kind: 'take-shared' };
 }
 
 // ============================================================ public surface
@@ -341,55 +499,58 @@ export class WorkspaceSession {
     // now, so this is a repair of history rather than an ongoing hazard.
     this.repairLineEndings(text);
     const seeded = this.deps.tree.get(nodeId)?.s === 1;
+    const own = this.deps.state.data.owned[nodeId] === true;
+    /** `R`: the shared document, after the repair. Read once, before the buffer. */
+    const shared = text.toString();
 
-    /**
-     * Whether this open has to resolve a difference between the file on disk and
-     * the shared document. Recorded here, ACTED ON after the mount: the local
-     * bytes are only worth preserving once something has actually replaced them.
-     */
-    let diverged = false;
-
-    if (text.length === 0 && !seeded) {
+    if (shared === '' && !seeded && !own) {
       // I5. Not an error and not a failure: the author simply has not uploaded
-      // yet. Mounting an empty document here would strand their content, because
+      // yet. Binding an empty document here would strand their content, because
       // the first keystroke would make this device's empty doc the shared truth.
-      if (this.deps.state.data.owned[nodeId] !== true) {
-        release(provider, doc);
-        this.localOnly(notePath, 'Waiting for the author to upload this note.');
-        return;
-      }
-      if (localText.length > 0) text.insert(0, localText);
-
-      // I17: the round trip decides whether the workspace may be told this node
-      // is published. An unconfirmed flush is a retry — the update stays in this
-      // doc and the publish queue will offer the node again once the note closes.
-      const confirmed = await provider.flush();
-      if (token !== this.token) { release(provider, doc); return; }
-      if (confirmed) this.deps.tree.patchNode(nodeId, { s: 1 });
-      else this.deps.notice('This note has not reached the server yet; it will retry.');
-    } else if (text.toString() !== localText) {
-      // The shared document wins on disk (spec §8 item 15: there is no merge UI).
-      // WHO WRITES: not this class. `VaultPort` has no `modify` and `create`
-      // refuses an occupied path, precisely because writing a note that is live
-      // under a `yCollab` binding turns Obsidian's external-change reload into a
-      // whole-document overwrite broadcast to every peer (I7). The editor is the
-      // legal writer, and `editor.mount` below is what makes it hold the shared
-      // text; Obsidian's save of that dirty buffer is what puts it on disk.
-      //
-      // This branch used to stash here and then mount, on the belief — written
-      // out at `stashLocalCopy` — that the mount would replace the file. It did
-      // not: the mount changed nothing, so every open stashed a fresh copy of a
-      // file that was never replaced, and in the incident this was written for
-      // the preserved copy was byte-identical to the file left at the canonical
-      // path. Nine of them in three minutes.
-      diverged = true;
+      // `decide` encodes this rule too, so the table is the whole of I19; it is
+      // ALSO here so the editor is never even read for a note this device has no
+      // business writing into.
+      release(provider, doc);
+      this.localOnly(notePath, 'Waiting for the author to upload this note.');
+      return;
     }
 
     // The target must still be the file the user is looking at. Between the first
     // await and here the user may have switched notes without a newer `open()`
     // having reached us yet.
     if (this.deps.activePath() !== notePath) { release(provider, doc); return; }
-    const mounted = this.deps.editor.mount(notePath, text, provider.awareness);
+
+    // THE DECISION AND ITS APPLICATION, and on three of the five arms there is no
+    // `await` between them.
+    //
+    // That is blocker 2 closed structurally rather than narrowed: the buffer is
+    // read, decided about and acted on inside one turn of the event loop, so
+    // there is no window in which a keystroke can be observed and then thrown
+    // away. The loop runs at most twice, and only for the `stale` answer that the
+    // no-await arms cannot produce — a can't-happen worth one comparison, because
+    // what it would otherwise write is a string nobody looked at into a document
+    // every peer reads.
+    let mounted: MountResult | undefined;
+    let buffer = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const B = this.deps.editor.bufferOf(notePath);
+      if (B === null) { release(provider, doc); return; }      // arm 0: no bindable leaf
+      buffer = B;
+      const plan = decide(B, shared, localText, own, seeded);
+      if (plan.kind === 'local-only') {
+        release(provider, doc);
+        this.localOnly(notePath, plan.reason);
+        return;
+      }
+      const planned: MountPlan = plan.kind === 'converge-up'
+        ? { kind: 'converge-up', expect: B, edit: plan.edit }
+        : plan.kind === 'agree'
+          ? { kind: 'agree', expect: B }
+          : { kind: 'take-shared', expect: B };
+      mounted = this.deps.editor.apply(notePath, text, provider.awareness, planned);
+      if (mounted.stale !== true) break;
+    }
+    if (mounted === undefined) { release(provider, doc); return; }
     if (mounted.ok) this.active = { nodeId, notePath, doc, provider };
     else release(provider, doc);
 
@@ -402,24 +563,26 @@ export class WorkspaceSession {
     // which is when people type. Obsidian's save of a dirty buffer is
     // asynchronous and the plugin cannot make it happen, so from the user's first
     // keystroke the EDITOR holds the newest copy of this note and the file does
-    // not. `mount` replaces the editor's whole document, so that copy is what an
-    // open costs, and `mount` is the only thing that ever sees it.
-    //
-    // Stashing `localText` instead is not a smaller version of preserving it: on
-    // a healthy note — file and shared document in agreement, no divergence, no
-    // stash branch taken at all — it preserved NOTHING while the paragraph the
-    // user had just written was thrown away in silence. On a divergent one it
-    // carefully preserved a revision they had already moved past, and threw the
-    // same paragraph away.
-    //
-    // The fallback covers the one case `replaced` cannot: the mount replaced
-    // nothing because the buffer already held the shared text, yet the file still
-    // disagrees with it, and Obsidian's next save is about to overwrite that file
-    // with the buffer. Those disk bytes go too, so they are preserved too.
-    const lost = mounted.replaced ?? (mounted.ok && diverged ? localText : undefined);
-    if (lost !== undefined) await this.stashLocalCopy(nodeId, notePath, lost);
+    // not. Only `apply` ever sees that copy, and only the `take-shared` arm
+    // displaces it — which is the point of there being five arms.
+    if (mounted.replaced !== undefined) {
+      await this.stashLocalCopy(nodeId, notePath, mounted.replaced);
+    }
 
     if (!mounted.ok) return;
+    void buffer;
+
+    // I6 + I17: the workspace may be told this node is published only once the
+    // round trip has come back AND there is something to publish. An empty
+    // document flushes and confirms perfectly and confirms nothing, and `s` is
+    // the whole definition of "published" for a note — set it here and every peer
+    // materializes a 0-byte file on the canonical path.
+    if (!seeded && own) {
+      const confirmed = await provider.flush();
+      if (token !== this.token) return;
+      if (confirmed && text.length > 0) this.deps.tree.patchNode(nodeId, { s: 1 });
+      else if (!confirmed) this.deps.notice('This note has not reached the server yet; it will retry.');
+    }
 
     // I17. A watermark names bytes that are simultaneously in the workspace and
     // on THIS disk, and it may advance only once a write has returned. This
@@ -712,50 +875,70 @@ export class CodeMirrorBinding implements EditorBinding {
     return this.compartment.of([]);
   }
 
-  mount(notePath: string, text: Y.Text, awareness: SessionAwareness): MountResult {
+  /**
+   * The buffer, and nothing else. No writes, no dispatch, no decision.
+   *
+   * `null` covers both "there is no view for this path" and "there is a view
+   * whose state does not carry the compartment". The LIVENESS CHECK belongs
+   * here, before anything is read or written, because `Compartment.reconfigure`
+   * aimed at a state that does not contain the compartment is inert and SILENT —
+   * `compartment.get(state)` is `undefined` there — so an `apply` into an editor
+   * Obsidian has not finished building would otherwise report success having
+   * bound nothing at all, and the session would behave as though the user were
+   * editing collaboratively.
+   */
+  bufferOf(notePath: string): string | null {
+    const view = this.viewFor(notePath);
+    if (view === null) return null;
+    if (this.compartment.get(view.state) === undefined) return null;
+    return view.state.doc.toString();
+  }
+
+  apply(
+    notePath: string,
+    text: Y.Text,
+    awareness: SessionAwareness,
+    plan: MountPlan,
+  ): MountResult {
     const view = this.viewFor(notePath);
     if (view === null) return { ok: false };
-
-    // LIVENESS FIRST, before anything is written. `Compartment.reconfigure`
-    // aimed at a state that does not contain the compartment is inert and
-    // silent — `compartment.get(state)` is `undefined` there — so without this
-    // check a mount into an editor Obsidian has not finished building returns
-    // true having bound nothing at all, and the session then behaves as though
-    // the user were editing collaboratively. Checking BEFORE the replacement
-    // also means a mount that cannot bind has not thrown the user's buffer away.
+    // Liveness again, and again before anything is written: `bufferOf` and this
+    // are two calls, and on the one arm that has an await between them Obsidian
+    // may have rebuilt the state in the meantime.
     if (this.compartment.get(view.state) === undefined) return { ok: false };
 
-    // I19. RAW `===`, here and at the gate below, and never a normalized
-    // comparison.
-    //
-    // This used to normalize both sides, on the argument that CodeMirror cannot
-    // hold a CRLF so an exact comparison would replace the document on every
-    // open and then refuse the mount it just performed. The first half is true
-    // and the conclusion was wrong: `yCollab` indexes the RAW text, so a
-    // normalized comparison answers "equal" for a `Y.Text` that is two
-    // characters out per line ending, binds it, and every later remote delta
-    // addresses a position the editor does not have. Measured: 21 characters
-    // bound into a 19-character buffer, then
-    // `Invalid change range 22 to 22 (in doc of length 20)`.
-    //
-    // The equality is made ACHIEVABLE instead of asserted away: the session
-    // repairs the document (`repairLineEndings`) before anything compares it, so
-    // by the time a well-formed document reaches here both sides are LF-only and
-    // an exact comparison succeeds. One that still holds a `\r` is refused, which
-    // is the honest answer — there is no configuration in which such a document
-    // and a buffer are equal.
-    const shared = text.toString();
-
-    // WHAT WAS ON SCREEN, captured before anything can change it. It is not
-    // necessarily the file's bytes: Obsidian's save of a dirty buffer is
-    // asynchronous, so from the user's first keystroke after the open began this
-    // is the newest copy of the note anywhere — and the replacement below is
-    // about to be the only thing that has ever held it.
-    const before = view.state.doc.toString();
+    // WHAT IS ON SCREEN NOW, re-read rather than trusted. It is not necessarily
+    // the file's bytes: Obsidian's save of a dirty buffer is asynchronous, so
+    // from the user's first keystroke after the open began this is the newest
+    // copy of the note anywhere.
+    const now = view.state.doc.toString();
+    if (now !== plan.expect && plan.kind !== 'take-shared') {
+      // The decision was made about a buffer that no longer exists. On the two
+      // arms that write the buffer INTO the CRDT that is a can't-happen — there
+      // is no await between `bufferOf` and here — and a can't-happen that writes
+      // a stale string into a shared document is worth one comparison. Nothing
+      // is written; the caller re-reads and re-decides.
+      //
+      // `take-shared` deliberately proceeds: its preservation is already
+      // confirmed on disk, and the buffer it actually displaces is `now`, which
+      // is what it reports.
+      return { ok: false, stale: true };
+    }
 
     let replaced: string | undefined;
-    if (before !== shared) {
-      replaced = before;
+    if (plan.kind === 'converge-up') {
+      // The CRDT comes up to the buffer, in ONE transaction and as genuine ops,
+      // so peers receive an edit rather than a whole-document rewrite. `yCollab`
+      // is not installed yet, so nothing echoes this back — and the editor is
+      // not dispatched into AT ALL, which is why the cursor, the selection and
+      // the undo history all survive this arm and blockers 1 and 2 have no path.
+      const edit = plan.edit;
+      text.doc?.transact(() => {
+        if (edit.to > edit.from) text.delete(edit.from, edit.to - edit.from);
+        if (edit.insert !== '') text.insert(edit.from, edit.insert);
+      });
+    } else if (plan.kind === 'take-shared') {
+      replaced = now;
       // WHAT THIS COSTS, deliberately. Replacing the whole document is the
       // bluntest possible convergence: the user's selection is remapped through
       // a change that touches every character, so a cursor mid-note lands at the
@@ -766,12 +949,16 @@ export class CodeMirrorBinding implements EditorBinding {
       // into the CRDT for every peer. The blunt version is the one whose result
       // is knowable: after it, the editor holds exactly the workspace's text.
       //
+      // It is now ONE arm of three rather than the default, and that is the
+      // whole of blockers 1 and 2: the other two reach the same equality without
+      // touching the buffer at all.
+      //
       // `addToHistory: false` keeps the replacement out of the undo stack. It
       // has to: once `yCollab` is installed one Ctrl+Z would push the stale
       // local revision back through `YSyncPluginValue.update` as a local edit,
       // and broadcast it to every peer.
       view.dispatch({
-        changes: { from: 0, to: view.state.doc.length, insert: shared },
+        changes: { from: 0, to: view.state.doc.length, insert: text.toString() },
         annotations: Transaction.addToHistory.of(false),
       });
     }
@@ -791,16 +978,34 @@ export class CodeMirrorBinding implements EditorBinding {
     // hands over a y-protocols Awareness that satisfies both.
     view.dispatch({ effects: this.compartment.reconfigure([yCollab(text, awareness)]) });
 
+    // THE GATE (I19), and RAW `===`, re-read from the live state after every
+    // dispatch. This is the single most important line in the file.
+    //
+    // It used to normalize both sides, on the argument that CodeMirror cannot
+    // hold a CRLF so an exact comparison would replace the document on every
+    // open and then refuse the mount it had just performed. The first half is
+    // true and the conclusion was wrong: `yCollab` indexes the RAW text, so a
+    // normalized comparison answers "equal" for a `Y.Text` two characters out
+    // per line ending, binds it, and every later remote delta addresses a
+    // position the editor does not have. Measured: 21 characters bound into a
+    // 19-character buffer, then `Invalid change range 22 to 22 (in doc of
+    // length 20)`.
+    //
+    // The equality is made ACHIEVABLE rather than asserted away: the session
+    // repairs the document before anything compares it, so both sides are
+    // LF-only by the time they get here. One that still holds a `\r` is refused,
+    // which is the honest answer — there is no configuration in which such a
+    // document and a buffer are equal.
     if (
       this.compartment.get(view.state) === undefined
-      || view.state.doc.toString() !== shared
+      || text.toString() !== view.state.doc.toString()
     ) {
-      // Belt and braces: the two claims `ok` makes are that the binding is
-      // installed and that the editor holds the shared text. If either is false
-      // after the dispatches, say so rather than let the session record a
-      // watermark and defer repairs for a note nothing is bound to. The buffer
-      // is left holding the shared text — restoring the stale revision would
-      // only re-dirty it with bytes the workspace has already moved past.
+      // The two claims `ok` makes are that the binding is installed and that the
+      // editor holds the shared text. If either is false after the dispatches,
+      // say so rather than let the session record a watermark and defer repairs
+      // for a note nothing is bound to. The buffer is left holding whatever it
+      // now holds — restoring a stale revision would only re-dirty it with bytes
+      // the workspace has already moved past.
       //
       // `replaced` is reported all the same, and this is the whole reason it is
       // on the failure arm too: the displaced characters are exactly as gone as

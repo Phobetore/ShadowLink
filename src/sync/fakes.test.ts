@@ -16,7 +16,7 @@ import {
   BlobUnavailable,
   type BlobPort,
 } from './BlobPort.ts';
-import type { EditorBinding, SessionAwareness } from './WorkspaceSession.ts';
+import type { EditorBinding, MountResult, SessionAwareness } from './WorkspaceSession.ts';
 import { hashOfBytes } from '../tree/paths.ts';
 
 // ---------------------------------------------------------------- case folding
@@ -811,6 +811,24 @@ function ytext(content: string): Y.Text {
   return text;
 }
 
+/**
+ * `bufferOf` + `apply` on the `take-shared` arm, which is what the single
+ * `mount` these tests used to call always did. Spelled out here rather than
+ * hidden behind a convenience method on the fake, because the arm chosen is the
+ * whole of what the session decides and a fake that picked one for you would be
+ * back to modelling a port as an outcome.
+ */
+function bind(
+  editor: FakeEditorBinding,
+  notePath: string,
+  text: Y.Text,
+  awareness: SessionAwareness,
+): MountResult {
+  const expect = editor.bufferOf(notePath);
+  if (expect === null) return { ok: false };
+  return editor.apply(notePath, text, awareness, { kind: 'take-shared', expect });
+}
+
 test('the fake editor keeps its own document, which the shared text does not touch', () => {
   const editor = new FakeEditorBinding();
   editor.openLeaf('Shared/a.md', 'what the file holds');
@@ -825,7 +843,7 @@ test('a mount makes the editor equal the Y.Text it binds', () => {
   const text = ytext('the workspace revision');
 
   assert.deepEqual(
-    editor.mount('Shared/a.md', text, new TestAwareness()),
+    bind(editor, 'Shared/a.md', text, new TestAwareness()),
     { ok: true, replaced: 'the stale local revision' },
     'and says what it displaced, which is the only copy of it there was',
   );
@@ -844,7 +862,7 @@ test('a remote delta into a DIVERGED editor raises the production RangeError', (
   const editor = new FakeEditorBinding();
   editor.openLeaf('Shared/a.md', 'fourteen chars');
   const text = ytext('fourteen chars');
-  editor.mount('Shared/a.md', text, new TestAwareness());
+  bind(editor, 'Shared/a.md', text, new TestAwareness());
 
   editor.openLeaf('Shared/a.md', '');
 
@@ -858,7 +876,7 @@ test('a remote delta into an EQUAL editor applies cleanly', () => {
   const editor = new FakeEditorBinding();
   editor.openLeaf('Shared/a.md', 'the stale local revision');
   const text = ytext('the workspace revision');
-  editor.mount('Shared/a.md', text, new TestAwareness());
+  bind(editor, 'Shared/a.md', text, new TestAwareness());
 
   text.insert(text.length, ', extended');
 
@@ -869,7 +887,7 @@ test('unmounting stops the editor tracking the document', () => {
   const editor = new FakeEditorBinding();
   editor.openLeaf('Shared/a.md', 'body');
   const text = ytext('body');
-  editor.mount('Shared/a.md', text, new TestAwareness());
+  bind(editor, 'Shared/a.md', text, new TestAwareness());
 
   editor.unmount();
   text.insert(text.length, ' more');
@@ -878,12 +896,16 @@ test('unmounting stops the editor tracking the document', () => {
   assert.equal(editor.unmounts, 1);
 });
 
-test('a mount into a leaf whose state has no compartment is refused', () => {
+test('a leaf whose state has no compartment has no buffer to decide about', () => {
+  // `Compartment.reconfigure` aimed at such a state is inert and silent, so
+  // `bufferOf` answers null rather than handing back a document nothing can be
+  // bound into. The session never gets as far as choosing an arm.
   const editor = new FakeEditorBinding();
   editor.openLeaf('Shared/a.md', 'body', { initialized: false });
 
-  assert.deepEqual(editor.mount('Shared/a.md', ytext('shared'), new TestAwareness()), { ok: false });
-  assert.deepEqual(editor.refused, ['Shared/a.md']);
+  assert.equal(editor.bufferOf('Shared/a.md'), null);
+  assert.deepEqual(bind(editor, 'Shared/a.md', ytext('shared'), new TestAwareness()), { ok: false });
+  assert.deepEqual(editor.mounts, [], 'nothing was bound');
   assert.equal(editor.document('Shared/a.md'), 'body', 'and it wrote nothing');
 });
 
@@ -892,9 +914,9 @@ test('a mount for a path with no leaf, or a missing one, is refused', () => {
   editor.openLeaf('Shared/a.md', 'body');
   editor.missing.add('Shared/a.md');
 
-  assert.deepEqual(editor.mount('Shared/a.md', ytext('shared'), new TestAwareness()), { ok: false });
+  assert.deepEqual(bind(editor, 'Shared/a.md', ytext('shared'), new TestAwareness()), { ok: false });
   assert.deepEqual(
-    editor.mount('Shared/never-opened.md', ytext('shared'), new TestAwareness()),
+    bind(editor, 'Shared/never-opened.md', ytext('shared'), new TestAwareness()),
     { ok: false },
   );
   assert.equal(editor.mounts.length, 0);
@@ -911,7 +933,7 @@ test('the editor is the only writer of an open note, and its save is explicit', 
   vault.seed('Shared/a.md', 'f', 'the stale local revision');
   editor.openLeaf('Shared/a.md', 'the stale local revision');
 
-  editor.mount('Shared/a.md', ytext('the workspace revision'), new TestAwareness());
+  bind(editor, 'Shared/a.md', ytext('the workspace revision'), new TestAwareness());
   assert.equal(await vault.read('Shared/a.md'), 'the stale local revision', 'the disk lags');
 
   editor.save('Shared/a.md');
@@ -926,7 +948,7 @@ test('FakeEditorBinding and CodeMirrorBinding present the same surface', async (
   const fake: EditorBinding = new FakeEditorBinding();
   const real: EditorBinding = new CodeMirrorBinding(() => null);
 
-  for (const method of ['mount', 'unmount'] as const) {
+  for (const method of ['bufferOf', 'apply', 'unmount'] as const) {
     assert.equal(
       fake[method].length, real[method].length,
       `${method}() takes a different number of arguments on the fake than on the real port`,
