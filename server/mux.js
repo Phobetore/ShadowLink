@@ -44,7 +44,16 @@ export const MUX_MAX_ROOMS_PER_SOCKET = 8_192;
  * ⚠ THE BOUND. A frame is written only if the socket can hold it: the check is
  * `bufferedAmount + frame.byteLength > this`, tested BEFORE `ws.send`, and the
  * socket is terminated instead of writing. No grace, no reset, no averaging.
- * This is the number a self-hoster may size a host from.
+ *
+ * ⚠ It bounds a MUX socket, and a host is not only mux sockets. The per-room
+ * route has no bound of any kind: `DocHub._send` never reads `bufferedAmount`,
+ * and there is no heartbeat and no idle reaper. Measured on this same binary,
+ * one per-room socket holding ONE 5 MiB room, re-requesting full state with an
+ * empty state vector 300 times: 1,490 MiB buffered, growing linearly, socket
+ * still open. That is 11.6x this bound out of a single room. So size a host
+ * from `mux sockets x 128 MiB + per-room sockets x unbounded` until the same
+ * check reaches `DocHub._send` — this route is the only bounded door in the
+ * building, not the one that opened a hole.
  *
  * ⚠ Why before and not after, which is a correction. The first version read
  * `bufferedAmount` AFTER the write, so the socket was terminated on the first
@@ -121,7 +130,12 @@ export const MUX_HARD_BUFFERED_BYTES = 128 * 1024 * 1024;
  * The SUSTAINED ceiling, which is a courtesy and not a bound. A buffer that
  * stays above this for `MUX_BACKPRESSURE_GRACE_MS` without once falling back
  * under is a peer that has stopped reading rather than one that is merely slow,
- * so the socket goes and the memory comes back before it reaches the hard bound.
+ * so the socket goes and the memory is reclaimed ON THE NEXT SEND TOWARD THAT
+ * PEER — and never if the workspace goes quiet, because the check lives inside
+ * `sendFrame` and there is no heartbeat to run it. Measured: a socket parked at
+ * 49 MiB for 75 s against a 60 s grace was still open, still holding, with
+ * `overflowed` false. The hard bound above is what caps it regardless, which is
+ * why this over-claim was a wrong sentence rather than a leak.
  *
  * ⚠ Read this tier for exactly what it is. It resets on a single dip under the
  * ceiling, so a peer that reads one byte per grace window never trips it — which
