@@ -224,6 +224,7 @@ export async function startMuxHub({
   serverKey = 'sk_harness',
   maxRooms,
   maxBufferedBytes,
+  backpressureGraceMs,
   persistDebounceMs = 50,
   dir = null,
 } = {}) {
@@ -247,7 +248,7 @@ export async function startMuxHub({
     wss.handleUpgrade(req, socket, head, (ws) => {
       if (result.docId === MUX_DOC_ID) {
         muxes.push(attachMux(ws, {
-          hub, workspaceId: result.workspaceId, maxRooms, maxBufferedBytes,
+          hub, workspaceId: result.workspaceId, maxRooms, maxBufferedBytes, backpressureGraceMs,
         }));
         return;
       }

@@ -41,21 +41,32 @@ export const MUX_DOC_ID = '_mux';
 export const MUX_MAX_ROOMS_PER_SOCKET = 8_192;
 
 /**
- * Backpressure, in bytes of `ws.bufferedAmount`, past which the socket is
- * terminated rather than buffered further.
+ * Backpressure: the socket is terminated when `ws.bufferedAmount` has stayed
+ * above this for `MUX_BACKPRESSURE_GRACE_MS` without once falling back under.
  *
  * The failure this exists for is a client that subscribes to everything and
- * never reads: the per-room route bounded that implicitly, because one socket
- * held one room's traffic, and the mux removes that bound. Measured on this
- * machine, a legitimate 2,000-room cold storm — the worst legitimate case in the
- * spec, 2.21 MB total on the wire — peaks well under a megabyte of buffer while
- * the client is draining, so 32 MiB is roughly thirty times the legitimate peak
- * and is a limit only a client that has stopped reading can reach.
+ * never reads. The per-room route bounded that implicitly — one socket held one
+ * room's traffic — and the mux removes that bound; worse, a client can ask for a
+ * room's full state again and again with an empty state vector, so the bytes the
+ * server queues toward it are not bounded by the workspace's size either.
+ *
+ * ⚠ Why it is a DURATION and not just a size, which is the correction a
+ * measurement forced. `mux.test.js` reports `stats.peakBufferedBytes` for a
+ * legitimate 2,000-room cold storm: it is ~2.0 MB on loopback, not the "well
+ * under a megabyte" this comment first claimed, and a vault with the spec's
+ * measured 6.04 KB of history per note projects to ~12 MB. A pure size ceiling
+ * would therefore have to sit above every legitimate burst on every link, which
+ * is a number nobody can defend. Requiring the buffer to stay high instead
+ * separates the two cases honestly: a peer that is draining falls back under
+ * within its burst, and a peer that has stopped reading never does.
  *
  * Terminate, not close: a graceful close waits for a handshake the peer is by
  * definition not reading, so it would keep the memory it was meant to release.
  */
 export const MUX_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
+
+/** How long the buffer must stay over the ceiling before the socket goes. */
+export const MUX_BACKPRESSURE_GRACE_MS = 60_000;
 
 // `ws` readyState. CONNECTING 0, OPEN 1, CLOSING 2, CLOSED 3 — the same numbers
 // `DocHub._send` branches on, which is what a virtual connection must imitate.
@@ -162,6 +173,11 @@ export function attachMux(ws, {
   workspaceId,
   maxRooms = MUX_MAX_ROOMS_PER_SOCKET,
   maxBufferedBytes = MUX_MAX_BUFFERED_BYTES,
+  backpressureGraceMs = MUX_BACKPRESSURE_GRACE_MS,
+  // Injectable so a test can express "over the ceiling, then drained in time"
+  // and "over the ceiling and stayed there" as two different things rather than
+  // as one flaky one.
+  now = Date.now,
 } = {}) {
   /** room → VirtualConn, created lazily on the first frame that names it. */
   const rooms = new Map();
@@ -179,6 +195,14 @@ export function attachMux(ws, {
       afterClose: 0,     // the socket is gone; nothing may resurrect a room
       roomFailed: 0,     // hub.handleConnection threw for this room
     },
+    /**
+     * The highest `ws.bufferedAmount` this socket ever reached. This is the
+     * measurement `MUX_MAX_BUFFERED_BYTES` is set from: without it the ceiling
+     * is a number somebody liked the look of.
+     */
+    peakBufferedBytes: 0,
+    /** When the buffer first went over the ceiling and stayed there, or null. */
+    overCeilingSince: null,
     /** True once backpressure terminated the socket. */
     overflowed: false,
     /** Last contained error, for diagnostics. Never thrown at a caller. */
@@ -209,20 +233,29 @@ export function attachMux(ws, {
     // A peer that has stopped reading turns every broadcast into resident
     // memory. `bufferedAmount` is the only honest measure of that, and it is a
     // property read, not a syscall.
-    if (
-      !stats.overflowed
-      && maxBufferedBytes > 0
-      && (ws.bufferedAmount ?? 0) > maxBufferedBytes
-    ) {
-      stats.overflowed = true;
-      // Asynchronous by construction in `ws` (the close event follows the
-      // socket's), so this cannot re-enter a DocHub broadcast loop mid-iteration.
-      try {
-        if (typeof ws.terminate === 'function') ws.terminate();
-        else ws.close();
-      } catch (err) {
-        record(err);
-      }
+    //
+    // Checked HERE rather than on a timer, because the buffer only grows when we
+    // write: a peer that has stopped reading while the server has also stopped
+    // sending is not growing and is not the failure this guards.
+    const buffered = ws.bufferedAmount ?? 0;
+    if (buffered > stats.peakBufferedBytes) stats.peakBufferedBytes = buffered;
+    if (maxBufferedBytes <= 0 || stats.overflowed) return;
+    if (buffered <= maxBufferedBytes) {
+      stats.overCeilingSince = null;              // it drained: not our problem
+      return;
+    }
+    const at = now();
+    if (stats.overCeilingSince === null) { stats.overCeilingSince = at; return; }
+    if (at - stats.overCeilingSince < backpressureGraceMs) return;
+
+    stats.overflowed = true;
+    // Asynchronous by construction in `ws` (the close event follows the
+    // socket's), so this cannot re-enter a DocHub broadcast loop mid-iteration.
+    try {
+      if (typeof ws.terminate === 'function') ws.terminate();
+      else ws.close();
+    } catch (err) {
+      record(err);
     }
   };
 
