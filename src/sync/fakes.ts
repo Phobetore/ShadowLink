@@ -33,6 +33,9 @@
 // untestable is not one.
 
 import * as Y from 'yjs';
+import * as syncProtocol from 'y-protocols/sync';
+import * as encoding from 'lib0/encoding';
+import * as decoding from 'lib0/decoding';
 import { EditorState } from '@codemirror/state';
 import type { Extension, Transaction, TransactionSpec } from '@codemirror/state';
 import type { EditorView } from '@codemirror/view';
@@ -54,6 +57,7 @@ import {
   type BlobPresence,
 } from './BlobPort.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
+import { decodeMuxFrame, encodeMuxFrame } from './MuxLink.ts';
 import type { Kind, VaultPort } from './VaultPort.ts';
 import { CodeMirrorBinding } from './WorkspaceSession.ts';
 import type {
@@ -1251,6 +1255,352 @@ export class FakeBlobs implements BlobPort {
     if (error !== undefined) throw error;
   }
 }
+
+// ============================================================ FakeMux
+
+/**
+ * A mux server and its transport, in memory (P3 spec §7).
+ *
+ * ⚠ WHY THIS ONE HAS TO BE ABLE TO PARTITION PER ROOM. Five fakes in this repo
+ * have already hidden a defect by not being able to SAY the failure — the editor
+ * fake that modelled every mount as total success is the expensive one, and the
+ * server's own `FakeSocket` grew `holdsWrites` for the same reason last round.
+ * The failures the later P3 slices live in are per-ROOM, not per-client: one
+ * room's frames stop while every other room on the same socket keeps flowing,
+ * and the question is whether that room alone goes `unsynced` (I24) or whether
+ * something downstream treats a live link as proof about it. A fake with only a
+ * whole-client `goOffline` cannot express that sentence, and a suite written
+ * against it would pass with the bug in.
+ *
+ * So `cut(room)` drops that room's frames in BOTH directions while the socket
+ * stays up and every other room keeps working, and `hold(room)` parks them so
+ * they can be released later, out of order with respect to the rooms that kept
+ * flowing.
+ *
+ * The server half is a faithful-enough `DocHub`: one `Y.Doc` per room, a
+ * SyncStep1 written the first time a socket names a room, `readSyncMessage` for
+ * the sync tag, and awareness relayed to the room's other sockets. That fidelity
+ * is what lets the SAME `MuxRoom` be driven here and against the real server in
+ * the structural suite, which is the only way to know the two agree.
+ */
+export type FakeMuxOpenMode = 'sync' | 'deferred';
+
+export interface FakeMuxOptions {
+  /**
+   * `'sync'` opens the socket inside the factory call, which keeps a test free of
+   * awaits. `'deferred'` fires `onopen` on a microtask, which is the only way to
+   * exercise the handler a real transport uses.
+   */
+  openMode?: FakeMuxOpenMode;
+  /**
+   * Behave like a server from before P3: accept the socket, answer with a RAW
+   * y-websocket SyncStep1 that is not a mux frame, and ignore every frame sent.
+   *
+   * Those are the measured bytes — `[0x00, 0x00, 0x01, 0x00]` — from a server
+   * checked out at the last commit before the mux work. It is what makes the
+   * legacy detector testable without a second process.
+   */
+  legacy?: boolean;
+}
+
+export class FakeMux {
+  /** The SERVER's document for each room. */
+  readonly docs = new Map<string, Y.Doc>();
+  /** Every socket this mux ever handed out, open or not. */
+  readonly sockets: FakeMuxSocket[] = [];
+
+  legacy: boolean;
+  /** When set, the next `openSocket` throws — a link that cannot even dial. */
+  refuseConnect = false;
+
+  private readonly openMode: FakeMuxOpenMode;
+  private readonly cutRooms = new Set<string>();
+  private readonly heldRooms = new Set<string>();
+  /** Frames parked by `hold`, as `[socket, room, payload, direction]`. */
+  private readonly parked: Array<{
+    socket: FakeMuxSocket; room: string; payload: Uint8Array; inbound: boolean;
+  }> = [];
+
+  /** Rooms whose outbound frames are written twice. Duplicate delivery, on demand. */
+  private readonly duplicated = new Set<string>();
+
+  readonly stats = { framesIn: 0, framesOut: 0, droppedIn: 0, droppedOut: 0 };
+
+  constructor(options: FakeMuxOptions = {}) {
+    this.legacy = options.legacy ?? false;
+    // ⚠ A legacy server's whole tell is a message it writes UNPROMPTED on
+    // connect, and a socket that is already open when the link's factory returns
+    // has nowhere to put it: the link has not assigned `onmessage` yet. So the
+    // old-server fake opens on a later turn, which is what a real socket does
+    // anyway. A test that wants the greeting has to await one microtask, and
+    // that await is the honest part.
+    this.openMode = options.openMode ?? (this.legacy ? 'deferred' : 'sync');
+  }
+
+  /** Hand this to `MuxLink`'s `openSocket`. */
+  get openSocket(): (url: string) => FakeMuxSocket {
+    return (url: string): FakeMuxSocket => {
+      if (this.refuseConnect) throw new Error('FakeMux: refusing to connect');
+      const socket = new FakeMuxSocket(this, url, this.openMode);
+      this.sockets.push(socket);
+      return socket;
+    };
+  }
+
+  get liveSockets(): FakeMuxSocket[] {
+    return this.sockets.filter((s) => s.readyState === 1);
+  }
+
+  // ---------------------------------------------------------- the server's rooms
+
+  doc(room: string): Y.Doc {
+    let doc = this.docs.get(room);
+    if (doc === undefined) {
+      doc = new Y.Doc();
+      this.docs.set(room, doc);
+    }
+    return doc;
+  }
+
+  text(room: string): string {
+    return this.doc(room).getText('content').toString();
+  }
+
+  /** Put something in a room BEFORE anybody connects — a workspace with history. */
+  seed(room: string, text: string): void {
+    this.doc(room).getText('content').insert(0, text);
+  }
+
+  // ---------------------------------------------------------- partition
+
+  /** Cut ONE room's traffic, both directions, with the socket still up. */
+  cut(room: string): void { this.cutRooms.add(room); }
+
+  heal(room: string): void { this.cutRooms.delete(room); }
+
+  isCut(room: string): boolean { return this.cutRooms.has(room); }
+
+  /** Park one room's frames instead of dropping them. `release` delivers them. */
+  hold(room: string): void { this.heldRooms.add(room); }
+
+  /** Deliver everything parked for `room`, in arrival order, and stop parking. */
+  release(room: string): void {
+    this.heldRooms.delete(room);
+    const mine = this.parked.filter((f) => f.room === room);
+    for (const frame of mine) this.parked.splice(this.parked.indexOf(frame), 1);
+    for (const frame of mine) {
+      if (frame.inbound) frame.socket.deliverToServer(frame.room, frame.payload);
+      else frame.socket.deliverToClient(frame.room, frame.payload);
+    }
+  }
+
+  /** Every outbound frame for `room` is written twice from here on. */
+  duplicate(room: string): void { this.duplicated.add(room); }
+
+  isDuplicated(room: string): boolean { return this.duplicated.has(room); }
+
+  parkedCount(room?: string): number {
+    return room === undefined
+      ? this.parked.length
+      : this.parked.filter((f) => f.room === room).length;
+  }
+
+  /** Kill every live socket, the way a network does. The link's backoff answers. */
+  dropSockets(code = 1006): void {
+    for (const socket of this.liveSockets) socket.serverClose(code);
+  }
+
+  // ---------------------------------------------------------- internals
+
+  /** @internal — routed by `FakeMuxSocket`. */
+  gate(
+    socket: FakeMuxSocket, room: string, payload: Uint8Array, inbound: boolean,
+  ): 'pass' | 'drop' | 'park' {
+    if (this.cutRooms.has(room)) {
+      if (inbound) this.stats.droppedIn += 1;
+      else this.stats.droppedOut += 1;
+      return 'drop';
+    }
+    if (this.heldRooms.has(room)) {
+      this.parked.push({ socket, room, payload, inbound });
+      return 'park';
+    }
+    return 'pass';
+  }
+
+  /** @internal — the other sockets that have this room open. */
+  peersOf(room: string, except: FakeMuxSocket): FakeMuxSocket[] {
+    return this.liveSockets.filter((s) => s !== except && s.hasRoom(room));
+  }
+}
+
+const MESSAGE_SYNC = 0;
+const MESSAGE_AWARENESS = 1;
+
+/**
+ * One socket to `FakeMux`, satisfying `MuxLink`'s `MuxSocket` structurally.
+ *
+ * The server logic lives here rather than in `FakeMux` because a room is opened
+ * PER SOCKET — that is what `DocHub.handleConnection` does, and it is why the
+ * first frame for a room gets a SyncStep1 back before anything else.
+ */
+export class FakeMuxSocket {
+  readyState = 0;
+  bufferedAmount = 0;
+  binaryType = '';
+
+  onopen: ((event?: unknown) => void) | null = null;
+  onmessage: ((event: { data?: unknown }) => void) | null = null;
+  onclose: ((event?: unknown) => void) | null = null;
+  onerror: ((event?: unknown) => void) | null = null;
+
+  /** Every frame this socket wrote, as `[room, payload]`. The wire, recorded. */
+  readonly sent: Array<{ room: string; payload: Uint8Array }> = [];
+  /** Raw bytes written that were not decodable frames. Only legacy mode makes any. */
+  readonly sentRaw: Uint8Array[] = [];
+
+  /** When true, `bufferedAmount` grows by what is written and never drains. */
+  holdsWrites = false;
+
+  private readonly rooms = new Set<string>();
+  private readonly updateHandlers = new Map<string, (u: Uint8Array, o: unknown) => void>();
+
+  constructor(
+    private readonly mux: FakeMux,
+    readonly url: string,
+    openMode: FakeMuxOpenMode,
+  ) {
+    if (openMode === 'sync') this.openNow();
+    else queueMicrotask(() => { this.openNow(); });
+  }
+
+  hasRoom(room: string): boolean { return this.rooms.has(room); }
+
+  openRooms(): string[] { return [...this.rooms].sort(); }
+
+  // ---------------------------------------------------------- MuxSocket
+
+  send(data: Uint8Array): void {
+    if (this.readyState !== 1) throw new Error('FakeMuxSocket: send on a closed socket');
+    if (this.holdsWrites) this.bufferedAmount += data.byteLength;
+    const frame = decodeMuxFrame(data);
+    if (frame === null) { this.sentRaw.push(data.slice()); return; }
+    this.sent.push({ room: frame.room, payload: frame.payload });
+    this.mux.stats.framesIn += 1;
+    // A pre-P3 server reads this as a y-websocket message whose tag is the room
+    // name's length, finds no handler for it, and does nothing at all.
+    if (this.mux.legacy) return;
+    if (this.mux.gate(this, frame.room, frame.payload, true) !== 'pass') return;
+    this.deliverToServer(frame.room, frame.payload);
+  }
+
+  close(): void {
+    this.shut(1000);
+  }
+
+  // ---------------------------------------------------------- test controls
+
+  /** Drain whatever `holdsWrites` accumulated, the way a reading peer would. */
+  drain(): void { this.bufferedAmount = 0; }
+
+  /** The SERVER hangs up: `MuxLink` sees a close it did not ask for. */
+  serverClose(code = 1006): void { this.shut(code); }
+
+  /**
+   * The server writing one frame toward this client, THROUGH the gates.
+   *
+   * This is what a test should use to push a frame: `cut`, `hold` and `duplicate`
+   * all live on this path, so a test that reached past it into `deliverToClient`
+   * would be asserting about a partition that was never applied.
+   */
+  push(room: string, payload: Uint8Array): void { this.write(room, payload); }
+
+  // ---------------------------------------------------------- server side
+
+  /** @internal */
+  deliverToServer(room: string, payload: Uint8Array): void {
+    if (!this.rooms.has(room)) this.openRoom(room);
+    const doc = this.mux.doc(room);
+    try {
+      const dec = decoding.createDecoder(payload);
+      const tag = decoding.readVarUint(dec);
+      if (tag === MESSAGE_SYNC) {
+        const enc = encoding.createEncoder();
+        encoding.writeVarUint(enc, MESSAGE_SYNC);
+        syncProtocol.readSyncMessage(dec, enc, doc, this);
+        if (encoding.length(enc) > 1) this.write(room, encoding.toUint8Array(enc));
+      } else if (tag === MESSAGE_AWARENESS) {
+        // Relayed opaquely to the room's other sockets, which is all a relay owes
+        // awareness: this fake keeps no awareness state of its own.
+        for (const peer of this.mux.peersOf(room, this)) peer.write(room, payload);
+      }
+    } catch {
+      /* a malformed payload is dropped, exactly as DocHub drops one */
+    }
+  }
+
+  /** @internal — one frame from the server to this client. */
+  deliverToClient(room: string, payload: Uint8Array): void {
+    if (this.readyState !== 1) return;
+    this.mux.stats.framesOut += 1;
+    const frame = encodeMuxFrame(room, payload);
+    this.onmessage?.({ data: frame });
+    if (this.mux.isDuplicated(room)) this.onmessage?.({ data: frame });
+  }
+
+  private openRoom(room: string): void {
+    this.rooms.add(room);
+    const doc = this.mux.doc(room);
+    // DocHub writes its own SyncStep1 the moment a connection joins a room, and
+    // that is the frame the legacy detector's positive test looks for.
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, MESSAGE_SYNC);
+    syncProtocol.writeSyncStep1(enc, doc);
+    this.write(room, encoding.toUint8Array(enc));
+
+    const handler = (update: Uint8Array, origin: unknown): void => {
+      if (origin === this) return;                // this socket's own write; do not echo
+      const uenc = encoding.createEncoder();
+      encoding.writeVarUint(uenc, MESSAGE_SYNC);
+      syncProtocol.writeUpdate(uenc, update);
+      this.write(room, encoding.toUint8Array(uenc));
+    };
+    this.updateHandlers.set(room, handler);
+    doc.on('update', handler);
+  }
+
+  /** @internal — the server writing one payload toward this client, gated. */
+  private write(room: string, payload: Uint8Array): void {
+    if (this.readyState !== 1) return;
+    if (this.mux.gate(this, room, payload, false) !== 'pass') return;
+    this.deliverToClient(room, payload);
+  }
+
+  private openNow(): void {
+    if (this.readyState !== 0) return;
+    this.readyState = 1;
+    this.onopen?.({});
+    if (!this.mux.legacy) return;
+    // ⚠ The measured behaviour of a pre-P3 server: a raw y-websocket SyncStep1
+    // for the room it thinks this socket is, sent unprompted on connect. Read as
+    // a mux frame it is a zero-length room name, an empty payload, and two bytes
+    // left over — which is exactly what `decodeMuxFrame` refuses.
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, MESSAGE_SYNC);
+    syncProtocol.writeSyncStep1(enc, new Y.Doc());
+    this.onmessage?.({ data: encoding.toUint8Array(enc) });
+  }
+
+  private shut(code: number): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    for (const [room, handler] of this.updateHandlers) this.mux.doc(room).off('update', handler);
+    this.updateHandlers.clear();
+    this.rooms.clear();
+    this.onclose?.({ code });
+  }
+}
+
 // ============================================================ platform numbers
 
 // §7.4 and §7.2 reach the engine as four plain numbers, and every class that

@@ -300,6 +300,9 @@ const VAULT_SHAPED = new Set(['vault', 'vaults', 'adapter', 'dataadapter', 'v', 
 const IN_MEMORY: Record<string, string[]> = {
   'src/sync/Deletions.ts': ['ctx.disk'],
   'src/sync/DiskIndex.ts': ['this.byFold'],
+  // P3 slice 2, and none of these can name a file. `this.rooms` is the link's
+  // room -> handler Map; the two handler Sets are observers.
+  'src/sync/MuxLink.ts': ['this.rooms', 'this.statusHandlers', 'this.unsupportedHandlers'],
   'src/sync/ObsidianDocPort.ts': ['this.live', 'this.rooms'],
   'src/sync/ProviderAck.ts': ['this.listeners'],
   // `parkedStat` is an in-memory Map of what a parked entry's file looked like,
@@ -319,8 +322,11 @@ const IN_MEMORY: Record<string, string[]> = {
   // `bound.text` is the bound content `Y.Text` — a CRDT in memory. The delete is
   // the fake's editor -> `Y.Text` direction: a `cut` in a bound leaf, which
   // `YSyncPluginValue.update` performs on exactly the same object in production.
+  // `cutRooms` and `heldRooms` are `FakeMux`'s per-room partition sets — the one
+  // capability the P3 spec demands of this fake by name (§7).
   'src/sync/fakes.ts': [
     'this.open', 'this.entries', 'this.byFold', 'this.liveHandles', 'this.objects', 'bound.text',
+    'this.cutRooms', 'this.heldRooms',
   ],
   'src/tree/TreeDoc.ts': ['m', 'this.subscribers'],
   'src/tree/TreeIndex.ts': ['derivedPath'],

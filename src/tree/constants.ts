@@ -37,6 +37,41 @@ export const FOUNDER_QUIET_MS = 500;
 export const RECOVERED_DIR = 'ShadowLink Recovered';
 export const STAGING_DIR = 'ShadowLink Staging';
 
+// ---------------------------------------------------------------- the mux (P3 spec §8.1)
+
+/**
+ * The backoff ladder for the ONE socket a vault holds (P3 spec §2, §8.1).
+ *
+ * One ladder for the whole link rather than one per room is the entire point of
+ * the mux on the client side: at 2,000 live rooms, per-room reconnect loops are
+ * 2,000 independent timers racing each other onto the same TCP accept queue, and
+ * this machine already reproduces `ECONNREFUSED` at 300 simultaneous connects.
+ */
+export const MUX_RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 15_000, 60_000];
+
+/**
+ * How far either side of a backoff rung the next attempt may land, as a fraction.
+ *
+ * A fleet that went offline together comes back together, and an unjittered
+ * ladder turns that into a synchronized retry storm on every rung — the thundering
+ * herd the ladder exists to avoid. ±25% is enough to smear a share's worth of
+ * devices across the window without materially changing what the ladder promises.
+ */
+export const MUX_RECONNECT_JITTER = 0.25;
+
+/**
+ * How long a connected mux socket may stay silent before the client concludes the
+ * server does not speak the mux protocol at all (P3 spec §4 "Compatibility").
+ *
+ * ⚠ This is a BACKSTOP, not the mechanism. A pre-P3 server accepts the `/_mux`
+ * upgrade — `_mux` matches its `DOC_RE`, so `authorizeUpgrade` is satisfied and
+ * `DocHub` serves it as an ordinary room called `_mux` — and it then sends a raw
+ * y-websocket SyncStep1 immediately, which is not a well-formed mux frame for any
+ * room this client subscribed. That is the detection in practice, and it lands in
+ * one round trip. This timeout only covers a server that says nothing at all.
+ */
+export const MUX_DETECT_TIMEOUT_MS = 10_000;
+
 // ---------------------------------------------------------------- attachments (spec §7.4)
 
 /**
