@@ -26,8 +26,9 @@ import {
   MUX_HARD_BUFFERED_BYTES,
 } from '../mux.js';
 import { authorizeUpgrade, isValidDocId } from '../upgradeAuth.js';
+import { createFanoutGate, MUX_CLOSE_FANOUT_CONCURRENCY } from '../mux.js';
 import {
-  FakeSocket, FlakyHub, MuxClient, RoomClient, startMuxHub,
+  FakeSocket, FlakyHub, MuxClient, RoomClient, startMuxHub, instrumentWrites,
   syncPayload, awarenessPayload, updateFor, textOfUpdate,
   SYNC, EMPTY_SV, sleep, until,
 } from './harness/mux.mjs';
@@ -605,6 +606,186 @@ test('close fan-out fires every room, and DocHub flushes every one of them', asy
       assert.equal(server.hub.getText(`wf/${room}`), `body ${i}`);
     }
   } finally {
+    await server.stop();
+  }
+});
+
+test('the close fan-out never has more snapshot writes in flight than its budget', async () => {
+  // ⚠ The blocker this exists for. The fan-out issued one write per room with no
+  // limit, so peak concurrency equalled the room count exactly: at the shipped
+  // MUX_MAX_ROOMS_PER_SOCKET of 8,192 that was 8,192 open file descriptors, which
+  // hit EMFILE and left 8,189 of 8,192 snapshots on disk — content loss arriving
+  // as an error nothing read. 40 rooms against a budget of 4 is the same
+  // mechanism at a size `npm test` can afford; the shipped numbers are in the
+  // constant's comment.
+  const gate = createFanoutGate(4);
+  const server = await startMuxHub({ persistDebounceMs: 60_000, fanoutGate: gate });
+  const writes = instrumentWrites(server.hub);
+  const rooms = Array.from({ length: 40 }, (_, i) => roomName(i));
+  const client = new MuxClient(server.muxUrl('wb'));
+  try {
+    await client.connect();
+    await client.syncAll(rooms);
+    for (const [i, room] of rooms.entries()) client.pushUpdate(room, updateFor(`body ${i}`));
+    await sleep(200);
+    assert.equal(writes.issued, 0, 'the debounce wrote before the fan-out could');
+
+    const mux = server.lastMux();
+    client.abort();
+    await until(() => mux.roomCount === 0, 5000);
+    await mux.drained;
+
+    assert.equal(writes.issued, rooms.length, 'a room was not flushed when the socket dropped');
+    assert.equal(
+      writes.peak <= 4, true,
+      `the fan-out had ${writes.peak} snapshot writes in flight against a budget of 4`,
+    );
+    assert.equal(writes.failed, 0);
+    assert.equal(mux.stats.snapshotsFailed, 0);
+    assert.equal(
+      mux.stats.peakFanoutInFlight <= 4, true,
+      `the socket saw ${mux.stats.peakFanoutInFlight} slots held against a budget of 4`,
+    );
+
+    // Bounded is not the same as skipped: every room is on disk and correct.
+    const snapshotDir = join(server.dir, 'yjs', 'wb');
+    for (const [i, room] of rooms.entries()) {
+      assert.equal(existsSync(join(snapshotDir, `${room}.bin`)), true, `${room} was not written`);
+      assert.equal(server.hub.getText(`wb/${room}`), `body ${i}`);
+    }
+    assert.equal(MUX_CLOSE_FANOUT_CONCURRENCY, 64, 'the shipped budget moved');
+  } finally {
+    writes.restore();
+    await server.stop();
+  }
+});
+
+test('the fan-out budget is shared by the whole process, not held per socket', async () => {
+  // Twenty sockets dropping 500 rooms each is how the blocker was measured at its
+  // worst — 1,811 of 10,000 snapshots lost. A budget held PER SOCKET would not
+  // have helped there: twenty bounded fan-outs of 64 is still 1,280 descriptors,
+  // past a stock Linux `ulimit -n`. So the budget is one, and this is that claim.
+  const gate = createFanoutGate(4);
+  const server = await startMuxHub({ persistDebounceMs: 60_000, fanoutGate: gate });
+  const writes = instrumentWrites(server.hub);
+  const rooms = Array.from({ length: 20 }, (_, i) => roomName(i));
+  const clients = [];
+  try {
+    for (let s = 0; s < 4; s++) {
+      const client = new MuxClient(server.muxUrl(`ws${s}`));
+      await client.connect();
+      await client.syncAll(rooms);
+      for (const [i, room] of rooms.entries()) client.pushUpdate(room, updateFor(`s${s} body ${i}`));
+      clients.push(client);
+    }
+    await sleep(250);
+
+    const muxes = server.muxes.slice(-4);
+    for (const client of clients) client.abort();          // all four at once
+    await until(() => muxes.every((m) => m.roomCount === 0), 5000);
+    await Promise.all(muxes.map((m) => m.drained));
+
+    assert.equal(writes.issued, 80, 'not every room of every socket was flushed');
+    assert.equal(
+      writes.peak <= 4, true,
+      `four sockets together reached ${writes.peak} concurrent writes against ONE budget of 4`,
+    );
+    assert.equal(gate.peakInFlight <= 4, true);
+    assert.equal(gate.inFlight, 0, 'the fan-out leaked a slot it never released');
+    assert.equal(writes.failed, 0);
+
+    for (let s = 0; s < 4; s++) {
+      for (const [i, room] of rooms.entries()) {
+        assert.equal(
+          existsSync(join(server.dir, 'yjs', `ws${s}`, `${room}.bin`)), true,
+          `ws${s}/${room} was not written`,
+        );
+        assert.equal(server.hub.getText(`ws${s}/${room}`), `s${s} body ${i}`);
+      }
+    }
+  } finally {
+    writes.restore();
+    await server.stop();
+  }
+});
+
+test('two sockets that name no gate draw on the SAME shipped budget', async () => {
+  // The test above proves one gate bounds four sockets; this one proves the gate
+  // a socket gets by DEFAULT is that one gate and not a fresh budget each. Two
+  // sockets of 64 rooms dropped together would peak at 128 concurrent writes if
+  // every socket had its own budget of MUX_CLOSE_FANOUT_CONCURRENCY, and at 64 if
+  // the process shares one — which is the difference the file-descriptor limit
+  // actually sees.
+  const server = await startMuxHub({ persistDebounceMs: 60_000 });   // no fanoutGate
+  const writes = instrumentWrites(server.hub);
+  const rooms = Array.from({ length: MUX_CLOSE_FANOUT_CONCURRENCY }, (_, i) => roomName(i));
+  const clients = [];
+  try {
+    for (let s = 0; s < 2; s++) {
+      const client = new MuxClient(server.muxUrl(`wg${s}`));
+      await client.connect();
+      await client.syncAll(rooms);
+      for (const room of rooms) client.pushUpdate(room, updateFor(`g${s} ${room}`));
+      clients.push(client);
+    }
+    await sleep(300);
+
+    const muxes = server.muxes.slice(-2);
+    for (const client of clients) client.abort();
+    await until(() => muxes.every((m) => m.roomCount === 0), 5000);
+    await Promise.all(muxes.map((m) => m.drained));
+
+    assert.equal(writes.issued, 2 * MUX_CLOSE_FANOUT_CONCURRENCY, 'a room went unflushed');
+    assert.equal(
+      writes.peak <= MUX_CLOSE_FANOUT_CONCURRENCY, true,
+      `two sockets reached ${writes.peak} concurrent writes against a shipped budget of `
+      + `${MUX_CLOSE_FANOUT_CONCURRENCY} — the budget is per socket, not per process`,
+    );
+    assert.equal(writes.failed, 0);
+  } finally {
+    writes.restore();
+    await server.stop();
+  }
+});
+
+test('a snapshot the fan-out could not write is counted, not swallowed', async () => {
+  // The other half of the blocker: the writes that DID fail landed in
+  // `DocHub.lastPersistError`, and nothing in `server/` ever read that map, so
+  // the loss was silent. A room whose rename cannot be made to work is the
+  // failure shape EMFILE produced.
+  const server = await startMuxHub({ persistDebounceMs: 60_000 });
+  const rooms = ['n_ok1', 'n_doomed', 'n_ok2'];
+  const client = new MuxClient(server.muxUrl('wp'));
+  const realRename = server.hub._rename.bind(server.hub);
+  server.hub._rename = (from, to) => (
+    to.includes('n_doomed')
+      ? Promise.reject(Object.assign(new Error('too many open files'), { code: 'EMFILE' }))
+      : realRename(from, to)
+  );
+  try {
+    await client.connect();
+    await client.syncAll(rooms);
+    for (const room of rooms) client.pushUpdate(room, updateFor(`body of ${room}`));
+    await sleep(200);
+
+    const mux = server.lastMux();
+    client.abort();
+    await until(() => mux.roomCount === 0, 5000);
+    await mux.drained;
+
+    assert.equal(mux.stats.snapshotsFailed, 1, 'a lost snapshot was not counted');
+    assert.equal(mux.stats.lastSnapshotError?.code, 'EMFILE');
+    // The rooms either side of it are on disk, which is the containment claim.
+    for (const room of ['n_ok1', 'n_ok2']) {
+      assert.equal(existsSync(join(server.dir, 'yjs', 'wp', `${room}.bin`)), true);
+    }
+    assert.equal(existsSync(join(server.dir, 'yjs', 'wp', 'n_doomed.bin')), false);
+    assert.equal(
+      existsSync(join(server.dir, 'yjs', 'wp', 'n_doomed.bin.tmp')), false,
+      'a failed write left its temp file behind',
+    );
+  } finally {
+    server.hub._rename = realRename;
     await server.stop();
   }
 });

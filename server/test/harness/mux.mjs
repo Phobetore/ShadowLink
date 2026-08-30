@@ -226,6 +226,7 @@ export async function startMuxHub({
   hardBufferedBytes,
   maxBufferedBytes,
   backpressureGraceMs,
+  fanoutGate,
   persistDebounceMs = 50,
   dir = null,
 } = {}) {
@@ -255,6 +256,7 @@ export async function startMuxHub({
           hardBufferedBytes,
           maxBufferedBytes,
           backpressureGraceMs,
+          fanoutGate,
         }));
         return;
       }
@@ -281,16 +283,68 @@ export async function startMuxHub({
       return `ws://127.0.0.1:${port}/${room}?t=${key}&w=${workspace}`;
     },
     async stop() {
-      hub.cancelPending();
       for (const client of wss.clients) {
         try { client.terminate(); } catch { /* already gone */ }
       }
+      // ⚠ Every write this server still owes must land BEFORE the directory it
+      // writes into is removed. Without this the snapshot writes race `rmSync`,
+      // which on Windows fails against its own open handles and leaves the temp
+      // directory half-deleted — the leftover `sl-mux-*` directories a previous
+      // session reported after PASSING runs, not only failing ones. Reproduced:
+      // one directory per full run of this file, holding 176 of the four-phase
+      // test's 250 snapshots.
+      //
+      // `mux.shutdown()` rather than `mux.drained`: a client aborting is
+      // asynchronous, so at this point the close event may not have fired yet and
+      // `drained` would still be the promise from before the fan-out started.
+      // `shutdown` is idempotent and returns that same promise either way.
+      await Promise.all(muxes.map((mux) => mux.shutdown()));
+      hub.cancelPending();
+      // ...and the debounced writes that were already enqueued when the timers
+      // were cancelled, which no fan-out is waiting on.
+      await Promise.all([...hub._persistChain.values()]);
       wss.close();
       await new Promise((res) => { httpServer.close(res); });
       await sleep(20);
       try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
     },
   };
+}
+
+// ============================================================ write concurrency
+
+/**
+ * Count how many snapshot writes a real `DocHub` has in flight at once.
+ *
+ * The close fan-out's cost is one `_writeSnapshot` per room and its danger is how
+ * many of those overlap — one open file descriptor each, against a hard,
+ * process-wide limit. Nothing the hub exposes says that, and `DocHub.js` may not
+ * be modified to make it say it, so the method is wrapped here. This is the
+ * instrument the blocker was measured with: at the shipped room cap the
+ * unbounded fan-out peaked at 8,192 concurrent writes, hit EMFILE, and left
+ * 8,189 of 8,192 snapshots on disk.
+ *
+ * Returns the counters plus `restore()`, so a test leaves the hub as it found it.
+ */
+export function instrumentWrites(hub) {
+  const original = hub._writeSnapshot.bind(hub);
+  const counters = { inFlight: 0, peak: 0, issued: 0, completed: 0, failed: 0 };
+  hub._writeSnapshot = async (docName, doc) => {
+    counters.issued += 1;
+    counters.inFlight += 1;
+    if (counters.inFlight > counters.peak) counters.peak = counters.inFlight;
+    try {
+      return await original(docName, doc);
+    } catch (err) {
+      counters.failed += 1;
+      throw err;
+    } finally {
+      counters.inFlight -= 1;
+      counters.completed += 1;
+    }
+  };
+  counters.restore = () => { hub._writeSnapshot = original; };
+  return counters;
 }
 
 // ============================================================ MuxClient

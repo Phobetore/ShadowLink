@@ -92,10 +92,80 @@ export const MUX_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 /** How long the buffer must stay over the sustained ceiling before the socket goes. */
 export const MUX_BACKPRESSURE_GRACE_MS = 60_000;
 
+/**
+ * Snapshot writes the close fan-out may have in flight AT ONCE, across the whole
+ * process.
+ *
+ * Dropping a mux socket closes every room on it, and `DocHub`'s existing
+ * flush-on-last-peer-left turns each of those into a snapshot write. Issued all
+ * at once that is one open file descriptor per room, and file descriptors are a
+ * hard, PROCESS-wide limit: measured at the shipped room cap, a single socket
+ * dropping 8,192 rooms put 8,192 writes in flight, hit EMFILE, and left 8,189 of
+ * 8,192 snapshots on disk — the tail of three rooms lost, reported only into a
+ * `DocHub.lastPersistError` map nothing in `server/` ever read. Twenty sockets
+ * dropping 500 rooms each lost 1,811 of 10,000.
+ *
+ * So the budget is shared by every socket in the process rather than held per
+ * socket: twenty bounded fan-outs of 64 would still be 1,280 descriptors, past
+ * the 1,024 a stock Linux `ulimit -n` allows.
+ *
+ * 64 is far under every such limit and costs nothing in wall clock — the work is
+ * serialized by `DocHub._persistChain` per room and by libuv's thread pool
+ * across rooms long before 64 is reached. Measured at the cap, the bounded
+ * fan-out is FASTER than the unbounded one it replaces: 4.35 s against 5.06 s
+ * for 8,192 rooms, and 3.43 s against 5.29 s for 10,000 over twenty sockets.
+ */
+export const MUX_CLOSE_FANOUT_CONCURRENCY = 64;
+
 // `ws` readyState. CONNECTING 0, OPEN 1, CLOSING 2, CLOSED 3 — the same numbers
 // `DocHub._send` branches on, which is what a virtual connection must imitate.
 const OPEN = 1;
 const CLOSED = 3;
+
+/**
+ * The counting semaphore the close fan-out draws its write budget from.
+ *
+ * `acquire()` returns `null` when a slot was free and took it SYNCHRONOUSLY, and
+ * a promise otherwise. That distinction is the point: while the budget is not
+ * exhausted a fan-out runs to completion in one turn, exactly as it did before it
+ * was bounded, so dropping a socket carrying a handful of rooms is still a
+ * synchronous event and every test that asserts on it directly still can. Only a
+ * fan-out large enough to matter is staged.
+ *
+ * Exported as a factory so a test can hold one gate with a small limit and pin
+ * the mechanism deterministically, and so two sockets can be handed the SAME gate
+ * to show the budget really is shared rather than one budget each.
+ */
+export function createFanoutGate(limit = MUX_CLOSE_FANOUT_CONCURRENCY) {
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const waiting = [];
+  return {
+    get limit() { return limit; },
+    get inFlight() { return inFlight; },
+    /** The most slots ever held at once. Diagnostic, and what a test asserts on. */
+    get peakInFlight() { return peakInFlight; },
+    acquire() {
+      if (inFlight < limit) {
+        inFlight += 1;
+        if (inFlight > peakInFlight) peakInFlight = inFlight;
+        return null;
+      }
+      return new Promise((resolve) => { waiting.push(resolve); });
+    },
+    release() {
+      // Hand a freed slot straight to the next waiter rather than releasing it
+      // and letting the waiter re-take it: the count must never dip, or a burst
+      // of releases would let more than `limit` writers through together.
+      const next = waiting.shift();
+      if (next !== undefined) { next(); return; }
+      inFlight -= 1;
+    },
+  };
+}
+
+/** The process-wide budget. Every socket that does not name its own uses this one. */
+const SHARED_FANOUT_GATE = createFanoutGate();
 
 /**
  * Whatever `ws` handed us, as a plain `Uint8Array` starting at offset zero.
@@ -199,6 +269,10 @@ export function attachMux(ws, {
   hardBufferedBytes = MUX_HARD_BUFFERED_BYTES,
   maxBufferedBytes = MUX_MAX_BUFFERED_BYTES,
   backpressureGraceMs = MUX_BACKPRESSURE_GRACE_MS,
+  // The process-wide snapshot-write budget the close fan-out draws on. Injectable
+  // so a test can pin the bound at a small number, and so two sockets can be
+  // handed the same gate to show the budget is not per socket.
+  fanoutGate = SHARED_FANOUT_GATE,
   // Injectable so a test can express "over the ceiling, then drained in time"
   // and "over the ceiling and stayed there" as two different things rather than
   // as one flaky one.
@@ -232,6 +306,20 @@ export function attachMux(ws, {
     overflowed: false,
     /** Which rule fired: 'hard' (the bound) or 'sustained' (the grace). */
     overflowReason: null,
+    /**
+     * Rooms whose close-fan-out snapshot never reached the disk. This is the
+     * count `DocHub.lastPersistError` was collecting and nothing was reading —
+     * a room here is a room whose tail was lost.
+     */
+    snapshotsFailed: 0,
+    /** The write error behind the last one of those. */
+    lastSnapshotError: null,
+    /**
+     * The most of the SHARED write budget ever occupied while this socket's
+     * fan-out was running — its own rooms and every other socket's together,
+     * because that is the number the file-descriptor limit answers to.
+     */
+    peakFanoutInFlight: 0,
     /** Last contained error, for diagnostics. Never thrown at a caller. */
     lastError: null,
   };
@@ -361,22 +449,96 @@ export function attachMux(ws, {
   };
 
   /**
-   * Close fan-out. Every room fires its own close, so `DocHub`'s existing
-   * flush-on-last-peer-left runs per room, untouched. One socket per vault means
-   * that fires for the whole share at once — measured, `flushAll` of 2,000
-   * snapshots is 742 ms, serialized per docName by DocHub's own `_persistChain`.
+   * When the snapshot write that closing `room` triggered has landed.
+   *
+   * `DocHub._closeConn` fires it as `void this.flush(docName)` — no handle comes
+   * back — so the only signal that the write finished is the per-docName promise
+   * chain the hub keeps. Reading that field is the price of the rule that
+   * `DocHub.js` may not be modified: the alternative is calling `hub.flush()` a
+   * second time, which writes the same bytes twice. The chain never rejects
+   * (`_enqueueWrite` attaches its own catch), and a hub that keeps no chain — a
+   * test double — simply does not pace us.
    */
-  const shutdown = () => {
-    if (closed) return;
-    closed = true;
-    for (const vconn of [...rooms.values()]) {
-      try {
-        vconn.shutdown();
-      } catch (err) {
-        record(err);
+  const roomWriteSettled = (room) => {
+    const chain = hub._persistChain;
+    if (!(chain instanceof Map)) return Promise.resolve();
+    return chain.get(`${workspaceId}/${room}`) ?? Promise.resolve();
+  };
+
+  /** The hub's own last write error for a room, if it keeps one. */
+  const writeErrorFor = (room) => {
+    const errors = hub.lastPersistError;
+    return errors instanceof Map ? errors.get(`${workspaceId}/${room}`) : undefined;
+  };
+
+  /**
+   * Close fan-out. Every room fires its own close, so `DocHub`'s existing
+   * flush-on-last-peer-left runs per room, untouched.
+   *
+   * ⚠ Why this is staged rather than a plain loop, which a measurement forced.
+   * One socket per vault means the flush fires for the whole share at once, and a
+   * plain loop put one snapshot write in flight PER ROOM: at the shipped room cap
+   * that is 8,192 open file descriptors, which hit EMFILE and left 8,189 of 8,192
+   * snapshots on disk — the tail of those rooms lost, and reported only into a map
+   * nothing read. Twenty sockets dropping 500 rooms each lost 1,811 of 10,000.
+   *
+   * So the rooms are closed against a budget, and the budget is shared by every
+   * socket in the process because file descriptors are. While it is not exhausted
+   * `acquire()` returns synchronously and this runs to completion in one turn, so
+   * a socket carrying a handful of rooms drops exactly as it did before.
+   *
+   * `rooms` is not cleared at the end: every `VirtualConn` removes itself through
+   * `_onGone` before its close handlers run, so clearing the map afterwards only
+   * hid a break in that path from the tests that assert `roomCount === 0` here.
+   */
+  const drain = async () => {
+    const pending = [...rooms.values()];
+    const settling = [];
+    for (const vconn of pending) {
+      const slot = fanoutGate.acquire();
+      if (slot !== null) await slot;
+      if (fanoutGate.inFlight > stats.peakFanoutInFlight) {
+        stats.peakFanoutInFlight = fanoutGate.inFlight;
       }
+      const errorBefore = writeErrorFor(vconn.room);
+      // `shutdown` contains its own errors — every close handler is individually
+      // caught and `_onGone` is a map delete — so one room cannot abort the rest,
+      // and there is no catch here pretending to guard something that cannot fire.
+      vconn.shutdown();
+      settling.push(roomWriteSettled(vconn.room).then(() => {
+        const errorAfter = writeErrorFor(vconn.room);
+        if (errorAfter !== undefined && errorAfter !== errorBefore) {
+          stats.snapshotsFailed += 1;
+          stats.lastSnapshotError = errorAfter;
+        }
+        fanoutGate.release();
+      }));
     }
-    rooms.clear();
+    await Promise.all(settling);
+    if (stats.snapshotsFailed > 0) {
+      // Content loss, said out loud. Before this line the hub recorded it into
+      // `lastPersistError` and nothing in `server/` ever read that map.
+      console.error(
+        `[mux] ${stats.snapshotsFailed} of ${pending.length} snapshots failed to write`
+        + ` when a socket for workspace ${workspaceId} closed`,
+        stats.lastSnapshotError,
+      );
+    }
+  };
+
+  /**
+   * Every room on this socket is closed and its snapshot has been written, or has
+   * failed and been counted. Replaced by the one fan-out this socket ever runs.
+   */
+  let drained = Promise.resolve();
+
+  const shutdown = () => {
+    if (closed) return drained;
+    closed = true;
+    // A throw would otherwise surface as an unhandled rejection: `drain` awaits,
+    // so its caller is the event loop rather than `ws.emit('close')`.
+    drained = drain().catch(record);
+    return drained;
   };
 
   ws.on('message', onMessage);
@@ -391,6 +553,8 @@ export function attachMux(ws, {
     roomNames() { return [...rooms.keys()].sort(); },
     /** Test/diagnostic: the docName a given room resolves to on this socket. */
     docNameFor(room) { return `${workspaceId}/${room}`; },
+    /** Resolves once the close fan-out has finished. Never rejects. */
+    get drained() { return drained; },
     shutdown,
   };
 }
