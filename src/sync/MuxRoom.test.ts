@@ -606,6 +606,15 @@ test('a room the server has stopped serving does not turn every retry into a rec
   // socket. Without both, a room the server will never answer would bounce the
   // vault's socket on every retry — which at 2,000 rooms is a worse failure than
   // the one being repaired.
+  //
+  // ⚠ AND THEN IT HEALS, which is the half this test used to stop one step short
+  // of. Declining the report must not SPEND it: `server/mux.js` drops a room's
+  // first frame in three named places and every one of them heals on its own — a
+  // slot frees, a disk clears — so a room whose handshake was lost has to be able
+  // to ask for the repair once it can be repaired. Measured before the fix: cut
+  // before the handshake, healed with the socket never moving, room synced,
+  // documents converged, a neighbour flushing true, and twelve consecutive
+  // flushes returning false with zero recycles.
   const mux = new FakeMux();
   const client = peer(mux);
   try {
@@ -617,6 +626,22 @@ test('a room the server has stopped serving does not turn every retry into a rec
     await client.room.flush(120);
     assert.equal(client.link.stats.recycles, afterFirst,
       'a room that was never synced kept recycling the whole link');
+
+    // The server starts serving the room again. Nothing else changes.
+    mux.heal('_tree');
+    client.doc.getText('content').insert(0, 'published after the drop healed');
+    const after: boolean[] = [];
+    for (let i = 0; i < 6; i++) {
+      client.reconnect();                       // the link's own ladder, if it recycled
+      after.push(await client.room.flush(1_000));
+    }
+    assert.ok(after.some((ok) => ok),
+      'a room that healed could never be confirmed again — the report was spent on a refusal');
+    assert.deepEqual(after.slice(-3), [true, true, true],
+      'the repair did not settle: the room is still not confirmable');
+    assert.equal(client.text(), mux.text('_tree'), 'the documents did not converge');
+    assert.equal(client.link.stats.recycles, afterFirst + 1,
+      'the repair cost more than one socket');
   } finally {
     client.destroy();
   }

@@ -162,7 +162,10 @@ export class MuxRoom {
         off: (_event, handler) => { ackStatus.delete(handler); },
       },
       doc,
-      () => { this.onAckStalled(); },
+      // ⚠ The RETURN is the point: `ProviderAck` spends its one stall report only
+      // on a report this room actually acted on. Dropping it here would put the
+      // permanent [false × N] stall straight back.
+      () => this.onAckStalled(),
     );
 
     this.unwatchStatus = link.onStatus((status) => {
@@ -423,10 +426,20 @@ export class MuxRoom {
    *
    * Gated on a room that WAS synced, so a room the server has stopped serving
    * cannot turn every retry into another reconnect.
+   *
+   * ⚠ AND IT SAYS SO, because the gate and the one-shot are two different things.
+   * `ProviderAck` allows one stall report per socket; declining here used to spend
+   * it anyway, so a room whose frames were lost BEFORE its first answer could
+   * never report again even after it healed. Measured: cut before the handshake,
+   * then healed with the socket never moving — the room synced, the documents
+   * converged, a neighbour on the same socket flushing true, and twelve
+   * consecutive flushes returning false with zero recycles. Returning the truth
+   * about whether a repair happened is the whole fix.
    */
-  private onAckStalled(): void {
-    if (this.destroyed || !this._synced || !this.link.connected) return;
+  private onAckStalled(): boolean {
+    if (this.destroyed || !this._synced || !this.link.connected) return false;
     this.link.recycle();
+    return true;
   }
 
   private write(payload: Uint8Array): void {

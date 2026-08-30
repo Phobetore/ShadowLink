@@ -139,12 +139,25 @@ export function isSyncStep2(data: unknown): boolean {
 export class ProviderAck {
   private readonly provider: AckProvider;
   private readonly doc: Y.Doc;
-  private readonly onStall: (() => void) | undefined;
+  private readonly onStall: (() => boolean | void) | undefined;
 
   private step2 = 0;
   private unanswered = 0;
   private epoch = 0;
-  /** One stall report per socket, so a caller in a retry loop cannot storm. */
+  /**
+   * One stall report per socket, so a caller in a retry loop cannot storm.
+   *
+   * ⚠ SET FROM WHAT THE OWNER DID, NOT FROM THE FACT OF ASKING. It used to be
+   * raised before `onStall()` was called, and the owner is allowed to decline —
+   * `MuxRoom` declines for a room that was never synced, which is what stops one
+   * unserved room turning every retry into a vault-wide reconnect. A declined
+   * report still burned the one-shot, so the room could never report again.
+   * Measured, driving the real link over a gate that drops one frame at a time:
+   * a room cut before its handshake, healed, converged, connected and synced,
+   * with a neighbour flushing true on the same socket, returned [false × 12] with
+   * zero recycles; un-burning the flag by hand and changing nothing else made the
+   * next flush report, recycle, and return true.
+   */
   private stallReported = false;
 
   private socket: AckSocket | null = null;
@@ -168,8 +181,13 @@ export class ProviderAck {
    * connection can no longer prove anything"; the owner's answer is a new socket.
    * Callers on a plain `WebsocketProvider` pass nothing: a real socket cannot
    * lose one message and stay up, so there is nothing there to repair.
+   *
+   * ⚠ IT RETURNS WHETHER IT ACTED. An owner that declines has not spent the one
+   * report, because a one-shot is consumed when the action happens, not when it
+   * is offered. Returning nothing reads as "acted", which is what an owner with
+   * no opinion means and what the older two-argument callers imply.
    */
-  constructor(provider: AckProvider, doc: Y.Doc, onStall?: () => void) {
+  constructor(provider: AckProvider, doc: Y.Doc, onStall?: () => boolean | void) {
     this.provider = provider;
     this.doc = doc;
     this.onStall = onStall;
@@ -303,16 +321,26 @@ export class ProviderAck {
    *
    * Reported once per socket. The owner's repair is a new socket; there is no
    * safe repair that keeps this one.
+   *
+   * ⚠ "ONCE PER SOCKET" COUNTS REPAIRS, NOT OFFERS. The gate exists so that a
+   * server dropping frames for many rooms cannot turn into a reconnect loop, and
+   * that argument is about reconnects that HAPPEN. An owner that declines has
+   * caused no reconnect and has spent nothing; a report it declined must still be
+   * available when the same room can be repaired. That is the difference between
+   * a repairable stall and the permanent one this whole mechanism exists to end.
    */
   private noteStallIfSilent(epoch: number, target: number): void {
     if (this.onStall === undefined || this.stallReported) return;
     if (this.epoch !== epoch || !this.provider.wsconnected) return;
     if (this.step2 >= target) return;
-    this.stallReported = true;
     try {
-      this.onStall();
+      // An owner that says nothing is an owner with no opinion, and the only
+      // shape a two-argument caller can have: treat it as having acted.
+      this.stallReported = this.onStall() !== false;
     } catch {
-      /* the owner's repair is not this module's to police */
+      // A repair that threw did not happen, so it did not consume the report
+      // either. The owner's repair is not this module's to police.
+      this.stallReported = false;
     }
   }
 

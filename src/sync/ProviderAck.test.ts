@@ -372,6 +372,79 @@ test('a flush that asked on a LIVE socket and got nothing reports a stall, once'
   }
 });
 
+test('a stall the owner DECLINED does not consume the one report', async () => {
+  // ⚠ MEASURED, and it is what left the [false × N] ratchet half-fixed. The gate
+  // is one report per socket, and its argument — a server dropping frames for
+  // many rooms must not become a reconnect loop — is about reconnects that
+  // HAPPEN. `MuxRoom` declines for a room that was never synced; the report was
+  // burned anyway, so a room whose frames were lost before its first answer could
+  // never ask for the repair again. Driving the real link over a frame gate: cut
+  // before the handshake, healed, converged, connected, synced, a neighbour on
+  // the same socket flushing true — and twelve flushes returning false with zero
+  // recycles.
+  const socket = new FakeSocket();
+  const provider = new FakeProvider(socket);
+  const doc = new Y.Doc();
+  let offers = 0;
+  let willAct = false;
+  const ack = new ProviderAck(provider, doc, () => { offers += 1; return willAct; });
+  try {
+    socket.deliver(step2Frame());
+    assert.equal(await ack.flush(60), false);
+    assert.equal(offers, 1, 'a silent live socket was never reported');
+
+    assert.equal(await ack.flush(60), false);
+    assert.equal(offers, 2, 'a declined report consumed the one the socket had');
+
+    // The owner can now act, on the SAME socket, and that is what spends it.
+    willAct = true;
+    assert.equal(await ack.flush(60), false);
+    assert.equal(offers, 3);
+    assert.equal(await ack.flush(60), false);
+    assert.equal(offers, 3, 'a report the owner ACTED on did not consume the one-shot');
+  } finally {
+    ack.destroy();
+    doc.destroy();
+  }
+});
+
+test('a stall report that THREW did not happen, so it did not spend the report', async () => {
+  const socket = new FakeSocket();
+  const provider = new FakeProvider(socket);
+  const doc = new Y.Doc();
+  let offers = 0;
+  const ack = new ProviderAck(provider, doc, () => {
+    offers += 1;
+    throw new Error('the owner could not repair it');
+  });
+  try {
+    socket.deliver(step2Frame());
+    assert.equal(await ack.flush(60), false);
+    assert.equal(await ack.flush(60), false);
+    assert.equal(offers, 2, 'a repair that threw was counted as a repair that happened');
+  } finally {
+    ack.destroy();
+    doc.destroy();
+  }
+});
+
+test('an owner that returns NOTHING is an owner that acted — the old two-arg shape', async () => {
+  const socket = new FakeSocket();
+  const provider = new FakeProvider(socket);
+  const doc = new Y.Doc();
+  let offers = 0;
+  const ack = new ProviderAck(provider, doc, () => { offers += 1; });
+  try {
+    socket.deliver(step2Frame());
+    assert.equal(await ack.flush(60), false);
+    assert.equal(await ack.flush(60), false);
+    assert.equal(offers, 1, 'an owner with no opinion was asked twice on one socket');
+  } finally {
+    ack.destroy();
+    doc.destroy();
+  }
+});
+
 test('a flush that failed because the CONNECTION went away is not a stall', async () => {
   // Nothing is wrong with the accounting when the socket is simply gone: the next
   // attach resets it. Reporting here would turn every ordinary disconnect into a
