@@ -33,9 +33,12 @@ import type { TreeTransport } from './TreeTransport.ts';
 
 const CONFIG = { serverUrl: 'ws://host:1234', serverKey: 'sk', workspaceId: 'ws-1' };
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
+
 /** Today's topology, without the socket. Only its lifecycle is under test. */
 class StubLegacy implements TreeTransport {
   synced = false;
+  connected = false;
   connects = 0;
   destroyed = false;
   private readonly handlers = new Set<() => void>();
@@ -66,6 +69,7 @@ class StubLegacy implements TreeTransport {
   /** The legacy socket completing its own handshake. */
   arrive(): void {
     this.synced = true;
+    this.connected = true;
     for (const settle of [...this.waiters]) settle(true);
     for (const handler of [...this.handlers]) handler();
   }
@@ -294,7 +298,7 @@ test('the bridge is ONE file, and the permanent transport names nothing legacy',
  * the transport that eventually wins are two different questions being asked of
  * the same constructor.
  */
-function unreachableHarness(): {
+function unreachableHarness({ connectTimeoutMs = 0 } = {}): {
   transport: TreeTransport;
   mux: FakeMux;
   link: MuxLink;
@@ -310,7 +314,7 @@ function unreachableHarness(): {
     ...CONFIG,
     openSocket: mux.openSocket,
     idleTimeoutMs: 0,
-    connectTimeoutMs: 0,
+    connectTimeoutMs,
     unreachableDials: 2,
     random: () => 0.5,
     setTimer: (fn) => { timers.push({ fn }); return timers.length - 1; },
@@ -363,6 +367,98 @@ test('a route that will not OPEN falls back once the per-room route is proved to
   h.dispose();
 });
 
+test('the adopted probe delivers the connected transition it was already past', () => {
+  // ⚠ MEASURED, and it is the only exit from read-only. `main.ts` registers
+  // `onConnected` -> `Bootstrap.onReconnect`, which is both the §4.6 reconnect
+  // pass and the one thing that clears `_readOnlyReason`. On the `unreachable`
+  // path the adopted probe is already connected — that IS the premise of the
+  // verdict — so a handler registered after the swap sees nothing at all.
+  // Against a real server behind a 404-ing proxy: verdict at 2,002 ms, `synced`
+  // true from then on, ZERO fires across 32 s of samples.
+  const h = unreachableHarness();
+  let fires = 0;
+  h.transport.onConnected(() => { fires += 1; });
+  h.mux.refuseConnect = true;
+  h.transport.connect();
+  h.fire();
+  assert.equal(fires, 0, 'something fired before there was anything to fire about');
+
+  h.made[0]?.arrive();
+  h.fire();
+  assert.equal(h.link.unsupportedReason, 'unreachable', 'the verdict never happened');
+  assert.equal(fires, 1, 'the swap left the session with no exit from read-only');
+  assert.equal(h.transport.connected, true);
+  h.dispose();
+});
+
+test('a route that already served this link is never demoted, and no probe is built', () => {
+  // ⚠ MEASURED, and it is the same rule from the other side. `unreachable` needs
+  // failed dials, and an outage, a slept radio or a proxy restart produce exactly
+  // those on a route that works. Before this: five seconds of `/_mux`-only
+  // trouble on an otherwise-working server demoted the session permanently, 3/3,
+  // and a flaky path demoted one that had already synced over the mux at
+  // 28,115 ms — where the parent branch rode out ten cuts on the same path.
+  const h = unreachableHarness();
+  h.transport.connect();
+  assert.equal(h.link.everServed, true, 'the mux route never worked in the first place');
+
+  h.mux.refuseConnect = true;
+  h.mux.dropSockets();
+  for (let i = 0; i < 8; i += 1) h.fire();
+
+  assert.ok(h.link.stats.dialsFailed >= 2, 'no dial actually failed');
+  assert.equal(h.made.length, 0, 'a probe was built against a route that had worked');
+  assert.equal(h.link.unsupportedReason, null, 'an outage demoted a working route');
+  assert.deepEqual(h.notices, []);
+  h.dispose();
+});
+
+test('the mux dial is widened to what the probe proved the path costs', async () => {
+  // ⚠ THE RIGGED COMPARISON, in unit form. A dial is bounded; the probe is a
+  // `WebsocketProvider` with no connect deadline at all, so on any path slower
+  // than the bound the mux can never open and the probe always eventually can —
+  // "the mux route is unreachable" is then a statement about the bound. Measured
+  // against the shipped server behind a proxy delaying every connection on every
+  // route by 4.5 s: `unreachable` at 14,952 ms with a sentence blaming a proxy
+  // that was forwarding every path. The parent branch connected at 5,041 ms.
+  //
+  // So the probe is timed on the route that works, and the mux is given at least
+  // that long before anything is concluded.
+  const h = unreachableHarness({ connectTimeoutMs: 30 });
+  h.mux.refuseConnect = true;
+  h.transport.connect();
+  h.fire();                                      // two failed dials: the probe starts
+  assert.equal(h.made.length, 1, 'the per-room route was never tried');
+
+  await sleep(120);                              // this path costs more than 30 ms
+  h.mux.refuseConnect = false;                   // and the mux route is fine, given time
+  h.made[0]?.arrive();
+
+  assert.ok(h.link.dialTimeoutMs >= 120,
+    'the dial kept a deadline the path was already known to beat');
+  assert.equal(h.link.connected, true, 'the fair re-dial never happened');
+  assert.equal(h.link.unsupportedReason, null, 'a slow path demoted a working route');
+  assert.deepEqual(h.notices, []);
+  h.dispose();
+});
+
+test('a probe that is synced but never connected settles nothing', () => {
+  // The cost of this path is what makes the comparison fair, and it is only known
+  // once the probe reports a connect. Without it there is nothing to be fair to.
+  const h = unreachableHarness();
+  h.mux.refuseConnect = true;
+  h.transport.connect();
+  h.fire();
+  assert.equal(h.made.length, 1);
+
+  const probe = h.made[0];
+  if (probe !== undefined) probe.synced = true;  // synced, with no connect reported
+  h.fire();
+  assert.equal(h.link.unsupportedReason, null,
+    'the route was condemned by a comparison with nothing on the other side');
+  h.dispose();
+});
+
 test('a server that is merely DOWN is not demoted — the per-room route fails too', () => {
   // ⚠ The other half, and the reason `MuxLink` reports rather than concludes. A
   // browser `WebSocket` reports a refused upgrade and a dead server as the same
@@ -391,28 +487,6 @@ test('a server that is merely DOWN is not demoted — the per-room route fails t
   assert.equal(h.link.unsupportedReason, null);
   assert.equal(h.made[0]?.destroyed, true, 'the probe was left running beside a working mux');
   assert.deepEqual(h.notices, [], 'an ordinary outage told the user their server is wrong');
-  h.dispose();
-});
-
-test('a route that already served this link is never demoted, and no probe is built', () => {
-  // ⚠ MEASURED, and it is the rule from the other side. `unreachable` needs failed
-  // dials, and an outage, a slept radio or a proxy restart produce exactly those
-  // on a route that works. Before this: five seconds of `/_mux`-only trouble on an
-  // otherwise-working server demoted the session permanently, 3/3, and a flaky
-  // path demoted one that had already synced over the mux at 28,115 ms — where the
-  // parent branch rode out ten cuts on the same path and stayed.
-  const h = unreachableHarness();
-  h.transport.connect();
-  assert.equal(h.link.everServed, true, 'the mux route never worked in the first place');
-
-  h.mux.refuseConnect = true;
-  h.mux.dropSockets();
-  for (let i = 0; i < 8; i += 1) h.fire();
-
-  assert.ok(h.link.stats.dialsFailed >= 2, 'no dial actually failed');
-  assert.equal(h.made.length, 0, 'a probe was built against a route that had worked');
-  assert.equal(h.link.unsupportedReason, null, 'an outage demoted a working route');
-  assert.deepEqual(h.notices, []);
   h.dispose();
 });
 

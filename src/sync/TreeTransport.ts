@@ -10,7 +10,15 @@
 //   connect()      Bootstrap's `connectTree`, which is idempotent by design
 //   whenSynced()   a GENUINE sync event, never a timeout (I3)
 //   onConnected()  the transition that runs `onReconnect` (I15)
+//   connected      whether that transition has already happened
 //   destroy()      teardown, which must never throw
+//
+// ⚠ `connected` IS THERE BECAUSE `onConnected` IS A TRANSITION. Something that
+// takes over an ALREADY-connected transport — which is what the bridge does when
+// it adopts its own probe — will never see the transition, and `onConnected` is
+// the only exit from read-only. Measured: verdict at 2,002 ms, `synced` true from
+// then on, and zero fires across 32 s. A transition is only usable by a late
+// arrival if the state behind it can be read.
 //
 // Everything else the provider exposed — `awareness`, `wsconnected`, `ws`,
 // `disconnect` — was never read for the tree, and naming it here would only make
@@ -29,6 +37,13 @@ export const TREE_ROOM = '_tree';
 export interface TreeTransport {
   /** True only after a genuine handshake completed on the current connection. */
   readonly synced: boolean;
+  /**
+   * True while the transport is in the state `onConnected` announces entering.
+   *
+   * Read by anything that registers a handler LATE and would otherwise wait for
+   * ever on a transition that already happened.
+   */
+  readonly connected: boolean;
   /**
    * Idempotent: `Bootstrap.connectTree` calls it on every attempt.
    *
@@ -68,6 +83,10 @@ export class MuxTreeTransport implements TreeTransport {
 
   get synced(): boolean {
     return this.room.synced;
+  }
+
+  get connected(): boolean {
+    return this.link.connected;
   }
 
   connect(options: { immediate?: boolean } = {}): void {

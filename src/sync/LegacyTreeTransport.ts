@@ -29,8 +29,13 @@
 // zero-length room name, a zero-length payload, and TWO BYTES LEFT OVER, for a
 // room this client never subscribed. `MuxLink.decodeMuxFrame` refuses a trailing
 // tail and `MuxLink` refuses an unknown room, and either one settles it inside
-// one round trip. The ten-second timeout in `MuxLink` is only for a peer that
-// says nothing at all.
+// one round trip.
+//
+// ⚠ AND THERE IS NO TIMEOUT BESIDE IT ANY MORE. A ten-second window used to
+// condemn a peer that had said nothing at all — a session-long verdict reached
+// from an ABSENCE, measured false and reachable on any reconnect. Silence is
+// never a verdict; a peer that accepts `/_mux` and does not answer is closed by
+// the liveness watchdog and dialled again, for as long as the link is wanted.
 //
 // ── AND WHY "THE SOCKET NEVER OPENED" IS NOT NOTHING ───────────────────────
 // Both of the above need a socket that OPENED. A `/_mux` upgrade that is REFUSED
@@ -47,9 +52,16 @@
 // a link that fell back on failed dials would demote a whole session every time a
 // server restarted. What tells them apart is the per-room route, and this file is
 // the only place that has one. So `MuxLink` reports evidence (`onUnreachable`)
-// and this bridge decides: it brings the legacy route up as a PROBE, gives the
-// mux an immediate, fair re-dial the moment the server is known to be reachable,
-// and only concludes when a dial fails again while the probe is synced.
+// and this bridge decides: it brings the legacy route up as a PROBE, MEASURES
+// WHAT THAT ROUTE ACTUALLY COST, hands the mux a dial deadline at least that
+// generous, re-dials it at once, and only concludes when a dial fails again
+// while the probe is synced. A comparison that decides a demotion measures both
+// sides the same way, or it does not get to decide: a 4 s-bounded dial racing a
+// probe with no deadline at all is not a comparison, and on a path with a 4.5 s
+// upgrade it demoted a working session at 14,952 ms with a false sentence.
+//
+// The link also stops reporting the evidence entirely once `/_mux` has served it
+// a frame. A route that has worked is never condemned by a later absence.
 // No `obsidian` import: the notice is a STRING this module owns, and `main.ts`
 // puts it in front of the user. That keeps the whole bridge headless and
 // therefore deletable in one piece.
@@ -123,6 +135,10 @@ export class LegacyTreeTransport implements TreeTransport {
 
   get synced(): boolean {
     return this.provider.synced;
+  }
+
+  get connected(): boolean {
+    return this.provider.wsconnected;
   }
 
   connect(): void {
@@ -210,6 +226,10 @@ class FallbackTreeTransport implements TreeTransport {
   private probe: TreeTransport | null = null;
   private releaseProbe: (() => void) | null = null;
 
+  /** When the probe was told to connect, and how long it took. Null until it did. */
+  private probeStartedAt = 0;
+  private probeConnectMs: number | null = null;
+
   private readonly releaseUnreachable: () => void;
   private readonly releaseMuxStatus: () => void;
 
@@ -240,6 +260,10 @@ class FallbackTreeTransport implements TreeTransport {
 
   get synced(): boolean {
     return this.active.synced;
+  }
+
+  get connected(): boolean {
+    return this.active.connected;
   }
 
   connect(options: { immediate?: boolean } = {}): void {
@@ -292,10 +316,22 @@ class FallbackTreeTransport implements TreeTransport {
    *
    * The FIRST one only starts the probe: a failed dial on its own says nothing,
    * because a server that is down fails dials exactly the same way. The verdict
-   * needs both halves at once — the per-room route synced, and `/_mux` still
-   * refusing to open — and the probe's own connect is what re-dials the mux
-   * immediately so the comparison is fair rather than a race the mux loses by
-   * being on a backoff rung.
+   * needs THREE things at once — the per-room route synced, `/_mux` still
+   * refusing to open, and the per-room route having said what a socket on this
+   * path costs, so that the dial which refused had been given at least that long.
+   *
+   * ⚠ THE THIRD ONE IS NOT A REFINEMENT, IT IS WHAT MAKES THE COMPARISON MEAN
+   * ANYTHING. A mux dial is bounded at `MUX_CONNECT_TIMEOUT_MS`; the probe is a
+   * `WebsocketProvider` with no connect deadline at all. On any path whose
+   * WebSocket upgrade takes longer than that bound, the mux can NEVER open and
+   * the probe always eventually can, so the verdict was deterministic on a slow
+   * path rather than the narrow race it was believed to be. Measured through a
+   * proxy delaying every connection on every route by 4.5 s, against the shipped
+   * server serving `/_mux` normally: `unreachable` at 14,952 ms, past the
+   * bootstrap deadline, with a sentence blaming a proxy that was forwarding every
+   * path — where the parent branch connected on the mux at 5,041 ms and stayed.
+   *
+   * If a comparison decides a demotion, both sides are measured the same way.
    */
   private onUnreachable(): void {
     if (this.legacy || this.destroyed) return;
@@ -304,16 +340,33 @@ class FallbackTreeTransport implements TreeTransport {
       return;
     }
     if (!this.probe.synced) return;
+    // ⚠ AND NOT UNTIL THE PATH HAS PRICED ITSELF. Until the probe has reported a
+    // connect, nothing here knows what a socket on this path costs, so a mux dial
+    // that failed under the shipped bound is evidence about the bound rather than
+    // about the route. `startProbe` widens the deadline the moment it does know,
+    // and the dial after that is the first one worth counting.
+    if (this.probeConnectMs === null) return;
     this.link.markUnsupported('unreachable');
   }
 
   private startProbe(): void {
     const probe = this.makeLegacy(this.config, this.doc);
     this.probe = probe;
+    this.probeStartedAt = Date.now();
+    this.probeConnectMs = null;
     this.releaseProbe = probe.onConnected(() => {
-      // The server is reachable. Give the mux route an immediate, fair attempt
-      // rather than letting it sit out a backoff rung and lose by default.
-      if (!this.destroyed && !this.legacy) this.link.connect({ immediate: true });
+      if (this.destroyed || this.legacy) return;
+      if (this.probeConnectMs === null) {
+        // What this path actually costs a socket, measured on the route that
+        // works. Doubling it is the margin between two connects on the same path:
+        // anything tighter and the comparison is decided by which of the two got
+        // the better draw rather than by whether `/_mux` is served.
+        this.probeConnectMs = Math.max(0, Date.now() - this.probeStartedAt);
+        this.link.allowDialTime(this.probeConnectMs * 2);
+      }
+      // The server is reachable. Give the mux route an immediate attempt rather
+      // than letting it sit out a backoff rung and lose by default.
+      this.link.connect({ immediate: true });
     });
     probe.connect();
   }
@@ -323,6 +376,7 @@ class FallbackTreeTransport implements TreeTransport {
     this.probe = null;
     this.releaseProbe?.();
     this.releaseProbe = null;
+    this.probeConnectMs = null;
     if (probe === null || probe === this.active) return;
     try {
       probe.destroy();
@@ -344,12 +398,25 @@ class FallbackTreeTransport implements TreeTransport {
     this.probe = null;
     this.releaseProbe?.();
     this.releaseProbe = null;
+    this.probeConnectMs = null;
     this.active.destroy();
     this.active = adopted ?? this.makeLegacy(this.config, this.doc);
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
     if (this.wantsConnect) this.active.connect();
     this.wakeSwapWaiters();
     this.onLegacy?.(reason);
+    // ⚠ THE TRANSITION THE ADOPTED PROBE ALREADY MADE, DELIVERED BY HAND.
+    // `onConnected` fires on a transition INTO connected, and on the `unreachable`
+    // path the adopted probe is by construction already connected — that is the
+    // premise of the verdict. So the handler registered two lines up would never
+    // see anything, and `Bootstrap.onReconnect` is BOTH the §4.6 reconnect pass
+    // and the only exit from read-only. Measured: verdict at 2,002 ms, `synced`
+    // true from then on, zero fires across 32 s; a client that had gone read-only
+    // before the swap stayed there against a server that was answering.
+    //
+    // Every path into read-only needs an exit, and the exit has to be reachable
+    // from the state the path actually produces.
+    if (this.active.connected) this.fireConnected();
   }
 
   private fireConnected(): void {
