@@ -890,3 +890,71 @@ test('markUnsupported is the one way in from outside, and it tears the link down
   link.connect();
   assert.equal(mux.sockets.length, 1, 'connect() re-dialled a route already known to be dead');
 });
+
+test('a close on a socket that never OPENED is a failed dial; one that opened is not', () => {
+  // ⚠ This is the exact shape a refused `/_mux` upgrade has, and the only one:
+  // the TCP connection is made, the HTTP upgrade is answered with a 404, and the
+  // socket closes without ever reaching OPEN. A counter that read every close as
+  // a failed dial would report an ordinary dropped connection as an unreachable
+  // route; one that read none of them would never see a refused upgrade at all,
+  // which is where this started.
+  const made: Array<MuxSocket & { fire: (event: 'open' | 'close') => void }> = [];
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    detectTimeoutMs: 0,
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 0,
+    unreachableDials: 2,
+    random: () => 0.5,
+    openSocket: () => {
+      const socket = { ...silentSocket(), readyState: 0 };
+      const handle = Object.assign(socket, {
+        fire: (event: 'open' | 'close'): void => {
+          if (event === 'open') { socket.readyState = 1; socket.onopen?.({}); }
+          else { socket.readyState = 3; socket.onclose?.({}); }
+        },
+      });
+      made.push(handle);
+      return handle;
+    },
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  let reports = 0;
+  link.onUnreachable(() => { reports += 1; });
+  const drain = (): void => {
+    const due = timers.splice(0).filter((t) => t !== undefined);
+    for (const timer of due) timer.fn();
+  };
+
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+
+  // A socket that OPENED and then dropped is an ordinary disconnection.
+  made[0]?.fire('open');
+  made[0]?.fire('close');
+  assert.equal(link.stats.dialsFailed, 0, 'a dropped connection was counted as a failed dial');
+  drain();
+
+  // Two that never opened at all: that is a route, not a connection.
+  made[1]?.fire('close');
+  assert.equal(link.stats.dialsFailed, 1);
+  assert.equal(reports, 0, 'one refused upgrade was treated as evidence on its own');
+  drain();
+  made[2]?.fire('close');
+  assert.equal(link.stats.dialsFailed, 2);
+  assert.equal(reports, 1, 'a route that will not open was never reported');
+
+  // And an open clears the count, so an outage cannot accumulate into a verdict.
+  drain();
+  made[3]?.fire('open');
+  drain();
+  made[3]?.fire('close');
+  assert.equal(link.stats.dialsFailed, 2, 'a dropped connection was counted after all');
+  drain();
+  made[4]?.fire('close');
+  assert.equal(reports, 1, 'the consecutive count survived a socket that opened');
+});
