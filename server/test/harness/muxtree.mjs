@@ -83,17 +83,23 @@ function realLink(server, workspace, opts = {}) {
  */
 function hostileProxy({ listen, target, mode }) {
   const held = [];
+  const live = [];
+  // Mutable so a case can start with the route WORKING and take it away later,
+  // which is a different question from "was it ever there" and needs the same
+  // proxy to answer both.
+  const state = { mode };
   const server = net.createServer((client) => {
     client.on('error', () => undefined);
     client.once('data', (first) => {
       const head = first.toString('latin1').split('\r\n')[0] ?? '';
-      if (head.includes(' /_mux')) {
-        if (mode === 'blackhole') { held.push(client); return; }
+      if (head.includes(' /_mux') && state.mode !== 'forward') {
+        if (state.mode === 'blackhole') { held.push(client); return; }
         client.write('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
         client.end();
         return;
       }
       const up = net.connect(target, '127.0.0.1', () => { up.write(first); });
+      live.push({ client, up });
       up.on('error', () => undefined);
       client.pipe(up);
       up.pipe(client);
@@ -107,8 +113,22 @@ function hostileProxy({ listen, target, mode }) {
   });
   return {
     start: () => new Promise((resolve) => server.listen(listen, '127.0.0.1', resolve)),
+    /** Change what `/_mux` gets from here on: 'forward', 'refuse' or 'blackhole'. */
+    setMode(next) { state.mode = next; },
+    /** One ordinary RST on every pair the proxy is carrying. */
+    cutAll() {
+      for (const { client, up } of live) {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      }
+      live.length = 0;
+    },
     async stop() {
       for (const client of held) { try { client.destroy(); } catch { /* gone */ } }
+      for (const { client, up } of live) {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      }
       await new Promise((resolve) => server.close(resolve));
     },
   };
@@ -158,6 +178,133 @@ function freezableProxy({ listen, target }) {
   };
 }
 
+/**
+ * A TCP proxy that is SLOW and nothing else: every connection on every route
+ * waits `delayMs` before a byte moves, then both directions are forwarded
+ * untouched for ever.
+ *
+ * ⚠ Nothing is refused and nothing is blocked, which is the whole point. This is
+ * a radio wake, a cold reverse proxy, a tunnel, a VPN re-key — the paths the
+ * self-hosters INSTALL.md sends to a proxy actually have. A client that demotes
+ * its transport here is reporting the shape of its own timeout.
+ */
+function slowProxy({ listen, target, delayMs }) {
+  const live = [];
+  const server = net.createServer((client) => {
+    client.on('error', () => undefined);
+    client.pause();
+    const timer = setTimeout(() => {
+      const up = net.connect(target, '127.0.0.1');
+      live.push({ client, up });
+      up.on('error', () => undefined);
+      client.pipe(up);
+      up.pipe(client);
+      client.resume();
+      const bye = () => {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      };
+      client.on('close', bye);
+      up.on('close', bye);
+    }, delayMs);
+    client.on('close', () => clearTimeout(timer));
+  });
+  return {
+    async start() {
+      await new Promise((resolve) => server.listen(listen, '127.0.0.1', resolve));
+      return `ws://127.0.0.1:${listen}`;
+    },
+    async stop() {
+      for (const { client, up } of live) {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      }
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+/**
+ * A TCP proxy that passes the HTTP 101 through untouched and then HOLDS the
+ * server's first WebSocket frame for `holdMs`, on the Nth connection only.
+ *
+ * ⚠ The upgrade SUCCEEDS. The socket is genuinely OPEN, the peer is the real
+ * current server, and it has simply not been heard from yet — which is the exact
+ * state a ten-second timer used to turn into "your server is older than this
+ * plugin", permanently, on a route that had already answered.
+ */
+function holdFirstFrameProxy({ listen, target, holdMs, onlyNth }) {
+  const live = [];
+  let seen = 0;
+  const server = net.createServer((client) => {
+    seen += 1;
+    const mine = seen;
+    const up = net.connect(target, '127.0.0.1');
+    live.push({ client, up });
+    client.on('error', () => undefined);
+    up.on('error', () => undefined);
+    client.on('data', (b) => { try { up.write(b); } catch { /* gone */ } });
+
+    let upgraded = false;
+    let holding = false;
+    const parked = [];
+    const release = () => {
+      holding = false;
+      for (const chunk of parked.splice(0)) {
+        try { client.write(chunk); } catch { /* gone */ }
+      }
+    };
+    up.on('data', (b) => {
+      if (!upgraded) {
+        const text = b.toString('latin1');
+        const end = text.indexOf('\r\n\r\n');
+        if (text.startsWith('HTTP/1.1 101') && end >= 0) {
+          upgraded = true;
+          const headEnd = end + 4;
+          try { client.write(b.subarray(0, headEnd)); } catch { /* gone */ }
+          if (mine === onlyNth) {
+            holding = true;
+            if (b.length > headEnd) parked.push(b.subarray(headEnd));
+            setTimeout(release, holdMs);
+          } else if (b.length > headEnd) {
+            try { client.write(b.subarray(headEnd)); } catch { /* gone */ }
+          }
+          return;
+        }
+      }
+      if (holding) { parked.push(b); return; }
+      try { client.write(b); } catch { /* gone */ }
+    });
+    const bye = () => {
+      try { client.destroy(); } catch { /* gone */ }
+      try { up.destroy(); } catch { /* gone */ }
+    };
+    client.on('close', bye);
+    up.on('close', bye);
+  });
+  return {
+    async start() {
+      await new Promise((resolve) => server.listen(listen, '127.0.0.1', resolve));
+      return `ws://127.0.0.1:${listen}`;
+    },
+    /** One ordinary RST on every live pair: a network cut, not a close handshake. */
+    cutAll() {
+      for (const { client, up } of live) {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      }
+      live.length = 0;
+    },
+    async stop() {
+      for (const { client, up } of live) {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      }
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
 export function registerMuxTreeCases(getServer, legacyPort) {
   let legacy = null;
   // Derived rather than plumbed: one env var already names this block, and three
@@ -165,6 +312,9 @@ export function registerMuxTreeCases(getServer, legacyPort) {
   const refusePort = legacyPort + 1;
   const swapPort = legacyPort + 2;
   const freezePort = legacyPort + 3;
+  const slowPort = legacyPort + 4;
+  const holdPort = legacyPort + 5;
+  const blockPort = legacyPort + 6;
 
   test('80a the shipped MuxLink carries _tree over the real server, and converges', async () => {
     const server = getServer();
@@ -428,6 +578,15 @@ export function registerMuxTreeCases(getServer, legacyPort) {
       { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
       (reason) => notices.push(reason),
     );
+    // ⚠ THE ONLY EXIT FROM READ-ONLY, registered exactly where `main.ts` registers
+    // it. `Bootstrap.onReconnect` is both the §4.6 reconnect pass and the one
+    // thing that clears `_readOnlyReason`, and the adopted probe is by
+    // construction already connected when the swap happens — so a bridge that
+    // only waits for the next TRANSITION hands the session no way out. Measured
+    // before the fix on this very path: verdict at 2,318 ms, `synced` true from
+    // then on, and zero fires across 34 s.
+    const connects = [];
+    transport.onConnected(() => connects.push(Date.now()));
     const peer = new Y.Doc();
     const peerLink = new DocLink(server.url('_tree', workspace), peer);
     try {
@@ -453,6 +612,11 @@ export function registerMuxTreeCases(getServer, legacyPort) {
         await until(() => peer.getMap('nodes').get('n1')?.p === 'blocked-route.md', 5_000), true,
         'the fallback never reached the server through the route that does work',
       );
+
+      assert.equal(connects.length, 1,
+        `the swap delivered ${connects.length} connected transitions, so a session that`
+        + ' had gone read-only before it has no way back');
+      assert.equal(transport.connected, true);
 
       const dialled = opened.length;
       await sleep(300);
@@ -579,6 +743,207 @@ export function registerMuxTreeCases(getServer, legacyPort) {
       observer.destroy();
     } finally {
       room.destroy(); link.destroy(); doc.destroy();
+      await proxy.stop();
+    }
+  });
+
+  test('80i a path that is merely SLOW keeps the mux — a demotion is not a stopwatch', async () => {
+    // ⚠ MEASURED, against this exact shape. `MuxLink` bounds a dial; the bridge's
+    // legacy probe is a `WebsocketProvider` with NO connect deadline at all, so on
+    // any path whose upgrade is slower than the bound the mux can never open and
+    // the probe always eventually can. The verdict was then deterministic rather
+    // than the narrow race it was believed to be: through a proxy delaying every
+    // connection on every route by 4.5 s, against this same shipped server serving
+    // `/_mux` normally, the session was demoted at 14,952 ms — past the bootstrap
+    // deadline — and shown a sentence blaming a proxy that was forwarding every
+    // path. The parent branch connected on the mux at 5,041 ms and stayed.
+    //
+    // The BOUND here is short and the delay is short so the suite stays fast; what
+    // matters is that the dial is bounded UNDER what the path costs, which is the
+    // whole of the failure. The shipped 4 s is pinned by the unit tests.
+    const server = getServer();
+    const workspace = 'muxtree80i';
+    const proxy = slowProxy({ listen: slowPort, target: server.port, delayMs: 1_200 });
+    const url = await proxy.start();
+    const tree = new TreeDoc();
+    const link = new MuxLink({
+      serverUrl: url,
+      serverKey: server.serverKey,
+      workspaceId: workspace,
+      openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+      connectTimeoutMs: 400,                      // bounded well under the path's cost
+      unreachableDials: 2,
+    });
+    const notices = [];
+    const transport = openTreeTransport(
+      link, tree.doc,
+      { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
+      (reason) => notices.push(reason),
+    );
+    const peer = new Y.Doc();
+    const peerLink = new DocLink(server.url('_tree', workspace), peer);
+    try {
+      transport.connect({ immediate: true });
+
+      assert.equal(await transport.whenSynced(TREE_SYNC_TIMEOUT_MS), true,
+        'a slow path left the tree unsynced against a server that answers on it');
+      assert.deepEqual(notices, [],
+        `a slow path demoted a working session: ${JSON.stringify(notices)}`);
+      assert.equal(link.unsupportedReason, null, 'the route was condemned for being slow');
+      // And it is really the MUX that is carrying it, not the legacy fallback
+      // quietly winning: the route served frames on this link.
+      assert.equal(link.everServed, true, 'the mux route never opened at all');
+      assert.ok(link.stats.framesIn > 0, 'nothing ever came back over /_mux');
+      assert.equal(transport.connected, true,
+        'the transport cannot say it is in the state its own onConnected announces');
+      assert.ok(link.dialTimeoutMs >= 1_200,
+        `the dial deadline stayed at ${link.dialTimeoutMs}ms on a path costing 1200ms`);
+
+      tree.doc.getMap('nodes').set('n1', { k: 'f', p: 'slow-path.md' });
+      peerLink.connect();
+      assert.equal(await peerLink.waitSync(5_000), true, 'the observer never synced');
+      assert.equal(
+        await until(() => peer.getMap('nodes').get('n1')?.p === 'slow-path.md', 5_000), true,
+        'the edit never reached the server over the route that was kept',
+      );
+    } finally {
+      transport.destroy(); link.destroy();
+      peerLink.destroy(); peer.destroy(); tree.doc.destroy();
+      await proxy.stop();
+    }
+  });
+
+  test('80j a route that has answered is not condemned by a silence after a cut', async () => {
+    // ⚠ SILENCE IS NEVER A VERDICT, produced against a real process. The proxy
+    // passes the HTTP 101 through untouched and holds the server's first frame on
+    // the SECOND connection only, so the redial after an ordinary RST is open,
+    // written to, and quiet. A ten-second timer used to call that "your server is
+    // older than this plugin" and mean it for the session: measured, synced over
+    // `/_mux` in 11 ms with two frames in, one RST, condemned 11,299 ms later,
+    // `connect()` a no-op afterwards and the room never syncing again.
+    //
+    // The hold is longer than that timer was, deliberately: a shorter one would
+    // not notice the timer coming back.
+    const server = getServer();
+    const workspace = 'muxtree80j';
+    const proxy = holdFirstFrameProxy({
+      listen: holdPort, target: server.port, holdMs: 12_000, onlyNth: 2,
+    });
+    const url = await proxy.start();
+    const doc = new Y.Doc();
+    const link = new MuxLink({
+      serverUrl: url,
+      serverKey: server.serverKey,
+      workspaceId: workspace,
+      openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+      backoffMs: [50],
+      jitter: 0,
+    });
+    const notices = [];
+    link.onUnsupported((reason) => notices.push(reason));
+    const room = new MuxRoom(link, '_tree', doc);
+    try {
+      link.connect();
+      assert.equal(await room.whenSynced(5_000), true, 'the room never synced');
+      assert.ok(link.stats.framesIn > 0, 'the route never proved it speaks the protocol');
+
+      const dialsBefore = link.stats.socketsOpened;
+      proxy.cutAll();
+      doc.getMap('nodes').set('n1', { k: 'f', p: 'held-frame.md' });
+
+      assert.equal(await until(() => link.stats.socketsOpened > dialsBefore, 8_000), true,
+        'the ladder never redialled after the cut');
+      assert.equal(await until(() => link.connected, 8_000), true,
+        'the redial never opened its socket');
+      const framesAtRedial = link.stats.framesIn;
+
+      // Eleven seconds of an OPEN socket that has been written to and has said
+      // nothing — one second inside the window that used to condemn it.
+      await sleep(11_000);
+      assert.equal(link.stats.framesIn, framesAtRedial,
+        'the proxy released the held frame early, so this proves nothing');
+      assert.equal(link.rawSocket?.readyState, 1, 'the quiet socket was not even open');
+      assert.equal(room.synced, false, 'the room claimed a handshake it never completed');
+      assert.deepEqual(notices, [],
+        `a quiet socket on a proven route was condemned: ${JSON.stringify(notices)}`);
+      assert.equal(link.unsupportedReason, null);
+
+      assert.equal(await until(() => room.synced && link.connected, 20_000), true,
+        'the room never came back once the held frame was released');
+      assert.deepEqual(notices, [], 'a verdict landed while the frame was merely late');
+      assert.equal(await room.flush(5_000), true, 'the recovered room could not confirm a flush');
+
+      const observer = new Y.Doc();
+      const check = new DocLink(server.url('_tree', workspace), observer);
+      check.connect();
+      assert.equal(await check.waitSync(5_000), true);
+      assert.equal(observer.getMap('nodes').get('n1')?.p, 'held-frame.md',
+        'the edit written while the answer was held never went up');
+      check.destroy();
+      observer.destroy();
+    } finally {
+      room.destroy(); link.destroy(); doc.destroy();
+      await proxy.stop();
+    }
+  });
+
+  test('80k a route blocked AFTER it has served is retried, not condemned', async () => {
+    // ⚠ MEASURED, and the other half of "silence is never a verdict". The evidence
+    // behind `unreachable` is a run of dials that produced no socket — which is
+    // exactly what an outage, a slept radio, a proxy restart or a tunnel re-key
+    // produce on a route that works. Before the gate: five to six seconds of
+    // `/_mux`-only trouble on an otherwise-working server demoted the session
+    // permanently, 3/3, and a flaky path demoted one that had already synced over
+    // the mux at 28,115 ms. The parent branch of that round rode out ten cuts on
+    // the same path and stayed.
+    //
+    // Here the proxy forwards `/_mux` until the link has PROVED the route, then
+    // 404s it. The ladder is fast so the case is fast; the dials are real.
+    const server = getServer();
+    const workspace = 'muxtree80k';
+    const proxy = hostileProxy({ listen: blockPort, target: server.port, mode: 'forward' });
+    await proxy.start();
+    const url = `ws://127.0.0.1:${blockPort}`;
+    const tree = new TreeDoc();
+    const link = new MuxLink({
+      serverUrl: url,
+      serverKey: server.serverKey,
+      workspaceId: workspace,
+      openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+      backoffMs: [150],
+      jitter: 0,
+      unreachableDials: 2,
+    });
+    const notices = [];
+    const transport = openTreeTransport(
+      link, tree.doc,
+      { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
+      (reason) => notices.push(reason),
+    );
+    try {
+      transport.connect({ immediate: true });
+      assert.equal(await transport.whenSynced(TREE_SYNC_TIMEOUT_MS), true,
+        'the tree never synced over the forwarded /_mux route');
+      assert.equal(link.everServed, true, 'the route never proved itself');
+
+      // The route goes away underneath a session that has already used it.
+      proxy.setMode('refuse');
+      proxy.cutAll();
+      const failedBefore = link.stats.dialsFailed;
+      assert.equal(await until(() => link.stats.dialsFailed >= failedBefore + 4, 8_000), true,
+        'the ladder stopped dialling a route it should be retrying');
+      assert.deepEqual(notices, [],
+        `a route that had served this link was condemned: ${JSON.stringify(notices)}`);
+      assert.equal(link.unsupportedReason, null, 'a blocked route demoted a proven session');
+
+      // And it comes back on its own when the route does.
+      proxy.setMode('forward');
+      assert.equal(await until(() => link.connected && transport.synced, 10_000), true,
+        'the ladder never brought the mux back once the route returned');
+      assert.equal(link.unsupportedReason, null);
+      assert.deepEqual(notices, []);
+    } finally {
+      transport.destroy(); link.destroy(); tree.doc.destroy();
       await proxy.stop();
     }
   });
