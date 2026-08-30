@@ -168,8 +168,22 @@ export class MuxRoom {
 
   // ---------------------------------------------------------- provider surface
 
+  /**
+   * A completed handshake on a link that is STILL UP.
+   *
+   * ⚠ The conjunction closes a window a real socket opens and `WebsocketProvider`
+   * leaves open: `terminate()` moves `readyState` to CLOSED at once, while the
+   * close EVENT that clears the flag arrives on a later turn. In between, a
+   * provider answers `synced === true` about a connection that is already gone.
+   * Found by the structural reconnect case, which read the link as down and the
+   * room as synced in the same tick.
+   *
+   * It can only ever make this answer more conservative, which is the direction
+   * I3/I4 require: a room whose link is down is not current, whatever its last
+   * handshake said.
+   */
   get synced(): boolean {
-    return this._synced;
+    return this._synced && this.link.connected;
   }
 
   /** `AckProvider.wsconnected`. */
@@ -201,7 +215,7 @@ export class MuxRoom {
    * The same shape `main.ts` and `ObsidianDocPort` already use.
    */
   whenSynced(ms: number): Promise<boolean> {
-    if (this._synced) return Promise.resolve(true);
+    if (this.synced) return Promise.resolve(true);
     return new Promise<boolean>((resolve) => {
       let done = false;
       const finish = (value: boolean): void => {
@@ -213,7 +227,7 @@ export class MuxRoom {
       };
       const onSync = (isSynced: boolean): void => { if (isSynced) finish(true); };
       this.on('sync', onSync);
-      const timer = setTimeout(() => finish(this._synced), ms);
+      const timer = setTimeout(() => finish(this.synced), ms);
     });
   }
 

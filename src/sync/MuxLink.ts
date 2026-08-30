@@ -465,6 +465,14 @@ export class MuxLink {
       // y-websocket SyncStep1, which is not a frame for anything we asked for.
       // Measured against a server checked out from before the P3 work: it opens,
       // sends `[0,0,1,0]`, and then ignores every frame we send, forever.
+      //
+      // The two clauses above are BELT AND BRACES, and that is measured rather
+      // than hoped: mutating out either one on its own leaves structural case 80c
+      // green — `[0,0,1,0]` has a two-byte tail AND names a room nothing
+      // subscribed — while mutating out both makes it fail. With both gone the
+      // fallback still happens, but only when `MUX_DETECT_TIMEOUT_MS` expires ten
+      // seconds later, which is exactly the difference between a verdict and a
+      // backstop.
       this.noteLegacyEvidence('not-a-frame');
       return;
     }

@@ -20,6 +20,7 @@ import { startServer } from './server.mjs';
 import { Client, settleAll, SHARE_ROOT } from './client.mjs';
 import { DocLink, sleep } from './net.mjs';
 import { registerBlobCases } from './blobs.mjs';
+import { registerMuxTreeCases } from './muxtree.mjs';
 import { MuxClient, syncPayload, updateFor, SYNC, EMPTY_SV, until } from './mux.mjs';
 import { fold, isLive, relPath } from '../../../src/tree/paths.ts';
 import { deriveTree } from '../../../src/tree/TreeIndex.ts';
@@ -29,6 +30,8 @@ const PORT = Number(process.env.SL_E2E_PORT ?? 4171);
 const DEAD_PORT = Number(process.env.SL_E2E_DEAD_PORT ?? 4197);
 /** The blob cases that need their own server configuration take these. */
 const BLOB_PORT = Number(process.env.SL_E2E_BLOB_PORT ?? 4181);
+/** A server from BEFORE the mux existed, for the P3 slice-2 fallback case (80c). */
+const LEGACY_PORT = Number(process.env.SL_E2E_LEGACY_PORT ?? 4191);
 
 let server = null;
 let workspaceCounter = 0;
@@ -1135,15 +1138,20 @@ async function main() {
   // Registered here rather than at module scope so the cases close over the
   // server this run actually started, and so `--only=` filters them like the rest.
   registerBlobCases(() => server, BLOB_PORT);
+  // P3 slice 2. Its own process, because one of its cases needs a server from
+  // BEFORE the mux route existed and a flag would prove nothing.
+  const muxTree = registerMuxTreeCases(() => server, LEGACY_PORT);
 
   console.log('ShadowLink — structural end-to-end (P1 spec §10 Group C, P2 spec §11 Group C)\n');
   let summary = { failed: 1, passed: 0, skipped: 0 };
   try {
     server = await startServer({ port: PORT });
+    await muxTree.start();
     summary = await run();
   } catch (err) {
     console.error(`✗ STRUCTURAL E2E FAILED to start: ${err?.stack ?? err}`);
   } finally {
+    await muxTree.stop();
     if (server !== null) {
       await server.stop();
       server.cleanup();

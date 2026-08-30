@@ -32,10 +32,17 @@ function health(port) {
  * `env` adds settings the case under test needs — a small `MAX_FILE_SIZE_MB`, a
  * short `INCOMPLETE_UPLOAD_TTL_HOURS` — read by the real `loadConfig`, so what is
  * exercised is the shipped configuration path and not a test-only injection.
+ *
+ * `entry` names a different module to run. There is exactly one caller and one
+ * reason: `harness/legacy-server.mjs` is `server/index.js` as it stood before any
+ * of the P3 work, run so that the client's fallback is proved against a server
+ * that GENUINELY lacks the endpoint rather than against a flag. Everything else
+ * gets the shipped entry point, which is the whole point of this harness.
  */
-export async function startServer({ port, dir = null, env = {} }) {
+export async function startServer({ port, dir = null, env = {}, entry = null }) {
   const dataDir = dir ?? mkdtempSync(join(tmpdir(), 'sl-e2es-'));
-  const proc = spawn(process.execPath, [join(REPO_ROOT, 'server', 'index.js')], {
+  const main = entry ?? join(REPO_ROOT, 'server', 'index.js');
+  const proc = spawn(process.execPath, [main], {
     cwd: REPO_ROOT,
     env: { ...process.env, ...env, PORT: String(port), PERSISTENCE_DIR: dataDir },
     stdio: 'ignore',
