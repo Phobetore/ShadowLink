@@ -271,3 +271,125 @@ test('isSyncStep2 reads only what it is given', () => {
   assert.equal(isSyncStep2(null), false);
   assert.equal(isSyncStep2(new Uint8Array([255, 255, 255])), false);
 });
+
+// ---------------------------------------------------------------- the count itself
+
+/** A socket that refuses to write, the way a shared link refuses a dropped frame. */
+class RefusingSocket extends FakeSocket {
+  refusing = false;
+
+  override send(data: Uint8Array): boolean {
+    if (this.refusing) return false;
+    super.send(data);
+    return true;
+  }
+}
+
+test('a question that could not be SENT is not counted as outstanding', async () => {
+  // ⚠ A real `WebSocket.send` returns nothing, but a link that shares a socket
+  // can refuse a frame it never wrote. Counting that refusal as a question raises
+  // every later flush's target by one, for ever — which is the same permanent
+  // stall as a lost answer, arrived at without the network being involved at all.
+  const socket = new RefusingSocket();
+  const provider = new FakeProvider(socket);
+  const doc = new Y.Doc();
+  const ack = new ProviderAck(provider, doc);
+  try {
+    socket.deliver(step2Frame());                       // the handshake's own reply
+
+    socket.refusing = true;
+    assert.equal(await ack.flush(50), false, 'a question that never went out was confirmed');
+
+    socket.refusing = false;
+    const flushing = ack.flush(1_000);
+    await Promise.resolve();
+    socket.deliver(step2Frame());
+    assert.equal(await flushing, true,
+      'a refused send left the count permanently short of its own target');
+  } finally {
+    ack.destroy();
+    doc.destroy();
+  }
+});
+
+test('an answer delivered INSIDE send is still counted against its own question', async () => {
+  // ⚠ A trap this file fell into once and this test holds shut. A peer can reply
+  // synchronously — every in-memory relay does, and so does anything that loops
+  // the write straight back — so the question has to be counted BEFORE the write,
+  // not after it. Counted after, the synchronous reply decrements a zero and the
+  // question stays outstanding for ever: exactly the ratchet being fixed.
+  const socket = new (class extends FakeSocket {
+    override send(data: Uint8Array): void {
+      super.send(data);
+      this.deliver(step2Frame());                       // answered inside the write
+    }
+  })();
+  const provider = new FakeProvider(socket);
+  const doc = new Y.Doc();
+  const ack = new ProviderAck(provider, doc);
+  try {
+    socket.deliver(step2Frame());                       // the handshake's own reply
+    const results: boolean[] = [];
+    for (let i = 0; i < 4; i++) results.push(await ack.flush(200));
+    assert.deepEqual(results, [true, true, true, true],
+      'a synchronously answered flush inflated the count for every flush after it');
+  } finally {
+    ack.destroy();
+    doc.destroy();
+  }
+});
+
+// ---------------------------------------------------------------- the stall
+
+test('a flush that asked on a LIVE socket and got nothing reports a stall, once', async () => {
+  // The count is positional, so a question whose frame is dropped after it leaves
+  // this process can never be retired: `unanswered` stays up and every later
+  // flush asks for one more answer than the socket will ever produce. Measured
+  // over a per-room partition: six consecutive flushes on a healed, converged,
+  // connected room all returned false. The counters cannot be cleared in place —
+  // a late reply would then confirm a flush whose bytes the server never saw — so
+  // the ack says so and the owner gets a new socket.
+  const socket = new FakeSocket();
+  const provider = new FakeProvider(socket);
+  const doc = new Y.Doc();
+  let stalls = 0;
+  const ack = new ProviderAck(provider, doc, () => { stalls += 1; });
+  try {
+    socket.deliver(step2Frame());
+    assert.equal(await ack.flush(60), false);
+    assert.equal(stalls, 1, 'a silent live socket was never reported');
+
+    assert.equal(await ack.flush(60), false);
+    assert.equal(stalls, 1, 'the stall repeated on the same socket');
+
+    // A fresh socket is the repair, and it re-arms the report.
+    provider.reconnect(new FakeSocket());
+    assert.equal(await ack.flush(60), false);
+    assert.equal(stalls, 2, 'the new socket did not re-arm the report');
+  } finally {
+    ack.destroy();
+    doc.destroy();
+  }
+});
+
+test('a flush that failed because the CONNECTION went away is not a stall', async () => {
+  // Nothing is wrong with the accounting when the socket is simply gone: the next
+  // attach resets it. Reporting here would turn every ordinary disconnect into a
+  // reconnect request.
+  const socket = new FakeSocket();
+  const provider = new FakeProvider(socket);
+  const doc = new Y.Doc();
+  let stalls = 0;
+  const ack = new ProviderAck(provider, doc, () => { stalls += 1; });
+  try {
+    socket.deliver(step2Frame());
+    const flushing = ack.flush(500);
+    await Promise.resolve();
+    provider.reconnect(null);
+    assert.equal(await flushing, false);
+    assert.equal(stalls, 0, 'a dropped connection was reported as an accounting stall');
+  } finally {
+    ack.destroy();
+    doc.destroy();
+  }
+});
