@@ -61,10 +61,18 @@ interface StubText {
   type(value: string): Promise<unknown>;
 }
 
+/** The stub's switch. `toggle()` is a real click; `setValue()` is not. */
+interface StubToggle {
+  value: boolean;
+  handler: ((value: boolean) => unknown) | null;
+  toggle(value: boolean): void;
+}
+
 interface StubSetting {
   name: string;
   desc: string;
   texts: StubText[];
+  toggles: StubToggle[];
 }
 
 interface StubEl {
@@ -108,6 +116,12 @@ function box(tab: Tab, name: string): StubText {
   const texts = field(tab, name).texts;
   assert.equal(texts.length, 1, `"${name}" has exactly one text box`);
   return texts[0]!;
+}
+
+function toggle(tab: Tab, name: string): StubToggle {
+  const toggles = field(tab, name).toggles;
+  assert.equal(toggles.length, 1, `"${name}" has exactly one toggle`);
+  return toggles[0]!;
 }
 
 // ---------------------------------------------------------------- the plugin
@@ -193,7 +207,7 @@ test('the screen offers exactly the settings the rest of the plugin reads', asyn
   assert.deepEqual(tab.containerEl.settings.map((s) => s.name), [
     'Display name', 'Cursor color',
     'Server URL', 'Server key', 'Workspace ID', 'Shared folder',
-    'Device ID', 'Sync status',
+    'Device ID', 'Use the compatibility connection', 'Sync status',
   ]);
 });
 
@@ -629,3 +643,72 @@ test('a mid-session Workspace ID edit does not move the state file that session 
 // file could make it pass, and it cannot: both remedies — capturing the snapshot
 // key at construction like every other share field, or not writing a live
 // workspace id through to a running session at all — are edits to `main.ts`.
+
+// ------------------------------------------------- §4's lever, on this screen
+
+const COMPAT = 'Use the compatibility connection';
+
+test('the compatibility connection is a persisted switch, and it starts off', async () => {
+  // ⚠ IT IS A LEVER BECAUSE THERE IS NO SOUND INFERENCE. A deployment can accept
+  // the multiplexed upgrade and carry nothing on it, which from inside the client
+  // is indistinguishable from a path that is merely slow; three rounds of trying
+  // to tell those apart each shipped a sentence telling somebody their current
+  // server was old. Nothing in the plugin writes this value — only a person does.
+  const plugin = fakePlugin(GOOD);
+  assert.equal(plugin.settings.useCompatibilityConnection, false,
+    'the multiplexed connection is the default, and the fallback is opt-in');
+  const tab = await open(plugin);
+  assert.equal(toggle(tab, COMPAT).value, false, 'the switch did not read the stored value');
+
+  toggle(tab, COMPAT).toggle(true);
+  assert.equal(plugin.settings.useCompatibilityConnection, true);
+  assert.equal(plugin.saves.at(-1)?.useCompatibilityConnection, true,
+    'the decision never reached data.json, so it does not survive a reload');
+
+  // ⚠ AND IT IS REVISABLE, which is the other half. Nothing about it may latch.
+  toggle(tab, COMPAT).toggle(false);
+  assert.equal(plugin.settings.useCompatibilityConnection, false);
+  assert.equal(plugin.saves.at(-1)?.useCompatibilityConnection, false,
+    'turning it off did not persist, so the mux would never come back');
+});
+
+test('a stored compatibility setting is shown as it is, not as the default', async () => {
+  const plugin = fakePlugin(GOOD, { useCompatibilityConnection: true });
+  const tab = await open(plugin);
+  assert.equal(toggle(tab, COMPAT).value, true,
+    'a user who turned it on last week is shown a switch that says off');
+});
+
+test('the switch says when to reach for it, what it costs, and how to undo it', async () => {
+  const { COMPATIBILITY_DESC } = await settingsTab();
+  const plugin = fakePlugin(GOOD);
+  const tab = await open(plugin);
+  assert.equal(field(tab, COMPAT).desc, COMPATIBILITY_DESC);
+
+  assert.match(COMPATIBILITY_DESC, /nothing is coming back on the multiplexed/,
+    'a self-hoster has to be able to match this to what the status bar told them');
+  assert.match(COMPATIBILITY_DESC, /stay out of date until you open them/,
+    'and to know what it costs before they throw it');
+  assert.match(COMPATIBILITY_DESC, /Turn it off to go back/);
+  assert.match(COMPATIBILITY_DESC, /reload the plugin/i,
+    'the transport is chosen when the runtime starts; saying otherwise is a lie');
+  // ⚠ NOT A DIAGNOSIS. The whole reason this is a switch and not a verdict is
+  // that the client cannot tell which deployment it is talking to.
+  assert.equal(/your server is old|older than this plugin/.test(COMPATIBILITY_DESC), false,
+    'the setting made the claim the verdict was deleted for making');
+});
+
+test('the switch is NOT among the fields every member must type identically', async () => {
+  // It is a fact about one device's path to the server. Standing it beside the
+  // three shared strings invites somebody to tell their collaborators to turn it
+  // on too, which is a share-wide downgrade nobody asked for.
+  const plugin = fakePlugin(GOOD);
+  const tab = await open(plugin);
+  const names = tab.containerEl.settings.map((s) => s.name);
+  const shared = names.indexOf('Shared folder');
+  const device = names.indexOf('Device ID');
+  const compat = names.indexOf(COMPAT);
+  assert.ok(shared >= 0 && device >= 0 && compat >= 0, 'a field went missing');
+  assert.ok(compat > shared, 'the switch sits inside the shared-workspace block');
+  assert.ok(compat > device, 'the switch is not under "This device"');
+});

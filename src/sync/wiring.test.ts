@@ -426,6 +426,69 @@ test('the three download commands and the embed post-processor are registered (�
   );
 });
 
+// ============================================================ §4: the lever
+
+// The compatibility connection is the ONE remedy for a route that accepts the
+// multiplexed upgrade and carries nothing on it — a state the client can measure
+// and must not diagnose. A lever nobody can find is the same as no lever, and the
+// status bar's own sentence sends the user looking for it, so both doors have to
+// exist and both have to be reachable with no runtime at all.
+test('the compatibility connection has a command as well as a setting (§4)', () => {
+  assert.ok(
+    CODE.includes("id: 'toggle-compatibility-connection'"),
+    'main.ts must register the compatibility command; the status bar tells a user to '
+    + 'reach for this at the moment their vault has stopped syncing',
+  );
+  const onload = block('\n  async onload(): Promise<void> {', 'main.ts no longer defines onload');
+  assert.ok(
+    onload.includes("id: 'toggle-compatibility-connection'"),
+    'it must be registered in onload, beside the download commands — a command that '
+    + 'only exists once a share is configured is missing exactly when it is wanted',
+  );
+});
+
+// ⚠ THE MUX IS NOT DIALLED AT ALL when the user has said their deployment does
+// not carry it. Constructing the bridge and letting it measure would put the
+// client back in the business of second-guessing a decision the person who owns
+// the deployment has already made.
+test('the compatibility setting picks the transport, ahead of any measurement (§4)', () => {
+  const ctor = block(
+    '\n  constructor(private readonly plugin: ShadowLinkPlugin, deviceId: string) {',
+    'main.ts no longer defines the runtime constructor',
+  );
+  const choice = ctor.indexOf('this.treeLink =');
+  assert.ok(choice >= 0, 'main.ts no longer assigns the tree transport');
+  const decision = ctor.slice(choice, choice + 400);
+  assert.ok(
+    decision.includes('useCompatibilityConnection'),
+    'the transport must be chosen from the persisted setting',
+  );
+  assert.ok(
+    decision.includes('new LegacyTreeTransport('),
+    'and the compatibility branch must be the legacy transport itself, not the bridge '
+    + 'measuring its way back to it',
+  );
+});
+
+// The state the lever answers is POLLED, like both read-only reasons, because it
+// heals on its own the instant a frame arrives.
+test('the status bar reads the link\'s own unserved state and the setting (§4)', () => {
+  const status = body(
+    '\n  status(): { text: string; tooltip: string } {',
+    'main.ts no longer defines status()',
+  );
+  assert.ok(
+    status.includes('this.mux.routeUnserved'),
+    'the bar must read the link rather than latch a one-shot: this state stops being '
+    + 'true the moment the route delivers anything',
+  );
+  assert.ok(
+    status.includes('useCompatibilityConnection'),
+    'and it must say when the compatibility connection is in force — a lever whose '
+    + 'effect is invisible is one the user forgets they pulled',
+  );
+});
+
 // §7.3. Every one of those four paths must go through the SAME mechanism —
 // approve, persist, then run a pass — because the pass owns every rule about what
 // may be written where. A command that fetched bytes itself would be a second

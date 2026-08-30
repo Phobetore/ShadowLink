@@ -30,6 +30,26 @@ export interface ShadowLinkSettings {
    * not predict.
    */
   attachmentFolderWarningDismissed: boolean;
+  /**
+   * Force the previous, per-room connection for this vault instead of the
+   * multiplexed one (P3 spec §4).
+   *
+   * ⚠ THE LEVER, AND IT IS A LEVER BECAUSE THERE IS NO SOUND INFERENCE. A
+   * deployment can accept the `/_mux` upgrade and then carry nothing on it — a
+   * proxy that upgrades the socket and drops the frames, a tunnel that forwards
+   * the handshake and nothing after it. From inside the client that is
+   * indistinguishable from a path that is merely slow, and three rounds of
+   * arithmetic that tried to tell them apart each shipped a sentence telling a
+   * user their current server was old. So the client states what it measured and
+   * the person who knows their own deployment decides.
+   *
+   * It lives HERE rather than in `share` because the first three fields of
+   * `ShareConfig` must be identical for every member of a workspace and this is a
+   * fact about one device's path to the server. It is read once, when the runtime
+   * starts, so turning it off returns to the multiplexed route on the next
+   * connect; nothing in the plugin ever sets it, and nothing latches it.
+   */
+  useCompatibilityConnection: boolean;
 }
 
 /**
@@ -61,4 +81,5 @@ export const DEFAULT_SETTINGS: ShadowLinkSettings = {
   share: { serverUrl: '', serverKey: '', workspaceId: '', sharedFolder: '' },
   deviceId: '',
   attachmentFolderWarningDismissed: false,
+  useCompatibilityConnection: false,
 };

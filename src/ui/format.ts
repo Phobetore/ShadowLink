@@ -10,6 +10,14 @@
 // that is load-bearing rather than cosmetic (§7.3), and a string built inline in
 // `main.ts` is a string no test can hold.
 //
+// THE TRANSPORT'S OWN SENTENCE is here for the same reason and one more. When the
+// multiplexed connection delivers nothing while the server answers, the bar has to
+// say that and name the setting that fixes it — and every clause of it has to be
+// something that was measured rather than inferred, because the three previous
+// attempts at this state all inferred, and all of them told somebody their current
+// server was old. A sentence that load-bearing does not belong in a file no test
+// can import. See `unservedLine` and `COMPATIBILITY_LINE`.
+//
 // THE WHOLE BAR now, not just the synced half, and that is why `statusLine` and
 // `parkedLine` moved here. They were built inline in `main.ts`, `main.ts` imports
 // `obsidian`, and the only thing in the suite that could reach them was a guard
@@ -78,14 +86,70 @@ export interface BarState {
   parked: ReadonlyArray<{ reason: ParkReason }>;
   /** What §7.3 says once a pass has finished and nothing is pending. */
   synced: () => StatusLine;
+  /**
+   * The server answers, and the multiplexed connection has delivered nothing.
+   * Null whenever that is not measurably the case.
+   *
+   * `framesOut` is the count of messages this session has written into it, and it
+   * is here so the sentence can be specific rather than atmospheric.
+   */
+  unserved: { framesOut: number } | null;
+  /** The user has forced the compatibility connection for this vault. */
+  compatibility: boolean;
 }
+
+/**
+ * What the bar says while the multiplexed connection is delivering nothing.
+ *
+ * ⚠ EVERY CLAUSE IS SOMETHING THAT WAS MEASURED, AND NOTHING ELSE IS HERE. The
+ * server answering is the bridge's probe having synced on the per-room route; the
+ * counts are the link's own; "nothing is syncing" is the tree being unsynced on
+ * the transport that is carrying it. There is deliberately no claim about the
+ * server's version, its age, or the cause — three rounds tried to infer one from
+ * how long an answer took, and each shipped a sentence telling somebody their
+ * current server was old.
+ *
+ * The last line is a CONDITIONAL naming a lever, not a diagnosis. A self-hoster
+ * knows whether their deployment carries that route; this client does not, and
+ * saying so is what makes the toggle findable at the moment it is wanted.
+ */
+export function unservedLine(framesOut: number): string {
+  return 'ShadowLink can reach your server, but nothing is coming back on its multiplexed '
+    + `connection: ${framesOut} message(s) have gone out on it and none have come back. `
+    + 'Nothing is syncing while that is true.\n'
+    + 'If your server, or something in front of it, does not carry that connection, turn on '
+    + '"Use the compatibility connection" in ShadowLink\'s settings.';
+}
+
+/**
+ * The line appended whenever the compatibility connection is in force.
+ *
+ * A lever the user cannot see the effect of is a lever they will forget they
+ * pulled, and this one costs continuous sync of unopened notes. It appears on
+ * every state, including "synced", for exactly that reason — and it names the way
+ * back.
+ */
+export const COMPATIBILITY_LINE =
+  'ShadowLink is using the compatibility connection because "Use the compatibility '
+  + 'connection" is on in its settings. Notes you have not opened will stay out of date '
+  + 'until you open them. Turn it off, then reload the plugin, to go back.';
 
 /**
  * What the status bar should say right now.
  *
- * Four states in order, and the order is the design: a share that has stopped
- * writing says so first; one that has not joined yet is not "synced"; work owed
- * is named as a count; and only then does §7.3's wording get a say.
+ * Five states in order, and the order is the design: a transport that is
+ * measurably delivering nothing says the specific thing first; a share that has
+ * stopped writing says so next; one that has not joined yet is not "synced"; work
+ * owed is named as a count; and only then does §7.3's wording get a say. The
+ * compatibility line is appended to whichever of the five wins, because it is
+ * true of all of them.
+ *
+ * ⚠ `unserved` OUTRANKS `paused`, and that is not a cosmetic ordering. In that
+ * state the pause reads "ShadowLink could not reach the workspace", which is the
+ * one thing measurement has ruled out: the server answered the probe. True but
+ * thin beats false, and specific beats both — the user's actual complaint is
+ * "nothing is syncing", and that sentence is available without inferring
+ * anything.
  *
  * `pending` EXCLUDES parked entries, and that exclusion is the whole of §6.2.6:
  * an empty note and a `.md` file that is not text are refused over the state of
@@ -95,6 +159,18 @@ export interface BarState {
  * false in the direction that stops the user looking.
  */
 export function statusLine(state: BarState): StatusLine {
+  const line = barState(state);
+  if (!state.compatibility) return line;
+  return { text: line.text, tooltip: `${line.tooltip}\n${COMPATIBILITY_LINE}` };
+}
+
+function barState(state: BarState): StatusLine {
+  if (state.unserved !== null) {
+    return {
+      text: 'ShadowLink: not syncing',
+      tooltip: unservedLine(state.unserved.framesOut),
+    };
+  }
   if (state.paused !== null) return { text: 'ShadowLink: paused', tooltip: state.paused };
   if (!state.ready) {
     return { text: 'ShadowLink: starting…', tooltip: 'ShadowLink is joining the workspace.' };

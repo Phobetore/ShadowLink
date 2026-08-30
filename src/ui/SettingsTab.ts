@@ -3,6 +3,27 @@ import { App, PluginSettingTab, Setting } from 'obsidian';
 import type ShadowLinkPlugin from '../../main';
 import { isValidWorkspaceId } from '../tree/ids.ts';
 
+/**
+ * The compatibility toggle's own description (P3 spec §4).
+ *
+ * ⚠ IT HAS TO SAY WHEN TO REACH FOR IT, WHAT IT COSTS AND HOW TO UNDO IT, and
+ * the reason is that nothing in the client can decide this. A deployment may
+ * accept the multiplexed upgrade and carry nothing on it, which from inside is
+ * indistinguishable from a path that is simply slow; three rounds of trying to
+ * tell those apart each shipped a sentence telling somebody their current server
+ * was old. So the plugin states what it measured, in the status bar, and this is
+ * the switch the person who knows their own deployment throws.
+ *
+ * Exported so `SettingsTab.test.ts` can hold the wording, which is the whole
+ * point of putting it in a constant.
+ */
+export const COMPATIBILITY_DESC =
+  'Use the previous, one-connection-per-note transport instead of the multiplexed one. '
+  + 'Turn this on if the status bar says nothing is coming back on the multiplexed '
+  + 'connection — some proxies and tunnels accept that connection and then carry nothing '
+  + 'on it. Everything still syncs, but notes you have not opened stay out of date until '
+  + 'you open them. Turn it off to go back. Either way, reload the plugin to apply it.';
+
 /** The rule, in the field's own words. Also the "nothing is wrong" state of the line. */
 const WORKSPACE_ID_DESC = 'Letters, digits, _ or - (max 64). Identical for all members.';
 
@@ -169,6 +190,20 @@ export class SettingsTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.deviceId || '(not yet generated)');
         t.setDisabled(true);
       });
+
+    // ⚠ NOT under "Shared workspace", deliberately. Every field up there must be
+    // typed identically by every member; this one is a fact about this device's
+    // path to the server, and putting it beside them would invite somebody to
+    // tell their collaborators to turn it on too.
+    new Setting(containerEl)
+      .setName('Use the compatibility connection')
+      .setDesc(COMPATIBILITY_DESC)
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.useCompatibilityConnection).onChange(async (v) => {
+          this.plugin.settings.useCompatibilityConnection = v;
+          await this.plugin.saveSettings();
+        }),
+      );
 
     syncStatus = new Setting(containerEl).setName('Sync status');
     syncStatus.setDesc(statusDesc(this.plugin.configured));

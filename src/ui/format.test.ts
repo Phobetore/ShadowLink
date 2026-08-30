@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 
 import type { ParkReason } from '../sync/PublishQueue.ts';
 import {
-  formatBytes, nothingToDownload, parkedLine, statusLine, syncedStatus, type StatusLine,
+  COMPATIBILITY_LINE, formatBytes, nothingToDownload, parkedLine, statusLine, syncedStatus,
+  unservedLine, type StatusLine,
 } from './format.ts';
 
 test('sizes read the way a person reads them', () => {
@@ -388,6 +389,8 @@ const bar = {
   pending: 0,
   parked: [] as ReadonlyArray<{ reason: ParkReason }>,
   synced: (): StatusLine => SYNCED,
+  unserved: null as { framesOut: number } | null,
+  compatibility: false,
 };
 
 test('a paused share says so and says why, before anything else', () => {
@@ -455,9 +458,90 @@ test('the synced line is not built unless it is going to be shown', () => {
   assert.equal(built, 1);
 });
 
+// ------------------------------------------- the transport's own sentence (§4)
+
+test('a route delivering nothing says THAT, not "could not reach the workspace"', () => {
+  // ⚠ THE STATE THE PREVIOUS ROUND LEFT WITH NOTHING TO SAY. Measured on the
+  // parent branch through a proxy that upgrades `/_mux` for real and drops every
+  // server frame: 70 s, 3 sockets, 2 idle closures, 18 frames out, 0 in, no
+  // verdict, no notice, and this bar reading "ShadowLink could not reach the
+  // workspace" while a control client synced with that same server on the
+  // per-room route. The pause is the one claim measurement has ruled out, so the
+  // specific line outranks it.
+  const line = statusLine({
+    ...bar,
+    paused: 'ShadowLink could not reach the workspace. Editing locally; sync is paused.',
+    ready: false,
+    unserved: { framesOut: 18 },
+  });
+  assert.equal(line.text, 'ShadowLink: not syncing');
+  assert.equal(line.tooltip, unservedLine(18));
+  assert.equal(
+    line.tooltip.includes('could not reach'), false,
+    'the bar repeated the one thing the probe disproved',
+  );
+});
+
+test('the sentence claims only what was measured, and names the lever', () => {
+  const line = unservedLine(18);
+  assert.match(line, /can reach your server/);
+  assert.match(line, /18 message\(s\) have gone out on it and none have come back/);
+  assert.match(line, /Nothing is syncing/);
+  assert.match(line, /"Use the compatibility connection"/,
+    'a state with no automatic remedy must name the one the user has');
+  // ⚠ NOT A DIAGNOSIS, and this half is the whole round. Three previous versions
+  // of this state inferred a cause from how long an answer took, and every one of
+  // them told somebody their current server was old.
+  for (const forbidden of [/older/, /out of date server/, /update the server/i, /version/]) {
+    assert.equal(forbidden.test(line), false,
+      `the honest line made a claim about the server: ${String(forbidden)}`);
+  }
+  assert.equal(/is misconfigured|is broken|is blocking/.test(line), false,
+    'the honest line diagnosed the deployment it cannot see');
+});
+
+test('the count in the sentence is the link\'s own, not a fixed phrase', () => {
+  assert.match(unservedLine(1), /1 message\(s\)/);
+  assert.match(unservedLine(184), /184 message\(s\)/);
+});
+
+test('no unserved state leaves every other line exactly as it was', () => {
+  assert.deepEqual(statusLine({ ...bar, unserved: null }), SYNCED);
+  assert.equal(statusLine({ ...bar, paused: 'stopped', unserved: null }).text,
+    'ShadowLink: paused');
+});
+
+// ------------------------------------------------------- the lever, made visible
+
+test('the compatibility connection is visible on every state, and says how to undo it', () => {
+  // A lever whose effect is invisible is a lever the user forgets they pulled,
+  // and this one costs continuous sync of unopened notes for the whole session.
+  for (const state of [
+    { ...bar },
+    { ...bar, paused: 'stopped' },
+    { ...bar, ready: false },
+    { ...bar, pending: 2 },
+  ]) {
+    const line = statusLine({ ...state, compatibility: true });
+    assert.ok(line.tooltip.endsWith(COMPATIBILITY_LINE),
+      `the compatibility line is missing from "${line.text}"`);
+  }
+  assert.match(COMPATIBILITY_LINE, /Turn it off/, 'the way back has to be in the sentence');
+  assert.match(COMPATIBILITY_LINE, /stay out of date until you open them/,
+    'and so does what it costs');
+});
+
+test('compatibility off adds nothing at all', () => {
+  assert.deepEqual(statusLine({ ...bar, compatibility: false }), SYNCED);
+});
+
 test('main.ts states the bar rather than composing it', () => {
   // The point of the move: the strings are gone from the file no test can load.
   assert.match(MAIN, /statusLine\(/, 'main.ts must call the tested function');
+  assert.equal(
+    MAIN.includes('none have come back'), false,
+    'the transport sentence lives where the suite can read it',
+  );
   assert.equal(
     MAIN.includes('file(s) waiting to upload'), false,
     'the wording lives where the suite can read it',

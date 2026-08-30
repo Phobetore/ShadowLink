@@ -76,7 +76,9 @@ import { KeptFiles } from './src/sync/KeptFiles';
 // ⚠ REMOVAL-SCHEDULED, P3 spec §4 "Compatibility, and its end date": one minor
 // version after slice 8, this import and the `openTreeTransport` call below are
 // replaced by `new MuxTreeTransport(this.mux, this.tree.doc)` and the file goes.
-import { legacyNoticeFor, openTreeTransport } from './src/sync/LegacyTreeTransport';
+import {
+  LegacyTreeTransport, legacyNoticeFor, openTreeTransport,
+} from './src/sync/LegacyTreeTransport';
 import { MuxLink } from './src/sync/MuxLink';
 import type { TreeTransport } from './src/sync/TreeTransport';
 import { ObsidianBlobPort } from './src/sync/ObsidianBlobPort';
@@ -437,20 +439,30 @@ class SyncRuntime {
       serverKey: share.serverKey,
       workspaceId: share.workspaceId,
     });
-    this.treeLink = openTreeTransport(
-      this.mux,
-      this.tree.doc,
-      {
-        serverUrl: share.serverUrl,
-        serverKey: share.serverKey,
-        workspaceId: share.workspaceId,
-      },
-      // Said once, and only the sentence that is true for THIS verdict: an old
-      // server and a blocked route are different problems with different fixes,
-      // and telling someone to update a server that is already current is worse
-      // than saying nothing.
-      (reason) => { new Notice(legacyNoticeFor(reason), 15_000); },
-    );
+    const link = {
+      serverUrl: share.serverUrl,
+      serverKey: share.serverKey,
+      workspaceId: share.workspaceId,
+    };
+    // ⚠ THE USER'S OWN DECISION, TAKEN AHEAD OF THE CLIENT'S. A deployment can
+    // accept the `/_mux` upgrade and carry nothing on it, and from in here that
+    // is indistinguishable from a path that is slow — so when the person who
+    // knows their deployment has said so, the mux is never dialled at all rather
+    // than dialled, measured and second-guessed. `this.mux` is still constructed
+    // (it opens nothing until `connect`) so that `dispose` and the slice-3
+    // registry have one shape to reason about.
+    this.treeLink = this.plugin.settings.useCompatibilityConnection
+      ? new LegacyTreeTransport(link, this.tree.doc)
+      : openTreeTransport(
+        this.mux,
+        this.tree.doc,
+        link,
+        // Said once, and only the sentence that is true for THIS verdict: an old
+        // server and a blocked route are different problems with different fixes,
+        // and telling someone to update a server that is already current is worse
+        // than saying nothing.
+        (reason) => { new Notice(legacyNoticeFor(reason), 15_000); },
+      );
     this.treeLink.connect();
 
     this.bootstrap = new Bootstrap({
@@ -736,6 +748,13 @@ class SyncRuntime {
    * one: §7.5's refusal leaves a file off this disk exactly as §7.2's does, and
    * §7.4's local half has no remedy and so reaches the tooltip and stops. Passed
    * as a THUNK because three of the four branches never look at it.
+   *
+   * `unserved` IS POLLED FROM THE LINK for the same reason both read-only reasons
+   * are: it is a state that heals on its own the instant a frame arrives, and a
+   * latched one-shot would leave "nothing is syncing" on the bar of a vault that
+   * had started syncing again. It is null in compatibility mode by construction —
+   * the mux is never dialled there — which is what stops the two lines
+   * contradicting each other.
    */
   status(): { text: string; tooltip: string } {
     return statusLine({
@@ -745,6 +764,8 @@ class SyncRuntime {
         || this.reconcileTimer !== null,
       pending: this.queue.pendingCount(),
       parked: this.queue.parked(),
+      unserved: this.mux.routeUnserved ? { framesOut: this.mux.stats.framesOut } : null,
+      compatibility: this.plugin.settings.useCompatibilityConnection,
       synced: () => syncedStatus(
         this.shareRoot,
         this.reconciler.deferredAttachments,
@@ -1085,6 +1106,16 @@ export default class ShadowLinkPlugin extends Plugin {
       callback: () => { void this.chooseAttachmentsToDownload(); },
     });
 
+    // P3 spec §4's lever, reachable without going through settings. It is the
+    // same persisted boolean the toggle writes — one mechanism, two doors —
+    // because the state the status bar names is one a user hits mid-session, and
+    // a fix they have to go hunting for is a fix most of them never find.
+    this.addCommand({
+      id: 'toggle-compatibility-connection',
+      name: 'Use the compatibility connection (toggle)',
+      callback: () => { void this.toggleCompatibilityConnection(); },
+    });
+
     // §7.3's embed button. Registered ONCE, in `onload`, for the same reason the
     // editor extension is: it has to outlive any single runtime, and it reads the
     // runtime through a closure so a share that starts later still gets it. With
@@ -1250,6 +1281,35 @@ export default class ShadowLinkPlugin extends Plugin {
 
   private notRunning(): void {
     new Notice('ShadowLink is not running in this vault. Check its settings and reload it.');
+  }
+
+  // ---------------------------------------------------------- §4's lever
+
+  /**
+   * Flip the compatibility connection and say what happens next.
+   *
+   * ⚠ IT PERSISTS AND IT DOES NOT LATCH, which are the two halves of what makes
+   * a lever a lever rather than a verdict with extra steps. Nothing in the plugin
+   * ever writes this value; only a person does, in one of exactly two places, and
+   * either place undoes the other. The transport is chosen once, when the runtime
+   * starts, so the Notice names the reload rather than pretending the socket
+   * swapped underneath the vault.
+   *
+   * Registered in `onload`, beside the download commands, so it exists — and can
+   * be found from the palette at the moment the status bar says nothing is coming
+   * back — even with no runtime and no configured share.
+   */
+  private async toggleCompatibilityConnection(): Promise<void> {
+    const next = !this.settings.useCompatibilityConnection;
+    this.settings.useCompatibilityConnection = next;
+    await this.saveSettings();
+    new Notice(
+      next
+        ? 'ShadowLink will use the compatibility connection. Reload the plugin to apply it. '
+          + 'Notes you have not opened will stay out of date until you open them.'
+        : 'ShadowLink will use the multiplexed connection again. Reload the plugin to apply it.',
+      15_000,
+    );
   }
 
   // ---------------------------------------------------------- status bar
