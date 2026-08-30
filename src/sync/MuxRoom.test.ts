@@ -626,3 +626,54 @@ test('a room the server has stopped serving does not turn every retry into a rec
     client.destroy();
   }
 });
+
+test('a room cut AFTER its handshake reports unsynced once something asks it (I24)', async () => {
+  // ⚠ THE CLAIM, NARROWED TO WHAT IS TRUE. "A live link is not evidence about a
+  // room" holds outright only for a room cut BEFORE its handshake. Cut AFTER one,
+  // `_synced` is latched per connection and the link is up, so the room went on
+  // reporting `synced === true` while the server held none of its bytes —
+  // probed, with the local document 35 characters ahead and the server's empty.
+  //
+  // What makes the sentence true is a QUESTION. `flush()` is that question: it
+  // returns false, reports the stall, the link gets a fresh socket, and the room
+  // then fails its re-handshake while every other room on the same socket
+  // completes theirs.
+  const mux = new FakeMux();
+  const doc = new Y.Doc();
+  const other = new Y.Doc();
+  const { link, fire } = makeLink(mux);
+  const cut = new MuxRoom(link, 'n_cut', doc);
+  const live = new MuxRoom(link, 'n_live', other);
+  try {
+    link.connect();
+    assert.equal(cut.synced, true, 'the room never synced in the first place');
+    assert.equal(live.synced, true);
+
+    mux.cut('n_cut');
+    doc.getText('content').insert(0, 'more work the server will never see');
+    assert.equal(cut.synced, true,
+      'this is the honest starting point: nothing has asked yet');
+
+    assert.equal(await cut.flush(200), false, 'a partitioned room confirmed a flush');
+    fire();
+
+    assert.equal(cut.synced, false, 'the cut room still claimed to be synced');
+    assert.equal(live.synced, true, 'one cut room took another room down with it');
+    assert.equal(link.connected, true, 'one cut room took the whole link down');
+    assert.equal(await live.flush(1_000), true, 'the healthy room stopped being able to flush');
+    assert.equal(mux.text('n_cut'), '', 'a cut room reached the server after all');
+
+    // And healing it converges, on the room's own next handshake.
+    mux.heal('n_cut');
+    link.recycle();
+    fire();
+    assert.equal(cut.synced, true, 'the healed room never re-synced');
+    assert.equal(mux.text('n_cut'), 'more work the server will never see');
+  } finally {
+    cut.destroy();
+    live.destroy();
+    link.destroy();
+    doc.destroy();
+    other.destroy();
+  }
+});
