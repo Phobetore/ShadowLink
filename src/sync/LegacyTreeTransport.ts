@@ -9,14 +9,28 @@
 // reporter is on. The legacy path is kept as a removal-scheduled fallback for
 // exactly one minor version, named in the spec, then deleted."
 //
-// ── HOW TO REMOVE IT, so that this is a deletion and not an untangling ──────
-//   1. delete this file;
+// ── HOW TO REMOVE IT ────────────────────────────────────────────────────────
+//   1. delete this file and its test;
 //   2. in `main.ts`, replace the one `openTreeTransport(...)` call with
 //      `new MuxTreeTransport(this.mux, this.tree.doc)` and drop this import;
 //   3. delete the `new Notice(...)` line beside it, and the two exported notice
 //      strings it names.
-// Nothing else in the plugin names a legacy transport, a fallback, or a mode.
-// `MuxLink`, `MuxRoom` and `MuxTreeTransport` contain no branch for either.
+//
+// ⚠ AND THEN THERE IS AN UNTANGLING, WHICH THIS HEADER USED TO DENY. It said
+// "`MuxLink`, `MuxRoom` and `MuxTreeTransport` contain no branch for either",
+// and that stopped being true when the link grew a verdict surface for this
+// bridge to consult. What is left in `MuxLink` after the three steps above,
+// serving nothing else: `MuxUnsupportedReason` and `unsupported` /
+// `unsupportedHandlers` / `onUnsupported` / `markUnsupported`;
+// `unreachableHandlers` / `onUnreachable` and the reporting half of
+// `noteFailedDial` with `failedDials`, `unreachableDials` and `routeEverServed`;
+// `noteLegacyEvidence` and its `external` option; `socketSpokeMux`;
+// `allowDialTime` / `dialTimeoutMs`; `MUX_UNREACHABLE_DIALS` in
+// `src/tree/constants.ts`; the legacy assertions in `MuxLink.test.ts`; the
+// structural cases 80c / 80f / 80g and `server/test/harness/legacy-server.mjs`
+// with `startServer`'s `entry` option. Call it a file deletion plus a few
+// hundred lines of unpicking, and say so here rather than let the next person
+// find out. `everSubscribed` and the frame decoder stay: they are the link's.
 //
 // ── WHY DETECTION IS NOT "DID THE SOCKET OPEN" ─────────────────────────────
 // Measured, not assumed. A server checked out from before any P3 work ACCEPTS
