@@ -9,6 +9,28 @@
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const DOC_RE = /^[A-Za-z0-9_-]{1,300}$/;
 
+/**
+ * Is `docId` a name this server will relay, and therefore a name it will use as
+ * a path segment under the snapshot directory?
+ *
+ * Exported because the P3 mux (`server/mux.js`) has to ask the SAME question at
+ * a different time. On the per-room route the docId is in the URL, so one check
+ * at upgrade covers the socket's whole life. A mux socket authenticates once and
+ * then names a room in every frame, so the check moves from upgrade time to
+ * frame time — and if that were a second, separately written regex, the two
+ * would drift and the mux would be the looser of the two. It is one predicate,
+ * used twice, and `mux.test.js` cross-checks the two call sites against each
+ * other on the same strings rather than trusting that they still agree.
+ */
+export function isValidDocId(docId) {
+  return typeof docId === 'string' && DOC_RE.test(docId);
+}
+
+/** The same question for a workspace id, which is the other half of a docName. */
+export function isValidWorkspaceId(workspaceId) {
+  return typeof workspaceId === 'string' && ID_RE.test(workspaceId);
+}
+
 export function authorizeUpgrade(rawUrl, isValidKey) {
   if (rawUrl == null) return { ok: false, code: 400 };
   let url;
@@ -25,7 +47,7 @@ export function authorizeUpgrade(rawUrl, isValidKey) {
   if (parts.length !== 1) return { ok: false, code: 400 };
 
   const docId = parts[0];
-  if (!ID_RE.test(workspaceId) || !DOC_RE.test(docId)) return { ok: false, code: 400 };
+  if (!isValidWorkspaceId(workspaceId) || !isValidDocId(docId)) return { ok: false, code: 400 };
 
   return { ok: true, workspaceId, docId, docName: `${workspaceId}/${docId}` };
 }
