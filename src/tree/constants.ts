@@ -74,18 +74,22 @@ export const MUX_RECONNECT_BACKOFF_MS = [1_000, 2_000, 3_000, 5_000];
  */
 export const MUX_RECONNECT_JITTER = 0.25;
 
-/**
- * How long a connected mux socket may stay silent before the client concludes the
- * server does not speak the mux protocol at all (P3 spec §4 "Compatibility").
- *
- * ⚠ This is a BACKSTOP, not the mechanism. A pre-P3 server accepts the `/_mux`
- * upgrade — `_mux` matches its `DOC_RE`, so `authorizeUpgrade` is satisfied and
- * `DocHub` serves it as an ordinary room called `_mux` — and it then sends a raw
- * y-websocket SyncStep1 immediately, which is not a well-formed mux frame for any
- * room this client subscribed. That is the detection in practice, and it lands in
- * one round trip. This timeout only covers a server that says nothing at all.
- */
-export const MUX_DETECT_TIMEOUT_MS = 10_000;
+// ⚠ `MUX_DETECT_TIMEOUT_MS` WAS HERE, AND IT WAS DELETED RATHER THAN RETUNED.
+// It bounded how long a connected mux socket could stay silent before the client
+// concluded the server does not speak the protocol — a session-long verdict
+// reached from the ABSENCE of an answer. Measured false and reachable on an
+// ordinary reconnect: the shipped server behind a proxy that passes the HTTP 101
+// through untouched and then holds the server's first frame for 12 s on the
+// second connection only. The link had synced over `/_mux` in 11 ms with frames
+// in — the peer is provably a current mux server — one RST followed, and
+// 11,299 ms later the route was condemned for the session with "your server is
+// older than this plugin" in front of the user.
+//
+// The detection that survives is the POSITIVE one, in `MuxLink.onMessage`: a
+// pre-P3 server SAYS `[0x00, 0x00, 0x01, 0x00]`, which is a two-byte tail and a
+// room nothing subscribed, and that lands in one round trip. Silence is answered
+// by `MUX_IDLE_TIMEOUT_MS` below — close the socket, dial again — because a
+// retry is what an absence is worth.
 
 /**
  * How long a CONNECTED mux socket may receive nothing at all before the link
@@ -122,11 +126,19 @@ export const MUX_CONNECT_TIMEOUT_MS = 4_000;
  * How many dials in a row may fail to produce an OPEN socket before the link
  * says so out loud (P3 spec §4).
  *
- * Every other route into the legacy verdict needs a socket that opened, so a
+ * The other route into the legacy verdict needs a socket that opened, so a
  * refused or black-holed `/_mux` upgrade reached nothing at all. This is the
  * signal that covers it. It is NOT a verdict on its own — a server that is merely
  * down fails dials the same way — so it is reported rather than latched, and the
  * bridge is what decides, by checking whether the per-room route works.
+ *
+ * ⚠ TWO THINGS BOUND WHAT THAT REPORT CAN DO, and both were added after a
+ * measurement. It is not reported at all once the route has served this link a
+ * frame, and the bridge may not conclude from it until the mux dial has been
+ * given at least as long as the legacy probe actually needed to connect. Without
+ * the second, the comparison is a race a 4 s-bounded dial loses by construction
+ * to a probe with no deadline: measured, a proxy delaying every connection on
+ * every route by 4.5 s demoted a working session at 14,952 ms.
  */
 export const MUX_UNREACHABLE_DIALS = 2;
 

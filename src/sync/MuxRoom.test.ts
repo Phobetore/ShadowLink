@@ -56,7 +56,6 @@ function makeLink(mux: FakeMux): { link: MuxLink; fire: () => void } {
     serverKey: 'sk',
     workspaceId: 'ws-1',
     openSocket: mux.openSocket,
-    detectTimeoutMs: 0,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
     clearTimer: (handle) => { timers[(handle as number) - 1] = undefined; },
   });
@@ -185,7 +184,6 @@ test('a peer answering our Step1 from a DIVERGENT state merges, it does not doub
     serverKey: 'sk',
     workspaceId: 'ws-1',
     openSocket: mux.openSocket,
-    detectTimeoutMs: 0,
     setTimer: () => 0,
     clearTimer: () => undefined,
   });
@@ -256,7 +254,6 @@ test('ONE room can be cut while another on the SAME socket keeps working', () =>
     serverKey: 'sk',
     workspaceId: 'ws-1',
     openSocket: mux.openSocket,
-    detectTimeoutMs: 0,
     setTimer: () => 0,
     clearTimer: () => undefined,
   });
@@ -505,7 +502,6 @@ test('a shared awareness instance is not destroyed by the room that borrowed it'
     serverKey: 'sk',
     workspaceId: 'ws-1',
     openSocket: mux.openSocket,
-    detectTimeoutMs: 0,
     setTimer: () => 0,
     clearTimer: () => undefined,
   });
@@ -534,7 +530,6 @@ test('a probe writes an awareness frame the SERVER will answer', () => {
     serverKey: 'sk',
     workspaceId: 'ws-1',
     openSocket: mux.openSocket,
-    detectTimeoutMs: 0,
     connectTimeoutMs: 0,
     idleTimeoutMs: 30_000,
     now: () => clock.t,

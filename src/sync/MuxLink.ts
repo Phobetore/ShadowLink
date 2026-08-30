@@ -27,7 +27,6 @@
 
 import {
   MUX_CONNECT_TIMEOUT_MS,
-  MUX_DETECT_TIMEOUT_MS,
   MUX_IDLE_TIMEOUT_MS,
   MUX_RECONNECT_BACKOFF_MS,
   MUX_RECONNECT_JITTER,
@@ -48,6 +47,14 @@ export const MUX_DOC_ID = '_mux';
 
 /** `WebSocket.OPEN`, spelled out so this module needs no DOM constant at runtime. */
 const WS_OPEN = 1;
+
+/**
+ * The ceiling on a dial deadline that `allowDialTime` may raise.
+ *
+ * Not a tuning knob: it is there so that one pathological measurement of the
+ * legacy route's latency cannot turn the dial deadline into an unbounded wait.
+ */
+const MAX_DIAL_TIMEOUT_MS = 60_000;
 
 // ============================================================ the frame codec
 
@@ -158,7 +165,6 @@ export interface MuxLinkConfig {
   openSocket?: MuxSocketFactory;
   backoffMs?: readonly number[];
   jitter?: number;
-  detectTimeoutMs?: number;
   /** Zero disables the liveness watchdog. Only a test that owns the clock should. */
   idleTimeoutMs?: number;
   /** Zero disables the connect timeout. */
@@ -174,22 +180,39 @@ export interface MuxLinkConfig {
  * Why the client concluded the peer is not a mux server. Reported so the fallback
  * can say something true, and so a test can tell the two apart rather than
  * asserting on "it fell back somehow".
+ *
+ * ⚠ SILENCE IS NEVER A VERDICT, and there used to be a third member here that
+ * was one. `'silent'` fired when a connected socket had been written to and had
+ * said nothing for ten seconds. It condemned the route for the whole session and
+ * showed the user "your server is older than this plugin" — measured FALSE and
+ * reachable on any reconnect: the shipped server behind a proxy that passes the
+ * 101 through and holds the server's first frame for 12 s on the second
+ * connection only. The link synced over `/_mux` in 11 ms with two frames in, one
+ * ordinary RST followed, and 11,299 ms later the route the server had just
+ * proved it speaks was condemned for the session.
+ *
+ * A route may be condemned only by POSITIVE evidence — the server said something
+ * that proves it does not speak this protocol. Everything else is a retry, and
+ * the retry for a socket that is open and saying nothing is the liveness
+ * watchdog, which closes it at `MUX_IDLE_TIMEOUT_MS` and lets the ladder dial
+ * again. This is the same rule as the invariant the project already lives by,
+ * that absence of evidence is never a delete, applied to a transport.
  */
 export type MuxUnsupportedReason =
   /** A message arrived that is not a well-formed frame for a room we subscribed. */
   | 'not-a-frame'
-  /** The socket connected, we sent frames, and nothing mux-shaped ever came back. */
-  | 'silent'
   /**
    * The `/_mux` route could not be opened at all, repeatedly, while the server
    * itself is reachable. Refused upgrade, black-holed upgrade, a proxy that only
    * knows the routes it was configured for.
    *
    * ⚠ Only the BRIDGE may conclude this one, and only after it has proved the
-   * per-room route works — `MuxLink` cannot tell a refused upgrade from a server
-   * that is down, because a browser `WebSocket` deliberately reports both as a
-   * bare close. `MuxLink` reports the evidence (`onUnreachable`); it never
-   * latches this reason by itself.
+   * per-room route works ON TERMS AT LEAST AS GENEROUS AS THE MUX GOT —
+   * `MuxLink` cannot tell a refused upgrade from a server that is down, because a
+   * browser `WebSocket` deliberately reports both as a bare close. `MuxLink`
+   * reports the evidence (`onUnreachable`); it never latches this reason by
+   * itself, and it stops reporting it entirely once the route has served this
+   * link a frame.
    */
   | 'unreachable';
 
@@ -200,9 +223,9 @@ export class MuxLink {
   private readonly openSocket: MuxSocketFactory;
   private readonly backoff: readonly number[];
   private readonly jitter: number;
-  private readonly detectTimeoutMs: number;
   private readonly idleTimeoutMs: number;
-  private readonly connectTimeoutMs: number;
+  /** ⚠ Not readonly: `allowDialTime` raises it so a comparison can be fair. */
+  private connectTimeoutMs: number;
   private readonly unreachableDials: number;
   private readonly now: () => number;
   private readonly random: () => number;
@@ -231,7 +254,6 @@ export class MuxLink {
 
   private attempt = 0;
   private retryHandle: unknown = null;
-  private detectHandle: unknown = null;
   private idleHandle: unknown = null;
   private connectHandle: unknown = null;
 
@@ -258,6 +280,21 @@ export class MuxLink {
    */
   private socketSpokeMux = false;
 
+  /**
+   * TRUE once ANY socket on this link has answered in the frame protocol.
+   *
+   * ⚠ LINK-LIFETIME, and it is the other half of "silence is never a verdict".
+   * `socketSpokeMux` is per socket because the peer may be a different process
+   * after a reconnect, and that is right for the POSITIVE `not-a-frame` verdict:
+   * a rolled-back server says `[0,0,1,0]` on the new socket and is caught in one
+   * round trip. But the ABSENCE of an answer says nothing about the peer, so once
+   * this route has served this link even once, no later silence and no later run
+   * of failed dials may condemn it. Measured: a 4.5 s-delay proxy in front of the
+   * shipped server serving `/_mux` normally demoted the session at 14,952 ms,
+   * with a sentence blaming a proxy that was forwarding every path.
+   */
+  private routeEverServed = false;
+
   /** When the current socket last received ANYTHING. Zero while it is down. */
   private lastInboundAt = 0;
 
@@ -272,9 +309,6 @@ export class MuxLink {
 
   /** Latched once, so the fallback is armed exactly one time. */
   private unsupported: MuxUnsupportedReason | null = null;
-
-  /** Frames sent on the CURRENT socket. `silent` only means anything above zero. */
-  private framesSentOnSocket = 0;
 
   readonly stats = {
     socketsOpened: 0,
@@ -305,7 +339,6 @@ export class MuxLink {
       });
     this.backoff = config.backoffMs ?? MUX_RECONNECT_BACKOFF_MS;
     this.jitter = config.jitter ?? MUX_RECONNECT_JITTER;
-    this.detectTimeoutMs = config.detectTimeoutMs ?? MUX_DETECT_TIMEOUT_MS;
     this.idleTimeoutMs = config.idleTimeoutMs ?? MUX_IDLE_TIMEOUT_MS;
     this.connectTimeoutMs = config.connectTimeoutMs ?? MUX_CONNECT_TIMEOUT_MS;
     this.unreachableDials = config.unreachableDials ?? MUX_UNREACHABLE_DIALS;
@@ -342,6 +375,16 @@ export class MuxLink {
   /** NULL while the link is still viable; the reason once it is not. */
   get unsupportedReason(): MuxUnsupportedReason | null {
     return this.unsupported;
+  }
+
+  /** TRUE once this route has answered this link in the framing, ever. */
+  get everServed(): boolean {
+    return this.routeEverServed;
+  }
+
+  /** How long the next dial has to produce an OPEN socket before it is a failure. */
+  get dialTimeoutMs(): number {
+    return this.connectTimeoutMs;
   }
 
   get roomCount(): number {
@@ -404,7 +447,6 @@ export class MuxLink {
     }
     this.stats.framesOut += 1;
     this.stats.bytesOut += frame.byteLength;
-    this.framesSentOnSocket += 1;
     return true;
   }
 
@@ -517,12 +559,40 @@ export class MuxLink {
     this.noteLegacyEvidence(reason, { external: true });
   }
 
+  /**
+   * Give a dial at least `ms` to produce an OPEN socket, from now on.
+   *
+   * ⚠ THIS IS WHAT MAKES THE COMPARISON FAIR, and the comparison was rigged
+   * without it. A dial is bounded at `MUX_CONNECT_TIMEOUT_MS`; the bridge's
+   * legacy probe is a `WebsocketProvider` with no connect deadline at all. On any
+   * path whose upgrade takes longer than the bound, the mux can NEVER open and
+   * the probe always eventually can, so "the mux route is unreachable" was
+   * deterministic on a slow path rather than the narrow race it was believed to
+   * be. Measured through a proxy delaying every connection on every route by
+   * 4.5 s, against the shipped server serving `/_mux` normally: demoted at
+   * 14,952 ms with a false sentence, where the parent branch connected at
+   * 5,041 ms and stayed.
+   *
+   * So the bridge measures what the legacy route actually needed and hands it
+   * here before it is allowed to conclude anything. Raises only — a deadline that
+   * could shrink would reintroduce the same bias — and is capped so one
+   * pathological measurement cannot turn a deadline into an unbounded wait.
+   */
+  allowDialTime(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= this.connectTimeoutMs) return;
+    this.connectTimeoutMs = Math.min(Math.round(ms), MAX_DIAL_TIMEOUT_MS);
+    // A dial already in flight was armed on the old, unfair deadline. Re-arming
+    // it is the difference between "the next dial is fair" and "the dial that is
+    // about to be counted as evidence is fair".
+    const socket = this.socket;
+    if (socket !== null && !this.socketOpened) this.armConnectTimeout(socket);
+  }
+
   // ---------------------------------------------------------- internals
 
   private open(): void {
     if (this.destroyed || !this.shouldConnect || this.socket !== null) return;
     this.setStatus('connecting');
-    this.framesSentOnSocket = 0;
     this.socketSpokeMux = false;
 
     let socket: MuxSocket;
@@ -566,7 +636,6 @@ export class MuxLink {
     this.cancelConnectTimeout();
     this.lastInboundAt = this.now();
     this.armIdleWatch();
-    this.armDetect();
     // Every subscribed room re-handshakes, in subscription order. I24: the room
     // asks from the state vector of the bytes it holds, and nothing is marked
     // synced on a handshake that did not complete.
@@ -609,20 +678,21 @@ export class MuxLink {
       // The two clauses above are BELT AND BRACES, and that is measured rather
       // than hoped: mutating out either one on its own leaves structural case 80c
       // green — `[0,0,1,0]` has a two-byte tail AND names a room nothing
-      // subscribed — while mutating out both makes it fail. With both gone the
-      // fallback still happens, but only when `MUX_DETECT_TIMEOUT_MS` expires ten
-      // seconds later, which is exactly the difference between a verdict and a
-      // backstop.
+      // subscribed — while mutating out both makes it fail. With both gone there
+      // is NO fallback at all any more: the ten-second backstop that used to
+      // catch it was a verdict reached from silence, and it has been removed.
+      // These two clauses are now the whole of what may condemn a peer.
       this.noteLegacyEvidence('not-a-frame');
       return;
     }
 
-    // THIS SOCKET's peer answered in the framing. From here a silent or malformed
-    // message on THIS socket is a network fault, never an old server — and the
-    // next socket has to prove it again, because the peer on the other end of it
-    // may be a different process entirely.
+    // THIS SOCKET's peer answered in the framing. From here a malformed message
+    // on THIS socket is a network fault, never an old server — and the next
+    // socket has to prove it again, because the peer on the other end of it may
+    // be a different process entirely.
     this.socketSpokeMux = true;
-    this.cancelDetect();
+    // The route's own record, which no reconnect resets: see `routeEverServed`.
+    this.routeEverServed = true;
 
     const handler = this.rooms.get(frame.room);
     if (handler === undefined) return;      // unsubscribed while in flight
@@ -640,7 +710,6 @@ export class MuxLink {
     this.socket = null;
     this.socketOpened = false;
     this.lastInboundAt = 0;
-    this.cancelDetect();
     this.cancelIdleWatch();
     this.cancelConnectTimeout();
     // A close on a socket that never reached OPEN is a failed DIAL, not a dropped
@@ -667,7 +736,6 @@ export class MuxLink {
     this.socket = null;
     this.socketOpened = false;
     this.lastInboundAt = 0;
-    this.cancelDetect();
     this.cancelIdleWatch();
     this.cancelConnectTimeout();
     if (socket === null) return;
@@ -728,34 +796,6 @@ export class MuxLink {
     this.retryHandle = null;
   }
 
-  /**
-   * The backstop half of detection: a peer that accepted the socket, took our
-   * frames and said nothing at all. The positive test above is what catches a
-   * pre-P3 server in one round trip; this catches a peer that is not even that.
-   *
-   * ⚠ Re-armed on EVERY connect, because the socket it judges is a new one. It
-   * used to be armed once and then disabled for the life of the link by the first
-   * good frame, which is what let a server be replaced underneath a reconnect
-   * with nothing looking again.
-   */
-  private armDetect(): void {
-    this.cancelDetect();
-    if (this.socketSpokeMux || this.detectTimeoutMs <= 0) return;
-    this.detectHandle = this.setTimer(() => {
-      this.detectHandle = null;
-      // Only a socket we actually WROTE to can be called silent. A link with no
-      // rooms yet has asked nothing and is owed no answer.
-      if (this.socketSpokeMux || !this.connected || this.framesSentOnSocket === 0) return;
-      this.noteLegacyEvidence('silent');
-    }, this.detectTimeoutMs);
-  }
-
-  private cancelDetect(): void {
-    if (this.detectHandle === null) return;
-    this.clearTimer(this.detectHandle);
-    this.detectHandle = null;
-  }
-
   // ---------------------------------------------------------- liveness
 
   /**
@@ -770,6 +810,15 @@ export class MuxLink {
    * Two thresholds, both y-websocket's: at HALF the timeout the link asks a room
    * to say something the server will answer, and at the full timeout it closes
    * the socket. The ladder does the rest, which is why this is the whole fix.
+   *
+   * ⚠ IT IS ALSO THE WHOLE ANSWER TO A PEER THAT SAYS NOTHING. There used to be a
+   * second, faster timer beside this one that turned ten seconds of silence into
+   * a session-long verdict against the route. Silence is not evidence about a
+   * peer, so the response to it is what it is here: close the socket and dial
+   * again, for as long as the link is wanted. A peer that accepts `/_mux` and
+   * never answers is therefore retried rather than condemned, and the bridge's
+   * `unreachable` — which needs the per-room route to have positively worked on
+   * terms at least as generous — is the only thing that may end the session's mux.
    */
   private armIdleWatch(): void {
     this.cancelIdleWatch();
@@ -874,6 +923,13 @@ export class MuxLink {
     this.stats.dialsFailed += 1;
     this.failedDials += 1;
     if (this.failedDials < this.unreachableDials) return;
+    // ⚠ A ROUTE THAT HAS SERVED THIS LINK IS NEVER REPORTED UNREACHABLE. Failed
+    // dials on such a route are an outage, a slept radio or a proxy restart, and
+    // the only honest response to those is the ladder. Measured before this
+    // clause: five seconds of `/_mux`-only trouble on an otherwise-working server
+    // demoted the session permanently, 3/3, and a flaky path demoted one that had
+    // already synced over the mux at 28,115 ms.
+    if (this.routeEverServed) return;
     for (const handler of [...this.unreachableHandlers]) {
       try {
         handler();
@@ -887,11 +943,10 @@ export class MuxLink {
     reason: MuxUnsupportedReason,
     options: { external?: boolean } = {},
   ): void {
-    // `socketSpokeMux` gates the two FIRST-MESSAGE verdicts, because a socket
-    // that has answered in the framing is not an old server. It does not gate a
-    // verdict reached from outside: the bridge concludes `unreachable` from
-    // sockets that never opened at all, and there is nothing for this socket to
-    // have said.
+    // `socketSpokeMux` gates the FIRST-MESSAGE verdict, because a socket that has
+    // answered in the framing is not an old server. It does not gate a verdict
+    // reached from outside: the bridge concludes `unreachable` from sockets that
+    // never opened at all, and there is nothing for this socket to have said.
     if (options.external !== true && this.socketSpokeMux) return;
     if (this.unsupported !== null || this.destroyed) return;
     this.unsupported = reason;

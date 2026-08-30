@@ -91,7 +91,6 @@ function harness({ legacy = false } = {}): Harness {
   const link = new MuxLink({
     ...CONFIG,
     openSocket: mux.openSocket,
-    detectTimeoutMs: 0,
     setTimer: () => 1,
     clearTimer: () => undefined,
   });
@@ -310,7 +309,6 @@ function unreachableHarness(): {
   const link = new MuxLink({
     ...CONFIG,
     openSocket: mux.openSocket,
-    detectTimeoutMs: 0,
     idleTimeoutMs: 0,
     connectTimeoutMs: 0,
     unreachableDials: 2,
@@ -342,10 +340,10 @@ test('a route that will not OPEN falls back once the per-room route is proved to
   // never shown, the link dialling for ever — while a plain per-room client on
   // the SAME path synced. Afterwards: verdict and a synced tree at 1,615 ms.
   const h = unreachableHarness();
-  h.transport.connect();
+  // Refused from the first dial, which is what a 404 on `/_mux` is: the route has
+  // never served this link, so failed dials are still reportable evidence.
   h.mux.refuseConnect = true;
-  h.mux.dropSockets();
-  h.fire();                                      // a first dial fails: not evidence yet
+  h.transport.connect();                         // a first dial fails: not evidence yet
   h.fire();                                      // and a second: evidence, not a verdict
 
   assert.equal(h.made.length, 1, 'the per-room route was never tried');
@@ -372,11 +370,12 @@ test('a server that is merely DOWN is not demoted — the per-room route fails t
   // demote a whole session every time a server restarted. Measured against a real
   // server stopped for twelve seconds: five failed dials, no verdict, no notice,
   // and the mux back up 6,634 ms after the server returned.
+  // Bootstrapped while the server is down, so the mux route has never served this
+  // link and its failed dials are still reportable evidence. That is the harder
+  // half: once the route HAS served, nothing is reported at all (below).
   const h = unreachableHarness();
-  h.transport.connect();
   h.mux.refuseConnect = true;
-  h.mux.dropSockets();
-  h.fire();
+  h.transport.connect();
   h.fire();
   assert.equal(h.made.length, 1, 'the per-room route was never tried');
 
@@ -395,12 +394,33 @@ test('a server that is merely DOWN is not demoted — the per-room route fails t
   h.dispose();
 });
 
+test('a route that already served this link is never demoted, and no probe is built', () => {
+  // ⚠ MEASURED, and it is the rule from the other side. `unreachable` needs failed
+  // dials, and an outage, a slept radio or a proxy restart produce exactly those
+  // on a route that works. Before this: five seconds of `/_mux`-only trouble on an
+  // otherwise-working server demoted the session permanently, 3/3, and a flaky
+  // path demoted one that had already synced over the mux at 28,115 ms — where the
+  // parent branch rode out ten cuts on the same path and stayed.
+  const h = unreachableHarness();
+  h.transport.connect();
+  assert.equal(h.link.everServed, true, 'the mux route never worked in the first place');
+
+  h.mux.refuseConnect = true;
+  h.mux.dropSockets();
+  for (let i = 0; i < 8; i += 1) h.fire();
+
+  assert.ok(h.link.stats.dialsFailed >= 2, 'no dial actually failed');
+  assert.equal(h.made.length, 0, 'a probe was built against a route that had worked');
+  assert.equal(h.link.unsupportedReason, null, 'an outage demoted a working route');
+  assert.deepEqual(h.notices, []);
+  h.dispose();
+});
+
 test('the two verdicts get two sentences, and neither says the other one\'s thing', () => {
   // "Update your server" is false for a current server behind a proxy that will
   // not forward the route, and sending somebody to update a server that is
   // already up to date is worse than saying nothing.
   assert.equal(legacyNoticeFor('not-a-frame'), LEGACY_SERVER_NOTICE);
-  assert.equal(legacyNoticeFor('silent'), LEGACY_SERVER_NOTICE);
   assert.equal(legacyNoticeFor('unreachable'), MUX_UNREACHABLE_NOTICE);
   assert.notEqual(MUX_UNREACHABLE_NOTICE, LEGACY_SERVER_NOTICE);
   assert.ok(!MUX_UNREACHABLE_NOTICE.includes('older'),

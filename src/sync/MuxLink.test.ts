@@ -58,9 +58,8 @@ function makeLink(over: Partial<MuxLinkConfig> = {}): {
     openSocket: mux.openSocket,
     random: () => 0.5,                                   // no jitter unless asked
     // Off by default so `timers` is the BACKOFF ladder and nothing else. The
-    // detection and liveness tests below build their own link and turn the one
-    // they are about back on.
-    detectTimeoutMs: 0,
+    // liveness tests below build their own link and turn the one they are about
+    // back on.
     idleTimeoutMs: 0,
     connectTimeoutMs: 0,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
@@ -450,20 +449,38 @@ test('a detected legacy server stops the ladder: there is nothing to retry into'
   assert.equal(mux.sockets.length, 1, 'connect() re-dialled a server already known to be old');
 });
 
-test('a peer that took our frames and said nothing is condemned by the timeout', () => {
-  const timers: Array<{ fn: () => void; ms: number }> = [];
+test('a peer that took our frames and said nothing is RETRIED, never condemned', () => {
+  // ⚠ THE RULE, in the one place it used to be broken hardest. A ten-second
+  // timer used to turn this exact state into `'silent'` — a session-long verdict
+  // reached from the absence of an answer, which then told the user their server
+  // was older than their plugin. Measured false against the shipped server behind
+  // a proxy holding its first frame; the route had already answered twice.
+  //
+  // What silence is worth is a retry, and the retry is the liveness watchdog: at
+  // the idle timeout the socket is closed and the ladder dials again, for as long
+  // as the link is wanted.
+  const clock = { t: 0 };
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
   const reasons: MuxUnsupportedReason[] = [];
+  const opened: MuxSocket[] = [];
   const link = new MuxLink({
     serverUrl: 'ws://host:1234',
     serverKey: KEY,
     workspaceId: WORKSPACE,
-    openSocket: () => silentSocket(),
-    // The liveness watchdog and the connect timeout are off here so that
-    // `timers` is the DETECT window and nothing else.
-    idleTimeoutMs: 0,
+    openSocket: () => {
+      // A socket that says nothing but whose close is a real close: the
+      // watchdog's own synthesised close is pinned by its own test below.
+      const socket = { ...silentSocket() };
+      socket.close = (): void => { socket.readyState = 3; socket.onclose?.({}); };
+      opened.push(socket);
+      return socket;
+    },
     connectTimeoutMs: 0,
+    idleTimeoutMs: 30_000,
+    random: () => 0.5,
+    now: () => clock.t,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
-    clearTimer: (handle) => { delete timers[handle as number]; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
   });
   link.onUnsupported((reason) => reasons.push(reason));
   // The room writes on handshake, exactly as `MuxRoom` does.
@@ -472,36 +489,124 @@ test('a peer that took our frames and said nothing is condemned by the timeout',
     onPayload: () => undefined,
   });
   link.connect();
+  assert.equal(link.stats.socketsOpened, 1);
 
-  const armed = timers.filter((t) => t !== undefined);
-  assert.equal(armed.length, 1, 'no detect window was armed on a connected socket');
-  armed[0].fn();
-  assert.deepEqual(reasons, ['silent']);
+  // A full idle timeout of nothing at all, polled the way the watchdog polls.
+  for (let i = 0; i < 11; i += 1) {
+    clock.t += 3_000;
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  }
+
+  assert.deepEqual(reasons, [], 'silence condemned the route');
+  assert.equal(link.unsupportedReason, null, 'a peer that said nothing was demoted');
+  assert.equal(link.stats.idleClosures, 1, 'the silent socket was never closed');
+  assert.equal(link.stats.socketsOpened, 2, 'the link did not dial again after the close');
 });
 
-test('a link that asked NOTHING never condemns the peer — silence is not evidence', () => {
-  const timers: Array<{ fn: () => void; ms: number }> = [];
+test('a link that asked NOTHING is not owed an answer either — no timer condemns it', () => {
+  const clock = { t: 0 };
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
   const reasons: MuxUnsupportedReason[] = [];
   const link = new MuxLink({
     serverUrl: 'ws://host:1234',
     serverKey: KEY,
     workspaceId: WORKSPACE,
     openSocket: () => silentSocket(),
-    // The liveness watchdog and the connect timeout are off here so that
-    // `timers` is the DETECT window and nothing else.
-    idleTimeoutMs: 0,
     connectTimeoutMs: 0,
+    idleTimeoutMs: 30_000,
+    random: () => 0.5,
+    now: () => clock.t,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
-    clearTimer: (handle) => { delete timers[handle as number]; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
   });
   link.onUnsupported((reason) => reasons.push(reason));
   link.connect();                                    // no rooms: nothing was asked
 
-  const armed = timers.filter((t) => t !== undefined);
-  assert.equal(armed.length, 1);
-  armed[0].fn();
+  for (let i = 0; i < 11; i += 1) {
+    clock.t += 3_000;
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  }
   assert.deepEqual(reasons, [], 'a link that asked nothing declared the server old');
   assert.equal(link.unsupportedReason, null);
+});
+
+test('a route that has served this link is never reported unreachable again', () => {
+  // ⚠ MEASURED, and the second half of the same rule. `unreachable` is the
+  // bridge's verdict, but the EVIDENCE for it is a run of dials that produced no
+  // socket — which is exactly what an outage, a slept radio or a proxy restart
+  // produces on a route that works. Before this clause, five seconds of
+  // `/_mux`-only trouble demoted a session permanently, 3/3, and a flaky path
+  // demoted one that had already synced over the mux.
+  const { link, mux, fire } = makeLink({ unreachableDials: 2 });
+  let reports = 0;
+  link.onUnreachable(() => { reports += 1; });
+  link.subscribe('_tree', collector());
+  link.connect();
+
+  // The route answers once. That is the positive fact no later silence undoes.
+  mux.sockets[0].push('_tree', bytes(0, 0));
+  assert.equal(link.everServed, true, 'a good frame did not record the route as served');
+
+  mux.refuseConnect = true;
+  mux.dropSockets();
+  for (let i = 0; i < 6; i += 1) fire();               // the ladder's own retries
+  assert.ok(link.stats.dialsFailed >= 2, 'the probe did not actually fail any dials');
+  assert.equal(reports, 0, 'a route that had served this link was reported unreachable');
+  assert.equal(link.unsupportedReason, null);
+});
+
+test('a route that has NEVER served is still reported, which is what 80f needs', () => {
+  const { link, mux, fire } = makeLink({ unreachableDials: 2 });
+  let reports = 0;
+  link.onUnreachable(() => { reports += 1; });
+  link.subscribe('_tree', collector());
+  mux.refuseConnect = true;
+  link.connect();
+  for (let i = 0; i < 3; i += 1) fire();
+  assert.equal(link.everServed, false);
+  assert.ok(reports > 0, 'a route that never answered was never reported');
+});
+
+test('allowDialTime raises the dial deadline and never lowers it', () => {
+  // ⚠ THE FAIRNESS RULE. A dial is bounded; the bridge's legacy probe is not, so
+  // on any path whose upgrade is slower than the bound the mux loses by
+  // construction. Measured: a proxy delaying every connection on every route by
+  // 4.5 s demoted a working session at 14,952 ms. The bridge measures what the
+  // legacy route actually needed and hands it here before it may conclude.
+  const { link } = makeLink({ connectTimeoutMs: 4_000 });
+  assert.equal(link.dialTimeoutMs, 4_000);
+  link.allowDialTime(9_000);
+  assert.equal(link.dialTimeoutMs, 9_000, 'the deadline was not widened');
+  link.allowDialTime(1_000);
+  assert.equal(link.dialTimeoutMs, 9_000, 'a deadline that can shrink is the old bias back');
+  link.allowDialTime(Number.POSITIVE_INFINITY);
+  assert.equal(link.dialTimeoutMs, 9_000, 'a nonsense measurement moved the deadline');
+  link.allowDialTime(10 * 60_000);
+  assert.equal(link.dialTimeoutMs, 60_000, 'the deadline is not capped');
+});
+
+test('allowDialTime re-arms the dial that is IN FLIGHT, not only the next one', () => {
+  // The dial about to be counted as evidence is the one that has to be fair.
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    openSocket: () => hangingSocket(),
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 4_000,
+    random: () => 0.5,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  link.connect();
+  const armedBefore = timers.filter((t) => t !== undefined);
+  assert.deepEqual(armedBefore.map((t) => t?.ms), [4_000]);
+
+  link.allowDialTime(9_000);
+  const armedAfter = timers.filter((t) => t !== undefined);
+  assert.deepEqual(armedAfter.map((t) => t?.ms), [9_000],
+    'the in-flight dial kept the deadline the comparison was rigged with');
 });
 
 test('a socket that HAS answered is not demoted by a later bad frame on it', () => {
@@ -624,6 +729,11 @@ test('destroy releases the rooms and the socket, and a later frame reaches nothi
 });
 
 /** A transport that accepts everything and answers nothing. */
+/** A dial that is accepted at TCP and whose upgrade is never answered. */
+function hangingSocket(): MuxSocket {
+  return { ...silentSocket(), readyState: 0 };
+}
+
 function silentSocket(): MuxSocket {
   return {
     readyState: 1,
@@ -674,7 +784,6 @@ function livenessLink(over: Partial<MuxLinkConfig> = {}): {
     serverUrl: 'ws://host:1234',
     serverKey: KEY,
     workspaceId: WORKSPACE,
-    detectTimeoutMs: 0,
     connectTimeoutMs: 0,
     random: () => 0.5,
     now: () => clock.t,
@@ -766,7 +875,6 @@ test('a dial that HANGS is a failed attempt, not a link parked forever', () => {
     serverUrl: 'ws://host:1234',
     serverKey: KEY,
     workspaceId: WORKSPACE,
-    detectTimeoutMs: 0,
     idleTimeoutMs: 0,
     connectTimeoutMs: 4_000,
     random: () => 0.5,
@@ -904,7 +1012,6 @@ test('a close on a socket that never OPENED is a failed dial; one that opened is
     serverUrl: 'ws://host:1234',
     serverKey: KEY,
     workspaceId: WORKSPACE,
-    detectTimeoutMs: 0,
     idleTimeoutMs: 0,
     connectTimeoutMs: 0,
     unreachableDials: 2,
