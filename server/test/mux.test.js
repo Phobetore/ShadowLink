@@ -26,7 +26,10 @@ import {
   MUX_HARD_BUFFERED_BYTES,
 } from '../mux.js';
 import { authorizeUpgrade, isValidDocId } from '../upgradeAuth.js';
-import { createFanoutGate, MUX_CLOSE_FANOUT_CONCURRENCY } from '../mux.js';
+import {
+  createFanoutGate, MUX_CLOSE_FANOUT_CONCURRENCY,
+  MUX_SNAPSHOT_WRITE_CONCURRENCY, snapshotWriteGovernor,
+} from '../mux.js';
 import {
   FakeSocket, FlakyHub, MuxClient, RoomClient, startMuxHub, instrumentWrites, seedRoom,
   syncPayload, awarenessPayload, updateFor, textOfUpdate,
@@ -993,6 +996,149 @@ test('a snapshot the fan-out could not write is counted, not swallowed', async (
     server.hub._rename = realRename;
     await server.stop();
   }
+});
+
+test('the ORDINARY debounce storm is bounded too, with nothing closed', async () => {
+  // ⚠ The blocker this exists for, and it is not the fan-out's. `DocHub` has
+  // always armed one debounce timer per resident doc and they fire together,
+  // governed by nothing; what the mux removes is the natural limit that hid it,
+  // because 8,192 resident docs used to cost 8,192 sockets and now cost 8,192
+  // frames on one. Measured on the shipped code before this bound existed, with
+  // NOTHING closed: one authenticated socket, 8,192 rooms, one update each —
+  // 0.6 MB over 24,576 frames — put 8,147 concurrent `_writeSnapshot` in flight,
+  // the exact number the close fan-out was bounded to prevent, with
+  // `stats.snapshotsFailed` reading 0. At 2,000 rooms it was 2,000 exactly.
+  // After: 64 at both sizes, every write issued, none lost, and FASTER at the
+  // cap (4,864 ms against 5,452 ms).
+  const gate = createFanoutGate(4);
+  const server = await startMuxHub({ persistDebounceMs: 100, writeGate: gate });
+  const rooms = Array.from({ length: 150 }, (_, i) => roomName(i));
+  const client = new MuxClient(server.muxUrl('wd'));
+  let writes = null;
+  try {
+    await client.connect();
+    // ⚠ Instrumented AFTER the socket attached, i.e. after the budget installed,
+    // which is the case that pins the harness's rule: the counter must sit UNDER
+    // the budget. Wrapped on top of it, it would count writes waiting for a slot
+    // as though they were running, and report the room count either way.
+    writes = instrumentWrites(server.hub);
+    const mux = server.lastMux();
+    await client.syncAll(rooms);
+    assert.equal(writes.issued, 0, 'a write landed before the storm was armed');
+
+    for (const [i, room] of rooms.entries()) client.pushUpdate(room, updateFor(`body ${i}`));
+    assert.equal(
+      await until(() => writes.issued >= rooms.length, 15_000), true,
+      'the debounce storm never fired',
+    );
+    await until(() => writes.inFlight === 0, 15_000);
+
+    assert.equal(
+      writes.peak, 4,
+      `the storm reached ${writes.peak} concurrent writes against a budget of 4`,
+    );
+    assert.equal(writes.failed, 0);
+
+    // ⚠ This is the debounce path and not the fan-out: nothing was closed.
+    assert.equal(mux.roomCount, rooms.length, 'a room closed, so this measured the fan-out');
+    assert.equal(mux.stats.peakFanoutInFlight, 0, 'the close fan-out ran, so this proves nothing');
+    assert.equal(client.connected, true, 'the socket went, so this measured the fan-out');
+
+    for (const room of rooms) {
+      assert.equal(
+        existsSync(join(server.dir, 'yjs', 'wd', `${room}.bin`)), true,
+        `${room} was bounded out of existence rather than queued`,
+      );
+    }
+    assert.equal(MUX_SNAPSHOT_WRITE_CONCURRENCY, 64, 'the shipped write budget moved');
+  } finally {
+    writes?.restore();
+    client.abort();
+    await server.stop();
+  }
+});
+
+test('the close fan-out draws on the write budget too, and the two gates do not deadlock', async () => {
+  // The fan-out holds one of ITS slots while it waits for the write that close
+  // caused, and that write now waits for a slot of its own. Two gates, so this
+  // composes; one gate serving both would stop dead at the limit, which is why
+  // `attachMux` refuses that configuration outright.
+  const writeGate = createFanoutGate(3);            // the fan-out keeps the shipped 64
+  const server = await startMuxHub({ persistDebounceMs: 600_000, writeGate });
+  const writes = instrumentWrites(server.hub);
+  const rooms = Array.from({ length: 40 }, (_, i) => roomName(i));
+  const client = new MuxClient(server.muxUrl('wx'));
+  try {
+    await client.connect();
+    await client.syncAll(rooms);
+    for (const [i, room] of rooms.entries()) client.pushUpdate(room, updateFor(`body ${i}`));
+    await sleep(200);
+    assert.equal(writes.issued, 0, 'the debounce wrote before the fan-out could');
+
+    const mux = server.lastMux();
+    client.abort();
+    assert.equal(await until(() => mux.roomCount === 0, 10_000), true, 'the fan-out never ran');
+    await mux.drained;                              // deadlock shows up here, as a hang
+
+    assert.equal(writes.issued, rooms.length, 'a room was not flushed when the socket dropped');
+    assert.equal(
+      writes.peak <= 3, true,
+      `the fan-out's writes reached ${writes.peak} against a write budget of 3`,
+    );
+    // ...and the fan-out itself was NOT held to 3, which is what makes these two
+    // separate budgets rather than one measured twice.
+    assert.equal(
+      mux.stats.peakFanoutInFlight > 3, true,
+      `the fan-out held ${mux.stats.peakFanoutInFlight} slots — it is being limited by the write budget`,
+    );
+    assert.equal(writes.failed, 0);
+    assert.equal(mux.stats.snapshotsFailed, 0);
+    for (const [i, room] of rooms.entries()) {
+      assert.equal(existsSync(join(server.dir, 'yjs', 'wx', `${room}.bin`)), true, `${room} lost`);
+      assert.equal(server.hub.getText(`wx/${room}`), `body ${i}`);
+    }
+  } finally {
+    writes.restore();
+    await server.stop();
+  }
+});
+
+test('two hubs that name no write budget draw on the SAME shipped one', async () => {
+  // File descriptors are a PROCESS resource, so the budget that bounds them is
+  // one object for the process rather than one per hub — the same argument the
+  // close fan-out's budget was made process-wide for.
+  const one = await startMuxHub({ persistDebounceMs: 600_000 });
+  const two = await startMuxHub({ persistDebounceMs: 600_000 });
+  const clientOne = new MuxClient(one.muxUrl('w1'));
+  const clientTwo = new MuxClient(two.muxUrl('w1'));
+  try {
+    await clientOne.connect();
+    await clientTwo.connect();
+    const govOne = snapshotWriteGovernor(one.hub);
+    const govTwo = snapshotWriteGovernor(two.hub);
+    assert.notEqual(govOne, undefined, 'attaching a mux did not install the write budget');
+    assert.equal(
+      govOne.gate, govTwo.gate,
+      'each hub got a budget of its own, so two hubs can hold 2 x the descriptors',
+    );
+    assert.equal(govOne.gate.limit, MUX_SNAPSHOT_WRITE_CONCURRENCY);
+  } finally {
+    clientOne.abort();
+    clientTwo.abort();
+    await one.stop();
+    await two.stop();
+  }
+});
+
+test('one gate serving both budgets is refused, not deadlocked into', () => {
+  const gate = createFanoutGate(2);
+  assert.throws(
+    () => attachMux(new FakeSocket(), {
+      hub: new FlakyHub(), workspaceId: 'w1', fanoutGate: gate, writeGate: gate,
+    }),
+    /separate gates/,
+    'one gate served both budgets, which deadlocks the fan-out at its limit',
+  );
 });
 
 test('one room that refuses to open takes neither the socket nor the other rooms with it', () => {

@@ -146,8 +146,13 @@ export const MUX_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 export const MUX_BACKPRESSURE_GRACE_MS = 60_000;
 
 /**
- * Snapshot writes the close fan-out may have in flight AT ONCE, across the whole
- * process.
+ * Rooms the close fan-out may be CLOSING at once, across the whole process.
+ *
+ * ⚠ Read the name narrowly: this bounds the fan-out, and only the fan-out. The
+ * snapshot writes themselves are bounded by `MUX_SNAPSHOT_WRITE_CONCURRENCY`
+ * below, which governs every write path including the ordinary debounce. The
+ * first version of this comment read as though this constant bounded snapshot
+ * writes generally, and process-wide it did not.
  *
  * Dropping a mux socket closes every room on it, and `DocHub`'s existing
  * flush-on-last-peer-left turns each of those into a snapshot write. Issued all
@@ -170,13 +175,46 @@ export const MUX_BACKPRESSURE_GRACE_MS = 60_000;
  */
 export const MUX_CLOSE_FANOUT_CONCURRENCY = 64;
 
+/**
+ * Snapshot writes ANY path may have in flight at once, across the whole process.
+ *
+ * ⚠ The defect this exists for, and whose defect it is. `DocHub` has always
+ * armed one debounce timer per resident doc, and they fire together with nothing
+ * governing them. What the mux removes is the natural limit that hid it: before,
+ * 8,192 resident docs meant 8,192 sockets and 8,192 authentications; now it is
+ * one frame per room on one authenticated socket. THE MUX DOES NOT CREATE THIS
+ * BUG, IT MAKES IT REACHABLE — which is exactly why the mux is where it is paid
+ * for. Measured on the shipped code, with nothing closed and no fan-out
+ * involved: one socket, 8,192 rooms, one update each — 0.6 MB uploaded over
+ * 24,576 frames — put 8,147 concurrent `_writeSnapshot` in flight, the same
+ * number and the same mechanism the close fan-out was bounded to prevent, with
+ * `stats.snapshotsFailed` reading 0 throughout. At 2,000 rooms it was 2,000
+ * exactly. This machine did not reach EMFILE; a stock Linux `ulimit -n` of 1,024
+ * would, and the loss would be silent.
+ *
+ * Governed from OUTSIDE `DocHub`, because `server/tools/check-dochub.mjs` pins
+ * that file's bytes and this slice may not move the pin. `governSnapshotWrites`
+ * wraps the hub's own `_writeSnapshot` — the single choke point every path goes
+ * through, debounce and flush and fan-out alike — so the bound is on the
+ * resource (open descriptors) rather than on one caller. `flushAllSync` is
+ * synchronous and deliberately untouched: the SIGINT path stays serial.
+ *
+ * 64 for the same reason as above, and separately from the fan-out budget: the
+ * fan-out holds one of ITS slots while waiting for the write, so one gate
+ * serving both would deadlock the moment the limit was reached.
+ */
+export const MUX_SNAPSHOT_WRITE_CONCURRENCY = 64;
+
 // `ws` readyState. CONNECTING 0, OPEN 1, CLOSING 2, CLOSED 3 — the same numbers
 // `DocHub._send` branches on, which is what a virtual connection must imitate.
 const OPEN = 1;
 const CLOSED = 3;
 
 /**
- * The counting semaphore the close fan-out draws its write budget from.
+ * The counting semaphore both process-wide budgets are built from — the close
+ * fan-out's, and the snapshot-write budget below. Two gates, never one: the
+ * fan-out holds a slot while it waits for the write it caused, so a single gate
+ * serving both would deadlock at its limit.
  *
  * `acquire()` returns `null` when a slot was free and took it SYNCHRONOUSLY, and
  * a promise otherwise. That distinction is the point: while the budget is not
@@ -219,6 +257,62 @@ export function createFanoutGate(limit = MUX_CLOSE_FANOUT_CONCURRENCY) {
 
 /** The process-wide budget. Every socket that does not name its own uses this one. */
 const SHARED_FANOUT_GATE = createFanoutGate();
+
+/** The process-wide snapshot-write budget. Descriptors are a process resource. */
+const SHARED_WRITE_GATE = createFanoutGate(MUX_SNAPSHOT_WRITE_CONCURRENCY);
+
+/**
+ * Marks a hub whose snapshot writes are already governed, so attaching a second
+ * socket does not wrap the wrapper. `Symbol.for` rather than a fresh symbol: two
+ * copies of this module in one process must still see one governor per hub.
+ */
+const WRITE_GOVERNOR = Symbol.for('shadowlink.mux.snapshotWriteGovernor');
+
+/** The write governor installed on `hub`, or undefined. Test/diagnostic. */
+export function snapshotWriteGovernor(hub) {
+  return hub?.[WRITE_GOVERNOR];
+}
+
+/**
+ * Bound the snapshot writes `hub` may have in flight, without changing `hub`.
+ *
+ * `DocHub._writeSnapshot` is the one place every snapshot write passes through —
+ * the 2 s debounce, `flush`, and the close fan-out all reach it through
+ * `_enqueueWrite` — so wrapping it bounds the RESOURCE rather than one caller.
+ * The alternative was to teach `DocHub` a write budget, and `DocHub.js` is
+ * byte-pinned by CI for this slice; wrapping keeps the pinned bytes exactly as
+ * they were measured while still closing the storm.
+ *
+ * Idempotent, and the wrapper delegates through a mutable `inner` so a test
+ * instrument can sit UNDER the budget (and therefore count writes that are
+ * actually running) no matter which was installed first. A hub double with no
+ * `_writeSnapshot` — `FlakyHub` — is simply not governed.
+ */
+export function governSnapshotWrites(hub, { gate = SHARED_WRITE_GATE } = {}) {
+  const existing = hub?.[WRITE_GOVERNOR];
+  if (existing !== undefined) return existing;
+  if (typeof hub?._writeSnapshot !== 'function') return undefined;
+
+  const inner = { fn: hub._writeSnapshot.bind(hub) };
+  const governor = {
+    gate,
+    get inner() { return inner.fn; },
+    set inner(fn) { inner.fn = fn; },
+  };
+  hub._writeSnapshot = async (docName, doc) => {
+    const slot = gate.acquire();
+    if (slot !== null) await slot;
+    try {
+      return await inner.fn(docName, doc);
+    } finally {
+      // Released whether the write landed or threw: a failing disk must not
+      // retire the budget one slot at a time.
+      gate.release();
+    }
+  };
+  Object.defineProperty(hub, WRITE_GOVERNOR, { value: governor, configurable: true });
+  return governor;
+}
 
 /**
  * Whatever `ws` handed us, as a plain `Uint8Array` starting at offset zero.
@@ -367,11 +461,27 @@ export function attachMux(ws, {
   // so a test can pin the bound at a small number, and so two sockets can be
   // handed the same gate to show the budget is not per socket.
   fanoutGate = SHARED_FANOUT_GATE,
+  // The process-wide snapshot-write budget. Separate from the fan-out's, and
+  // injectable for the same two reasons.
+  writeGate = SHARED_WRITE_GATE,
   // Injectable so a test can express "over the ceiling, then drained in time"
   // and "over the ceiling and stayed there" as two different things rather than
   // as one flaky one.
   now = Date.now,
 } = {}) {
+  if (writeGate === fanoutGate) {
+    // The fan-out holds one of ITS slots while it waits for the write that close
+    // caused, so one gate serving both stops dead once the limit is reached.
+    throw new TypeError('mux: the close fan-out and the snapshot write budget must be separate gates');
+  }
+  // ⚠ Installed HERE, by the thing that makes the storm reachable. DocHub has
+  // always armed one debounce timer per resident doc; what the mux removes is
+  // the natural limit that hid it — 8,192 resident docs used to cost 8,192
+  // sockets, and now cost 8,192 frames on one. Every deployment that exposes
+  // this route is therefore governed, including `server/index.js`, which needs
+  // no change and gets one budget for the whole process either way.
+  governSnapshotWrites(hub, { gate: writeGate });
+
   /** room → VirtualConn, created lazily on the first frame that names it. */
   const rooms = new Map();
   const stats = {

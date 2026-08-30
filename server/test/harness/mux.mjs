@@ -34,7 +34,9 @@ import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { DocHub } from '../../DocHub.js';
 import { authorizeUpgrade } from '../../upgradeAuth.js';
-import { attachMux, encodeMuxFrame, decodeMuxFrame, MUX_DOC_ID } from '../../mux.js';
+import {
+  attachMux, encodeMuxFrame, decodeMuxFrame, MUX_DOC_ID, snapshotWriteGovernor,
+} from '../../mux.js';
 
 export { encodeMuxFrame, decodeMuxFrame, MUX_DOC_ID };
 
@@ -276,6 +278,7 @@ export async function startMuxHub({
   maxBufferedBytes,
   backpressureGraceMs,
   fanoutGate,
+  writeGate,
   persistDebounceMs = 50,
   dir = null,
 } = {}) {
@@ -306,6 +309,7 @@ export async function startMuxHub({
           maxBufferedBytes,
           backpressureGraceMs,
           fanoutGate,
+          writeGate,
         }));
         return;
       }
@@ -392,9 +396,18 @@ export function seedRoom(hub, docName, text, field = 'content') {
  * Returns the counters plus `restore()`, so a test leaves the hub as it found it.
  */
 export function instrumentWrites(hub) {
-  const original = hub._writeSnapshot.bind(hub);
+  // ⚠ Sit UNDER the write budget, never on top of it. `governSnapshotWrites`
+  // wraps `_writeSnapshot` too, and a counter wrapped around THAT would count
+  // writes that are waiting for a slot as though they were running — the exact
+  // number this instrument exists to measure. Both orders end up the same way:
+  // if the governor is already installed we replace its inner function, and if
+  // it is not, it will capture this counter as its inner when it installs.
+  const governed = snapshotWriteGovernor(hub);
+  const original = governed === undefined
+    ? hub._writeSnapshot.bind(hub)
+    : governed.inner;
   const counters = { inFlight: 0, peak: 0, issued: 0, completed: 0, failed: 0 };
-  hub._writeSnapshot = async (docName, doc) => {
+  const instrumented = async (docName, doc) => {
     counters.issued += 1;
     counters.inFlight += 1;
     if (counters.inFlight > counters.peak) counters.peak = counters.inFlight;
@@ -408,7 +421,15 @@ export function instrumentWrites(hub) {
       counters.completed += 1;
     }
   };
-  counters.restore = () => { hub._writeSnapshot = original; };
+  const install = (fn) => {
+    // Re-read at call time: the governor may have installed since, and putting
+    // the raw function back on the hub would then delete the budget with it.
+    const now = snapshotWriteGovernor(hub);
+    if (now === undefined) hub._writeSnapshot = fn;
+    else now.inner = fn;
+  };
+  install(instrumented);
+  counters.restore = () => { install(original); };
   return counters;
 }
 
