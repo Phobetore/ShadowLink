@@ -11,6 +11,8 @@
 // that still answers.
 
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { WebSocket } from 'ws';
 import * as Y from 'yjs';
 import { test, run, setFilter, assert } from './runner.mjs';
@@ -18,6 +20,7 @@ import { startServer } from './server.mjs';
 import { Client, settleAll, SHARE_ROOT } from './client.mjs';
 import { DocLink, sleep } from './net.mjs';
 import { registerBlobCases } from './blobs.mjs';
+import { MuxClient, syncPayload, updateFor, SYNC, EMPTY_SV, until } from './mux.mjs';
 import { fold, isLive, relPath } from '../../../src/tree/paths.ts';
 import { deriveTree } from '../../../src/tree/TreeIndex.ts';
 
@@ -903,6 +906,120 @@ scenario('78 the server accepts _tree and n_<22 chars> and rejects a docId with 
     await tryUpgrade(`ws://127.0.0.1:${PORT}/_tree?t=sk_wrong&w=${workspace}`), 'rejected',
     'a wrong SERVER_KEY was accepted',
   );
+});
+
+// ============================================================ 79 (P3 slice 1)
+
+// Everything else about the mux is unit-tested in `server/test/mux.test.js`
+// against an in-process server. What only THIS suite can say is that the SHIPPED
+// `server/index.js` routes it — that the six lines of wiring in the real process
+// are the ones under test, not a faithful-looking copy of them in a harness.
+
+scenario('79a the shipped server routes _mux, and a hostile frame reaches no other room', async ({ workspace }) => {
+  const other = `${workspace}x`;
+  const rooms = ['_tree', 'n_AbCdEfGhIjKlMnOpQrStUv', 'n_ZyXwVuTsRqPoNmLkJiHgFe'];
+  const mux = new MuxClient(server.url('_mux', workspace));
+
+  // ⚠ These are the names that MATTER, and the reason is the filesystem rather
+  // than the relay. A docName is `${workspaceId}/${room}` and DocHub turns it
+  // straight into `<data>/yjs/<docName>.bin`, so a room name carrying `../` does
+  // not reach another room in memory — it reaches another room's FILE, which the
+  // next restart loads. That is a cross-workspace write with a delay on it, and
+  // it is exactly what the per-frame charset check exists to refuse.
+  const escapes = [
+    { room: `../${other}/n_secret`, at: join(other, 'n_secret.bin') },
+    { room: '../escaped', at: 'escaped.bin' },
+  ];
+  const alsoBad = ['', 'a.b', 'a b', 'a'.repeat(301), `${other}/n_secret`];
+
+  try {
+    await mux.connect();
+    await mux.syncAll(rooms);
+
+    // Hostile frames interleaved with legitimate ones, on the SAME socket. Each
+    // is refused per frame, and none of them may take the socket down.
+    for (const { room } of escapes) {
+      mux.sendFrame(room, syncPayload(SYNC.SYNC_UPDATE, updateFor('written where it should not be')));
+    }
+    for (const room of alsoBad) mux.sendFrame(room, syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+    mux.sendRaw(Uint8Array.from([0x7f, 0x7f, 0x7f]));            // not a frame at all
+
+    for (const [i, room] of rooms.entries()) mux.pushUpdate(room, updateFor(`mux body ${i}`));
+
+    // Every legitimate room really is on the server, in THIS workspace, with
+    // these bytes — read back over a connection the mux client does not own.
+    for (const [i, room] of rooms.entries()) {
+      assert.equal(
+        await readRoom(workspace, room), `mux body ${i}`,
+        `${room} did not reach the server over the mux`,
+      );
+    }
+    assert.equal(mux.connected, true, 'a hostile frame closed the socket');
+
+    // Drop the socket. DocHub flushes a room when its last peer leaves, so once
+    // the legitimate snapshots are on disk, every room this socket ever opened
+    // has had its chance to write — and the escapes must have written NOTHING.
+    mux.close();
+    const flushed = await until(
+      () => rooms.every((r) => existsSync(join(server.snapshotDir, workspace, `${r}.bin`))),
+      6000,
+    );
+    assert.ok(flushed, 'the mux socket dropping did not flush the rooms it carried');
+
+    for (const { room, at } of escapes) {
+      assert.equal(
+        existsSync(join(server.snapshotDir, at)), false,
+        `a frame naming ${JSON.stringify(room)} wrote ${at} — it escaped its workspace`,
+      );
+    }
+  } finally {
+    mux.abort();
+  }
+});
+
+scenario('79b a mux client and a legacy per-room client converge on one room', async ({ workspace }) => {
+  // Spec §"Assumptions only a real vault can confirm", item 10: the mixed-fleet
+  // claim was inferred rather than measured end to end, and slice 1 was told to
+  // add exactly this. Two connection SHAPES onto one `Y.Doc`, over the shipped
+  // process, with a room name a real node would have.
+  const room = 'n_AbCdEfGhIjKlMnOpQrStUv';
+  const doc = new Y.Doc();
+  const legacy = new DocLink(server.url(room, workspace), doc);
+  const mux = new MuxClient(server.url('_mux', workspace));
+
+  try {
+    legacy.connect();
+    assert.equal(await legacy.waitSync(4000), true, 'the legacy client never synced');
+    await mux.connect();
+    await mux.syncAll([room]);
+
+    doc.getText('content').insert(0, 'written on a per-room socket');
+    assert.equal(
+      await until(() => mux.textOf(room) === 'written on a per-room socket', 4000), true,
+      `the mux client never saw the legacy edit (has ${JSON.stringify(mux.textOf(room))})`,
+    );
+
+    // Back the other way, doc-free: the mux client computes the delta from the
+    // bytes it holds, never from a resident document for that room.
+    const scratch = new Y.Doc();
+    Y.applyUpdate(scratch, mux.ledger.get(room));
+    const sv = Y.encodeStateVector(scratch);
+    scratch.getText('content').insert(scratch.getText('content').length, ' + and on a mux one');
+    const delta = Y.encodeStateAsUpdate(scratch, sv);
+    scratch.destroy();
+    mux.pushUpdate(room, delta);
+
+    const expected = 'written on a per-room socket + and on a mux one';
+    assert.equal(
+      await until(() => doc.getText('content').toString() === expected, 4000), true,
+      `the legacy client never saw the mux edit (has ${JSON.stringify(doc.getText('content').toString())})`,
+    );
+    assert.equal(await readRoom(workspace, room), expected, 'the server holds neither version');
+  } finally {
+    mux.abort();
+    legacy.destroy();
+    doc.destroy();
+  }
 });
 
 // ============================================================ main
