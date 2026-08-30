@@ -543,7 +543,15 @@ export class MuxLink {
    * network outage in lockstep on every rung.
    */
   private scheduleRetry(): void {
-    if (this.destroyed || !this.shouldConnect || this.retryHandle !== null) return;
+    // ⚠ No "a retry is already armed" clause here, and its absence is deliberate.
+    // `connect()` owns that invariant — it refuses to dial while a rung is
+    // waiting, which is what stops `Bootstrap.connectTree` from hammering a server
+    // that is down. A second clause here was unreachable: this is called from
+    // `onClose`, which is guarded on socket identity and fires once per socket,
+    // and from a failed dial, which never produced a socket to close. A mutation
+    // probe deleted it with the whole suite green, so it went the way slice 1's
+    // fifth unkillable guard went.
+    if (this.destroyed || !this.shouldConnect) return;
     const rung = this.backoff[Math.min(this.attempt, this.backoff.length - 1)] ?? 1_000;
     this.attempt += 1;
     const spread = rung * this.jitter;

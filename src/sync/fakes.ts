@@ -1507,6 +1507,22 @@ export class FakeMuxSocket {
   serverClose(code = 1006): void { this.shut(code); }
 
   /**
+   * The socket is GONE but nobody has been told yet.
+   *
+   * ⚠ This is what `ws.terminate()` really does, and the reason the fake needs to
+   * be able to say it: `readyState` becomes CLOSED in the calling tick while the
+   * close EVENT arrives on a later one. In between, anything that answers "am I
+   * current?" from a latched flag is answering about a connection that is already
+   * dead. Without this knob that window is only reachable by racing a real socket,
+   * which is not a test.
+   */
+  dieAbruptly(code = 1006): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    queueMicrotask(() => { this.shut(code); });
+  }
+
+  /**
    * The server writing one frame toward this client, THROUGH the gates.
    *
    * This is what a test should use to push a frame: `cut`, `hold` and `duplicate`
@@ -1592,13 +1608,20 @@ export class FakeMuxSocket {
   }
 
   private shut(code: number): void {
-    if (this.readyState === 3) return;
+    // ⚠ Guarded on "has the close event been delivered", NOT on `readyState`.
+    // `dieAbruptly` sets CLOSED first and delivers later, which is what a real
+    // `terminate()` does; a guard that read `readyState` would swallow the very
+    // event that knob exists to delay.
+    if (this.closeDelivered) return;
+    this.closeDelivered = true;
     this.readyState = 3;
     for (const [room, handler] of this.updateHandlers) this.mux.doc(room).off('update', handler);
     this.updateHandlers.clear();
     this.rooms.clear();
     this.onclose?.({ code });
   }
+
+  private closeDelivered = false;
 }
 
 // ============================================================ platform numbers

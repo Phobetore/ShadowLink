@@ -204,6 +204,30 @@ test('a peer answering our Step1 from a DIVERGENT state merges, it does not doub
   }
 });
 
+test('an update that came off the wire is never echoed back', () => {
+  // ⚠ Without the origin guard this is not a loop that hangs — the server applies
+  // a duplicate update, produces no new struct, and broadcasts nothing — it is
+  // every remote edit costing a second frame, on every peer, for ever. At the
+  // 2,000 live rooms this design is for, that is the traffic the mux exists to
+  // remove, spent back. Found by a mutation probe: the guard survived deletion.
+  const mux = new FakeMux();
+  const ann = peer(mux);
+  const bob = peer(mux);
+  try {
+    const bobSocket = socketOf(bob, mux);
+    const before = bobSocket.sent.length;
+    ann.doc.getText('content').insert(0, 'from Ann');
+    assert.equal(bob.text(), 'from Ann', 'the edit never arrived');
+    assert.equal(
+      bobSocket.sent.length, before,
+      'the receiving client wrote a frame back for an update it had just been sent',
+    );
+  } finally {
+    ann.destroy();
+    bob.destroy();
+  }
+});
+
 test('a frame for another room never reaches this room\'s document', () => {
   const mux = new FakeMux();
   const tree = peer(mux, '_tree');
@@ -313,6 +337,30 @@ test('the link dropping unsyncs the room, and reconnect re-handshakes it (I24)',
     client.reconnect();
     assert.equal(client.link.connected, true, 'the ladder never brought the link back');
     assert.equal(client.room.synced, true, 'the room never re-synced');
+  } finally {
+    client.destroy();
+  }
+});
+
+test('a socket that is CLOSED but has not yet fired its close event is not synced', async () => {
+  // ⚠ The window `WebsocketProvider` leaves open, made reachable. `terminate()`
+  // moves `readyState` to CLOSED in this tick and delivers the close event on a
+  // later one; a `synced` that is only a latched flag answers "yes, current"
+  // about a connection that is already gone. Found by the structural reconnect
+  // case, pinned here because racing a real socket is not a test.
+  const mux = new FakeMux();
+  const client = peer(mux);
+  try {
+    assert.equal(client.room.synced, true);
+    socketOf(client, mux).dieAbruptly();
+    assert.equal(client.link.connected, false, 'the link should already see a dead socket');
+    assert.equal(
+      client.room.synced, false,
+      'the room reported itself current on a socket that is already closed',
+    );
+    // And the close event still arrives, so the ordinary path is not broken by it.
+    await Promise.resolve();
+    assert.equal(client.room.synced, false);
   } finally {
     client.destroy();
   }

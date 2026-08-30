@@ -339,6 +339,28 @@ test('a factory that refuses to dial is one failed attempt, not a spin', () => {
   assert.equal(timers.filter((t) => t !== undefined).length, 1, 'a refused dial armed no retry');
 });
 
+test('connect() while the ladder is waiting does not jump the queue', () => {
+  // ⚠ Not hypothetical: `Bootstrap.connectTree` calls `connect()` on every
+  // attempt, and `onReconnect` reaches it too. If each call dialled immediately,
+  // a client whose server is down would hammer it once per bootstrap attempt and
+  // the ladder would be decoration. Found by a mutation probe — the guard
+  // survived deletion until this existed.
+  const { link, mux, timers } = makeLink();
+  link.subscribe('_tree', collector());
+  link.connect();
+  mux.dropSockets();
+  assert.equal(timers.filter((t) => t !== undefined).length, 1, 'no retry was armed');
+  const dialled = mux.sockets.length;
+
+  link.connect();
+  link.connect();
+  assert.equal(mux.sockets.length, dialled, 'connect() dialled while the ladder was waiting');
+  assert.equal(
+    timers.filter((t) => t !== undefined).length, 1,
+    'connect() armed a second rung beside the one already waiting',
+  );
+});
+
 test('disconnect stops the ladder, and connect starts it again', () => {
   const { link, mux, timers } = makeLink();
   link.subscribe('_tree', collector());
