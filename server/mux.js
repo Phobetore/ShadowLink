@@ -71,15 +71,46 @@ export const MUX_MAX_ROOMS_PER_SOCKET = 8_192;
  * full state again and again with an empty state vector, so the bytes the server
  * queues toward it are not bounded by the workspace's size either.
  *
- * Where 128 MiB comes from, measured rather than chosen. The heaviest LEGITIMATE
- * burst is a cold storm over a link so slow that nothing drains while it runs —
- * a phone on a dying connection asking for a whole vault — and its peak buffer
- * is then the vault's entire state. At the design maximum the spec budgets
- * (2,000 notes at its own measured 6.04 KB of history each) that peak measures
- * 11.7 MiB, and all 2,000 texts are still byte-correct once the link recovers.
- * 128 MiB is 10.9x that, so it clears a vault ten times the design budget, and
- * it holds a socket that has stopped reading to 128 MiB instead of the 1.63 GB
- * such a socket reached in ten seconds without it.
+ * Where 128 MiB comes from, measured rather than chosen — and the earlier answer
+ * here was wrong in the dangerous direction. It said the heaviest legitimate
+ * burst is "a cold storm over a link so slow that nothing drains while it runs",
+ * which implies a FAST link is safe at any vault size. It is not. The server
+ * writes every full-state answer before any peer can drain it, so THE PEAK IS
+ * THE BURST, not the link. Same vault, same subscribe-to-everything, a client
+ * draining as fast as loopback allows against one draining nothing:
+ *
+ *     vault total state     draining client      stalled client
+ *        2.10 MiB              1.99 MiB             1.99 MiB
+ *       11.48 MiB             11.41 MiB            11.41 MiB
+ *      114.48 MiB            114.28 MiB           114.28 MiB
+ *
+ * Identical to three decimals at every size. So what this constant must clear is
+ * not a link condition but THE LARGEST WAVE OF STATE A CLIENT ASKS FOR AT ONCE.
+ *
+ * At the design maximum the spec budgets — 2,000 notes at its own measured
+ * 6.04 KB of history each — a client that asks for the whole vault at once peaks
+ * at 11.41 MiB and 128 MiB clears that 11.2x.
+ *
+ * ⚠ Where it stops working, stated because a margin without a wall is a wish.
+ * A client that asks for everything in one wave cannot cold-sync a vault whose
+ * total state passes this constant, ON ANY LINK, and it fails identically on
+ * every reconnect. Measured: 114.48 MiB of vault syncs, 2,000 of 2,000
+ * byte-correct; 133.56 MiB is terminated at the bound with 3 of 2,000 rooms
+ * delivered — and the well-behaved draining client dies exactly where the
+ * stalled one does. Against `MUX_MAX_ROOMS_PER_SOCKET` the same arithmetic reads
+ * 128 MiB / 8,192 = 16 KiB of state per room, only 2.7x the measured 6.04 KB
+ * average, so the cap and this bound are not independent numbers.
+ *
+ * ⚠ And what removes that wall is the CLIENT pacing itself, which is a design
+ * constraint on the client half and not a server setting: the spec's own
+ * `MUX_SUBSCRIBE_WAVE = 200` makes the burst one wave rather than one vault.
+ * Measured on the same 133.56 MiB vault that dies unpaced: waves of 200, peak
+ * 13.23 MiB (0.99x of ONE wave, 0.099x of the vault), 2,000 of 2,000 rooms
+ * byte-correct in 875 ms. Nothing on the server enforces the pacing, so this
+ * bound is what a client that ignores it meets.
+ *
+ * It also holds a socket that has stopped reading to 128 MiB instead of the
+ * 1.63 GB such a socket reached in ten seconds without it.
  *
  * Terminate, not close: a graceful close waits for a handshake the peer is by
  * definition not reading, so it would keep the memory it was meant to release.
@@ -102,9 +133,12 @@ export const MUX_HARD_BUFFERED_BYTES = 128 * 1024 * 1024;
  * constant naming a multi-gigabyte reality. The bound above is what makes this
  * tier safe to keep.
  *
- * It is worth keeping because a legitimate cold storm sits at 11.7 MiB, well
- * under it: nothing honest reaches this ceiling, and a peer parked between it
- * and the hard bound is holding memory nobody is using.
+ * It is worth keeping because a cold storm at the design maximum peaks at
+ * 11.41 MiB, well under it: nothing that size reaches this ceiling, and a peer
+ * parked between it and the hard bound is holding memory nobody is using. Note
+ * what that does NOT say — a bigger vault asked for in one wave sails straight
+ * through this ceiling on a perfectly healthy link, because the peak is the
+ * burst. This tier catches a peer that stopped reading, not a large request.
  */
 export const MUX_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 

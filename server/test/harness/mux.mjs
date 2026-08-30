@@ -360,6 +360,22 @@ export async function startMuxHub({
   };
 }
 
+/**
+ * Put `text` into a room with NO socket attached.
+ *
+ * A test that measures what the server writes TOWARD a client must not first pay
+ * for a client that wrote it: `DocHub` echoes every update back to the connection
+ * that sent it, so a seeding socket meets the same buffer bound as the socket
+ * under test and dies of its own upload. Seeding the hub directly keeps the
+ * measurement about one socket.
+ *
+ * It reaches `DocHub._getDocState` because the hub exposes no other way to author
+ * a document, and `DocHub.js` may not be modified to add one.
+ */
+export function seedRoom(hub, docName, text, field = 'content') {
+  hub._getDocState(docName).doc.getText(field).insert(0, text);
+}
+
 // ============================================================ write concurrency
 
 /**

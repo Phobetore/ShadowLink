@@ -28,7 +28,7 @@ import {
 import { authorizeUpgrade, isValidDocId } from '../upgradeAuth.js';
 import { createFanoutGate, MUX_CLOSE_FANOUT_CONCURRENCY } from '../mux.js';
 import {
-  FakeSocket, FlakyHub, MuxClient, RoomClient, startMuxHub, instrumentWrites,
+  FakeSocket, FlakyHub, MuxClient, RoomClient, startMuxHub, instrumentWrites, seedRoom,
   syncPayload, awarenessPayload, updateFor, textOfUpdate,
   SYNC, EMPTY_SV, sleep, until,
 } from './harness/mux.mjs';
@@ -461,6 +461,13 @@ test('a room too big for the bound is refused whole, and named, not half-written
 
   ws.deliver('fat', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));   // the hub's own Step1
   assert.equal(mux.stats.overflowed, false, 'the fixture was over the bound before it started');
+  // The peak counts the write that just happened and not only what was already
+  // buffered when it started — otherwise a socket's last frame is never counted.
+  assert.equal(ws.bufferedAmount > 0, true, 'the fixture socket drained the Step1');
+  assert.equal(
+    mux.stats.peakBufferedBytes, ws.bufferedAmount,
+    'the peak was recorded before the send and never after it',
+  );
   const writtenBefore = ws.sentRaw.length;
 
   hub.push('w1/fat', syncPayload(SYNC.SYNC_UPDATE, updateFor('x'.repeat(20_000))));
@@ -478,6 +485,141 @@ test('a room too big for the bound is refused whole, and named, not half-written
     'the frame fitted under the bound, so this is not the oversized case',
   );
   assert.equal(ws.terminated, true);
+});
+
+test('a socket refused on its very first frame still reports what it was holding', () => {
+  // The buffer is read BEFORE the write because the bound needs it, and the peak
+  // is recorded from that reading as well as from the one after. Without it, a
+  // socket terminated before it ever wrote anything reports
+  // `peakBufferedBytes = 0` — "this socket cost nothing" in exactly the case
+  // where it cost the most. A socket can arrive holding bytes: `bufferedAmount`
+  // counts the upgrade response still queued on the same TCP socket.
+  const ws = new FakeSocket({ holdsWrites: true, bufferedAmount: 4096 });
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, {
+    hub, workspaceId: 'w1', hardBufferedBytes: 4096, maxBufferedBytes: 0,
+  });
+
+  ws.deliver('r1', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+
+  assert.equal(mux.stats.overflowed, true, 'a full socket accepted a frame');
+  assert.equal(mux.stats.overflowReason, 'hard');
+  assert.equal(ws.sentRaw.length, 0, 'a frame reached the wire on a socket already at the bound');
+  assert.equal(mux.stats.peakBufferedBytes, 4096, 'the socket reported holding nothing');
+});
+
+test('the peak is the BURST, not the link: a draining peer costs what a stalled one costs', async () => {
+  // ⚠ The justification this constant was chosen from, and the correction to it.
+  // The comment on MUX_HARD_BUFFERED_BYTES used to say the heaviest legitimate
+  // burst is "a cold storm over a link so slow that nothing drains while it
+  // runs" — which implies a FAST link is safe at any vault size. It is not. The
+  // server writes every full-state answer before any peer can drain one, so the
+  // peak is set by what was ASKED FOR, not by how fast it leaves.
+  //
+  // Measured at three vault sizes, draining against stalled: 2.10 MiB -> 1.99 /
+  // 1.99; 11.48 MiB -> 11.41 / 11.41; 114.48 MiB -> 114.28 / 114.28. Identical
+  // to three decimals every time, and byte-identical over ten repeats at the
+  // size below.
+  const server = await startMuxHub({
+    hardBufferedBytes: 32 * 1024 * 1024,          // deliberately out of reach
+    maxBufferedBytes: 0,
+    persistDebounceMs: 600_000,
+  });
+  const rooms = Array.from({ length: 200 }, (_, i) => roomName(i));
+  const body = 'v'.repeat(6000);
+  const vaultBytes = rooms.length * body.length;
+  const draining = new MuxClient(server.muxUrl('w1'));
+  const stalled = new MuxClient(server.muxUrl('w1'));
+  try {
+    for (const room of rooms) seedRoom(server.hub, `w1/${room}`, body);
+
+    await draining.connect();
+    const muxDraining = server.lastMux();
+    await draining.syncAll(rooms);                 // reads as fast as loopback allows
+
+    await stalled.connect();
+    const muxStalled = server.lastMux();
+    stalled.stopReading();                         // reads nothing at all
+    for (const room of rooms) stalled.subscribe(room);
+    assert.equal(
+      await until(() => muxStalled.stats.bytesOut >= muxDraining.stats.bytesOut, 5000), true,
+      'the stalled peer was never sent the whole vault',
+    );
+    await sleep(50);
+
+    const peakDraining = muxDraining.stats.peakBufferedBytes;
+    const peakStalled = muxStalled.stats.peakBufferedBytes;
+    assert.equal(draining.synced.size, rooms.length, 'the draining peer did not get the vault');
+    assert.equal(peakStalled > vaultBytes * 0.8, true, 'the stalled peer did not hold the burst');
+    // ⚠ The claim, one-sided so it cannot pass by accident on a slow machine:
+    // draining is NOT cheaper. A fast link buys nothing here.
+    assert.equal(
+      peakDraining >= peakStalled * 0.85, true,
+      `a draining peer peaked at ${peakDraining} B against ${peakStalled} B stalled — `
+      + 'if a fast link really were safer, the bound could be derived from the link',
+    );
+    assert.equal(muxDraining.stats.overflowed, false);
+    assert.equal(muxStalled.stats.overflowed, false);
+  } finally {
+    draining.abort();
+    stalled.abort();
+    await server.stop();
+  }
+});
+
+test('a wave over the bound dies on a healthy link, and the same vault paced does not', async () => {
+  // What the bound therefore bounds: ONE WAVE of requested state. So a vault
+  // whose total state passes it cannot be cold-synced by a client that asks for
+  // everything at once — on any link, identically on every reconnect — and the
+  // spec's own MUX_SUBSCRIBE_WAVE is what keeps that out of reach. Nothing on
+  // the server enforces the pacing, which is why the bound has to exist.
+  //
+  // Measured at the shipped 128 MiB: a 114.48 MiB vault syncs 2,000 of 2,000; a
+  // 133.56 MiB vault is terminated with 3 of 2,000 delivered; the SAME
+  // 133.56 MiB vault in waves of 200 syncs 2,000 of 2,000 in 875 ms, peaking at
+  // one wave. Below is that arithmetic at a size `npm test` can afford.
+  const BOUND = 512 * 1024;
+  const WAVE = 25;
+  const server = await startMuxHub({
+    hardBufferedBytes: BOUND, maxBufferedBytes: 0, persistDebounceMs: 600_000,
+  });
+  const rooms = Array.from({ length: 200 }, (_, i) => roomName(i));
+  const body = 'v'.repeat(6000);
+  const unpaced = new MuxClient(server.muxUrl('w1'));
+  const paced = new MuxClient(server.muxUrl('w1'));
+  try {
+    for (const room of rooms) seedRoom(server.hub, `w1/${room}`, body);
+    assert.equal(rooms.length * body.length > BOUND, true, 'the vault fits under the bound');
+
+    // Asks for everything at once, and drains as fast as loopback allows.
+    await unpaced.connect();
+    const muxUnpaced = server.lastMux();
+    await Promise.race([unpaced.syncAll(rooms), sleep(3000)]);
+    assert.equal(muxUnpaced.stats.overflowed, true, 'a burst past the bound survived a healthy link');
+    assert.equal(muxUnpaced.stats.overflowReason, 'hard');
+    assert.equal(unpaced.synced.size < rooms.length, true, 'the whole vault arrived anyway');
+    assert.equal(muxUnpaced.stats.peakBufferedBytes <= BOUND, true);
+    unpaced.abort();
+
+    // Same vault, same bound, same link — asked for in waves.
+    await paced.connect();
+    const muxPaced = server.lastMux();
+    for (let i = 0; i < rooms.length; i += WAVE) {
+      const wave = rooms.slice(i, i + WAVE);
+      const waits = paced.expect(wave);
+      for (const room of wave) paced.subscribe(room);
+      await Promise.race([waits, sleep(3000)]);
+    }
+    assert.equal(muxPaced.stats.overflowed, false, 'a paced client tripped the bound');
+    assert.equal(paced.synced.size, rooms.length, 'pacing did not deliver the vault');
+    for (const room of rooms) {
+      assert.equal(paced.textOf(room), body, `${room} came back wrong`);
+    }
+  } finally {
+    unpaced.abort();
+    paced.abort();
+    await server.stop();
+  }
 });
 
 test('a peer that dips under the ceiling once per grace window is still bounded', async () => {
