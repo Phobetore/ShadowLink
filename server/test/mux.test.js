@@ -385,36 +385,56 @@ test('a socket that never reads is terminated once it has stayed over the ceilin
   assert.equal(MUX_BACKPRESSURE_GRACE_MS, 60_000, 'the shipped grace moved');
 });
 
-test('the HARD bound terminates on the first byte over it, with no grace at all', () => {
-  // ⚠ The blocker this exists for. With only the sustained ceiling, one
-  // authenticated socket that subscribes and never reads — re-requesting full
-  // state with an empty state vector — grew its server-side buffer at 161.7 MB/s
-  // and held 1.63 GB after ten seconds with `overflowed` still false, because
-  // nothing enforced anything until 60 s of that rate had passed. A ceiling that
-  // takes a minute to mean something is not a ceiling.
-  const ws = new FakeSocket();
+test('the HARD bound is tested before the write, so the buffer never crosses it', () => {
+  // ⚠ The blocker this exists for, and its correction. With only the sustained
+  // ceiling, one authenticated socket that subscribes and never reads grew its
+  // buffer at 161.7 MB/s and held 1.63 GB after ten seconds with `overflowed`
+  // still false. The bound fixed that — but it read `bufferedAmount` AFTER
+  // `ws.send`, so the socket was terminated on the first observation ABOVE the
+  // bound rather than before crossing it. The real bound was "the bound plus one
+  // message", one message is one room's entire state, and nothing in this
+  // codebase caps a room's state. Measured on a real socket parked at 70% of an
+  // 8 MiB bound and then asked for one client-grown room: peak 28.50 MiB, 3.56x.
+  //
+  // `holdsWrites` rather than `bufferedPerSend` is the point of the fixture: the
+  // buffer must grow by exactly what was written, or the rule under test — a
+  // check against the FRAME's size — cannot be measured at all.
+  const BOUND = 8192;
+  const ws = new FakeSocket({ holdsWrites: true });
   const hub = new FlakyHub();
   let clock = 1_000;
   const mux = attachMux(ws, {
     hub,
     workspaceId: 'w1',
-    hardBufferedBytes: 8192,
+    hardBufferedBytes: BOUND,
     maxBufferedBytes: 4096,
     backpressureGraceMs: 10_000,
     now: () => clock,                             // deliberately NEVER advanced
   });
-  ws.bufferedPerSend = 3072;
 
-  ws.deliver('r1', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));   // 3 KiB: under both
-  assert.equal(mux.stats.overflowed, false);
-  hub.push('w1/r1', updateFor('over the sustained ceiling'));  // 6 KiB: over 4096
-  assert.equal(mux.stats.overflowed, false, 'the sustained tier stopped being a grace');
-  assert.notEqual(mux.stats.overCeilingSince, null);
+  ws.deliver('r1', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  for (let i = 0; i < 40 && !mux.stats.overflowed; i++) {
+    hub.push('w1/r1', syncPayload(SYNC.SYNC_UPDATE, updateFor('z'.repeat(1000))));
+  }
 
-  hub.push('w1/r1', updateFor('over the bound'));              // 9 KiB: over 8192
   assert.equal(mux.stats.overflowed, true, 'the hard bound never fired');
   assert.equal(mux.stats.overflowReason, 'hard', 'the sustained rule fired, not the bound');
   assert.equal(ws.terminated, true);
+
+  // ⚠ THE promise, and the one the previous version could not make: the buffer
+  // is never OBSERVED above the bound, rather than terminated once it is.
+  assert.equal(
+    mux.stats.peakBufferedBytes <= BOUND, true,
+    `peak ${mux.stats.peakBufferedBytes} B crossed a bound of ${BOUND} B`,
+  );
+  assert.equal(ws.bufferedAmount <= BOUND, true, 'the socket ended up holding more than the bound');
+  // The refused frame is named, and it really would not have fitted.
+  assert.equal(mux.stats.refusedFrame.room, 'r1');
+  assert.equal(
+    ws.bufferedAmount + mux.stats.refusedFrame.bytes > BOUND, true,
+    'the frame the bound refused would have fitted after all',
+  );
+
   // Not one millisecond passed on the clock the sustained tier reads.
   assert.equal(clock, 1_000, 'the test moved the clock and proved nothing');
   assert.equal(MUX_HARD_BUFFERED_BYTES, 128 * 1024 * 1024, 'the shipped bound moved');
@@ -422,6 +442,42 @@ test('the HARD bound terminates on the first byte over it, with no grace at all'
     MUX_HARD_BUFFERED_BYTES > MUX_MAX_BUFFERED_BYTES, true,
     'the bound is below the ceiling it is meant to backstop',
   );
+});
+
+test('a room too big for the bound is refused whole, and named, not half-written', () => {
+  // The other half of "128 MiB plus one message": the message the client chooses.
+  // A frame that cannot fit under the bound on an EMPTY buffer is not a slow
+  // peer — it is a room no socket can be given at this bound, on any link, and it
+  // will refuse again on every reconnect. Terminating is the honest answer:
+  // dropping the frame and keeping the socket would leave a peer that believes it
+  // is synced and is not. What is NOT acceptable is doing it silently, so the
+  // reason is its own word and the room is on the record.
+  const BOUND = 4096;
+  const ws = new FakeSocket({ holdsWrites: true });
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, {
+    hub, workspaceId: 'w1', hardBufferedBytes: BOUND, maxBufferedBytes: 0,
+  });
+
+  ws.deliver('fat', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));   // the hub's own Step1
+  assert.equal(mux.stats.overflowed, false, 'the fixture was over the bound before it started');
+  const writtenBefore = ws.sentRaw.length;
+
+  hub.push('w1/fat', syncPayload(SYNC.SYNC_UPDATE, updateFor('x'.repeat(20_000))));
+
+  assert.equal(mux.stats.overflowed, true, 'an undeliverable room was written anyway');
+  assert.equal(
+    mux.stats.overflowReason, 'oversized',
+    'an undeliverable room reads as a peer that stopped draining',
+  );
+  assert.equal(ws.sentRaw.length, writtenBefore, 'the frame that cannot fit reached the wire');
+  assert.equal(mux.stats.peakBufferedBytes <= BOUND, true);
+  assert.equal(mux.stats.refusedFrame.room, 'fat', 'the undeliverable room is not named');
+  assert.equal(
+    mux.stats.refusedFrame.bytes > BOUND, true,
+    'the frame fitted under the bound, so this is not the oversized case',
+  );
+  assert.equal(ws.terminated, true);
 });
 
 test('a peer that dips under the ceiling once per grace window is still bounded', async () => {
@@ -459,7 +515,13 @@ test('a peer that dips under the ceiling once per grace window is still bounded'
     mux.stats.overflowReason, 'hard',
     'the sustained tier claimed a peer it demonstrably cannot catch',
   );
-  assert.equal(mux.stats.peakBufferedBytes > 1_000_000, true);
+  // It really did park far above the courtesy ceiling — and still never above
+  // the bound, which is what the bound now promises rather than merely detects.
+  assert.equal(mux.stats.peakBufferedBytes >= 900_000, true, 'the peer never parked high');
+  assert.equal(
+    mux.stats.peakBufferedBytes <= 1_000_000, true,
+    `peak ${mux.stats.peakBufferedBytes} B crossed a 1,000,000 B bound`,
+  );
   await sleep(0);
   assert.equal(mux.roomCount, 0, 'the terminated socket never fanned out');
 });
@@ -500,10 +562,11 @@ test('the hard bound holds a REAL non-reading socket, with the grace out of reac
     );
     assert.equal(mux.stats.overflowReason, 'hard', 'the grace fired, which cannot be right');
     assert.equal(await until(() => mux.roomCount === 0, 3000), true, 'the fan-out never ran');
-    // The bound is a bound: the peak really is within one frame of it.
+    // The bound is a bound, on a REAL socket: not "within one frame of it",
+    // which is what this assertion used to settle for, but at or under it.
     assert.equal(
-      mux.stats.peakBufferedBytes < 256 * 1024 * 4, true,
-      `peak ${mux.stats.peakBufferedBytes} B ran far past a 256 KiB bound`,
+      mux.stats.peakBufferedBytes <= 256 * 1024, true,
+      `peak ${mux.stats.peakBufferedBytes} B crossed a 256 KiB bound`,
     );
     assert.ok(server.hub.getText('w1/r1').length > 0, 'the room lost its content');
     writer.abort();
@@ -902,10 +965,15 @@ test('a room the fan-out already closed is not delivered into, even mid-open', (
   // close is synchronous the fan-out then closes and flushes that room before
   // `onMessage` gets back to its `deliver`. Delivering then writes into a room
   // `DocHub` has already flushed and forgotten.
-  const ws = new FakeSocket({ noTerminate: true });
+  //
+  // The socket arrives holding exactly the bound, so the room's very first send —
+  // the hub's own SyncStep1, issued from inside `handleConnection` — is refused
+  // and terminates from there. (It used to arrive empty and grow past the bound
+  // on that send; the bound is now tested before the write, so the fixture has to
+  // say "already full" rather than "will overflow".)
+  const ws = new FakeSocket({ noTerminate: true, bufferedAmount: 1024 });
   const hub = new FlakyHub();
   const mux = attachMux(ws, { hub, workspaceId: 'w1', hardBufferedBytes: 1024 });
-  ws.bufferedPerSend = 4096;                    // the hub's own SyncStep1 blows it
 
   ws.deliver('r1', syncPayload(SYNC.SYNC_UPDATE, updateFor('must not land')));
 

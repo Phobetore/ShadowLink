@@ -106,8 +106,18 @@ export function textOfUpdate(bytes, field = 'content') {
  * close event, report an arbitrary `bufferedAmount`, or throw from `send`.
  */
 export class FakeSocket extends EventEmitter {
-  constructor({ bufferedAmount = 0, noTerminate = false } = {}) {
+  constructor({ bufferedAmount = 0, noTerminate = false, holdsWrites = false } = {}) {
     super();
+    /**
+     * ⚠ A socket that drains NOTHING, the way a real one behaves toward a peer
+     * that has stopped reading: `bufferedAmount` grows by exactly the bytes that
+     * were written. `bufferedPerSend` below is the older, coarser knob — a fixed
+     * growth per send, independent of what was sent — and it cannot express the
+     * hard bound at all, because that bound is now tested against the FRAME's
+     * size before the frame is written. A fixture whose buffer grows by an amount
+     * unrelated to the frame can only measure the wrong rule.
+     */
+    this.holdsWrites = holdsWrites;
     // ⚠ A transport with no `terminate` falls back to `close()`, and this fake's
     // `close()` emits SYNCHRONOUSLY. That combination is the nastiest reentrancy
     // the mux can face — backpressure dropping the socket from inside the first
@@ -132,7 +142,7 @@ export class FakeSocket extends EventEmitter {
   send(data) {
     if (this.sendThrows !== null) throw this.sendThrows;
     this.sentRaw.push(Uint8Array.from(data));
-    this.bufferedAmount += this.bufferedPerSend;
+    this.bufferedAmount += this.holdsWrites ? data.byteLength : this.bufferedPerSend;
     try {
       this.sent.push(decodeMuxFrame(data));
     } catch {

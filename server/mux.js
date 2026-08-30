@@ -41,10 +41,29 @@ export const MUX_DOC_ID = '_mux';
 export const MUX_MAX_ROOMS_PER_SOCKET = 8_192;
 
 /**
- * ⚠ THE BOUND. The socket is terminated the first time `ws.bufferedAmount` is
- * observed above this — no grace, no reset, no averaging. This is the number a
- * self-hoster may size a host from, and it is the only one that is true of a mux
- * socket at every instant.
+ * ⚠ THE BOUND. A frame is written only if the socket can hold it: the check is
+ * `bufferedAmount + frame.byteLength > this`, tested BEFORE `ws.send`, and the
+ * socket is terminated instead of writing. No grace, no reset, no averaging.
+ * This is the number a self-hoster may size a host from.
+ *
+ * ⚠ Why before and not after, which is a correction. The first version read
+ * `bufferedAmount` AFTER the write, so the socket was terminated on the first
+ * observation ABOVE the bound rather than before crossing it — the real bound
+ * was "this, plus one message", and one message is one room's ENTIRE state.
+ * Nothing anywhere caps a room's state (`maxFileSizeMb` and `maxTotalStorageGb`
+ * bound the blob store; there is no document-size limit in this codebase), so
+ * the client chose the overshoot term: measured, a socket parked at 70% of an
+ * 8 MiB bound, then asked for one client-grown room, peaked at 28.50 MiB —
+ * 3.56x — and the room is permanent, so every later socket got that free.
+ *
+ * What this promises now, exactly: `bufferedAmount` is never observed above the
+ * bound, on any socket, at any instant — plus whatever control frames the
+ * transport sends on its own account (a pong is ≤ 131 B and is not sized by the
+ * peer). What it does NOT promise is that a large room is deliverable: a frame
+ * that cannot fit under the bound on an EMPTY buffer terminates the socket with
+ * `overflowReason === 'oversized'`, and it will do so again on every reconnect.
+ * See `stats.refusedFrame`. Capping a document is a different promise from
+ * capping a socket, and this file makes only the second one.
  *
  * The failure it exists for is a client that subscribes to everything and never
  * reads. The per-room route bounded that implicitly — one socket held one room's
@@ -345,8 +364,22 @@ export function attachMux(ws, {
     overCeilingSince: null,
     /** True once backpressure terminated the socket. */
     overflowed: false,
-    /** Which rule fired: 'hard' (the bound) or 'sustained' (the grace). */
+    /**
+     * Which rule fired:
+     * - 'hard'      — this frame would have pushed the buffer over the bound.
+     *                 The peer is not draining; it may do better next time.
+     * - 'oversized' — this frame does not fit under the bound on an EMPTY
+     *                 buffer. That is a property of the ROOM, not of the link,
+     *                 so it recurs on every reconnect until the room shrinks.
+     * - 'sustained' — the courtesy ceiling below, held for the grace window.
+     */
     overflowReason: null,
+    /**
+     * The frame the bound refused, as `{ room, bytes }`. With 'oversized' it
+     * names the room that can no longer be delivered to anyone — the only
+     * record anywhere that this happened.
+     */
+    refusedFrame: null,
     /**
      * Rooms whose close-fan-out snapshot never reached the disk. This is the
      * count `DocHub.lastPersistError` was collecting and nothing was reading —
@@ -369,12 +402,42 @@ export function attachMux(ws, {
 
   const record = (err) => { stats.lastError = err; };
 
+  const notePeak = (buffered) => {
+    if (buffered > stats.peakBufferedBytes) stats.peakBufferedBytes = buffered;
+  };
+
   const sendFrame = (room, payload) => {
     if (closed || ws.readyState !== OPEN) return;
     const enc = encoding.createEncoder();
     encoding.writeVarString(enc, room);
     encoding.writeVarUint8Array(enc, payload);
     const frame = encoding.toUint8Array(enc);
+
+    // A peer that has stopped reading turns every broadcast into resident
+    // memory. `bufferedAmount` is the only honest measure of that, and it is a
+    // property read, not a syscall.
+    //
+    // Read HERE rather than on a timer, because the buffer only grows when we
+    // write: a peer that has stopped reading while the server has also stopped
+    // sending is not growing and is not the failure this guards.
+    const buffered = ws.bufferedAmount ?? 0;
+    notePeak(buffered);
+    if (stats.overflowed) return;
+
+    // ⚠ THE BOUND, first and without conditions, and tested against the frame
+    // BEFORE the frame is written. Reading `bufferedAmount` after `ws.send`
+    // would make this "the bound plus one message", and one message is one
+    // room's whole state — a term the client grows and the server never caps.
+    // Whatever else is true of this socket, it is holding no more than this.
+    if (hardBufferedBytes > 0 && buffered + frame.byteLength > hardBufferedBytes) {
+      stats.refusedFrame = { room, bytes: frame.byteLength };
+      // A frame that does not fit on an EMPTY buffer is not a slow peer; it is a
+      // room no socket can be given under this bound. Named apart so an operator
+      // can tell an undeliverable room from a peer that stopped reading.
+      terminate(frame.byteLength > hardBufferedBytes ? 'oversized' : 'hard');
+      return;
+    }
+
     try {
       ws.send(frame);
     } catch (err) {
@@ -386,30 +449,15 @@ export function attachMux(ws, {
     stats.framesOut += 1;
     stats.bytesOut += frame.byteLength;
 
-    // A peer that has stopped reading turns every broadcast into resident
-    // memory. `bufferedAmount` is the only honest measure of that, and it is a
-    // property read, not a syscall.
-    //
-    // Checked HERE rather than on a timer, because the buffer only grows when we
-    // write: a peer that has stopped reading while the server has also stopped
-    // sending is not growing and is not the failure this guards.
-    const buffered = ws.bufferedAmount ?? 0;
-    if (buffered > stats.peakBufferedBytes) stats.peakBufferedBytes = buffered;
-    if (stats.overflowed) return;
-
-    // ⚠ THE BOUND, first and without conditions. No grace, no reset, no state:
-    // whatever else is true of this socket, it is holding no more than this.
-    if (hardBufferedBytes > 0 && buffered > hardBufferedBytes) {
-      terminate('hard');
-      return;
-    }
+    const settled = ws.bufferedAmount ?? 0;
+    notePeak(settled);
 
     // Under the bound, a SUSTAINED stall is still memory nobody is using, so
     // reclaim it. This tier is deliberately forgiving — one dip under the ceiling
     // resets the clock — because a slow link is not an attack. That forgiveness
     // is exactly why it is a courtesy and never the bound.
     if (maxBufferedBytes <= 0) return;
-    if (buffered <= maxBufferedBytes) {
+    if (settled <= maxBufferedBytes) {
       stats.overCeilingSince = null;              // it drained: not our problem
       return;
     }
