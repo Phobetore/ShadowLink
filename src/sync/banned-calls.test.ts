@@ -300,6 +300,10 @@ const VAULT_SHAPED = new Set(['vault', 'vaults', 'adapter', 'dataadapter', 'v', 
 const IN_MEMORY: Record<string, string[]> = {
   'src/sync/Deletions.ts': ['ctx.disk'],
   'src/sync/DiskIndex.ts': ['this.byFold'],
+  // `swapWaiters` is the set of in-flight `whenSynced` calls woken when the tree's
+  // transport is swapped for the legacy one; `connectedHandlers` is the plugin's
+  // reconnect subscription, which follows that swap.
+  'src/sync/LegacyTreeTransport.ts': ['this.connectedHandlers', 'this.swapWaiters'],
   // P3 slice 2, and none of these can name a file. `this.rooms` is the link's
   // room -> handler Map; the two handler Sets are observers.
   'src/sync/MuxLink.ts': ['this.rooms', 'this.statusHandlers', 'this.unsupportedHandlers'],

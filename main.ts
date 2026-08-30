@@ -40,7 +40,6 @@
 import { MarkdownView, Notice, Platform, Plugin, TFolder, normalizePath } from 'obsidian';
 import type { TAbstractFile } from 'obsidian';
 import type { EditorView } from '@codemirror/view';
-import { WebsocketProvider } from 'y-websocket';
 
 import { SettingsTab } from './src/ui/SettingsTab';
 import {
@@ -74,6 +73,12 @@ import { Bootstrap } from './src/sync/Bootstrap';
 import { DeviceState } from './src/sync/DeviceState';
 import { Deletions } from './src/sync/Deletions';
 import { KeptFiles } from './src/sync/KeptFiles';
+// ⚠ REMOVAL-SCHEDULED, P3 spec §4 "Compatibility, and its end date": one minor
+// version after slice 8, this import and the `openTreeTransport` call below are
+// replaced by `new MuxTreeTransport(this.mux, this.tree.doc)` and the file goes.
+import { LEGACY_SERVER_NOTICE, openTreeTransport } from './src/sync/LegacyTreeTransport';
+import { MuxLink } from './src/sync/MuxLink';
+import type { TreeTransport } from './src/sync/TreeTransport';
 import { ObsidianBlobPort } from './src/sync/ObsidianBlobPort';
 import { ObsidianDocPort } from './src/sync/ObsidianDocPort';
 import { ObsidianStatePort, treeSnapshotKey } from './src/sync/ObsidianStatePort';
@@ -193,24 +198,6 @@ function toCause(reason: string): ReconcileCause {
     : 'sync';
 }
 
-/** Resolves TRUE only on a genuine provider `sync` event. A timeout is not a sync (I3). */
-function waitForSync(provider: WebsocketProvider, ms: number): Promise<boolean> {
-  if (provider.synced) return Promise.resolve(true);
-  return new Promise<boolean>((resolve) => {
-    let done = false;
-    const finish = (value: boolean): void => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      provider.off('sync', onSync);
-      resolve(value);
-    };
-    const onSync = (isSynced: boolean): void => { if (isSynced) finish(true); };
-    provider.on('sync', onSync);
-    const timer = setTimeout(() => finish(provider.synced), ms);
-  });
-}
-
 // ============================================================ the runtime
 
 /**
@@ -229,7 +216,14 @@ class SyncRuntime {
   readonly state: DeviceState;
   readonly tickets: Tickets;
   readonly tree: TreeDoc;
-  readonly treeProvider: WebsocketProvider;
+  /**
+   * The vault's ONE socket (P3 spec §1.1). From slice 2 it carries `_tree`; from
+   * slice 3 it carries every live note's room as well, which is where the socket
+   * count actually falls. It exists as a field rather than inside the transport
+   * because `RoomRegistry` will be handed the same object.
+   */
+  readonly mux: MuxLink;
+  readonly treeLink: TreeTransport;
   readonly session: WorkspaceSession;
   readonly queue: PublishQueue;
   readonly watcher: VaultWatcher;
@@ -247,6 +241,9 @@ class SyncRuntime {
   private reconcileRunning = false;
   private reconcileDirty = false;
   private nextCause: ReconcileCause = 'sync';
+
+  /** Releases the tree's reconnect subscription. Set in `start`, called in `dispose`. */
+  private releaseTreeConnected: (() => void) | null = null;
 
   /** Chained so two `status: connected` transitions cannot run bootstrap twice at once. */
   private reconnectChain: Promise<void> = Promise.resolve();
@@ -431,11 +428,27 @@ class SyncRuntime {
       notice: (msg) => { new Notice(msg); },
     });
 
-    this.treeProvider = new WebsocketProvider(share.serverUrl, '_tree', this.tree.doc, {
-      connect: true,
-      params: { t: share.serverKey, w: share.workspaceId },
-      disableBc: true,
+    // P3 slice 2. `_tree` is the first — and, this slice, the only — room on the
+    // vault's shared socket. It is chosen because it is the least dangerous room
+    // in the system: no note content passes through it, so the reconnect ladder
+    // and the frame codec soak here before slice 3 puts prose on them.
+    this.mux = new MuxLink({
+      serverUrl: share.serverUrl,
+      serverKey: share.serverKey,
+      workspaceId: share.workspaceId,
     });
+    this.treeLink = openTreeTransport(
+      this.mux,
+      this.tree.doc,
+      {
+        serverUrl: share.serverUrl,
+        serverKey: share.serverKey,
+        workspaceId: share.workspaceId,
+      },
+      // Said once, and only when it is true: the server is older than the plugin.
+      () => { new Notice(LEGACY_SERVER_NOTICE, 15_000); },
+    );
+    this.treeLink.connect();
 
     this.bootstrap = new Bootstrap({
       state: this.state,
@@ -445,13 +458,9 @@ class SyncRuntime {
       deviceId,
       loadSnapshot: () => this.statePort.readBinary(treeSnapshotKey(share.workspaceId)),
       connectTree: async (ms) => {
-        if (this.treeProvider.synced) return true;
-        try {
-          this.treeProvider.connect();
-        } catch {
-          /* already connecting; the wait below is what decides */
-        }
-        return waitForSync(this.treeProvider, ms);
+        if (this.treeLink.synced) return true;
+        this.treeLink.connect();
+        return this.treeLink.whenSynced(ms);
       },
       confirm: (confirmation) => confirmFirstSync(app, confirmation),
       // §7.2/§7.5: the same three numbers the reconciler applies, so the
@@ -530,10 +539,7 @@ class SyncRuntime {
       if (!isLocal) this.scheduleReconcile('remote');
     });
 
-    this.treeProvider.on('status', (event: { status?: string }) => {
-      if (event?.status !== 'connected') return;
-      this.onReconnect();
-    });
+    this.releaseTreeConnected = this.treeLink.onConnected(() => { this.onReconnect(); });
 
     // The ladder in `state.publish` is measured in minutes; this is only what
     // guarantees somebody asks once a rung comes due.
@@ -639,8 +645,17 @@ class SyncRuntime {
     } catch (err) {
       console.error('[ShadowLink] writing device state failed', err);
     }
+    this.releaseTreeConnected?.();
+    this.releaseTreeConnected = null;
     try {
-      this.treeProvider.destroy();
+      this.treeLink.destroy();
+    } catch {
+      /* already gone */
+    }
+    // After the transport: destroying the link first would take the room's socket
+    // out from under a transport that is still unsubscribing from it.
+    try {
+      this.mux.destroy();
     } catch {
       /* already gone */
     }
