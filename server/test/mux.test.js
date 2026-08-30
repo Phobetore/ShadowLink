@@ -829,6 +829,122 @@ test('one room that throws during the close fan-out does not strand the rest', (
   assert.match(String(mux.stats.lastError?.message), /close handler threw for w1\/r1/);
 });
 
+// ---------------------------------------------------------- the guards
+//
+// Four guards in `VirtualConn` survived every mutation the shipped suite could
+// make, because the real `DocHub` cannot currently reach them: it wraps its own
+// message handler in a try/catch and removes a connection from `state.conns`
+// before calling `conn.close()`. That means the mux's containment rests on the
+// hub's internals — which the byte-pin freezes, and which DocHub.js:178 says will
+// change in P3/P4 ("flush-then-destroy on last leave"). Unreachable-but-untested
+// is the same lie as a guard that inspects nothing, so each is made reachable
+// here and pinned. A fifth, `rooms.clear()` in the fan-out, was deleted instead:
+// every `VirtualConn` removes itself through `_onGone` before its close handlers
+// run, so clearing afterwards only hid a break in that path from the
+// `roomCount === 0` assertions above.
+
+test('a message handler that throws stays in its room, and the next handler still runs', () => {
+  const ws = new FakeSocket();
+  const hub = new FlakyHub({ throwOnMessage: ['r1'] });
+  const mux = attachMux(ws, { hub, workspaceId: 'w1' });
+
+  ws.deliver('r1', syncPayload(SYNC.SYNC_UPDATE, updateFor('a')));
+  ws.deliver('r2', syncPayload(SYNC.SYNC_UPDATE, updateFor('b')));
+
+  assert.match(String(mux.stats.lastError?.message), /message handler threw for w1\/r1/);
+  assert.equal(ws.readyState, 1, 'one handler\'s throw took the socket down');
+  assert.equal(mux.roomCount, 2, 'one handler\'s throw closed a room');
+
+  const r1 = hub.connections.get('w1/r1');
+  assert.equal(r1.received.length, 0, 'the throwing handler somehow recorded the payload');
+  assert.equal(
+    r1.alsoReceived.length, 1,
+    'the second handler on the same room never ran — the try/catch is not per handler',
+  );
+  assert.equal(hub.connections.get('w1/r2').received.length, 1, 'the neighbour room lost a frame');
+
+  // ...and the room that threw keeps carrying traffic afterwards.
+  ws.deliver('r1', syncPayload(SYNC.SYNC_UPDATE, updateFor('c')));
+  assert.equal(r1.alsoReceived.length, 2);
+});
+
+test('a virtual connection fires its close handlers exactly once, as a real socket does', () => {
+  // Reached on every room of every fan-out: `DocHub._closeConn` calls
+  // `conn.close()` from inside the close handler this is running, which re-enters
+  // `shutdown()`. Only `_closeConn`'s own idempotence hides the double fire today.
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, { hub, workspaceId: 'w1' });
+  const rooms = ['r0', 'r1', 'r2'];
+  for (const room of rooms) ws.deliver(room, syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+
+  ws.close();
+
+  assert.equal(mux.roomCount, 0);
+  for (const room of rooms) {
+    const entry = hub.connections.get(`w1/${room}`);
+    assert.equal(entry.closed, true, `${room} never saw its close`);
+    assert.equal(
+      entry.closeHandlerCalls, 1,
+      `${room}'s close handler ran ${entry.closeHandlerCalls} times; a real ws fires once`,
+    );
+  }
+  // Closing the socket again is still one close per room, not a second round.
+  ws.emit('close');
+  for (const room of rooms) {
+    assert.equal(hub.connections.get(`w1/${room}`).closeHandlerCalls, 1);
+  }
+});
+
+test('a room the fan-out already closed is not delivered into, even mid-open', () => {
+  // The reentrancy this guards: backpressure drops the socket from INSIDE the
+  // first send of a room that is still being opened, and on a transport whose
+  // close is synchronous the fan-out then closes and flushes that room before
+  // `onMessage` gets back to its `deliver`. Delivering then writes into a room
+  // `DocHub` has already flushed and forgotten.
+  const ws = new FakeSocket({ noTerminate: true });
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, { hub, workspaceId: 'w1', hardBufferedBytes: 1024 });
+  ws.bufferedPerSend = 4096;                    // the hub's own SyncStep1 blows it
+
+  ws.deliver('r1', syncPayload(SYNC.SYNC_UPDATE, updateFor('must not land')));
+
+  assert.equal(mux.stats.overflowed, true, 'the fixture never tripped the bound');
+  assert.equal(mux.stats.overflowReason, 'hard');
+  assert.equal(ws.readyState, 3, 'the fixture socket never closed synchronously');
+  const entry = hub.connections.get('w1/r1');
+  assert.equal(entry.closed, true, 'the fan-out did not run inside the open');
+  assert.equal(
+    entry.received.length, 0,
+    'a payload was delivered into a room the fan-out had already closed and flushed',
+  );
+  assert.equal(mux.roomCount, 0);
+});
+
+test('a send into a room that has already closed never reaches the wire', () => {
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, { hub, workspaceId: 'w1' });
+  ws.deliver('r1', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  ws.deliver('r2', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  const framesR1 = ws.framesFor('r1').length;
+  const framesR2 = ws.framesFor('r2').length;
+
+  hub.closeRoom('w1/r1');                       // one room ends; the socket does not
+  hub.push('w1/r1', Uint8Array.from([1, 2, 3]));
+
+  assert.equal(
+    ws.framesFor('r1').length, framesR1,
+    'a closed room still wrote to the shared socket',
+  );
+  assert.equal(ws.readyState, 1, 'one room closing took the socket with it');
+  assert.equal(mux.roomCount, 1, 'the closed room was left in the map');
+
+  // The other room on the same socket is entirely unaffected.
+  hub.push('w1/r2', Uint8Array.from([4, 5, 6]));
+  assert.equal(ws.framesFor('r2').length, framesR2 + 1, 'the neighbour room stopped sending');
+});
+
 test('a corrupt snapshot fails one room on a REAL hub and the socket carries on', async () => {
   const server = await startMuxHub();
   try {

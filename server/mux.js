@@ -204,6 +204,19 @@ class VirtualConn {
     return this;
   }
 
+  /**
+   * A send into a room that has already ended is dropped, the way a real `ws`
+   * refuses one after its close.
+   *
+   * ⚠ Not reachable through today's `DocHub`, and pinned by a test regardless.
+   * `DocHub._send` checks `readyState` itself, and `_closeConn` removes a
+   * connection from `state.conns` BEFORE calling `conn.close()`, so the hub never
+   * holds a closed conn to write to. That is the hub's internals doing this
+   * file's containment for it — which is why `check-dochub.mjs` pinning that file
+   * turns out to be load-bearing for isolation, not only for the relay. The
+   * property is asserted against a hub that does write after a close, in
+   * "a send into a room that has already closed never reaches the wire".
+   */
   send(message) {
     if (this.readyState !== OPEN) return;
     this._sendFrame(this.room, message);
@@ -219,7 +232,24 @@ class VirtualConn {
     this.shutdown();
   }
 
-  /** Deliver one payload to this room. One room's throw stays in this room. */
+  /**
+   * Deliver one payload to this room. One room's throw stays in this room.
+   *
+   * ⚠ Both guards below are reachable, and each dies to a mutation without the
+   * test written for it:
+   *
+   * - The readyState check. Backpressure can drop the socket from INSIDE the
+   *   first send of a room that is still being opened; on a transport whose close
+   *   is synchronous the fan-out then closes and flushes that room before
+   *   `onMessage` gets back here. Delivering then writes into a room `DocHub` has
+   *   already flushed and forgotten — "a room the fan-out already closed is not
+   *   delivered into, even mid-open".
+   * - The per-handler try/catch. `DocHub` wraps its own message handler
+   *   (DocHub.js:112-118), so nothing it registers can throw out of here today.
+   *   A handler that does throw must take neither the socket, nor the handlers
+   *   after it, nor the other rooms with it — "a message handler that throws
+   *   stays in its room, and the next handler still runs".
+   */
   deliver(payload) {
     if (this.readyState !== OPEN) return;
     for (const handler of [...this._handlers.message]) {
@@ -235,6 +265,17 @@ class VirtualConn {
    * End this room. Fires `DocHub`'s close handler, which is what runs its
    * flush-on-last-peer-left — so a mux socket dropping is, per room, exactly the
    * event a per-room socket dropping used to be.
+   *
+   * ⚠ The idempotence guard is reached on EVERY room of EVERY fan-out:
+   * `DocHub._closeConn` calls `conn.close()` from inside the very close handler
+   * this loop is running, which re-enters here. A real `ws` fires its close event
+   * once, so a virtual one must too — without the guard every registered close
+   * handler runs twice, and only `_closeConn`'s own idempotence hides that.
+   * Pinned by "a virtual connection fires its close handlers exactly once".
+   *
+   * `_onGone` is likewise load-bearing rather than bookkeeping: it is the only
+   * thing that removes this room from the socket's map, including during the
+   * close fan-out, which no longer clears the map behind it.
    */
   shutdown() {
     if (this.readyState === CLOSED) return;

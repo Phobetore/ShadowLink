@@ -106,8 +106,15 @@ export function textOfUpdate(bytes, field = 'content') {
  * close event, report an arbitrary `bufferedAmount`, or throw from `send`.
  */
 export class FakeSocket extends EventEmitter {
-  constructor({ bufferedAmount = 0 } = {}) {
+  constructor({ bufferedAmount = 0, noTerminate = false } = {}) {
     super();
+    // ⚠ A transport with no `terminate` falls back to `close()`, and this fake's
+    // `close()` emits SYNCHRONOUSLY. That combination is the nastiest reentrancy
+    // the mux can face — backpressure dropping the socket from inside the first
+    // send of a room that is still being opened — and it is what makes
+    // `VirtualConn.deliver`'s readyState check reachable. `ws` itself defers its
+    // close event, which is why this has to be asked for explicitly.
+    if (noTerminate) this.terminate = undefined;
     this.readyState = 1;                       // OPEN
     this.bufferedAmount = bufferedAmount;
     /** Every frame the server wrote, decoded. */
@@ -178,12 +185,17 @@ export class FakeSocket extends EventEmitter {
  * demand, and the thing "error containment" is a claim about.
  *
  * `failOn` names rooms whose `handleConnection` throws; `failCloseOn` names rooms
- * whose close handler throws during the fan-out.
+ * whose close handler throws during the fan-out; `throwOnMessage` names rooms
+ * whose MESSAGE handler throws, which the real `DocHub` cannot be made to do
+ * because it wraps its own handler in a try/catch (DocHub.js:112-118). That
+ * wrapper is exactly why several of the mux's containment guards are unreachable
+ * through the real hub, and why they are pinned against this one instead.
  */
 export class FlakyHub {
-  constructor({ failOn = [], failCloseOn = [] } = {}) {
+  constructor({ failOn = [], failCloseOn = [], throwOnMessage = [] } = {}) {
     this.failOn = new Set(failOn);
     this.failCloseOn = new Set(failCloseOn);
+    this.throwOnMessage = new Set(throwOnMessage);
     /** docName → { conn, closed } for every connection it accepted. */
     this.connections = new Map();
     this.docNames = [];
@@ -193,11 +205,33 @@ export class FlakyHub {
     this.docNames.push(docName);
     const room = docName.slice(docName.indexOf('/') + 1);
     if (this.failOn.has(room)) throw new Error(`hub refuses ${docName}`);
-    const entry = { conn, docName, closed: false, received: [] };
-    conn.on('message', (payload) => { entry.received.push(payload); });
+    const entry = {
+      conn,
+      docName,
+      closed: false,
+      received: [],
+      /** What a SECOND message handler saw — the first one may have thrown. */
+      alsoReceived: [],
+      /** Raw close-handler invocations. A real `ws` fires its close once. */
+      closeHandlerCalls: 0,
+    };
+    conn.on('message', (payload) => {
+      if (this.throwOnMessage.has(room)) throw new Error(`message handler threw for ${docName}`);
+      entry.received.push(payload);
+    });
+    // A second handler on the same room, so "the try/catch is PER HANDLER" is an
+    // assertion rather than a reading of the loop.
+    conn.on('message', (payload) => { entry.alsoReceived.push(payload); });
     conn.on('close', () => {
+      entry.closeHandlerCalls += 1;
+      // ⚠ Imitates `DocHub._closeConn` in the detail that matters: it removes the
+      // connection from its own map BEFORE calling `conn.close()` (DocHub.js:167
+      // then :170), so the re-entry that call causes is a no-op there. Without
+      // that shape a fake cannot express what the mux's idempotence guard is for.
+      if (entry.closed) return;
       entry.closed = true;
       if (this.failCloseOn.has(room)) throw new Error(`close handler threw for ${docName}`);
+      conn.close();
     });
     this.connections.set(docName, entry);
     // The real hub's first act is a SyncStep1, so imitate having one.
@@ -207,6 +241,11 @@ export class FlakyHub {
   /** Broadcast into one room, the way a peer's update would. */
   push(docName, payload) {
     this.connections.get(docName)?.conn.send(payload);
+  }
+
+  /** End one room the way `DocHub._closeConn` does, leaving the socket alone. */
+  closeRoom(docName) {
+    this.connections.get(docName)?.conn.close();
   }
 }
 
