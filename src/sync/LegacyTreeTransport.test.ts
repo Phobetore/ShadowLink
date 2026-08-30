@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import * as Y from 'yjs';
 
 import { FakeMux } from './fakes.ts';
-import { MuxLink, type MuxUnsupportedReason } from './MuxLink.ts';
+import { MuxLink, type MuxSocket, type MuxUnsupportedReason } from './MuxLink.ts';
 import {
   LEGACY_SERVER_NOTICE, MUX_UNREACHABLE_NOTICE, legacyNoticeFor, openTreeTransport,
 } from './LegacyTreeTransport.ts';
@@ -33,7 +33,10 @@ import type { TreeTransport } from './TreeTransport.ts';
 
 const CONFIG = { serverUrl: 'ws://host:1234', serverKey: 'sk', workspaceId: 'ws-1' };
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
+// ⚠ A `sleep` USED TO LIVE HERE, and it went with the mechanism it served: the
+// only test that needed real elapsed time was the one asserting the mux dial had
+// been widened to what the probe measured. Nothing in this file times anything
+// any more, which is the point of the round.
 
 /** Today's topology, without the socket. Only its lifecycle is under test. */
 class StubLegacy implements TreeTransport {
@@ -298,7 +301,7 @@ test('the bridge is ONE file, and the permanent transport names nothing legacy',
  * the transport that eventually wins are two different questions being asked of
  * the same constructor.
  */
-function unreachableHarness({ connectTimeoutMs = 0 } = {}): {
+function unreachableHarness({ connectTimeoutMs = 0, hang = false } = {}): {
   transport: TreeTransport;
   mux: FakeMux;
   link: MuxLink;
@@ -312,7 +315,23 @@ function unreachableHarness({ connectTimeoutMs = 0 } = {}): {
   const timers: Array<{ fn: () => void } | undefined> = [];
   const link = new MuxLink({
     ...CONFIG,
-    openSocket: mux.openSocket,
+    // ⚠ `hang` is the OTHER shape a route that produces nothing has, and the two
+    // must not be confused: `FakeMux.refuseConnect` throws, which is the path
+    // saying no, while this one accepts the connection and never finishes it —
+    // a black-holed upgrade, and byte-for-byte what an arbitrarily slow path
+    // looks like until it finally opens.
+    openSocket: hang
+      ? (): MuxSocket => ({
+        readyState: 0,
+        bufferedAmount: 0,
+        send: () => undefined,
+        close: () => undefined,
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+        onerror: null,
+      })
+      : mux.openSocket,
     idleTimeoutMs: 0,
     connectTimeoutMs,
     unreachableDials: 2,
@@ -413,50 +432,79 @@ test('a route that already served this link is never demoted, and no probe is bu
   h.dispose();
 });
 
-test('the mux dial is widened to what the probe proved the path costs', async () => {
-  // ⚠ THE RIGGED COMPARISON, in unit form. A dial is bounded; the probe is a
-  // `WebsocketProvider` with no connect deadline at all, so on any path slower
-  // than the bound the mux can never open and the probe always eventually can —
-  // "the mux route is unreachable" is then a statement about the bound. Measured
-  // against the shipped server behind a proxy delaying every connection on every
-  // route by 4.5 s: `unreachable` at 14,952 ms with a sentence blaming a proxy
-  // that was forwarding every path. The parent branch connected at 5,041 ms.
+test('a dial NOBODY refused is never a verdict, however many of them there are', () => {
+  // ⚠ THE ROUND, IN ONE TEST. Three attempts were made to price this comparison —
+  // a fixed 4 s bound, then a bound widened to twice the probe's own connect —
+  // and a variable-latency path defeated both, because the mux's draw and the
+  // probe's draw are two samples from the same distribution. Measured on the
+  // parent branch against the shipped server serving `/_mux` normally, behind a
+  // proxy drawing 75% of its connections from 5.5-8.5 s and 25% from 1.2-2.2 s:
+  // a PERMANENT false `unreachable` at 14,527 ms, framesIn 0, notice shown.
   //
-  // So the probe is timed on the route that works, and the mux is given at least
-  // that long before anything is concluded.
-  const h = unreachableHarness({ connectTimeoutMs: 30 });
-  h.mux.refuseConnect = true;
+  // Here every dial simply hangs, which is what a black-holed upgrade and an
+  // arbitrarily slow path BOTH look like from inside. No number of them may
+  // condemn anything.
+  const h = unreachableHarness({ connectTimeoutMs: 40, hang: true });
   h.transport.connect();
-  h.fire();                                      // two failed dials: the probe starts
-  assert.equal(h.made.length, 1, 'the per-room route was never tried');
+  for (let i = 0; i < 6; i += 1) h.fire();
 
-  await sleep(120);                              // this path costs more than 30 ms
-  h.mux.refuseConnect = false;                   // and the mux route is fine, given time
+  assert.ok(h.link.stats.dialsAbandoned >= 2, 'no dial actually ran out of time');
+  assert.equal(h.link.stats.dialsRefused, 0, 'the hanging dial was read as a refusal');
+  assert.equal(h.made.length, 1, 'a route producing nothing was never even looked into');
+
+  // And the probe answering does NOT unlock a verdict, because what it answers is
+  // "the server is reachable", not "this route is refused".
   h.made[0]?.arrive();
-
-  assert.ok(h.link.dialTimeoutMs >= 120,
-    'the dial kept a deadline the path was already known to beat');
-  assert.equal(h.link.connected, true, 'the fair re-dial never happened');
-  assert.equal(h.link.unsupportedReason, null, 'a slow path demoted a working route');
-  assert.deepEqual(h.notices, []);
+  for (let i = 0; i < 6; i += 1) h.fire();
+  assert.equal(h.link.unsupportedReason, null, 'a stopwatch condemned the route after all');
+  assert.deepEqual(h.notices, [], 'the user was told their server was wrong');
   h.dispose();
 });
 
-test('a probe that is synced but never connected settles nothing', () => {
-  // The cost of this path is what makes the comparison fair, and it is only known
-  // once the probe reports a connect. Without it there is nothing to be fair to.
-  const h = unreachableHarness();
-  h.mux.refuseConnect = true;
+test('what a route producing nothing gets instead is the truth, and one probe', () => {
+  // ⚠ THE HOLE DELETING THE LAST ABSENCE-VERDICT LEFT, filled without inferring
+  // anything. Measured on the parent branch through a proxy that upgrades `/_mux`
+  // for real and drops every server frame: 70 s, 3 sockets, 2 idle closures, 18
+  // frames out, 0 in, NO PROBE EVER BUILT, no verdict, the tree never synced, and
+  // a status bar reading "ShadowLink could not reach the workspace" against a
+  // server a control client was syncing with on the per-room route.
+  const h = unreachableHarness({ connectTimeoutMs: 40, hang: true });
   h.transport.connect();
-  h.fire();
-  assert.equal(h.made.length, 1);
+  for (let i = 0; i < 4; i += 1) h.fire();
+  assert.equal(h.link.routeUnserved, false, 'the fact was recorded before it was known');
 
-  const probe = h.made[0];
-  if (probe !== undefined) probe.synced = true;  // synced, with no connect reported
-  h.fire();
-  assert.equal(h.link.unsupportedReason, null,
-    'the route was condemned by a comparison with nothing on the other side');
+  h.made[0]?.arrive();                           // the server DOES answer, elsewhere
+  for (let i = 0; i < 4; i += 1) h.fire();
+
+  assert.equal(h.link.routeUnserved, true,
+    'the one thing measurement establishes here was never recorded');
+  assert.equal(h.link.unsupportedReason, null, 'a fact was allowed to become a verdict');
+  assert.deepEqual(h.notices, []);
+  // ONE probe, and it is gone: the question it was built to answer has been
+  // answered, and a second permanent socket is the topology this slice removes.
+  assert.equal(h.made[0]?.destroyed, true, 'the probe was left running for ever');
+  for (let i = 0; i < 10; i += 1) h.fire();
+  assert.equal(h.made.length, 1,
+    `a dark route built ${h.made.length} providers on the tree doc`);
   h.dispose();
+});
+
+test('a REFUSED route still reaches the verdict, and that is the only thing that does', () => {
+  // The two shapes side by side, in the same harness: `refuseConnect` throws,
+  // which is the path saying no, and that is the last evidence a demotion may
+  // rest on. It is also what 80f drives against a real 404-ing proxy.
+  const refused = unreachableHarness();
+  refused.mux.refuseConnect = true;
+  refused.transport.connect();
+  refused.fire();
+  refused.made[0]?.arrive();
+  refused.fire();
+  assert.equal(refused.link.routeRefused, true, 'a run of refusals was not recognised as one');
+  assert.equal(refused.link.unsupportedReason, 'unreachable');
+  assert.deepEqual(refused.notices, ['unreachable']);
+  assert.equal(refused.link.routeUnserved, false,
+    'a route with a verdict also got the sentence for routes without one');
+  refused.dispose();
 });
 
 test('a server that is merely DOWN is not demoted — the per-room route fails too', () => {

@@ -503,6 +503,122 @@ test('a peer that took our frames and said nothing is RETRIED, never condemned',
   assert.equal(link.stats.socketsOpened, 2, 'the link did not dial again after the close');
 });
 
+test('a socket closed for saying nothing REPORTS it — retrying in silence is not enough', () => {
+  // ⚠ THE HOLE THE PREVIOUS ROUND LEFT. Deleting the ten-second verdict deleted
+  // the evidence-gathering with it, and the route it left behind produced
+  // nothing at all: measured on the parent branch through a proxy that upgrades
+  // `/_mux` for real and drops every server frame, 70 s gave 3 sockets, 2 idle
+  // closures, 18 frames out, 0 in, dialsFailed 0, no probe ever built and no
+  // sentence a user could act on. A closure here is not evidence about the peer —
+  // but it IS a reason to go and ask whether the server answers anywhere else,
+  // which is the question only the bridge can put.
+  const clock = { t: 0 };
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const seen: string[] = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    openSocket: () => {
+      const socket = { ...silentSocket() };
+      socket.close = (): void => { socket.readyState = 3; socket.onclose?.({}); };
+      return socket;
+    },
+    connectTimeoutMs: 0,
+    idleTimeoutMs: 30_000,
+    random: () => 0.5,
+    now: () => clock.t,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  link.onUnreachable((evidence) => seen.push(evidence));
+  link.subscribe('_tree', {
+    onOpen: () => { link.send('_tree', bytes(0, 0)); },
+    onPayload: () => undefined,
+  });
+  link.connect();
+  for (let i = 0; i < 11; i += 1) {
+    clock.t += 3_000;
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  }
+
+  assert.equal(link.stats.idleClosures, 1, 'the deaf socket was never closed');
+  assert.deepEqual(seen, ['unanswered'],
+    `a deaf socket on a route that never served reported ${JSON.stringify(seen)}`);
+  // ⚠ AND IT IS STILL NOT A VERDICT, which is the half the last round got right.
+  assert.equal(link.unsupportedReason, null, 'a silence condemned the route');
+  assert.equal(link.routeRefused, false, 'a silence was counted as a refusal');
+});
+
+test('a deaf socket on a route that HAS served says nothing at all', () => {
+  // The gate is the same one the dial reports have: a route that has worked is
+  // never reported, because an outage, a slept radio and a proxy restart all look
+  // exactly like this and the only honest answer to them is the ladder.
+  const clock = { t: 0 };
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const seen: string[] = [];
+  const sockets: MuxSocket[] = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    openSocket: () => {
+      const socket = { ...silentSocket() };
+      socket.close = (): void => { socket.readyState = 3; socket.onclose?.({}); };
+      sockets.push(socket);
+      return socket;
+    },
+    connectTimeoutMs: 0,
+    idleTimeoutMs: 30_000,
+    random: () => 0.5,
+    now: () => clock.t,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  link.onUnreachable((evidence) => seen.push(evidence));
+  link.subscribe('_tree', {
+    onOpen: () => { link.send('_tree', bytes(0, 0)); },
+    onPayload: () => undefined,
+  });
+  link.connect();
+  sockets[0]?.onmessage?.({ data: encodeMuxFrame('_tree', bytes(0, 0)) });
+  assert.equal(link.everServed, true, 'the route never answered in the first place');
+
+  for (let i = 0; i < 11; i += 1) {
+    clock.t += 3_000;
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  }
+  assert.ok(link.stats.idleClosures >= 1, 'the dead socket was never closed');
+  assert.deepEqual(seen, [], 'a route that had served this link was reported');
+});
+
+test('noteRouteUnserved is a fact that a single frame retracts', () => {
+  // It is deliberately not a latch. The bridge records what it proved; the moment
+  // the route delivers anything, the sentence built on it stops being true and
+  // stops being said, with nothing to clear and nobody to clear it.
+  const { link, mux } = makeLink();
+  link.subscribe('_tree', collector());
+  link.connect();
+  assert.equal(link.routeUnserved, false);
+
+  link.noteRouteUnserved();
+  assert.equal(link.routeUnserved, true, 'the bridge could not record what it proved');
+
+  mux.sockets[0]?.push('_tree', bytes(0, 0));
+  assert.equal(link.everServed, true);
+  assert.equal(link.routeUnserved, false, 'a route that answered still read as delivering nothing');
+});
+
+test('noteRouteUnserved cannot be recorded against a route that has already served', () => {
+  const { link, mux } = makeLink();
+  link.subscribe('_tree', collector());
+  link.connect();
+  mux.sockets[0]?.push('_tree', bytes(0, 0));
+
+  link.noteRouteUnserved();
+  assert.equal(link.routeUnserved, false, 'a proven route was described as delivering nothing');
+});
+
 test('a link that asked NOTHING is not owed an answer either — no timer condemns it', () => {
   const clock = { t: 0 };
   const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
@@ -567,26 +683,72 @@ test('a route that has NEVER served is still reported, which is what 80f needs',
   assert.ok(reports > 0, 'a route that never answered was never reported');
 });
 
-test('allowDialTime raises the dial deadline and never lowers it', () => {
-  // ⚠ THE FAIRNESS RULE. A dial is bounded; the bridge's legacy probe is not, so
-  // on any path whose upgrade is slower than the bound the mux loses by
-  // construction. Measured: a proxy delaying every connection on every route by
-  // 4.5 s demoted a working session at 14,952 ms. The bridge measures what the
-  // legacy route actually needed and hands it here before it may conclude.
-  const { link } = makeLink({ connectTimeoutMs: 4_000 });
-  assert.equal(link.dialTimeoutMs, 4_000);
-  link.allowDialTime(9_000);
-  assert.equal(link.dialTimeoutMs, 9_000, 'the deadline was not widened');
-  link.allowDialTime(1_000);
-  assert.equal(link.dialTimeoutMs, 9_000, 'a deadline that can shrink is the old bias back');
-  link.allowDialTime(Number.POSITIVE_INFINITY);
-  assert.equal(link.dialTimeoutMs, 9_000, 'a nonsense measurement moved the deadline');
-  link.allowDialTime(10 * 60_000);
-  assert.equal(link.dialTimeoutMs, 60_000, 'the deadline is not capped');
+test('the dial deadline is a PATIENCE ladder, and it resets on any socket that opens', () => {
+  // ⚠ NOT A MEASUREMENT OF ANYTHING, which is the whole difference from what this
+  // replaces. The deadline used to be raised from what the bridge's legacy probe
+  // cost, so one slow start left it widened — up to a minute — for the life of the
+  // link, and a later black hole parked a dial for that whole minute on a path
+  // that had been fast the entire time between. Here nothing is timed: each dial
+  // that ran out of time makes the next one longer, exactly as the backoff ladder
+  // makes the next wait longer, and one open socket puts it back.
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const made: Array<MuxSocket & { fire: (event: 'open' | 'close') => void }> = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 4_000,
+    random: () => 0.5,
+    openSocket: () => {
+      const socket = { ...silentSocket(), readyState: 0 };
+      const handle = Object.assign(socket, {
+        fire: (event: 'open' | 'close'): void => {
+          if (event === 'open') { socket.readyState = 1; socket.onopen?.({}); }
+          else { socket.readyState = 3; socket.onclose?.({}); }
+        },
+      });
+      made.push(handle);
+      return handle;
+    },
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  const drain = (): number[] => {
+    const due = timers.splice(0).filter((t) => t !== undefined);
+    for (const timer of due) timer.fn();
+    return due.map((t) => t.ms);
+  };
+
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  assert.equal(link.dialTimeoutMs, 4_000, 'the first dial did not get the first rung');
+  drain();                                             // the deadline elapses
+  assert.equal(link.dialTimeoutMs, 8_000, 'the second dial was no more patient than the first');
+  drain();                                             // the retry rung fires
+  drain();                                             // and the second deadline elapses
+  assert.equal(link.dialTimeoutMs, 12_000);
+  drain();                                             // rung, third dial
+  drain();                                             // third deadline elapses
+  assert.equal(link.dialTimeoutMs, 12_000, 'the ladder has no top rung');
+
+  // One socket that opens, and the patience is spent — a session that connected
+  // never carries a widened deadline into a later outage.
+  drain();                                             // rung, fourth dial
+  const socket = made[made.length - 1];
+  assert.equal(made.length, 4, 'the ladder stopped dialling');
+  socket?.fire('open');
+  assert.equal(link.dialTimeoutMs, 4_000, 'an open socket did not reset the ladder');
 });
 
-test('allowDialTime re-arms the dial that is IN FLIGHT, not only the next one', () => {
-  // The dial about to be counted as evidence is the one that has to be fair.
+test('a dial the CLIENT abandoned is never reported as a refusal', () => {
+  // ⚠ THE RULE THIS ROUND EXISTS FOR. A black-holed upgrade and an arbitrarily
+  // slow path produce the same observation — our own deadline elapsing — and one
+  // of them is a working server. Measured on the parent branch: a path drawing
+  // 75% of its connections from 5.5-8.5 s and 25% from 1.2-2.2 s reached a
+  // permanent false `unreachable` at 14,527 ms against a server serving `/_mux`
+  // normally, with framesIn 0 and a notice blaming a proxy that was forwarding
+  // every path.
   const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
   const link = new MuxLink({
     serverUrl: 'ws://host:1234',
@@ -595,18 +757,66 @@ test('allowDialTime re-arms the dial that is IN FLIGHT, not only the next one', 
     openSocket: () => hangingSocket(),
     idleTimeoutMs: 0,
     connectTimeoutMs: 4_000,
+    unreachableDials: 2,
     random: () => 0.5,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
     clearTimer: (handle) => { timers[handle as number] = undefined; },
   });
+  const seen: string[] = [];
+  link.onUnreachable((evidence) => seen.push(evidence));
+  link.subscribe('_tree', { onPayload: () => undefined });
   link.connect();
-  const armedBefore = timers.filter((t) => t !== undefined);
-  assert.deepEqual(armedBefore.map((t) => t?.ms), [4_000]);
+  for (let i = 0; i < 8; i += 1) {
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  }
 
-  link.allowDialTime(9_000);
-  const armedAfter = timers.filter((t) => t !== undefined);
-  assert.deepEqual(armedAfter.map((t) => t?.ms), [9_000],
-    'the in-flight dial kept the deadline the comparison was rigged with');
+  assert.ok(link.stats.dialsAbandoned >= 2, 'no dial actually ran out of time');
+  assert.equal(link.stats.dialsRefused, 0, 'a deadline was counted as a refusal');
+  assert.equal(link.routeRefused, false, 'a run of deadlines became something a verdict may rest on');
+  assert.ok(seen.length > 0, 'a route producing nothing was never reported at all');
+  assert.deepEqual([...new Set(seen)], ['unanswered'],
+    `the evidence named a refusal that never happened: ${JSON.stringify(seen)}`);
+  assert.equal(link.unsupportedReason, null);
+});
+
+test('connect({ immediate }) jumps a dial that has already had the first rung', () => {
+  // ⚠ MEASURED AS INERT. `open()` assigns `this.socket` before the socket opens
+  // and `connect()` returns early while one exists, so a dial parked on a widened
+  // deadline swallowed every immediate request behind it: on the previous round,
+  // an eight-second black hole left a client read-only for 48,037 ms of which
+  // 40,063 ms were after the path had fully recovered.
+  const clock = { t: 0 };
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  let dials = 0;
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    openSocket: () => { dials += 1; return hangingSocket(); },
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 4_000,
+    random: () => 0.5,
+    now: () => clock.t,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  assert.equal(dials, 1);
+
+  // ⚠ THE FIRST RUNG IS LEFT ALONE. A dial that has not had the ordinary
+  // allowance may simply be on a slow path, and replacing it with an identical
+  // one is the bias the patience ladder exists to remove.
+  clock.t += 3_000;
+  link.connect({ immediate: true });
+  assert.equal(dials, 1, 'an immediate connect killed a dial still inside its first rung');
+
+  clock.t += 1_500;
+  link.connect({ immediate: true });
+  assert.equal(dials, 2, 'an immediate connect waited out a dial that had had its allowance');
+  // And it is not counted as evidence: nothing failed, somebody just asked.
+  assert.equal(link.stats.dialsFailed, 0, 'a superseded dial was counted as a failure');
+  assert.equal(link.dialTimeoutMs, 4_000, 'a superseded dial widened the patience ladder');
 });
 
 test('a socket that HAS answered is not demoted by a later bad frame on it', () => {

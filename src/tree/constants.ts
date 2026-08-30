@@ -112,19 +112,52 @@ export const MUX_RECONNECT_JITTER = 0.25;
 export const MUX_IDLE_TIMEOUT_MS = 30_000;
 
 /**
- * How long a dial may take before it is counted as a failed attempt.
+ * The FIRST rung of the dial-patience ladder: how long the first dial after an
+ * open socket has to produce another one before it is given up on.
  *
  * `MuxLink.open()` assigns `this.socket` before the socket opens and `connect()`
  * refuses to dial while one exists, so a dial that HANGS — the TCP connection
  * accepted and the HTTP upgrade never answered, which is what a misconfigured
  * reverse proxy does — parked the link for ever with no timer armed. Measured: 1
- * dial, 0 timers, still 1 dial 45 s later.
+ * dial, 0 timers, still 1 dial 45 s later. That is the whole job.
+ *
+ * ⚠ IT IS NOT, AND MAY NEVER AGAIN BE, HALF OF A COMPARISON. A dial deadline is
+ * a statement about how long this client is willing to hold one attempt open; it
+ * is not evidence about the path, and nothing that ends a dial at this deadline
+ * may condemn the route. Two rounds spent it that way — first as a fixed bound
+ * against an unbounded probe, then as a bound widened to twice the probe's own
+ * connect — and a variable-latency path defeated both, because the dial that
+ * draws 8 s and the probe that draws 1.2 s are the same path.
  */
 export const MUX_CONNECT_TIMEOUT_MS = 4_000;
 
 /**
- * How many dials in a row may fail to produce an OPEN socket before the link
- * says so out loud (P3 spec §4).
+ * How the dial deadline grows over consecutive dials that produced no socket, as
+ * multiples of `MUX_CONNECT_TIMEOUT_MS`: 4 s, then 8 s, then 12 s for ever.
+ *
+ * ⚠ THIS IS PATIENCE, NOT MEASUREMENT, and the distinction is the round. Nothing
+ * is timed and nothing is compared: the link simply holds the next attempt open
+ * longer each time the last one ran out, exactly as `MUX_RECONNECT_BACKOFF_MS`
+ * waits longer each time. It resets to the first rung on any socket that opens,
+ * so a session that once connected never carries a widened deadline into a later
+ * outage — which is the defect that made the previous round's raise permanent.
+ *
+ * It exists because a fixed 4 s deadline is unreachable on a path whose upgrade
+ * costs more than that, and a route that can never open is a route that can never
+ * be used. Measured through a proxy delaying every connection on every route by
+ * 4.5 s, against the shipped server serving `/_mux` normally: at a fixed 4 s the
+ * mux never opened at all.
+ *
+ * The top rung is deliberately UNDER `TREE_SYNC_TIMEOUT_MS`, so a bootstrap
+ * always sees at least one completed dial inside its own window, and
+ * `connect({ immediate: true })` may drop a dial that has already had the first
+ * rung — so a widened deadline never becomes a person's wait.
+ */
+export const MUX_DIAL_PATIENCE = [1, 2, 3];
+
+/**
+ * How many dials in a row must produce no OPEN socket before the link says so out
+ * loud (P3 spec §4).
  *
  * The other route into the legacy verdict needs a socket that opened, so a
  * refused or black-holed `/_mux` upgrade reached nothing at all. This is the
@@ -132,13 +165,16 @@ export const MUX_CONNECT_TIMEOUT_MS = 4_000;
  * down fails dials the same way — so it is reported rather than latched, and the
  * bridge is what decides, by checking whether the per-room route works.
  *
- * ⚠ TWO THINGS BOUND WHAT THAT REPORT CAN DO, and both were added after a
- * measurement. It is not reported at all once the route has served this link a
- * frame, and the bridge may not conclude from it until the mux dial has been
- * given at least as long as the legacy probe actually needed to connect. Without
- * the second, the comparison is a race a 4 s-bounded dial loses by construction
- * to a probe with no deadline: measured, a proxy delaying every connection on
- * every route by 4.5 s demoted a working session at 14,952 ms.
+ * ⚠ WHAT ENDED THE DIAL IS PART OF THE EVIDENCE, and that is what this round
+ * added. A dial the PATH ended — an error, a close, a 404 at the upgrade — is
+ * something the network said, and enough of those on a route that has never
+ * served is what the bridge may still turn into a verdict. A dial THIS CLIENT
+ * ended at its own deadline says only that the deadline elapsed, and may never
+ * condemn anything: measured, a path drawing 75% of its connections from
+ * 5.5–8.5 s and 25% from 1.2–2.2 s produced a permanent false demotion against a
+ * server serving `/_mux` normally, at 14,527 ms, with a sentence blaming a proxy
+ * that was forwarding every path. Both kinds still count towards ASKING the
+ * bridge to look, because ignorance is a reason to gather evidence.
  */
 export const MUX_UNREACHABLE_DIALS = 2;
 

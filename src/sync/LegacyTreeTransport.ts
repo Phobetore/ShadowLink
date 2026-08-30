@@ -22,15 +22,23 @@
 // bridge to consult. What is left in `MuxLink` after the three steps above,
 // serving nothing else: `MuxUnsupportedReason` and `unsupported` /
 // `unsupportedHandlers` / `onUnsupported` / `markUnsupported`;
-// `unreachableHandlers` / `onUnreachable` and the reporting half of
-// `noteFailedDial` with `failedDials`, `unreachableDials` and `routeEverServed`;
-// `noteLegacyEvidence` and its `external` option; `socketSpokeMux`;
-// `allowDialTime` / `dialTimeoutMs`; `MUX_UNREACHABLE_DIALS` in
+// `MuxRouteEvidence`, `unreachableHandlers` / `onUnreachable` / `reportRoute` and
+// the `cause` half of `noteFailedDial` with `refusedDials`, `routeRefused`,
+// `unreachableDials` and `routeEverServed`; `noteLegacyEvidence` and its
+// `external` option; `socketSpokeMux`; `MUX_UNREACHABLE_DIALS` in
 // `src/tree/constants.ts`; the legacy assertions in `MuxLink.test.ts`; the
 // structural cases 80c / 80f / 80g and `server/test/harness/legacy-server.mjs`
 // with `startServer`'s `entry` option. Call it a file deletion plus a few
 // hundred lines of unpicking, and say so here rather than let the next person
 // find out. `everSubscribed` and the frame decoder stay: they are the link's.
+//
+// ⚠ TWO THINGS DO NOT GO WITH IT, and they are named here so nobody deletes them
+// with the bridge. `noteRouteUnserved` / `routeUnserved` describe a state of the
+// MUX — the server answers, this route delivers nothing — and the status bar
+// reads them whether or not a fallback exists; and the compatibility setting in
+// `src/types.ts` is what a self-hoster reaches for when it holds. Both outlive
+// this file, and after it goes the setting simply stops having a transport to
+// select and should be removed on its own, deliberately.
 //
 // ── WHY DETECTION IS NOT "DID THE SOCKET OPEN" ─────────────────────────────
 // Measured, not assumed. A server checked out from before any P3 work ACCEPTS
@@ -53,26 +61,48 @@
 //
 // ── AND WHY "THE SOCKET NEVER OPENED" IS NOT NOTHING ───────────────────────
 // Both of the above need a socket that OPENED. A `/_mux` upgrade that is REFUSED
-// or BLACK-HOLED reaches neither, and before the probe below existed it reached
-// nothing at all: measured against a real server behind a proxy that answers 404
-// on `/_mux` and serves every other route, `whenSynced(15000)` was false, the
-// verdict was empty, the notice never appeared, and the link dialled for ever —
-// while a plain per-room client on the SAME path synced. That is the canonical
-// reverse-proxy misconfiguration, and INSTALL.md tells self-hosters to put a
-// proxy in front without giving them a config.
+// reaches neither, and before the probe below existed it reached nothing at all:
+// measured against a real server behind a proxy that answers 404 on `/_mux` and
+// serves every other route, `whenSynced(15000)` was false, the verdict was empty,
+// the notice never appeared, and the link dialled for ever — while a plain
+// per-room client on the SAME path synced. That is the canonical reverse-proxy
+// misconfiguration, and INSTALL.md tells self-hosters to put a proxy in front
+// without giving them a config.
 //
 // `MuxLink` cannot conclude it alone. A browser `WebSocket` reports a refused
 // upgrade and a server that is simply DOWN as the same bare close, on purpose, so
 // a link that fell back on failed dials would demote a whole session every time a
 // server restarted. What tells them apart is the per-room route, and this file is
 // the only place that has one. So `MuxLink` reports evidence (`onUnreachable`)
-// and this bridge decides: it brings the legacy route up as a PROBE, MEASURES
-// WHAT THAT ROUTE ACTUALLY COST, hands the mux a dial deadline at least that
-// generous, re-dials it at once, and only concludes when a dial fails again
-// while the probe is synced. A comparison that decides a demotion measures both
-// sides the same way, or it does not get to decide: a 4 s-bounded dial racing a
-// probe with no deadline at all is not a comparison, and on a path with a 4.5 s
-// upgrade it demoted a working session at 14,952 ms with a false sentence.
+// and this bridge decides, by bringing the legacy route up as a PROBE.
+//
+// ── AND WHAT THE VERDICT IS ALLOWED TO REST ON ─────────────────────────────
+// ⚠ A REFUSAL, NEVER A DEADLINE, and three rounds were spent learning that the
+// difference is not a tuning problem. The dial was bounded and the probe was not,
+// so any path slower than the bound demoted by construction; bounding both and
+// widening the dial to twice the probe's own connect fixed the constant-latency
+// case and left the VARIABLE one, where the mux's draw and the probe's draw are
+// two samples from the same distribution. Measured on the parent branch, real
+// server serving `/_mux` normally behind a proxy drawing 75% of connections from
+// 5.5–8.5 s and 25% from 1.2–2.2 s: a permanent false `unreachable` at 14,527 ms,
+// framesIn 0, telling the user to reconfigure a proxy that was forwarding every
+// path. There is no fair threshold. So the stopwatch is gone: a dial the PATH
+// ended — an error, a close, a 404 — is something the network said and may still
+// condemn the route; a dial this client abandoned may not.
+//
+// ── AND WHAT REPLACES IT WHERE NOTHING WAS SAID ────────────────────────────
+// A black-holed upgrade and an arbitrarily slow path are one observation, so
+// neither gets a verdict. What they get instead is the truth and a lever. The
+// probe still runs — ignorance is a reason to LOOK — and when it syncs on a route
+// this one has never served, the bridge records that fact on the link
+// (`noteRouteUnserved`) and drops the probe. Nothing is concluded about the
+// server's version, its age or the cause; the status bar says the server answers
+// and this route delivers nothing, and names the compatibility setting a
+// self-hoster whose deployment does not carry `/_mux` can turn on. Measured on
+// the parent branch through a proxy that upgrades `/_mux` for real and drops every
+// server frame: 70 s, 3 sockets, 2 idle closures, 18 frames out, 0 in, no probe
+// ever built, no verdict, and "ShadowLink could not reach the workspace" in front
+// of a user whose server a control client was syncing with.
 //
 // The link also stops reporting the evidence entirely once `/_mux` has served it
 // a frame. A route that has worked is never condemned by a later absence.
@@ -240,9 +270,16 @@ class FallbackTreeTransport implements TreeTransport {
   private probe: TreeTransport | null = null;
   private releaseProbe: (() => void) | null = null;
 
-  /** When the probe was told to connect, and how long it took. Null until it did. */
-  private probeStartedAt = 0;
-  private probeConnectMs: number | null = null;
+  /**
+   * The probe has answered the only question it was asked, and the answer was
+   * "the server is reachable, and this route still is not". Latched so a route
+   * that stays dark does not build a fresh `WebsocketProvider` every thirty
+   * seconds for the life of the session.
+   *
+   * It is never cleared, and it does not need to be: `MuxLink` stops reporting
+   * the moment the route serves a frame, so nothing asks again.
+   */
+  private probeAnswered = false;
 
   private readonly releaseUnreachable: () => void;
   private readonly releaseMuxStatus: () => void;
@@ -326,26 +363,27 @@ class FallbackTreeTransport implements TreeTransport {
   }
 
   /**
-   * A dial failed again, `MUX_UNREACHABLE_DIALS` of them in a row now.
+   * The mux route has produced nothing, and `MuxLink` says what that looked like.
    *
-   * The FIRST one only starts the probe: a failed dial on its own says nothing,
-   * because a server that is down fails dials exactly the same way. The verdict
-   * needs THREE things at once — the per-room route synced, `/_mux` still
-   * refusing to open, and the per-room route having said what a socket on this
-   * path costs, so that the dial which refused had been given at least that long.
+   * The FIRST report only starts the probe, whatever its evidence: on its own a
+   * report says nothing, because a server that is down produces exactly the same
+   * one. What the probe answers is the single question `MuxLink` cannot put — does
+   * this server answer AT ALL, on the route that has always worked?
    *
-   * ⚠ THE THIRD ONE IS NOT A REFINEMENT, IT IS WHAT MAKES THE COMPARISON MEAN
-   * ANYTHING. A mux dial is bounded at `MUX_CONNECT_TIMEOUT_MS`; the probe is a
-   * `WebsocketProvider` with no connect deadline at all. On any path whose
-   * WebSocket upgrade takes longer than that bound, the mux can NEVER open and
-   * the probe always eventually can, so the verdict was deterministic on a slow
-   * path rather than the narrow race it was believed to be. Measured through a
-   * proxy delaying every connection on every route by 4.5 s, against the shipped
-   * server serving `/_mux` normally: `unreachable` at 14,952 ms, past the
-   * bootstrap deadline, with a sentence blaming a proxy that was forwarding every
-   * path — where the parent branch connected on the mux at 5,041 ms and stayed.
+   * ⚠ AND THE ANSWER FORKS ON WHAT ENDED THE DIALS, not on how long they took.
+   * `link.routeRefused` is true only when the PATH ended them — a 404 at the
+   * upgrade, an RST, a refused connection — which is the network saying this route
+   * is not served, and is the last thing left that may condemn it. Everything
+   * else is a dial this client abandoned or a socket that opened and never spoke,
+   * and both of those are indistinguishable from a path that is merely slow.
+   * Measured: at twice the probe's own connect as the bound, a variable-latency
+   * path still reached a permanent false `unreachable` at 14,527 ms against a
+   * server serving `/_mux` normally. There is no fair threshold, so there is no
+   * threshold.
    *
-   * If a comparison decides a demotion, both sides are measured the same way.
+   * The other branch is not silence. It records the fact on the link so the
+   * status bar can state it, and drops the probe: one transport, one socket, and
+   * a user who is told what is true rather than guessed at.
    */
   private onUnreachable(): void {
     if (this.legacy || this.destroyed) return;
@@ -354,30 +392,21 @@ class FallbackTreeTransport implements TreeTransport {
       return;
     }
     if (!this.probe.synced) return;
-    // ⚠ AND NOT UNTIL THE PATH HAS PRICED ITSELF. Until the probe has reported a
-    // connect, nothing here knows what a socket on this path costs, so a mux dial
-    // that failed under the shipped bound is evidence about the bound rather than
-    // about the route. `startProbe` widens the deadline the moment it does know,
-    // and the dial after that is the first one worth counting.
-    if (this.probeConnectMs === null) return;
-    this.link.markUnsupported('unreachable');
+    if (this.link.routeRefused) {
+      this.link.markUnsupported('unreachable');
+      return;
+    }
+    this.link.noteRouteUnserved();
+    this.probeAnswered = true;
+    this.discardProbe();
   }
 
   private startProbe(): void {
+    if (this.probeAnswered) return;
     const probe = this.makeLegacy(this.config, this.doc);
     this.probe = probe;
-    this.probeStartedAt = Date.now();
-    this.probeConnectMs = null;
     this.releaseProbe = probe.onConnected(() => {
       if (this.destroyed || this.legacy) return;
-      if (this.probeConnectMs === null) {
-        // What this path actually costs a socket, measured on the route that
-        // works. Doubling it is the margin between two connects on the same path:
-        // anything tighter and the comparison is decided by which of the two got
-        // the better draw rather than by whether `/_mux` is served.
-        this.probeConnectMs = Math.max(0, Date.now() - this.probeStartedAt);
-        this.link.allowDialTime(this.probeConnectMs * 2);
-      }
       // The server is reachable. Give the mux route an immediate attempt rather
       // than letting it sit out a backoff rung and lose by default.
       this.link.connect({ immediate: true });
@@ -390,7 +419,6 @@ class FallbackTreeTransport implements TreeTransport {
     this.probe = null;
     this.releaseProbe?.();
     this.releaseProbe = null;
-    this.probeConnectMs = null;
     if (probe === null || probe === this.active) return;
     try {
       probe.destroy();
@@ -412,7 +440,6 @@ class FallbackTreeTransport implements TreeTransport {
     this.probe = null;
     this.releaseProbe?.();
     this.releaseProbe = null;
-    this.probeConnectMs = null;
     this.active.destroy();
     this.active = adopted ?? this.makeLegacy(this.config, this.doc);
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
