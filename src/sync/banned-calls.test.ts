@@ -303,6 +303,12 @@ const IN_MEMORY: Record<string, string[]> = {
   // P3 slice 2, and none of these can name a file. `this.rooms` is the link's
   // room -> handler Map; the two handler Sets are observers.
   'src/sync/MuxLink.ts': ['this.rooms', 'this.statusHandlers', 'this.unsupportedHandlers'],
+  // The room's observers, and the two listener Sets on the per-room socket view
+  // `ProviderAck` is handed. Nothing here has a path.
+  'src/sync/MuxRoom.ts': [
+    'ackStatus', 'this.statusHandlers', 'this.syncHandlers',
+    'this.closeListeners', 'this.messageListeners',
+  ],
   'src/sync/ObsidianDocPort.ts': ['this.live', 'this.rooms'],
   'src/sync/ProviderAck.ts': ['this.listeners'],
   // `parkedStat` is an in-memory Map of what a parked entry's file looked like,
