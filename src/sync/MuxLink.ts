@@ -26,9 +26,12 @@
 // No `obsidian` import, no node builtins.
 
 import {
+  MUX_CONNECT_TIMEOUT_MS,
   MUX_DETECT_TIMEOUT_MS,
+  MUX_IDLE_TIMEOUT_MS,
   MUX_RECONNECT_BACKOFF_MS,
   MUX_RECONNECT_JITTER,
+  MUX_UNREACHABLE_DIALS,
 } from '../tree/constants.ts';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
@@ -134,6 +137,16 @@ export interface MuxRoomHandler {
   onPayload(payload: Uint8Array): void;
   /** The link went away. Fires once per connection that was open. */
   onClose?(): void;
+  /**
+   * The link has heard nothing for half the idle timeout and wants proof of life.
+   *
+   * The room's job is to write something the SERVER will answer. It has to be the
+   * room's job because the link knows no protocol: a frame is a name and opaque
+   * bytes. `MuxRoom` touches its own awareness, which `DocHub` echoes back to the
+   * sender — the same heartbeat y-websocket's watchdog is fed by, driven from the
+   * link's one timer instead of one interval per room.
+   */
+  onProbe?(): void;
 }
 
 export interface MuxLinkConfig {
@@ -146,6 +159,11 @@ export interface MuxLinkConfig {
   backoffMs?: readonly number[];
   jitter?: number;
   detectTimeoutMs?: number;
+  /** Zero disables the liveness watchdog. Only a test that owns the clock should. */
+  idleTimeoutMs?: number;
+  /** Zero disables the connect timeout. */
+  connectTimeoutMs?: number;
+  unreachableDials?: number;
   now?: () => number;
   random?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
@@ -161,7 +179,19 @@ export type MuxUnsupportedReason =
   /** A message arrived that is not a well-formed frame for a room we subscribed. */
   | 'not-a-frame'
   /** The socket connected, we sent frames, and nothing mux-shaped ever came back. */
-  | 'silent';
+  | 'silent'
+  /**
+   * The `/_mux` route could not be opened at all, repeatedly, while the server
+   * itself is reachable. Refused upgrade, black-holed upgrade, a proxy that only
+   * knows the routes it was configured for.
+   *
+   * ⚠ Only the BRIDGE may conclude this one, and only after it has proved the
+   * per-room route works — `MuxLink` cannot tell a refused upgrade from a server
+   * that is down, because a browser `WebSocket` deliberately reports both as a
+   * bare close. `MuxLink` reports the evidence (`onUnreachable`); it never
+   * latches this reason by itself.
+   */
+  | 'unreachable';
 
 // ============================================================ MuxLink
 
@@ -171,6 +201,9 @@ export class MuxLink {
   private readonly backoff: readonly number[];
   private readonly jitter: number;
   private readonly detectTimeoutMs: number;
+  private readonly idleTimeoutMs: number;
+  private readonly connectTimeoutMs: number;
+  private readonly unreachableDials: number;
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
@@ -194,23 +227,48 @@ export class MuxLink {
   private status: MuxStatus = 'disconnected';
   private readonly statusHandlers = new Set<(status: MuxStatus) => void>();
   private readonly unsupportedHandlers = new Set<(reason: MuxUnsupportedReason) => void>();
+  private readonly unreachableHandlers = new Set<() => void>();
 
   private attempt = 0;
   private retryHandle: unknown = null;
   private detectHandle: unknown = null;
+  private idleHandle: unknown = null;
+  private connectHandle: unknown = null;
 
   private shouldConnect = false;
   private destroyed = false;
 
   /**
-   * Latched TRUE the first time this server answers in the frame protocol.
+   * TRUE once THIS socket has answered in the frame protocol.
    *
-   * Once a server has proven it speaks the mux, a later silent or malformed
-   * socket is a network fault, not an old server — and tearing the whole
-   * transport down and rebuilding it as the legacy topology on a flaky reconnect
-   * would be a far worse outcome than one slow reconnect.
+   * ⚠ PER SOCKET, not per link, and the difference is a measured one. It used to
+   * latch for the life of the link, on the argument that a flaky reconnect must
+   * not rebuild the whole topology as the legacy one. That argument is right and
+   * this still serves it — a genuine mux server re-proves itself in one round
+   * trip on every reconnect — but a link-wide latch cannot tell a flaky reconnect
+   * from a DIFFERENT SERVER on the other end. Measured: a current server, then
+   * stopped, then a pre-P3 server started on the same port and the same data dir;
+   * the ladder reconnected in 180 ms, the client stayed in mux mode, the bridge
+   * built for exactly that server sat unused, and nothing ever synced again,
+   * silently, until Obsidian was restarted.
+   *
+   * Judging each socket on its own behaviour separates the two: a reconnect to a
+   * server that still speaks mux latches again immediately, and a reconnect to
+   * one that does not is detected in the same round trip a first connect is.
    */
-  private spokeMux = false;
+  private socketSpokeMux = false;
+
+  /** When the current socket last received ANYTHING. Zero while it is down. */
+  private lastInboundAt = 0;
+
+  /** Dials in a row that never produced an OPEN socket. Reset by any open. */
+  private failedDials = 0;
+
+  /** Which room `onProbe` goes to next, so one dead room cannot mask a live link. */
+  private probeCursor = 0;
+
+  /** Whether the CURRENT socket ever reached OPEN. Read once, on its close. */
+  private socketOpened = false;
 
   /** Latched once, so the fallback is armed exactly one time. */
   private unsupported: MuxUnsupportedReason | null = null;
@@ -229,6 +287,12 @@ export class MuxLink {
     /** Sends made while the link was down. */
     droppedOutbound: 0,
     reconnects: 0,
+    /** Dials that never produced an open socket. */
+    dialsFailed: 0,
+    /** Sockets closed by the liveness watchdog: OPEN, and dead. */
+    idleClosures: 0,
+    /** Sockets dropped because something on top of the link asked for a fresh one. */
+    recycles: 0,
   };
 
   constructor(config: MuxLinkConfig) {
@@ -242,6 +306,9 @@ export class MuxLink {
     this.backoff = config.backoffMs ?? MUX_RECONNECT_BACKOFF_MS;
     this.jitter = config.jitter ?? MUX_RECONNECT_JITTER;
     this.detectTimeoutMs = config.detectTimeoutMs ?? MUX_DETECT_TIMEOUT_MS;
+    this.idleTimeoutMs = config.idleTimeoutMs ?? MUX_IDLE_TIMEOUT_MS;
+    this.connectTimeoutMs = config.connectTimeoutMs ?? MUX_CONNECT_TIMEOUT_MS;
+    this.unreachableDials = config.unreachableDials ?? MUX_UNREACHABLE_DIALS;
     this.now = config.now ?? Date.now;
     this.random = config.random ?? Math.random;
     this.setTimer = config.setTimer
@@ -365,13 +432,61 @@ export class MuxLink {
     return () => { this.unsupportedHandlers.delete(handler); };
   }
 
+  /**
+   * `unreachableDials` dials in a row produced no OPEN socket, and one more just
+   * did the same. Fires repeatedly, never latches, and NEVER stops the ladder.
+   *
+   * It is evidence, not a verdict: a refused `/_mux` upgrade and a server that is
+   * simply down are the same bare close through a browser `WebSocket`. Only
+   * something that can also try the per-room route — the bridge — can tell them
+   * apart, which is why this reports rather than concludes.
+   */
+  onUnreachable(handler: () => void): () => void {
+    this.unreachableHandlers.add(handler);
+    return () => { this.unreachableHandlers.delete(handler); };
+  }
+
   // ---------------------------------------------------------- lifecycle
 
-  connect(): void {
+  /**
+   * Ask the link to be up.
+   *
+   * `immediate` cancels whatever rung is waiting and dials NOW, and it exists
+   * because the ladder was protecting the wrong thing. The rung stops the RETRY
+   * LOOP from hammering a server that is down; it has no business making a
+   * person wait. Measured before it existed: a 30-second outage cost the mux
+   * 52,703 ms to resync where a `WebsocketProvider` on the same server took
+   * 649 ms, which is past `TREE_SYNC_TIMEOUT_MS` and therefore a read-only
+   * banner against a server that is up.
+   *
+   * `Bootstrap.connectTree` is the caller that passes it: somebody is waiting.
+   * The loop itself never does.
+   */
+  connect(options: { immediate?: boolean } = {}): void {
     if (this.destroyed || this.unsupported !== null) return;
     this.shouldConnect = true;
-    if (this.socket !== null || this.retryHandle !== null) return;
+    if (this.socket !== null) return;
+    if (this.retryHandle !== null) {
+      if (options.immediate !== true) return;
+      this.cancelRetry();
+      this.attempt = 0;
+    }
     this.open();
+  }
+
+  /**
+   * Throw this socket away and dial a fresh one.
+   *
+   * The one caller is a room whose acknowledgement accounting has become
+   * unusable on a live socket (see `ProviderAck`). A new socket is the only reset
+   * that is provably clean — no reply to a question asked on the old one can
+   * arrive on it — so "start again" is spelled as a reconnect rather than as a
+   * counter being cleared underneath frames that are still in flight.
+   */
+  recycle(): void {
+    if (this.destroyed || this.socket === null) return;
+    this.stats.recycles += 1;
+    this.closeCurrentSocket();
   }
 
   /** Stop connecting and drop the socket. `connect()` revives it. */
@@ -387,6 +502,19 @@ export class MuxLink {
     this.rooms.clear();
     this.statusHandlers.clear();
     this.unsupportedHandlers.clear();
+    this.unreachableHandlers.clear();
+  }
+
+  /**
+   * Conclude, from OUTSIDE, that this link's route is not served.
+   *
+   * The bridge calls this once it has proved the per-room route works while
+   * `/_mux` will not open. It runs the same teardown the two first-message
+   * verdicts do, so there is one way the link dies and one way the fallback is
+   * armed.
+   */
+  markUnsupported(reason: MuxUnsupportedReason): void {
+    this.noteLegacyEvidence(reason, { external: true });
   }
 
   // ---------------------------------------------------------- internals
@@ -395,6 +523,7 @@ export class MuxLink {
     if (this.destroyed || !this.shouldConnect || this.socket !== null) return;
     this.setStatus('connecting');
     this.framesSentOnSocket = 0;
+    this.socketSpokeMux = false;
 
     let socket: MuxSocket;
     try {
@@ -402,11 +531,13 @@ export class MuxLink {
     } catch {
       // A factory that refuses outright is an unsuccessful attempt like any
       // other; the ladder is what keeps it from becoming a spin.
+      this.noteFailedDial();
       this.scheduleRetry();
       return;
     }
     this.socket = socket;
     this.stats.socketsOpened += 1;
+    this.armConnectTimeout(socket);
     try {
       socket.binaryType = 'arraybuffer';
     } catch {
@@ -430,6 +561,11 @@ export class MuxLink {
   private onOpen(socket: MuxSocket): void {
     if (socket !== this.socket) return;
     this.attempt = 0;
+    this.failedDials = 0;
+    this.socketOpened = true;
+    this.cancelConnectTimeout();
+    this.lastInboundAt = this.now();
+    this.armIdleWatch();
     this.armDetect();
     // Every subscribed room re-handshakes, in subscription order. I24: the room
     // asks from the state vector of the bytes it holds, and nothing is marked
@@ -454,6 +590,10 @@ export class MuxLink {
     if (socket !== this.socket) return;
     const bytes = toBytes(event.data);
     if (bytes === null) return;
+    // ⚠ BEFORE the decode, and deliberately: liveness is a question about the
+    // PATH, not about the protocol. Bytes arriving prove the socket is not one of
+    // the dead-but-open ones, whatever they turn out to say.
+    this.lastInboundAt = this.now();
     this.stats.framesIn += 1;
     this.stats.bytesIn += bytes.byteLength;
 
@@ -477,9 +617,11 @@ export class MuxLink {
       return;
     }
 
-    // The peer answered in the protocol. From here a silent or malformed socket
-    // is a network fault, never an old server.
-    this.spokeMux = true;
+    // THIS SOCKET's peer answered in the framing. From here a silent or malformed
+    // message on THIS socket is a network fault, never an old server — and the
+    // next socket has to prove it again, because the peer on the other end of it
+    // may be a different process entirely.
+    this.socketSpokeMux = true;
     this.cancelDetect();
 
     const handler = this.rooms.get(frame.room);
@@ -494,8 +636,17 @@ export class MuxLink {
 
   private onClose(socket: MuxSocket): void {
     if (socket !== this.socket) return;
+    const hadOpened = this.socketOpened;
     this.socket = null;
+    this.socketOpened = false;
+    this.lastInboundAt = 0;
     this.cancelDetect();
+    this.cancelIdleWatch();
+    this.cancelConnectTimeout();
+    // A close on a socket that never reached OPEN is a failed DIAL, not a dropped
+    // connection — and it is the ONLY shape a refused `/_mux` upgrade has, which
+    // is why nothing downstream could see one before this counter existed.
+    if (!hadOpened) this.noteFailedDial();
     // Rooms first, status second — the mirror of `onOpen`, so an observer that
     // reads a room from the status transition sees a room that already knows.
     for (const handler of [...this.rooms.values()]) {
@@ -514,12 +665,21 @@ export class MuxLink {
   private dropSocket(): void {
     const socket = this.socket;
     this.socket = null;
+    this.socketOpened = false;
+    this.lastInboundAt = 0;
     this.cancelDetect();
+    this.cancelIdleWatch();
+    this.cancelConnectTimeout();
     if (socket === null) return;
     socket.onopen = null;
     socket.onmessage = null;
     socket.onclose = null;
-    socket.onerror = null;
+    // ⚠ A NO-OP, never null, and the connect timeout is what made this reachable.
+    // `ws` emits a bare `error` when `close()` lands on a socket that is still
+    // CONNECTING, and an `error` with no handler is an unhandled event that takes
+    // the process down. Closing a still-connecting socket is exactly what a
+    // connect timeout does, so the handler has to outlive the close.
+    socket.onerror = (): void => undefined;
     try {
       socket.close();
     } catch {
@@ -572,15 +732,20 @@ export class MuxLink {
    * The backstop half of detection: a peer that accepted the socket, took our
    * frames and said nothing at all. The positive test above is what catches a
    * pre-P3 server in one round trip; this catches a peer that is not even that.
+   *
+   * ⚠ Re-armed on EVERY connect, because the socket it judges is a new one. It
+   * used to be armed once and then disabled for the life of the link by the first
+   * good frame, which is what let a server be replaced underneath a reconnect
+   * with nothing looking again.
    */
   private armDetect(): void {
     this.cancelDetect();
-    if (this.spokeMux || this.detectTimeoutMs <= 0) return;
+    if (this.socketSpokeMux || this.detectTimeoutMs <= 0) return;
     this.detectHandle = this.setTimer(() => {
       this.detectHandle = null;
       // Only a socket we actually WROTE to can be called silent. A link with no
       // rooms yet has asked nothing and is owed no answer.
-      if (this.spokeMux || !this.connected || this.framesSentOnSocket === 0) return;
+      if (this.socketSpokeMux || !this.connected || this.framesSentOnSocket === 0) return;
       this.noteLegacyEvidence('silent');
     }, this.detectTimeoutMs);
   }
@@ -591,8 +756,144 @@ export class MuxLink {
     this.detectHandle = null;
   }
 
-  private noteLegacyEvidence(reason: MuxUnsupportedReason): void {
-    if (this.spokeMux || this.unsupported !== null || this.destroyed) return;
+  // ---------------------------------------------------------- liveness
+
+  /**
+   * THE WATCHDOG y-websocket has and `MuxRoom` gave away.
+   *
+   * A socket can be OPEN and dead: bytes stop moving with no FIN and no RST, and
+   * `readyState` never moves, so `connected`, `synced` and every caller that
+   * branches on them go on saying the vault is fine. `MuxRoom`'s header removed
+   * the 30-second check on the argument that "liveness is the link's business and
+   * only the link's" — correct, and this is that business.
+   *
+   * Two thresholds, both y-websocket's: at HALF the timeout the link asks a room
+   * to say something the server will answer, and at the full timeout it closes
+   * the socket. The ladder does the rest, which is why this is the whole fix.
+   */
+  private armIdleWatch(): void {
+    this.cancelIdleWatch();
+    if (this.idleTimeoutMs <= 0) return;
+    const poll = Math.max(250, Math.round(this.idleTimeoutMs / 10));
+    const tick = (): void => {
+      this.idleHandle = null;
+      if (this.destroyed || !this.connected) return;
+      const quiet = this.now() - this.lastInboundAt;
+      if (quiet >= this.idleTimeoutMs) {
+        this.stats.idleClosures += 1;
+        this.closeCurrentSocket();
+        return;
+      }
+      if (quiet >= this.idleTimeoutMs / 2) this.probeOneRoom();
+      this.idleHandle = this.armIdleTick(tick, poll);
+    };
+    this.idleHandle = this.armIdleTick(tick, poll);
+  }
+
+  /**
+   * ⚠ UNREF'd where the runtime offers it, duck-typed rather than imported.
+   *
+   * This is the one timer that re-arms itself for as long as the link is up, so
+   * it is the one timer that can be the last handle in a process and keep it
+   * alive for ever. `DocHub` unrefs y-protocols' awareness interval for exactly
+   * this reason and says so. Obsidian's event loop is held open by Obsidian; a
+   * test run's is not, and a watchdog that hangs the suite would be removed
+   * again within the week.
+   */
+  private armIdleTick(fn: () => void, ms: number): unknown {
+    const handle = this.setTimer(fn, ms);
+    (handle as { unref?: () => void } | null)?.unref?.();
+    return handle;
+  }
+
+  private cancelIdleWatch(): void {
+    if (this.idleHandle === null) return;
+    this.clearTimer(this.idleHandle);
+    this.idleHandle = null;
+  }
+
+  /**
+   * Ask ONE room to provoke an answer, rotating.
+   *
+   * One echo is all the proof a socket needs, so this is one frame rather than
+   * one per room — and rotating means a single room that the server has stopped
+   * serving cannot keep the link looking dead, nor keep it looking alive.
+   */
+  private probeOneRoom(): void {
+    const handlers = [...this.rooms.values()];
+    if (handlers.length === 0) return;
+    this.probeCursor = (this.probeCursor + 1) % handlers.length;
+    try {
+      handlers[this.probeCursor]?.onProbe?.();
+    } catch {
+      /* a room that cannot say hello is not the link's problem */
+    }
+  }
+
+  /** Close the live socket and let `onClose` schedule the retry. */
+  private closeCurrentSocket(): void {
+    const socket = this.socket;
+    if (socket === null) return;
+    try {
+      socket.close();
+    } catch {
+      /* already gone */
+    }
+    // A transport whose `close()` fires no event would otherwise park the link
+    // for ever, which is the failure this whole section exists to end.
+    if (this.socket === socket && socket.readyState !== WS_OPEN) this.onClose(socket);
+  }
+
+  /**
+   * A dial that never opens the socket, whatever the shape.
+   *
+   * `MuxLink.open()` assigns `this.socket` before the socket opens and `connect()`
+   * refuses to dial while one exists, so a dial that HANGS parked the link for
+   * ever with no timer armed. Measured against a black-holed upgrade: one dial,
+   * zero timers, still one dial forty-five seconds later.
+   */
+  private armConnectTimeout(socket: MuxSocket): void {
+    this.cancelConnectTimeout();
+    if (this.connectTimeoutMs <= 0) return;
+    this.connectHandle = this.setTimer(() => {
+      this.connectHandle = null;
+      if (this.destroyed || this.socket !== socket || this.socketOpened) return;
+      this.dropSocket();
+      this.noteFailedDial();
+      this.scheduleRetry();
+    }, this.connectTimeoutMs);
+  }
+
+  private cancelConnectTimeout(): void {
+    if (this.connectHandle === null) return;
+    this.clearTimer(this.connectHandle);
+    this.connectHandle = null;
+  }
+
+  private noteFailedDial(): void {
+    this.stats.dialsFailed += 1;
+    this.failedDials += 1;
+    if (this.failedDials < this.unreachableDials) return;
+    for (const handler of [...this.unreachableHandlers]) {
+      try {
+        handler();
+      } catch {
+        /* an observer may not break the link */
+      }
+    }
+  }
+
+  private noteLegacyEvidence(
+    reason: MuxUnsupportedReason,
+    options: { external?: boolean } = {},
+  ): void {
+    // `socketSpokeMux` gates the two FIRST-MESSAGE verdicts, because a socket
+    // that has answered in the framing is not an old server. It does not gate a
+    // verdict reached from outside: the bridge concludes `unreachable` from
+    // sockets that never opened at all, and there is nothing for this socket to
+    // have said.
+    if (options.external !== true && this.socketSpokeMux) return;
+    if (this.unsupported !== null || this.destroyed) return;
     this.unsupported = reason;
     this.shouldConnect = false;
     this.cancelRetry();

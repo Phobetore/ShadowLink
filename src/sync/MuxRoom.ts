@@ -20,7 +20,11 @@
 //    already passes;
 //  * no 30-second "no message received" watchdog that closes the socket. One
 //    quiet room may not drop a socket that 1,999 other rooms are using. Liveness
-//    is the link's business and only the link's.
+//    is the link's business and only the link's — and the link now HAS that
+//    business (`MuxLink.armIdleWatch`). When this file was written the sentence
+//    was a promise nobody had kept, and a half-open socket reported
+//    `synced === true` for as long as anyone cared to watch. What a room owes the
+//    link is `onProbe`: something the server will answer, on demand.
 //
 // THE ACKNOWLEDGEMENT, which is the part with teeth. `ProviderAck`'s guarantee is
 // "frames on one socket are delivered and processed in order, so a SyncStep1
@@ -139,6 +143,7 @@ export class MuxRoom {
       },
       onPayload: (payload) => { this.onPayload(payload); },
       onClose: () => { this.onLinkClose(); },
+      onProbe: () => { this.onProbe(); },
     });
     constructed = true;
 
@@ -157,6 +162,7 @@ export class MuxRoom {
         off: (_event, handler) => { ackStatus.delete(handler); },
       },
       doc,
+      () => { this.onAckStalled(); },
     );
 
     this.unwatchStatus = link.onStatus((status) => {
@@ -374,6 +380,55 @@ export class MuxRoom {
     this.view?.deliver(payload);
   }
 
+  /**
+   * Say something the SERVER will answer, because the link asked.
+   *
+   * Re-setting the local awareness state is exactly y-protocols' own 15-second
+   * heartbeat, and `DocHub` broadcasts an awareness update to every connection on
+   * the room INCLUDING the one it came from — which is what feeds y-websocket's
+   * watchdog and is now what feeds the link's. Measured against the real server:
+   * an idle healthy link received one echo every 15.03 s, six times in 95 s.
+   *
+   * A room with no local state says nothing; the link rotates, so another room
+   * answers instead.
+   */
+  private onProbe(): void {
+    if (this.destroyed) return;
+    const state = this.awareness.getLocalState();
+    if (state === null) return;
+    try {
+      this.awareness.setLocalState(state);
+    } catch {
+      /* a room that cannot say hello is not the link's problem */
+    }
+  }
+
+  /**
+   * The acknowledgement accounting on this socket has become unusable, and the
+   * only clean repair is a socket that never carried the question.
+   *
+   * WHY A RECONNECT AND NOT A COUNTER RESET. `ProviderAck` counts answers
+   * positionally: a SyncStep1's reply is identified by being the next SyncStep2
+   * to arrive. That is sound while every question is eventually answered and it
+   * has no way back when one is not — a lost answer leaves the count permanently
+   * short of its own target, and every later flush on that room fails for ever.
+   * Clearing the counters in place would be worse than the disease: a reply to a
+   * question asked before the reset can still arrive, and would then be counted
+   * as the answer to a flush whose bytes the server had never seen. I17 says that
+   * particular mistake is permanent content loss.
+   *
+   * A NEW SOCKET has no such replies in flight, which is why `attach()`'s existing
+   * reset is safe and an in-place one is not. So the repair is spelled as the
+   * thing that is actually true: this connection is no longer usable for proof.
+   *
+   * Gated on a room that WAS synced, so a room the server has stopped serving
+   * cannot turn every retry into another reconnect.
+   */
+  private onAckStalled(): void {
+    if (this.destroyed || !this._synced || !this.link.connected) return;
+    this.link.recycle();
+  }
+
   private write(payload: Uint8Array): void {
     this.subscription.send(payload);
   }
@@ -448,9 +503,15 @@ class RoomSocketView implements AckSocket {
    * a question about this room, asked behind this room's updates on the one
    * ordered socket. Without the framing it would reach the server as a message
    * naming no room at all, and be dropped — a flush that could never confirm.
+   *
+   * ⚠ And it REPORTS. A real `WebSocket.send` returns nothing, but the link can
+   * refuse a frame it never wrote, and `ProviderAck` counts a question as
+   * outstanding for ever once it believes it was asked. Returning the link's
+   * answer is what keeps a question that never left this process from inflating
+   * every later flush's target.
    */
-  send(data: Uint8Array): void {
-    this.subscription.send(data);
+  send(data: Uint8Array): boolean {
+    return this.subscription.send(data);
   }
 
   addEventListener(

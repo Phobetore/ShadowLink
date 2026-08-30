@@ -46,8 +46,23 @@ export const STAGING_DIR = 'ShadowLink Staging';
  * the mux on the client side: at 2,000 live rooms, per-room reconnect loops are
  * 2,000 independent timers racing each other onto the same TCP accept queue, and
  * this machine already reproduces `ECONNREFUSED` at 300 simultaneous connects.
+ *
+ * ⚠ THE TOP RUNG USED TO BE 60 SECONDS, AND IT WAS PROTECTING THE WRONG THING.
+ * The ladder exists so that N DEVICES coming back together do not stampede a
+ * server; it is not a reason to make one device wait. Measured against a real
+ * server stopped for thirty seconds and restarted on the same port and data dir:
+ * a `WebsocketProvider` on that server resynced in 649 ms, the mux link in
+ * 52,703 ms. `TREE_SYNC_TIMEOUT_MS` is 15 s, so any bootstrap or reconnect
+ * landing in that window reported "ShadowLink could not reach the workspace" and
+ * dropped the plugin to read-only against a server that was up.
+ *
+ * The mux already removed the pressure the long tail was buying: y-websocket
+ * capped at 2,500 ms PER PROVIDER, so a vault with N open rooms dialled N times
+ * per 2.5 s. One link at a 5 s cap is strictly gentler than the topology this
+ * replaces, and 12× faster to recover than 60 s. Anything user-visible also gets
+ * `connect({ immediate: true })`, which does not wait for a rung at all.
  */
-export const MUX_RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 15_000, 60_000];
+export const MUX_RECONNECT_BACKOFF_MS = [1_000, 2_000, 3_000, 5_000];
 
 /**
  * How far either side of a backoff rung the next attempt may land, as a fraction.
@@ -71,6 +86,49 @@ export const MUX_RECONNECT_JITTER = 0.25;
  * one round trip. This timeout only covers a server that says nothing at all.
  */
 export const MUX_DETECT_TIMEOUT_MS = 10_000;
+
+/**
+ * How long a CONNECTED mux socket may receive nothing at all before the link
+ * concludes it is dead and closes it (P3 spec §2 "Liveness").
+ *
+ * ⚠ THIS IS y-websocket's `messageReconnectTimeout`, restored. A socket can be
+ * OPEN and dead — a dropped NAT flow, a slept laptop, a wifi handover — and
+ * `readyState` never moves, so nothing that reads it can tell. Measured through a
+ * TCP proxy that stops forwarding without a FIN or an RST: a `WebsocketProvider`
+ * on the frozen path noticed at 30,266 ms; a link without this timer reported
+ * `connected` and `synced` for the whole 78 s the probe watched, and would have
+ * done so for ever.
+ *
+ * 30 s is not arbitrary. A healthy idle link is NOT quiet: every room's awareness
+ * re-broadcasts its own state every 15 s and `DocHub` echoes it back to the
+ * sender, which is what feeds y-websocket's watchdog too. Measured on a healthy
+ * idle mux link against the real server: six inbound messages in 95 s, gaps of
+ * 15029/15030/15040/15040/15041/15036 ms. 30 s is two heartbeats of headroom.
+ */
+export const MUX_IDLE_TIMEOUT_MS = 30_000;
+
+/**
+ * How long a dial may take before it is counted as a failed attempt.
+ *
+ * `MuxLink.open()` assigns `this.socket` before the socket opens and `connect()`
+ * refuses to dial while one exists, so a dial that HANGS — the TCP connection
+ * accepted and the HTTP upgrade never answered, which is what a misconfigured
+ * reverse proxy does — parked the link for ever with no timer armed. Measured: 1
+ * dial, 0 timers, still 1 dial 45 s later.
+ */
+export const MUX_CONNECT_TIMEOUT_MS = 4_000;
+
+/**
+ * How many dials in a row may fail to produce an OPEN socket before the link
+ * says so out loud (P3 spec §4).
+ *
+ * Every other route into the legacy verdict needs a socket that opened, so a
+ * refused or black-holed `/_mux` upgrade reached nothing at all. This is the
+ * signal that covers it. It is NOT a verdict on its own — a server that is merely
+ * down fails dials the same way — so it is reported rather than latched, and the
+ * bridge is what decides, by checking whether the per-room route works.
+ */
+export const MUX_UNREACHABLE_DIALS = 2;
 
 // ---------------------------------------------------------------- attachments (spec §7.4)
 

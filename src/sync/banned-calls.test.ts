@@ -306,7 +306,12 @@ const IN_MEMORY: Record<string, string[]> = {
   'src/sync/LegacyTreeTransport.ts': ['this.connectedHandlers', 'this.swapWaiters'],
   // P3 slice 2, and none of these can name a file. `this.rooms` is the link's
   // room -> handler Map; the two handler Sets are observers.
-  'src/sync/MuxLink.ts': ['this.rooms', 'this.statusHandlers', 'this.unsupportedHandlers'],
+  'src/sync/MuxLink.ts': [
+    'this.rooms', 'this.statusHandlers', 'this.unsupportedHandlers',
+    // The observer set for "a dial produced no socket, again". A Set of
+    // callbacks, like the two beside it.
+    'this.unreachableHandlers',
+  ],
   // The room's observers, and the two listener Sets on the per-room socket view
   // `ProviderAck` is handed. Nothing here has a path.
   'src/sync/MuxRoom.ts': [

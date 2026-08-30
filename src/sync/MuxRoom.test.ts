@@ -518,3 +518,111 @@ test('a shared awareness instance is not destroyed by the room that borrowed it'
   link.destroy();
   doc.destroy();
 });
+
+// ---------------------------------------------------------------- liveness
+
+test('a probe writes an awareness frame the SERVER will answer', () => {
+  // The link has no protocol, so proof of life has to come from a room. This is
+  // y-protocols' own 15-second heartbeat, on the link's schedule instead of one
+  // interval per room — and `DocHub` broadcasts an awareness update to every
+  // connection on the room INCLUDING the sender, which is what makes it an echo.
+  const mux = new FakeMux();
+  const clock = { t: 1_000_000 };
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: 'sk',
+    workspaceId: 'ws-1',
+    openSocket: mux.openSocket,
+    detectTimeoutMs: 0,
+    connectTimeoutMs: 0,
+    idleTimeoutMs: 30_000,
+    now: () => clock.t,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  const doc = new Y.Doc();
+  const room = new MuxRoom(link, '_tree', doc);
+  try {
+    link.connect();
+    const socket = mux.sockets[mux.sockets.length - 1];
+    const before = socket?.sent.length ?? 0;
+
+    // Sixteen seconds of silence: past half the idle timeout, nowhere near it.
+    for (let i = 0; i < 6; i++) {
+      clock.t += 3_000;
+      for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+    }
+
+    const written = socket?.sent.slice(before) ?? [];
+    assert.ok(written.length > 0, 'the probe wrote nothing the server could answer');
+    assert.equal(written[0]?.room, '_tree', 'the probe frame was addressed elsewhere');
+    assert.equal(written[0]?.payload[0], MESSAGE_AWARENESS,
+      'the probe was not an awareness frame');
+    assert.equal(link.connected, true, 'the watchdog closed a link it had just provoked');
+    assert.equal(room.synced, true);
+  } finally {
+    room.destroy();
+    link.destroy();
+    doc.destroy();
+  }
+});
+
+// ---------------------------------------------------------------- the stall
+
+test('a flush the room cannot get answered recycles the link instead of stalling forever', async () => {
+  // ⚠ MEASURED, and this is the repair for it. `ProviderAck` identifies an answer
+  // positionally, so a question whose frame is dropped after it leaves this
+  // process leaves the count permanently short of its own target: one lost
+  // acknowledgement then disabled `flush()` for that room for ever. Measured with
+  // a per-room partition: one flush lost, then six consecutive flushes on a
+  // HEALED, converged, connected room returned [false,false,false,false,false,
+  // false], while another room on the same socket returned true throughout.
+  //
+  // The counters cannot be cleared in place — a reply to the old question could
+  // still arrive and confirm a flush whose bytes the server never saw, which I17
+  // calls permanent content loss. A NEW SOCKET has no such replies in flight, so
+  // the repair is a reconnect.
+  const mux = new FakeMux();
+  const client = peer(mux);
+  try {
+    client.doc.getText('content').insert(0, 'first');
+    assert.equal(await client.room.flush(1_000), true, 'the baseline round trip failed');
+
+    mux.cut('_tree');
+    assert.equal(await client.room.flush(200), false, 'a room nobody answers confirmed a flush');
+    assert.equal(client.link.stats.recycles, 1, 'the stall did not ask for a fresh socket');
+
+    mux.heal('_tree');
+    client.reconnect();
+    assert.equal(client.room.synced, true, 'the room never re-synced on the new socket');
+
+    const after: boolean[] = [];
+    for (let i = 0; i < 6; i++) after.push(await client.room.flush(1_000));
+    assert.deepEqual(after, [true, true, true, true, true, true],
+      'one lost acknowledgement is still disabling flush for this room');
+  } finally {
+    client.destroy();
+  }
+});
+
+test('a room the server has stopped serving does not turn every retry into a reconnect', async () => {
+  // The stall repair is gated on a room that WAS synced, and reported once per
+  // socket. Without both, a room the server will never answer would bounce the
+  // vault's socket on every retry — which at 2,000 rooms is a worse failure than
+  // the one being repaired.
+  const mux = new FakeMux();
+  const client = peer(mux);
+  try {
+    mux.cut('_tree');
+    await client.room.flush(120);
+    client.reconnect();
+    const afterFirst = client.link.stats.recycles;
+    await client.room.flush(120);
+    await client.room.flush(120);
+    assert.equal(client.link.stats.recycles, afterFirst,
+      'a room that was never synced kept recycling the whole link');
+  } finally {
+    client.destroy();
+  }
+});

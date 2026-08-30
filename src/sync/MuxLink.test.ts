@@ -26,7 +26,9 @@ import {
   MUX_DOC_ID, MuxLink, decodeMuxFrame, encodeMuxFrame,
   type MuxLinkConfig, type MuxSocket, type MuxUnsupportedReason,
 } from './MuxLink.ts';
-import { MUX_RECONNECT_BACKOFF_MS } from '../tree/constants.ts';
+import {
+  MUX_RECONNECT_BACKOFF_MS, MUX_RECONNECT_JITTER, TREE_SYNC_TIMEOUT_MS,
+} from '../tree/constants.ts';
 
 // ---------------------------------------------------------------- fixtures
 
@@ -56,8 +58,11 @@ function makeLink(over: Partial<MuxLinkConfig> = {}): {
     openSocket: mux.openSocket,
     random: () => 0.5,                                   // no jitter unless asked
     // Off by default so `timers` is the BACKOFF ladder and nothing else. The
-    // detection tests below build their own link and turn it back on.
+    // detection and liveness tests below build their own link and turn the one
+    // they are about back on.
     detectTimeoutMs: 0,
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 0,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
     clearTimer: (handle) => { delete timers[handle as number]; },
     ...over,
@@ -283,8 +288,16 @@ test('the ladder climbs on each failed attempt and resets when a socket opens', 
     rungs.push(armed[armed.length - 1].ms);
     fire();
   }
-  assert.deepEqual(rungs, [...MUX_RECONNECT_BACKOFF_MS, 60_000],
+  const top = MUX_RECONNECT_BACKOFF_MS[MUX_RECONNECT_BACKOFF_MS.length - 1];
+  assert.deepEqual(rungs, [...MUX_RECONNECT_BACKOFF_MS, top, top],
     'the ladder did not climb, or did not saturate at the top rung');
+  // ⚠ And the top rung is a number a person waits out. It used to be 60 s, which
+  // is four times `TREE_SYNC_TIMEOUT_MS`: an ordinary outage ending inside that
+  // window put the plugin into read-only against a server that was up. Measured
+  // before the change: 52,703 ms to resync a 30-second outage, where a
+  // `WebsocketProvider` on the same server took 649 ms.
+  assert.ok(top + top * MUX_RECONNECT_JITTER < TREE_SYNC_TIMEOUT_MS,
+    `the worst-case rung ${top}ms +jitter outlasts the tree's own deadline`);
 
   // A socket that opened resets it: the next failure is back on rung one.
   mux.refuseConnect = false;
@@ -310,8 +323,13 @@ test('the ladder is jittered, both directions, around the rung', () => {
     delays.push(armed[armed.length - 1].ms);
     fire();
   }
-  // rung 1000 at -25%, rung 2000 at +25%, rung 5000 at the centre.
-  assert.deepEqual(delays, [750, 2_500, 5_000]);
+  // rung 1 at -25%, rung 2 at +25%, rung 3 at the centre.
+  const [r1, r2, r3] = MUX_RECONNECT_BACKOFF_MS;
+  assert.deepEqual(delays, [
+    Math.round(r1 * (1 - MUX_RECONNECT_JITTER)),
+    Math.round(r2 * (1 + MUX_RECONNECT_JITTER)),
+    r3,
+  ]);
 });
 
 test('every subscribed room re-handshakes on reconnect, and only once per connect (I24)', () => {
@@ -440,6 +458,10 @@ test('a peer that took our frames and said nothing is condemned by the timeout',
     serverKey: KEY,
     workspaceId: WORKSPACE,
     openSocket: () => silentSocket(),
+    // The liveness watchdog and the connect timeout are off here so that
+    // `timers` is the DETECT window and nothing else.
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 0,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
     clearTimer: (handle) => { delete timers[handle as number]; },
   });
@@ -465,6 +487,10 @@ test('a link that asked NOTHING never condemns the peer — silence is not evide
     serverKey: KEY,
     workspaceId: WORKSPACE,
     openSocket: () => silentSocket(),
+    // The liveness watchdog and the connect timeout are off here so that
+    // `timers` is the DETECT window and nothing else.
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 0,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
     clearTimer: (handle) => { delete timers[handle as number]; },
   });
@@ -478,26 +504,50 @@ test('a link that asked NOTHING never condemns the peer — silence is not evide
   assert.equal(link.unsupportedReason, null);
 });
 
-test('a server that HAS answered is never demoted by a later flaky socket', () => {
+test('a socket that HAS answered is not demoted by a later bad frame on it', () => {
+  const { link, mux } = makeLink();
+  const reasons: MuxUnsupportedReason[] = [];
+  link.onUnsupported((reason) => reasons.push(reason));
+  link.subscribe('_tree', collector());
+  link.connect();
+
+  // One good frame is the proof, and it is proof about THIS socket.
+  mux.sockets[0].push('_tree', bytes(0, 0));
+  assert.equal(link.unsupportedReason, null);
+
+  mux.sockets[0].onmessage?.({ data: bytes(0xff, 0xff, 0xff) });
+  assert.deepEqual(reasons, [], 'a peer that answered was demoted by one bad frame');
+  assert.equal(link.unsupportedReason, null);
+  assert.equal(link.connected, true, 'a stray bad message dropped a healthy socket');
+});
+
+test('the latch is PER SOCKET: a server replaced underneath a reconnect is judged again', () => {
+  // ⚠ MEASURED, and the reason the latch moved. Against real processes: a current
+  // server, then stopped, then a pre-P3 server started on the SAME port and the
+  // SAME data dir. With a link-wide latch the ladder reconnected in 180 ms, the
+  // client stayed in mux mode, `unsupportedReason` stayed null, no notice fired,
+  // `whenSynced(15000)` was false and the post-swap edit never reached the
+  // server — silently, until Obsidian was restarted. A latch cannot tell a flaky
+  // reconnect from a different process on the other end; judging each socket on
+  // what IT says can.
   const { link, mux, fire } = makeLink();
   const reasons: MuxUnsupportedReason[] = [];
   link.onUnsupported((reason) => reasons.push(reason));
   link.subscribe('_tree', collector());
   link.connect();
 
-  // One good frame is the proof.
   mux.sockets[0].push('_tree', bytes(0, 0));
-  assert.equal(link.unsupportedReason, null);
+  assert.equal(link.unsupportedReason, null, 'a peer that framed correctly was condemned');
 
-  // Now the socket dies and the next one delivers gibberish. That is a network
-  // fault, and demoting the whole topology over it would be far worse than one
-  // slow reconnect.
+  // The server goes away and something that does NOT speak the protocol comes
+  // back on the same address.
   mux.dropSockets();
   fire();
+  assert.equal(link.connected, true, 'the ladder never reconnected');
   mux.sockets[1].onmessage?.({ data: bytes(0xff, 0xff, 0xff) });
-  assert.deepEqual(reasons, [], 'a proven mux server was demoted by one bad frame');
-  assert.equal(link.unsupportedReason, null);
-  assert.equal(link.connected, true, 'a stray bad message dropped a healthy socket');
+
+  assert.deepEqual(reasons, ['not-a-frame'], 'the replacement server was never examined');
+  assert.equal(link.connected, false, 'the link stayed on a peer that cannot serve it');
 });
 
 test('a fallback registered after the verdict still runs — a tick late is not never', async () => {
@@ -596,4 +646,247 @@ test('the codec agrees with lib0 written by hand — the wire is not our own dia
   encoding.writeVarString(enc, 'n_x');
   encoding.writeVarUint8Array(enc, bytes(4, 5, 6));
   assert.deepEqual([...encodeMuxFrame('n_x', bytes(4, 5, 6))], [...encoding.toUint8Array(enc)]);
+});
+
+// ---------------------------------------------------------------- liveness
+
+/**
+ * A socket whose readyState never leaves OPEN however dead the path is, plus a
+ * hand-driven clock.
+ *
+ * ⚠ This is the shape the whole section is about, and it is not hypothetical: a
+ * dropped NAT flow, a slept laptop and a wifi handover all stop the bytes without
+ * a FIN or an RST, and `readyState` has no way to say so. Measured through a TCP
+ * proxy that stops forwarding in both directions: a `WebsocketProvider` on the
+ * frozen path dropped its socket at 30,266 ms; a link with no watchdog reported
+ * `connected` and `synced` for the whole 78 s the probe watched.
+ */
+function livenessLink(over: Partial<MuxLinkConfig> = {}): {
+  link: MuxLink;
+  timers: Array<{ fn: () => void; ms: number } | undefined>;
+  sockets: Array<MuxSocket & { closes: number }>;
+  tick: (ms: number) => void;
+} {
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const clock = { t: 1_000_000 };
+  const sockets: Array<MuxSocket & { closes: number }> = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    detectTimeoutMs: 0,
+    connectTimeoutMs: 0,
+    random: () => 0.5,
+    now: () => clock.t,
+    openSocket: () => {
+      const socket = { ...silentSocket(), closes: 0 };
+      socket.close = (): void => {
+        socket.closes += 1;
+        socket.readyState = 3;
+        socket.onclose?.({});
+      };
+      sockets.push(socket);
+      return socket;
+    },
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+    ...over,
+  });
+  /** Advance the clock and run whatever is due, once. */
+  const tick = (ms: number): void => {
+    clock.t += ms;
+    const due = timers.splice(0).filter((t) => t !== undefined);
+    for (const timer of due) timer?.fn();
+  };
+  return { link, timers, sockets, tick };
+}
+
+test('a socket that is OPEN and dead is closed, and the ladder brings the link back', () => {
+  const { link, sockets, tick } = livenessLink({ idleTimeoutMs: 30_000 });
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  assert.equal(link.connected, true);
+
+  // Nothing arrives, ever. Ten polls of three seconds each is the timeout.
+  for (let i = 0; i < 10; i++) tick(3_000);
+
+  assert.equal(sockets[0]?.closes, 1, 'a dead-but-open socket was never closed');
+  assert.equal(link.stats.idleClosures, 1);
+  assert.equal(link.connected, false, 'the link still called a dead socket connected');
+
+  tick(1_000);                                   // the retry rung
+  assert.equal(sockets.length, 2, 'the ladder never redialled after the watchdog fired');
+  assert.equal(link.connected, true);
+});
+
+test('bytes arriving reset the watchdog — a busy link is never closed', () => {
+  const { link, sockets, tick } = livenessLink({ idleTimeoutMs: 30_000 });
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+
+  // A frame every twelve seconds, which is FASTER than the heartbeat a real idle
+  // link already gets: measured against the real server, an idle mux link
+  // received an awareness echo every 15.03 s, six times in 95 s.
+  for (let i = 0; i < 12; i++) {
+    tick(3_000);
+    if (i % 4 === 3) sockets[0]?.onmessage?.({ data: encodeMuxFrame('_tree', bytes(1)) });
+  }
+  assert.equal(sockets[0]?.closes, 0, 'a link receiving frames was closed as dead');
+  assert.equal(link.connected, true);
+});
+
+test('at half the idle timeout the link asks ONE room to provoke an answer', () => {
+  const { link, tick } = livenessLink({ idleTimeoutMs: 30_000 });
+  const probes: string[] = [];
+  for (const room of ['n_a', 'n_b']) {
+    link.subscribe(room, { onPayload: () => undefined, onProbe: () => probes.push(room) });
+  }
+  link.connect();
+
+  // Below half: nothing is owed.
+  for (let i = 0; i < 4; i++) tick(3_000);
+  assert.deepEqual(probes, [], 'the link nagged a peer that had not gone quiet');
+
+  // Past half: ONE room per poll, rotating, so a single room the server has
+  // stopped serving can neither mask a live link nor condemn one.
+  tick(3_000);
+  tick(3_000);
+  assert.deepEqual(probes, ['n_b', 'n_a'], 'the probe did not rotate across rooms');
+});
+
+test('a dial that HANGS is a failed attempt, not a link parked forever', () => {
+  // ⚠ `open()` assigns `this.socket` before the socket opens and `connect()`
+  // refuses to dial while one exists, so a TCP connection accepted with the HTTP
+  // upgrade never answered used to park the link with no timer armed at all.
+  // Measured against a black-holed upgrade: one dial, zero timers, still one dial
+  // forty-five seconds later.
+  const connecting: MuxSocket[] = [];
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    detectTimeoutMs: 0,
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 4_000,
+    random: () => 0.5,
+    openSocket: () => {
+      const socket = { ...silentSocket(), readyState: 0 };     // CONNECTING, forever
+      connecting.push(socket);
+      return socket;
+    },
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  /** Take everything armed since the last call, and run it. */
+  const drain = (): Array<{ fn: () => void; ms: number }> => {
+    const due = timers.splice(0).filter((t) => t !== undefined);
+    for (const timer of due) timer.fn();
+    return due;
+  };
+
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  assert.equal(connecting.length, 1);
+
+  const armed = timers.filter((t) => t !== undefined);
+  assert.equal(armed.length, 1, 'a dial in flight armed no connect timeout');
+  assert.equal(armed[0]?.ms, 4_000);
+  drain();
+
+  assert.equal(link.stats.dialsFailed, 1, 'a hung dial was not counted as a failure');
+  const retry = timers.filter((t) => t !== undefined);
+  assert.equal(retry.length, 1, 'a hung dial armed no retry');
+  assert.equal(retry[0]?.ms, MUX_RECONNECT_BACKOFF_MS[0]);
+  drain();
+  assert.equal(connecting.length, 2, 'the ladder never redialled past a hung dial');
+});
+
+test('connect({ immediate }) jumps a waiting rung; a plain connect() still does not', () => {
+  // The rung protects the RETRY LOOP from hammering a server that is down. It is
+  // not a reason to make a person wait: measured against a real 30-second outage,
+  // resync took 52,703 ms before this existed and 5 ms after, on the path
+  // `Bootstrap.connectTree` takes.
+  const { link, mux, timers } = makeLink();
+  link.subscribe('_tree', collector());
+  link.connect();
+  mux.dropSockets();
+  const dialled = mux.sockets.length;
+  assert.equal(timers.filter((t) => t !== undefined).length, 1);
+
+  link.connect();
+  assert.equal(mux.sockets.length, dialled, 'a plain connect() jumped the queue');
+
+  link.connect({ immediate: true });
+  assert.equal(mux.sockets.length, dialled + 1, 'an immediate connect() waited out the rung');
+  assert.equal(link.connected, true);
+  assert.equal(timers.filter((t) => t !== undefined).length, 0,
+    'the rung was left armed beside a socket that is already up');
+});
+
+test('recycle() throws the socket away and the ladder dials a fresh one', () => {
+  const { link, mux, timers, fire } = makeLink();
+  link.subscribe('_tree', collector());
+  link.connect();
+  const first = mux.sockets.length;
+
+  link.recycle();
+  assert.equal(link.stats.recycles, 1);
+  assert.equal(link.connected, false, 'recycle left the old socket in place');
+  assert.equal(timers.filter((t) => t !== undefined).length, 1, 'recycle armed no retry');
+  fire();
+  assert.equal(mux.sockets.length, first + 1, 'recycle never produced a new socket');
+  assert.equal(link.connected, true);
+});
+
+// ---------------------------------------------------------------- unreachable
+
+test('dials that never OPEN are reported, and an open socket clears the count', () => {
+  // ⚠ The evidence no other route into the verdict can carry: `onClose` and the
+  // detect timer both need a socket that OPENED, so a refused or black-holed
+  // `/_mux` upgrade reached nothing at all. Measured against a real server behind
+  // a proxy answering 404 on `/_mux`: `whenSynced(15000)` false, verdict empty,
+  // notice never shown, and the link dialling for ever — while a plain per-room
+  // client on the same path synced.
+  const { link, mux, fire } = makeLink({ unreachableDials: 2 });
+  let reports = 0;
+  link.onUnreachable(() => { reports += 1; });
+  link.subscribe('_tree', collector());
+  mux.refuseConnect = true;
+  link.connect();
+
+  assert.equal(reports, 0, 'one failed dial is not evidence of anything');
+  fire();
+  assert.equal(reports, 1, 'two failed dials in a row were not reported');
+  fire();
+  assert.equal(reports, 2, 'the report stopped repeating while the dials kept failing');
+
+  // ⚠ And it is NOT a verdict. A server that is merely down fails dials in
+  // exactly this shape, so the link keeps its ladder and stays usable.
+  assert.equal(link.unsupportedReason, null, 'failed dials condemned the server on their own');
+  mux.refuseConnect = false;
+  fire();
+  assert.equal(link.connected, true);
+  const settled = reports;
+  mux.dropSockets();
+  fire();
+  assert.equal(reports, settled, 'an open socket did not clear the consecutive count');
+});
+
+test('markUnsupported is the one way in from outside, and it tears the link down', () => {
+  const { link, mux } = makeLink();
+  const reasons: MuxUnsupportedReason[] = [];
+  link.onUnsupported((reason) => reasons.push(reason));
+  link.subscribe('_tree', collector());
+  link.connect();
+  // The peer HAS framed correctly; an external verdict is about the ROUTE, not
+  // about what this socket said, so the per-socket latch must not veto it.
+  mux.sockets[0]?.push('_tree', bytes(0, 0));
+
+  link.markUnsupported('unreachable');
+  assert.deepEqual(reasons, ['unreachable']);
+  assert.equal(link.unsupportedReason, 'unreachable');
+  assert.equal(link.connected, false, 'the link stayed up after an external verdict');
+  link.connect();
+  assert.equal(mux.sockets.length, 1, 'connect() re-dialled a route already known to be dead');
 });
