@@ -6,6 +6,7 @@ import { loadConfig } from './config.js';
 import { Auth } from './auth.js';
 import { DocHub } from './DocHub.js';
 import { authorizeUpgrade } from './upgradeAuth.js';
+import { attachMux, MUX_DOC_ID } from './mux.js';
 import { BlobStore } from './blobStore.js';
 import { createBlobRoutes } from './blobRoutes.js';
 
@@ -57,6 +58,15 @@ httpServer.on('upgrade', (req, socket, head) => {
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
+    // P3 spec §4. `_mux` already matches the upgrade's `DOC_RE`, so this route is
+    // purely additive: it needs no grammar change, and a client that has not been
+    // upgraded takes the branch below and cannot tell the difference. The socket
+    // is authenticated exactly once, here, by the check every other socket faces,
+    // and `result.workspaceId` is the only workspace its frames can ever reach.
+    if (result.docId === MUX_DOC_ID) {
+      attachMux(ws, { hub: docHub, workspaceId: result.workspaceId });
+      return;
+    }
     docHub.handleConnection(ws, result.docName);
   });
 });
