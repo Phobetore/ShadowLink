@@ -25,6 +25,15 @@ jobs:
 
       - run: npm ci
 
+      # P3 spec §4: the mux endpoint was measured against an UNMODIFIED DocHub,
+      # and slice 1 ships on that claim. Three questions, because each one sees
+      # something the others cannot: the file's own bytes against a pinned git
+      # blob id (which is also asserted by `npm test`, on both platforms, with no
+      # git at all), that same id at HEAD, and the spec's own literal sentence —
+      # `git diff --stat server/DocHub.js` is empty.
+      - name: DocHub is untouched
+        run: node server/tools/check-dochub.mjs
+
       # Type-checks every source AND test file, then bundles the plugin.
       - name: Build
         run: npm run build
