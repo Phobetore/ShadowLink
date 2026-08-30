@@ -76,7 +76,7 @@ import { KeptFiles } from './src/sync/KeptFiles';
 // ⚠ REMOVAL-SCHEDULED, P3 spec §4 "Compatibility, and its end date": one minor
 // version after slice 8, this import and the `openTreeTransport` call below are
 // replaced by `new MuxTreeTransport(this.mux, this.tree.doc)` and the file goes.
-import { LEGACY_SERVER_NOTICE, openTreeTransport } from './src/sync/LegacyTreeTransport';
+import { legacyNoticeFor, openTreeTransport } from './src/sync/LegacyTreeTransport';
 import { MuxLink } from './src/sync/MuxLink';
 import type { TreeTransport } from './src/sync/TreeTransport';
 import { ObsidianBlobPort } from './src/sync/ObsidianBlobPort';
@@ -445,8 +445,11 @@ class SyncRuntime {
         serverKey: share.serverKey,
         workspaceId: share.workspaceId,
       },
-      // Said once, and only when it is true: the server is older than the plugin.
-      () => { new Notice(LEGACY_SERVER_NOTICE, 15_000); },
+      // Said once, and only the sentence that is true for THIS verdict: an old
+      // server and a blocked route are different problems with different fixes,
+      // and telling someone to update a server that is already current is worse
+      // than saying nothing.
+      (reason) => { new Notice(legacyNoticeFor(reason), 15_000); },
     );
     this.treeLink.connect();
 
@@ -459,7 +462,13 @@ class SyncRuntime {
       loadSnapshot: () => this.statePort.readBinary(treeSnapshotKey(share.workspaceId)),
       connectTree: async (ms) => {
         if (this.treeLink.synced) return true;
-        this.treeLink.connect();
+        // ⚠ `immediate`, because this call means somebody is waiting: a bootstrap
+        // or a reconnect pass, both of which give up after `TREE_SYNC_TIMEOUT_MS`
+        // and drop the plugin to read-only. The backoff rung exists to stop the
+        // RETRY LOOP hammering a server that is down; making a person wait out a
+        // rung against a server that is up is what turned a thirty-second outage
+        // into a fifty-second one and a false "could not reach the workspace".
+        this.treeLink.connect({ immediate: true });
         return this.treeLink.whenSynced(ms);
       },
       confirm: (confirmation) => confirmFirstSync(app, confirmation),
