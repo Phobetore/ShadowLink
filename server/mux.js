@@ -41,31 +41,55 @@ export const MUX_DOC_ID = '_mux';
 export const MUX_MAX_ROOMS_PER_SOCKET = 8_192;
 
 /**
- * Backpressure: the socket is terminated when `ws.bufferedAmount` has stayed
- * above this for `MUX_BACKPRESSURE_GRACE_MS` without once falling back under.
+ * ⚠ THE BOUND. The socket is terminated the first time `ws.bufferedAmount` is
+ * observed above this — no grace, no reset, no averaging. This is the number a
+ * self-hoster may size a host from, and it is the only one that is true of a mux
+ * socket at every instant.
  *
- * The failure this exists for is a client that subscribes to everything and
- * never reads. The per-room route bounded that implicitly — one socket held one
- * room's traffic — and the mux removes that bound; worse, a client can ask for a
- * room's full state again and again with an empty state vector, so the bytes the
- * server queues toward it are not bounded by the workspace's size either.
+ * The failure it exists for is a client that subscribes to everything and never
+ * reads. The per-room route bounded that implicitly — one socket held one room's
+ * traffic — and the mux removes that bound; worse, a client can ask for a room's
+ * full state again and again with an empty state vector, so the bytes the server
+ * queues toward it are not bounded by the workspace's size either.
  *
- * ⚠ Why it is a DURATION and not just a size, which is the correction a
- * measurement forced. `mux.test.js` reports `stats.peakBufferedBytes` for a
- * legitimate 2,000-room cold storm: it is ~2.0 MB on loopback, not the "well
- * under a megabyte" this comment first claimed, and a vault with the spec's
- * measured 6.04 KB of history per note projects to ~12 MB. A pure size ceiling
- * would therefore have to sit above every legitimate burst on every link, which
- * is a number nobody can defend. Requiring the buffer to stay high instead
- * separates the two cases honestly: a peer that is draining falls back under
- * within its burst, and a peer that has stopped reading never does.
+ * Where 128 MiB comes from, measured rather than chosen. The heaviest LEGITIMATE
+ * burst is a cold storm over a link so slow that nothing drains while it runs —
+ * a phone on a dying connection asking for a whole vault — and its peak buffer
+ * is then the vault's entire state. At the design maximum the spec budgets
+ * (2,000 notes at its own measured 6.04 KB of history each) that peak measures
+ * 11.7 MiB, and all 2,000 texts are still byte-correct once the link recovers.
+ * 128 MiB is 10.9x that, so it clears a vault ten times the design budget, and
+ * it holds a socket that has stopped reading to 128 MiB instead of the 1.63 GB
+ * such a socket reached in ten seconds without it.
  *
  * Terminate, not close: a graceful close waits for a handshake the peer is by
  * definition not reading, so it would keep the memory it was meant to release.
  */
+export const MUX_HARD_BUFFERED_BYTES = 128 * 1024 * 1024;
+
+/**
+ * The SUSTAINED ceiling, which is a courtesy and not a bound. A buffer that
+ * stays above this for `MUX_BACKPRESSURE_GRACE_MS` without once falling back
+ * under is a peer that has stopped reading rather than one that is merely slow,
+ * so the socket goes and the memory comes back before it reaches the hard bound.
+ *
+ * ⚠ Read this tier for exactly what it is. It resets on a single dip under the
+ * ceiling, so a peer that reads one byte per grace window never trips it — which
+ * is why it CANNOT be the bound, and why the previous version of this file was
+ * wrong to let it stand alone. Measured on this 32 MiB / 60 s pair with nothing
+ * above it: one authenticated socket re-requesting full state with an empty state
+ * vector reached 1.63 GB of buffer and 2.4 GB of RSS in ten seconds, growing at
+ * 161.7 MB/s, with `stats.overflowed` still false the whole time — a 32 MiB
+ * constant naming a multi-gigabyte reality. The bound above is what makes this
+ * tier safe to keep.
+ *
+ * It is worth keeping because a legitimate cold storm sits at 11.7 MiB, well
+ * under it: nothing honest reaches this ceiling, and a peer parked between it
+ * and the hard bound is holding memory nobody is using.
+ */
 export const MUX_MAX_BUFFERED_BYTES = 32 * 1024 * 1024;
 
-/** How long the buffer must stay over the ceiling before the socket goes. */
+/** How long the buffer must stay over the sustained ceiling before the socket goes. */
 export const MUX_BACKPRESSURE_GRACE_MS = 60_000;
 
 // `ws` readyState. CONNECTING 0, OPEN 1, CLOSING 2, CLOSED 3 — the same numbers
@@ -172,6 +196,7 @@ export function attachMux(ws, {
   hub,
   workspaceId,
   maxRooms = MUX_MAX_ROOMS_PER_SOCKET,
+  hardBufferedBytes = MUX_HARD_BUFFERED_BYTES,
   maxBufferedBytes = MUX_MAX_BUFFERED_BYTES,
   backpressureGraceMs = MUX_BACKPRESSURE_GRACE_MS,
   // Injectable so a test can express "over the ceiling, then drained in time"
@@ -201,10 +226,12 @@ export function attachMux(ws, {
      * is a number somebody liked the look of.
      */
     peakBufferedBytes: 0,
-    /** When the buffer first went over the ceiling and stayed there, or null. */
+    /** When the buffer first went over the SUSTAINED ceiling, or null. */
     overCeilingSince: null,
     /** True once backpressure terminated the socket. */
     overflowed: false,
+    /** Which rule fired: 'hard' (the bound) or 'sustained' (the grace). */
+    overflowReason: null,
     /** Last contained error, for diagnostics. Never thrown at a caller. */
     lastError: null,
   };
@@ -239,7 +266,20 @@ export function attachMux(ws, {
     // sending is not growing and is not the failure this guards.
     const buffered = ws.bufferedAmount ?? 0;
     if (buffered > stats.peakBufferedBytes) stats.peakBufferedBytes = buffered;
-    if (maxBufferedBytes <= 0 || stats.overflowed) return;
+    if (stats.overflowed) return;
+
+    // ⚠ THE BOUND, first and without conditions. No grace, no reset, no state:
+    // whatever else is true of this socket, it is holding no more than this.
+    if (hardBufferedBytes > 0 && buffered > hardBufferedBytes) {
+      terminate('hard');
+      return;
+    }
+
+    // Under the bound, a SUSTAINED stall is still memory nobody is using, so
+    // reclaim it. This tier is deliberately forgiving — one dip under the ceiling
+    // resets the clock — because a slow link is not an attack. That forgiveness
+    // is exactly why it is a courtesy and never the bound.
+    if (maxBufferedBytes <= 0) return;
     if (buffered <= maxBufferedBytes) {
       stats.overCeilingSince = null;              // it drained: not our problem
       return;
@@ -247,10 +287,19 @@ export function attachMux(ws, {
     const at = now();
     if (stats.overCeilingSince === null) { stats.overCeilingSince = at; return; }
     if (at - stats.overCeilingSince < backpressureGraceMs) return;
+    terminate('sustained');
+  };
 
+  /**
+   * Drop the socket for exceeding a buffer rule. Terminate rather than close: a
+   * graceful close waits for a handshake the peer is by definition not reading.
+   *
+   * Asynchronous by construction in `ws` (the close event follows the socket's),
+   * so this cannot re-enter a DocHub broadcast loop mid-iteration.
+   */
+  const terminate = (reason) => {
     stats.overflowed = true;
-    // Asynchronous by construction in `ws` (the close event follows the
-    // socket's), so this cannot re-enter a DocHub broadcast loop mid-iteration.
+    stats.overflowReason = reason;
     try {
       if (typeof ws.terminate === 'function') ws.terminate();
       else ws.close();

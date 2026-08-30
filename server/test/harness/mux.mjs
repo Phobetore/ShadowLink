@@ -223,6 +223,7 @@ export class FlakyHub {
 export async function startMuxHub({
   serverKey = 'sk_harness',
   maxRooms,
+  hardBufferedBytes,
   maxBufferedBytes,
   backpressureGraceMs,
   persistDebounceMs = 50,
@@ -248,7 +249,12 @@ export async function startMuxHub({
     wss.handleUpgrade(req, socket, head, (ws) => {
       if (result.docId === MUX_DOC_ID) {
         muxes.push(attachMux(ws, {
-          hub, workspaceId: result.workspaceId, maxRooms, maxBufferedBytes, backpressureGraceMs,
+          hub,
+          workspaceId: result.workspaceId,
+          maxRooms,
+          hardBufferedBytes,
+          maxBufferedBytes,
+          backpressureGraceMs,
         }));
         return;
       }

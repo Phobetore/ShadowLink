@@ -23,6 +23,7 @@ import * as Y from 'yjs';
 import {
   attachMux, encodeMuxFrame, decodeMuxFrame, MUX_DOC_ID,
   MUX_MAX_ROOMS_PER_SOCKET, MUX_MAX_BUFFERED_BYTES, MUX_BACKPRESSURE_GRACE_MS,
+  MUX_HARD_BUFFERED_BYTES,
 } from '../mux.js';
 import { authorizeUpgrade, isValidDocId } from '../upgradeAuth.js';
 import {
@@ -369,6 +370,7 @@ test('a socket that never reads is terminated once it has stayed over the ceilin
   clock += 2_000;
   hub.push('w1/r1', updateFor('the one that crosses'));
   assert.equal(mux.stats.overflowed, true, 'backpressure never fired');
+  assert.equal(mux.stats.overflowReason, 'sustained', 'the wrong rule fired');
   assert.equal(ws.terminated, true, 'the socket was closed gracefully, which buffers more');
 
   // ⚠ The close must NOT be synchronous: it happens inside a DocHub broadcast
@@ -380,6 +382,134 @@ test('a socket that never reads is terminated once it has stayed over the ceilin
 
   assert.equal(MUX_MAX_BUFFERED_BYTES, 32 * 1024 * 1024, 'the shipped ceiling moved');
   assert.equal(MUX_BACKPRESSURE_GRACE_MS, 60_000, 'the shipped grace moved');
+});
+
+test('the HARD bound terminates on the first byte over it, with no grace at all', () => {
+  // ⚠ The blocker this exists for. With only the sustained ceiling, one
+  // authenticated socket that subscribes and never reads — re-requesting full
+  // state with an empty state vector — grew its server-side buffer at 161.7 MB/s
+  // and held 1.63 GB after ten seconds with `overflowed` still false, because
+  // nothing enforced anything until 60 s of that rate had passed. A ceiling that
+  // takes a minute to mean something is not a ceiling.
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  let clock = 1_000;
+  const mux = attachMux(ws, {
+    hub,
+    workspaceId: 'w1',
+    hardBufferedBytes: 8192,
+    maxBufferedBytes: 4096,
+    backpressureGraceMs: 10_000,
+    now: () => clock,                             // deliberately NEVER advanced
+  });
+  ws.bufferedPerSend = 3072;
+
+  ws.deliver('r1', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));   // 3 KiB: under both
+  assert.equal(mux.stats.overflowed, false);
+  hub.push('w1/r1', updateFor('over the sustained ceiling'));  // 6 KiB: over 4096
+  assert.equal(mux.stats.overflowed, false, 'the sustained tier stopped being a grace');
+  assert.notEqual(mux.stats.overCeilingSince, null);
+
+  hub.push('w1/r1', updateFor('over the bound'));              // 9 KiB: over 8192
+  assert.equal(mux.stats.overflowed, true, 'the hard bound never fired');
+  assert.equal(mux.stats.overflowReason, 'hard', 'the sustained rule fired, not the bound');
+  assert.equal(ws.terminated, true);
+  // Not one millisecond passed on the clock the sustained tier reads.
+  assert.equal(clock, 1_000, 'the test moved the clock and proved nothing');
+  assert.equal(MUX_HARD_BUFFERED_BYTES, 128 * 1024 * 1024, 'the shipped bound moved');
+  assert.equal(
+    MUX_HARD_BUFFERED_BYTES > MUX_MAX_BUFFERED_BYTES, true,
+    'the bound is below the ceiling it is meant to backstop',
+  );
+});
+
+test('a peer that dips under the ceiling once per grace window is still bounded', async () => {
+  // Measured on the shipped constants before the bound existed: a peer that
+  // resumes reading for one instant per grace window resets `overCeilingSince`
+  // and is never terminated — 200 cycles of "a million bytes buffered for 999 ms,
+  // then one dip" left the socket open. The sustained tier CANNOT contain that
+  // peer, by construction. The hard bound can, because it has no memory to reset.
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  let clock = 1_000;
+  const mux = attachMux(ws, {
+    hub,
+    workspaceId: 'w1',
+    hardBufferedBytes: 1_000_000,
+    maxBufferedBytes: 4096,
+    backpressureGraceMs: 1_000,
+    now: () => clock,
+  });
+
+  ws.deliver('r1', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  let dips = 0;
+  for (let cycle = 0; cycle < 50 && !mux.stats.overflowed; cycle++) {
+    ws.bufferedAmount = 100_000 + cycle * 20_000;   // parked far over the ceiling
+    hub.push('w1/r1', updateFor('parked'));
+    clock += 999;                                    // just inside the grace...
+    ws.bufferedAmount = 1;                           // ...and one byte read
+    hub.push('w1/r1', updateFor('one dip'));
+    dips += 1;
+  }
+
+  assert.equal(dips > 1, true, 'the fixture terminated before it could dip');
+  assert.equal(mux.stats.overflowed, true, 'a dipping peer was never bounded');
+  assert.equal(
+    mux.stats.overflowReason, 'hard',
+    'the sustained tier claimed a peer it demonstrably cannot catch',
+  );
+  assert.equal(mux.stats.peakBufferedBytes > 1_000_000, true);
+  await sleep(0);
+  assert.equal(mux.roomCount, 0, 'the terminated socket never fanned out');
+});
+
+test('the hard bound holds a REAL non-reading socket, with the grace out of reach', async () => {
+  // The shipped SHAPE on a real socket: a real `ws.bufferedAmount`, a real paused
+  // TCP socket, a real DocHub — and a grace so long that only the bound can fire,
+  // which is the arrangement the shipped 128 MiB / 60 s pair is in for the first
+  // minute of any attack.
+  const server = await startMuxHub({
+    hardBufferedBytes: 256 * 1024,
+    maxBufferedBytes: 128 * 1024,
+    backpressureGraceMs: 10 * 60_000,
+  });
+  const client = new MuxClient(server.muxUrl('w1'));
+  try {
+    await client.connect();
+    await client.syncAll(['r1']);
+    const mux = server.lastMux();
+
+    client.stopReading();
+    const writer = new MuxClient(server.muxUrl('w1'));
+    await writer.connect();
+    await writer.syncAll(['r1']);
+
+    const doc = new Y.Doc();
+    for (let i = 0; i < 400 && !mux.stats.overflowed; i++) {
+      const sv = Y.encodeStateVector(doc);
+      doc.getText('content').insert(0, 'x'.repeat(4096));
+      writer.sendFrame('r1', syncPayload(SYNC.SYNC_UPDATE, Y.encodeStateAsUpdate(doc, sv)));
+      await sleep(2);
+    }
+    doc.destroy();
+
+    assert.equal(
+      await until(() => mux.stats.overflowed, 3000), true,
+      'a silent peer outlasted the bound',
+    );
+    assert.equal(mux.stats.overflowReason, 'hard', 'the grace fired, which cannot be right');
+    assert.equal(await until(() => mux.roomCount === 0, 3000), true, 'the fan-out never ran');
+    // The bound is a bound: the peak really is within one frame of it.
+    assert.equal(
+      mux.stats.peakBufferedBytes < 256 * 1024 * 4, true,
+      `peak ${mux.stats.peakBufferedBytes} B ran far past a 256 KiB bound`,
+    );
+    assert.ok(server.hub.getText('w1/r1').length > 0, 'the room lost its content');
+    writer.abort();
+  } finally {
+    client.abort();
+    await server.stop();
+  }
 });
 
 test('a peer that goes over the ceiling and then DRAINS is never terminated', () => {
@@ -608,19 +738,22 @@ test(`the four phases: seed, cold storm, warm reconnect and a live delta over ${
     const peak = coldMux.stats.peakBufferedBytes;
     console.log(
       `      [cold]  peak send buffer ${(peak / 1024).toFixed(1)} KB, `
+      + `${(MUX_HARD_BUFFERED_BYTES / Math.max(peak, 1)).toFixed(1)}x under the `
+      + `${MUX_HARD_BUFFERED_BYTES / 1024 / 1024} MiB bound and `
       + `${(MUX_MAX_BUFFERED_BYTES / Math.max(peak, 1)).toFixed(1)}x under the `
-      + `${MUX_MAX_BUFFERED_BYTES / 1024 / 1024} MiB ceiling, drained in ${coldMs.toFixed(0)} ms `
-      + `against a ${MUX_BACKPRESSURE_GRACE_MS / 1000} s grace`,
+      + `${MUX_MAX_BUFFERED_BYTES / 1024 / 1024} MiB ceiling, drained in ${coldMs.toFixed(0)} ms`,
     );
     assert.equal(coldMux.stats.overflowed, false, 'a legitimate cold storm tripped backpressure');
-    // The ceiling alone is NOT what makes this safe — at 2,000 rooms the peak is
-    // megabytes, and a history-heavy vault projects higher still. What makes it
-    // safe is that the burst DRAINS: the grace never starts, or starts and is
-    // reset long before it expires.
+    // ⚠ Loopback drains as fast as the server writes, so this peak is the FLOOR of
+    // what a cold storm costs, not its worst case. The worst case is the same
+    // storm over a link that drains nothing while it runs — a phone on a dying
+    // connection — and there the peak is the whole vault's state: measured at the
+    // design maximum (2,000 notes at the spec's own 6.04 KB of history each) it is
+    // 11.7 MiB, with all 2,000 texts still byte-correct once the link recovers.
+    // That measurement, not this one, is what MUX_HARD_BUFFERED_BYTES clears 10.9x.
     assert.equal(
-      coldMs < MUX_BACKPRESSURE_GRACE_MS, true,
-      `the storm took ${coldMs.toFixed(0)} ms, which is not comfortably inside the `
-      + `${MUX_BACKPRESSURE_GRACE_MS} ms grace`,
+      peak < MUX_HARD_BUFFERED_BYTES, true,
+      `a legitimate cold storm peaked at ${(peak / 1024 / 1024).toFixed(1)} MiB, over the bound`,
     );
 
     // The ledger is doc-free by construction, and it agrees with the doc-based
