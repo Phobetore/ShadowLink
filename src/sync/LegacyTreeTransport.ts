@@ -13,7 +13,8 @@
 //   1. delete this file;
 //   2. in `main.ts`, replace the one `openTreeTransport(...)` call with
 //      `new MuxTreeTransport(this.mux, this.tree.doc)` and drop this import;
-//   3. delete the `legacyServerNotice` call beside it.
+//   3. delete the `new Notice(...)` line beside it, and the two exported notice
+//      strings it names.
 // Nothing else in the plugin names a legacy transport, a fallback, or a mode.
 // `MuxLink`, `MuxRoom` and `MuxTreeTransport` contain no branch for either.
 //
@@ -31,6 +32,24 @@
 // one round trip. The ten-second timeout in `MuxLink` is only for a peer that
 // says nothing at all.
 //
+// ── AND WHY "THE SOCKET NEVER OPENED" IS NOT NOTHING ───────────────────────
+// Both of the above need a socket that OPENED. A `/_mux` upgrade that is REFUSED
+// or BLACK-HOLED reaches neither, and before the probe below existed it reached
+// nothing at all: measured against a real server behind a proxy that answers 404
+// on `/_mux` and serves every other route, `whenSynced(15000)` was false, the
+// verdict was empty, the notice never appeared, and the link dialled for ever —
+// while a plain per-room client on the SAME path synced. That is the canonical
+// reverse-proxy misconfiguration, and INSTALL.md tells self-hosters to put a
+// proxy in front without giving them a config.
+//
+// `MuxLink` cannot conclude it alone. A browser `WebSocket` reports a refused
+// upgrade and a server that is simply DOWN as the same bare close, on purpose, so
+// a link that fell back on failed dials would demote a whole session every time a
+// server restarted. What tells them apart is the per-room route, and this file is
+// the only place that has one. So `MuxLink` reports evidence (`onUnreachable`)
+// and this bridge decides: it brings the legacy route up as a PROBE, gives the
+// mux an immediate, fair re-dial the moment the server is known to be reachable,
+// and only concludes when a dial fails again while the probe is synced.
 // No `obsidian` import: the notice is a STRING this module owns, and `main.ts`
 // puts it in front of the user. That keeps the whole bridge headless and
 // therefore deletable in one piece.
@@ -52,7 +71,30 @@ import { MuxTreeTransport, TREE_ROOM, type TreeTransport } from './TreeTransport
 export const LEGACY_SERVER_NOTICE =
   'ShadowLink: your server is older than this plugin, so it is running in the '
   + 'previous sync mode. Everything still syncs, but notes you have not opened '
-  + 'will stay out of date until you open them. Updating the server fixes it.';
+  + 'will stay out of date until you open them. Update the server, then restart '
+  + 'Obsidian.';
+
+/**
+ * The OTHER true sentence, for a server that is current but whose multiplexed
+ * route cannot be opened — a proxy that only forwards the routes it was told
+ * about, most often.
+ *
+ * ⚠ It must not say the server is old, because it is not, and the user would go
+ * and update a server that is already up to date. The two reasons get two
+ * strings for exactly that reason: the fallback is only honest if the sentence
+ * beside it is.
+ */
+export const MUX_UNREACHABLE_NOTICE =
+  'ShadowLink: your server is reachable but its multiplexed connection is not, '
+  + 'so sync is running in the previous mode. Everything still syncs, but notes '
+  + 'you have not opened will stay out of date until you open them. A proxy in '
+  + 'front of the server usually needs to forward every path, not just the ones '
+  + 'it was configured for.';
+
+/** The sentence to put in front of the user for a given verdict. */
+export function legacyNoticeFor(reason: MuxUnsupportedReason): string {
+  return reason === 'unreachable' ? MUX_UNREACHABLE_NOTICE : LEGACY_SERVER_NOTICE;
+}
 
 export interface LegacyTreeConfig {
   serverUrl: string;
@@ -129,13 +171,15 @@ export class LegacyTreeTransport implements TreeTransport {
 /**
  * The tree's transport, whichever the server turns out to support.
  *
- * Starts on the mux and switches ONCE, and only ever in that direction: a server
- * that has proven it speaks the protocol is never demoted, because a flaky
- * reconnect must not be able to tear the whole topology down (`MuxLink.spokeMux`
- * is what latches that).
+ * Starts on the mux and switches ONCE, and only ever in that direction. What is
+ * NOT permanent any more is the mux link's own judgement: it latches "this peer
+ * speaks the protocol" per SOCKET, so a server replaced underneath a reconnect is
+ * judged on what the new socket says rather than on what the old one said.
  *
- * `onLegacy` fires at most once, after the switch, so the caller can say the one
- * true sentence to the user.
+ * `onLegacy` fires at most once, after the switch, with the reason — and the
+ * reason is what picks the sentence, because "your server is old" and "your
+ * server's multiplexed route is blocked" are different problems with different
+ * fixes.
  */
 export function openTreeTransport(
   link: MuxLink,
@@ -159,6 +203,16 @@ class FallbackTreeTransport implements TreeTransport {
   private destroyed = false;
   private wantsConnect = false;
 
+  /**
+   * The legacy route, brought up to answer ONE question: is the server reachable
+   * at all? Null until a dial has failed often enough to make that worth asking.
+   */
+  private probe: TreeTransport | null = null;
+  private releaseProbe: (() => void) | null = null;
+
+  private readonly releaseUnreachable: () => void;
+  private readonly releaseMuxStatus: () => void;
+
   /** Handlers the plugin registered, re-registered on the transport that wins. */
   private readonly connectedHandlers = new Set<() => void>();
   private releaseConnected: () => void;
@@ -167,7 +221,7 @@ class FallbackTreeTransport implements TreeTransport {
   private readonly swapWaiters = new Set<() => void>();
 
   constructor(
-    link: MuxLink,
+    private readonly link: MuxLink,
     private readonly doc: Y.Doc,
     private readonly config: LegacyTreeConfig,
     private readonly onLegacy: ((reason: MuxUnsupportedReason) => void) | undefined,
@@ -176,15 +230,21 @@ class FallbackTreeTransport implements TreeTransport {
     this.active = new MuxTreeTransport(link, doc, config.room ?? TREE_ROOM);
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
     link.onUnsupported((reason) => { this.fallBack(reason); });
+    this.releaseUnreachable = link.onUnreachable(() => { this.onUnreachable(); });
+    // A mux socket that opens settles the question the probe was asking, whatever
+    // the probe was about to say.
+    this.releaseMuxStatus = link.onStatus((status) => {
+      if (status === 'connected') this.discardProbe();
+    });
   }
 
   get synced(): boolean {
     return this.active.synced;
   }
 
-  connect(): void {
+  connect(options: { immediate?: boolean } = {}): void {
     this.wantsConnect = true;
-    this.active.connect();
+    this.active.connect(options);
   }
 
   /**
@@ -218,18 +278,74 @@ class FallbackTreeTransport implements TreeTransport {
 
   destroy(): void {
     this.destroyed = true;
+    this.releaseUnreachable();
+    this.releaseMuxStatus();
+    this.discardProbe();
     this.releaseConnected();
     this.active.destroy();
     this.connectedHandlers.clear();
     this.wakeSwapWaiters();
   }
 
+  /**
+   * A dial failed again, `MUX_UNREACHABLE_DIALS` of them in a row now.
+   *
+   * The FIRST one only starts the probe: a failed dial on its own says nothing,
+   * because a server that is down fails dials exactly the same way. The verdict
+   * needs both halves at once — the per-room route synced, and `/_mux` still
+   * refusing to open — and the probe's own connect is what re-dials the mux
+   * immediately so the comparison is fair rather than a race the mux loses by
+   * being on a backoff rung.
+   */
+  private onUnreachable(): void {
+    if (this.legacy || this.destroyed) return;
+    if (this.probe === null) {
+      this.startProbe();
+      return;
+    }
+    if (!this.probe.synced) return;
+    this.link.markUnsupported('unreachable');
+  }
+
+  private startProbe(): void {
+    const probe = this.makeLegacy(this.config, this.doc);
+    this.probe = probe;
+    this.releaseProbe = probe.onConnected(() => {
+      // The server is reachable. Give the mux route an immediate, fair attempt
+      // rather than letting it sit out a backoff rung and lose by default.
+      if (!this.destroyed && !this.legacy) this.link.connect({ immediate: true });
+    });
+    probe.connect();
+  }
+
+  private discardProbe(): void {
+    const probe = this.probe;
+    this.probe = null;
+    this.releaseProbe?.();
+    this.releaseProbe = null;
+    if (probe === null || probe === this.active) return;
+    try {
+      probe.destroy();
+    } catch {
+      /* already gone */
+    }
+  }
+
   private fallBack(reason: MuxUnsupportedReason): void {
     if (this.legacy || this.destroyed) return;
     this.legacy = true;
+    this.releaseUnreachable();
+    this.releaseMuxStatus();
     this.releaseConnected();
+    // ⚠ ADOPT the probe rather than build a second provider. Two of them on one
+    // `Y.Doc` is not a correctness problem — Yjs converges — but it is two
+    // sockets, two handshakes and two things to tear down for one job.
+    const adopted = this.probe;
+    this.probe = null;
+    this.releaseProbe?.();
+    this.releaseProbe = null;
     this.active.destroy();
-    this.active = this.makeLegacy(this.config, this.doc);
+    this.active = adopted ?? this.makeLegacy(this.config, this.doc);
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
     if (this.wantsConnect) this.active.connect();
     this.wakeSwapWaiters();

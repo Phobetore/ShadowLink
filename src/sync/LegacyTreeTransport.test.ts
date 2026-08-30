@@ -24,7 +24,9 @@ import * as Y from 'yjs';
 
 import { FakeMux } from './fakes.ts';
 import { MuxLink, type MuxUnsupportedReason } from './MuxLink.ts';
-import { LEGACY_SERVER_NOTICE, openTreeTransport } from './LegacyTreeTransport.ts';
+import {
+  LEGACY_SERVER_NOTICE, MUX_UNREACHABLE_NOTICE, legacyNoticeFor, openTreeTransport,
+} from './LegacyTreeTransport.ts';
 import type { TreeTransport } from './TreeTransport.ts';
 
 // ---------------------------------------------------------------- fixtures
@@ -283,4 +285,133 @@ test('the bridge is ONE file, and the permanent transport names nothing legacy',
     main.includes('new WebsocketProvider('), false,
     'main.ts constructs a provider directly; the tree\'s belongs to the bridge',
   );
+});
+
+// ---------------------------------------------------------------- the route that will not open
+
+/**
+ * A harness whose ladder can actually be walked, and which hands out a FRESH
+ * legacy transport each time the switcher asks for one — because the probe and
+ * the transport that eventually wins are two different questions being asked of
+ * the same constructor.
+ */
+function unreachableHarness(): {
+  transport: TreeTransport;
+  mux: FakeMux;
+  link: MuxLink;
+  made: StubLegacy[];
+  notices: MuxUnsupportedReason[];
+  fire: () => void;
+  dispose(): void;
+} {
+  const mux = new FakeMux();
+  const doc = new Y.Doc();
+  const timers: Array<{ fn: () => void } | undefined> = [];
+  const link = new MuxLink({
+    ...CONFIG,
+    openSocket: mux.openSocket,
+    detectTimeoutMs: 0,
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 0,
+    unreachableDials: 2,
+    random: () => 0.5,
+    setTimer: (fn) => { timers.push({ fn }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  const made: StubLegacy[] = [];
+  const notices: MuxUnsupportedReason[] = [];
+  const transport = openTreeTransport(
+    link, doc, CONFIG, (reason) => notices.push(reason),
+    () => { const stub = new StubLegacy(); made.push(stub); return stub; },
+  );
+  const fire = (): void => {
+    const due = timers.splice(0).filter((t) => t !== undefined);
+    for (const timer of due) timer.fn();
+  };
+  return {
+    transport, mux, link, made, notices, fire,
+    dispose: () => { transport.destroy(); link.destroy(); doc.destroy(); },
+  };
+}
+
+test('a route that will not OPEN falls back once the per-room route is proved to work', () => {
+  // ⚠ MEASURED, and it is why this path exists at all: every other route into the
+  // verdict needs a socket that OPENED, so a `/_mux` upgrade refused with a 404
+  // reached nothing. Against a real server behind such a proxy:
+  // `whenSynced(15000)` false, verdict empty, `unsupportedReason` null, notice
+  // never shown, the link dialling for ever — while a plain per-room client on
+  // the SAME path synced. Afterwards: verdict and a synced tree at 1,615 ms.
+  const h = unreachableHarness();
+  h.transport.connect();
+  h.mux.refuseConnect = true;
+  h.mux.dropSockets();
+  h.fire();                                      // a first dial fails: not evidence yet
+  h.fire();                                      // and a second: evidence, not a verdict
+
+  assert.equal(h.made.length, 1, 'the per-room route was never tried');
+  assert.equal(h.link.unsupportedReason, null,
+    'failed dials condemned the route before anything had been proved');
+  assert.deepEqual(h.notices, [], 'the user was told something before it was known');
+
+  // The per-room route works. That is the other half of the evidence.
+  h.made[0]?.arrive();
+  h.fire();                                      // and the mux STILL will not open
+
+  assert.equal(h.link.unsupportedReason, 'unreachable');
+  assert.deepEqual(h.notices, ['unreachable']);
+  assert.equal(h.transport.synced, true, 'the tree did not end up on the route that works');
+  assert.equal(h.made.length, 1, 'the probe was thrown away and a second one built');
+  assert.equal(h.made[0]?.destroyed, false, 'the transport that won was destroyed');
+  h.dispose();
+});
+
+test('a server that is merely DOWN is not demoted — the per-room route fails too', () => {
+  // ⚠ The other half, and the reason `MuxLink` reports rather than concludes. A
+  // browser `WebSocket` reports a refused upgrade and a dead server as the same
+  // bare close, on purpose, so a link that fell back on failed dials alone would
+  // demote a whole session every time a server restarted. Measured against a real
+  // server stopped for twelve seconds: five failed dials, no verdict, no notice,
+  // and the mux back up 6,634 ms after the server returned.
+  const h = unreachableHarness();
+  h.transport.connect();
+  h.mux.refuseConnect = true;
+  h.mux.dropSockets();
+  h.fire();
+  h.fire();
+  assert.equal(h.made.length, 1, 'the per-room route was never tried');
+
+  // The probe cannot sync either: nothing is listening.
+  for (let i = 0; i < 4; i++) h.fire();
+  assert.equal(h.link.unsupportedReason, null, 'a server that is down was called incompatible');
+  assert.deepEqual(h.notices, []);
+
+  // The server comes back, on both routes.
+  h.mux.refuseConnect = false;
+  h.fire();
+  assert.equal(h.link.connected, true, 'the ladder never brought the link back');
+  assert.equal(h.link.unsupportedReason, null);
+  assert.equal(h.made[0]?.destroyed, true, 'the probe was left running beside a working mux');
+  assert.deepEqual(h.notices, [], 'an ordinary outage told the user their server is wrong');
+  h.dispose();
+});
+
+test('the two verdicts get two sentences, and neither says the other one\'s thing', () => {
+  // "Update your server" is false for a current server behind a proxy that will
+  // not forward the route, and sending somebody to update a server that is
+  // already up to date is worse than saying nothing.
+  assert.equal(legacyNoticeFor('not-a-frame'), LEGACY_SERVER_NOTICE);
+  assert.equal(legacyNoticeFor('silent'), LEGACY_SERVER_NOTICE);
+  assert.equal(legacyNoticeFor('unreachable'), MUX_UNREACHABLE_NOTICE);
+  assert.notEqual(MUX_UNREACHABLE_NOTICE, LEGACY_SERVER_NOTICE);
+  assert.ok(!MUX_UNREACHABLE_NOTICE.includes('older'),
+    'the unreachable notice blames the server version for a routing problem');
+  for (const notice of [LEGACY_SERVER_NOTICE, MUX_UNREACHABLE_NOTICE]) {
+    assert.ok(!notice.includes('_mux'),
+      'the notice names an endpoint a self-hoster cannot act on');
+  }
+  // ⚠ `startSync()` runs once at layout-ready and the link never re-probes, so
+  // "update the server" on its own is an instruction that does not work.
+  assert.ok(LEGACY_SERVER_NOTICE.includes('restart Obsidian')
+    || LEGACY_SERVER_NOTICE.includes('restart Obsidian.'),
+    'the notice promises a repair the running session cannot make');
 });

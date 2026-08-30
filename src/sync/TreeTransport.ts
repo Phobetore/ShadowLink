@@ -29,8 +29,14 @@ export const TREE_ROOM = '_tree';
 export interface TreeTransport {
   /** True only after a genuine handshake completed on the current connection. */
   readonly synced: boolean;
-  /** Idempotent: `Bootstrap.connectTree` calls it on every attempt. */
-  connect(): void;
+  /**
+   * Idempotent: `Bootstrap.connectTree` calls it on every attempt.
+   *
+   * `immediate` means somebody is waiting — a bootstrap, a reconnect pass — so
+   * the backoff rung, which exists to protect a server from a retry LOOP, must
+   * not also be what makes that person wait.
+   */
+  connect(options?: { immediate?: boolean }): void;
   /** Resolves TRUE only on a genuine sync. A timeout resolves FALSE (I3/I4). */
   whenSynced(ms: number): Promise<boolean>;
   /** Fires on every transition INTO connected. Returns an unsubscribe. */
@@ -64,8 +70,8 @@ export class MuxTreeTransport implements TreeTransport {
     return this.room.synced;
   }
 
-  connect(): void {
-    this.link.connect();
+  connect(options: { immediate?: boolean } = {}): void {
+    this.link.connect(options);
   }
 
   whenSynced(ms: number): Promise<boolean> {
