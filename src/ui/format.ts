@@ -312,9 +312,19 @@ export function compatibilityLine(state: BarCompatibility): string | null {
  * ⚠ AND THE ORDERING IS ONLY SAFE BECAUSE THE CLAIM IS NOW LIVE. While the
  * sentence was a stored record it could outrank the true one with evidence that
  * had expired minutes earlier — measured at 60 s of "ShadowLink can reach your
- * server" over a path that had been dark the whole time. A claim that stops being
- * computable the instant the probe stops answering cannot suppress anything it
- * has stopped being able to support.
+ * server" over a path that had been dark the whole time. A claim recomputed where
+ * it is rendered ends when its evidence does, with nothing having to retract it.
+ *
+ * ⚠ "ENDS WHEN ITS EVIDENCE DOES" IS NOT "ENDS INSTANTLY", and this comment used
+ * to say the second. `provider.synced` goes false when y-websocket NOTICES, which
+ * on a route dropped mid-flow with no FIN and no RST is `messageReconnectTimeout`
+ * (30 s before it closes an unfed socket) plus the close-handshake timeout
+ * (another 30 s before `onclose` fires) — measured by a reviewer at 60,167 ms on
+ * a frozen route and 63,099 ms against a genuinely suspended server process. The
+ * ordering is still right, and the difference from the stored record it replaced
+ * is still the whole point: a BOUND is not a retraction mechanism that a dark
+ * path can leave incomplete. But "instant" is what a later round would cite as
+ * settled, so it says about 60 s, and the spec's §4 note 1 carries the runs.
  *
  * `pending` EXCLUDES parked entries, and that exclusion is the whole of §6.2.6:
  * an empty note and a `.md` file that is not text are refused over the state of
