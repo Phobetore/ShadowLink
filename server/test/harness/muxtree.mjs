@@ -574,21 +574,44 @@ function slowRoomProxy({ listen, target, delayMs }) {
  * outage and absent at 7,500 and 8,500 — which is a real defect and a terrible
  * regression test. Here the route that has to be slower simply is.
  */
+/**
+ * A TCP proxy that forwards EVERY route in full — nothing 404s, nothing is
+ * dropped, every byte arrives — and merely delays the upstream connection of
+ * `/_mux` by `delayMs`. Every other route connects at once. The server behind it
+ * is the shipped, current one, serving the multiplexed path perfectly.
+ *
+ * ⚠ IT IS THE SHAPE A CEILING ON THE LINK'S PATIENCE TURNS FROM SLOW INTO DEAD
+ * AND SILENT, which is case 80y. Above the top rung every dial runs out and the
+ * retry carries the same expired deadline, so the link never opens a socket at
+ * all — and because an abandoned dial may not condemn and breaks the refusal run,
+ * `routeRefused` never fires, no probe is built and the user is told nothing.
+ * Measured at shipped constants against a real `server/index.js` behind exactly
+ * this proxy: 5 s synced at 10,174 ms; 13 s dead across 90 s, with `others` 0 —
+ * the healthy per-room route beside it never even dialled.
+ *
+ * `counts` is what tells a passing run from a vacuous one; the `clearTimeout` is
+ * what keeps it honest, because a dial the client abandoned must not go on to
+ * open an upstream connection nobody is holding any more.
+ */
 function slowMuxProxy({ listen, target, delayMs }) {
   const live = [];
+  const counts = { mux: 0, muxOpened: 0, others: 0, othersOpened: 0 };
   const server = net.createServer((client) => {
     client.on('error', () => undefined);
     client.once('data', (first) => {
       const head = first.toString('latin1').split('\r\n')[0] ?? '';
-      const wait = head.includes(' /_mux') ? delayMs : 0;
+      const isMux = head.includes(' /_mux');
+      if (isMux) counts.mux += 1; else counts.others += 1;
+      const wait = isMux ? delayMs : 0;
       const queued = [first];
       let up = null;
       client.on('data', (b) => {
         if (up === null) { queued.push(b); return; }
         try { up.write(b); } catch { /* gone */ }
       });
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         up = net.connect(target, '127.0.0.1', () => {
+          if (isMux) counts.muxOpened += 1; else counts.othersOpened += 1;
           for (const b of queued.splice(0)) { try { up.write(b); } catch { /* gone */ } }
         });
         live.push({ client, up });
@@ -601,9 +624,11 @@ function slowMuxProxy({ listen, target, delayMs }) {
         client.on('close', bye);
         up.on('close', bye);
       }, wait);
+      client.on('close', () => clearTimeout(timer));
     });
   });
   return {
+    counts,
     async start() {
       await new Promise((resolve) => server.listen(listen, '127.0.0.1', resolve));
       return `ws://127.0.0.1:${listen}`;
@@ -696,6 +721,7 @@ export function registerMuxTreeCases(getServer, legacyPort) {
   const wedgePort = legacyPort + 18;
   const slowRoomPort = legacyPort + 19;
   const accruePort = legacyPort + 20;
+  const slowMuxPort = legacyPort + 21;
 
   test('80a the shipped MuxLink carries _tree over the real server, and converges', async () => {
     const server = getServer();
@@ -2186,6 +2212,123 @@ export function registerMuxTreeCases(getServer, legacyPort) {
         assert.deepEqual(notices, ['unreachable']);
         assert.equal(await until(() => transport.synced, 20_000), true,
           'the tree never reached the route that was answering all along');
+      } finally {
+        transport.destroy(); link.destroy(); tree.doc.destroy();
+        await proxy.stop();
+      }
+    });
+
+  test('80y a mux handshake slower than the top rung still opens, and says nothing untrue',
+    async () => {
+      // ⚠ THE SAME DEFECT AS 80v, ONE LEVEL DOWN, AND IT SURVIVED THE ROUND THAT
+      // FIXED 80v. The probe's ceiling was removed on the argument that the LINK
+      // may keep one, "because the route it wants is still there to be dialled
+      // again". That is false above the ceiling: the retry carries the same expired
+      // deadline, so a `/_mux` upgrade costing more than the top rung can never
+      // complete a dial, and the ladder re-runs the same failure for ever.
+      //
+      // And it fails SILENTLY, which is what made it a blocker rather than a
+      // slowness. An abandoned dial may not condemn (fifth round, correctly) and it
+      // breaks the refusal run, so `routeRefused` never fires, `decide` is never
+      // reached, no probe is ever built, and there is no verdict, no notice and no
+      // sentence. The session is dead and tidy.
+      //
+      // Measured at fully shipped constants, real `server/index.js` behind a real
+      // TCP proxy forwarding every byte of every route and merely delaying each
+      // connection: D=5 s synced at 10,174 ms; D=13 s DEAD across 90 s — six
+      // abandoned dials, `framesIn` 0, `probesBuilt` 0, verdict null, notices [].
+      // Pre-slice-2 master on that same 13 s path simply cost 13,280 ms, so it was
+      // a regression against master on exactly the tether / cold-start / captive
+      // portal shape. With the ladder continued: synced at 43,429 ms.
+      //
+      // The proxy delays `/_mux` ALONE and forwards every other route instantly, so
+      // this is the sharpest form of the silence: a perfectly healthy per-room route
+      // is sitting right there, and on the parent it is never so much as dialled
+      // (`others` 0), because the thing that would dial it is a refusal run that a
+      // run of abandoned dials can never produce.
+      //
+      // This case is that shape at a tenth of the LINK's dial bound, the way 80v
+      // shortens the probe's: 700 ms rungs put the top SHIPPED rung at 2,100 ms and
+      // the path costs 2,600 ms, so it opens only because the ladder goes on
+      // doubling into a 4,200 ms rung.
+      const server = getServer();
+      const workspace = 'muxtree80y';
+      const proxy = slowMuxProxy({
+        listen: slowMuxPort, target: server.port, delayMs: 2_600,
+      });
+      const url = await proxy.start();
+      const tree = new TreeDoc();
+      const link = new MuxLink({
+        serverUrl: url,
+        serverKey: server.serverKey,
+        workspaceId: workspace,
+        openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+        connectTimeoutMs: 700,
+        backoffMs: [200],
+        jitter: 0,
+        unreachableDials: 2,
+      });
+      const notices = [];
+      let probes = 0;
+      const transport = openTreeTransport(
+        link, tree.doc,
+        { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
+        (reason) => notices.push(reason),
+        (config, doc) => { probes += 1; return new LegacyTreeTransport(config, doc); },
+        {},
+      );
+      const paused = 'ShadowLink could not reach the workspace. Editing locally; sync is paused.';
+      try {
+        transport.connect({ immediate: true });
+
+        // ⚠ WHAT IT SAYS WHILE IT WAITS, SAMPLED THROUGHOUT — the other half of the
+        // blocker. A slow path must not be described as a broken one, and the bar
+        // may not name the compatibility lever for a route that is about to work.
+        // Nothing here is remembered: the sentence is recomputed each poll from the
+        // link's own counters and the probe's live `synced`, and on this path there
+        // is no probe at all, so it is false because it has nothing to rest on.
+        const untrue = [];
+        const watching = (async () => {
+          while (!transport.synced) {
+            if (saysUnserved(link, transport)) untrue.push(`sentence at ${link.stats.dialsAbandoned} dials`);
+            const bar = barFor(link, { witness: transport, paused });
+            if (bar.text !== 'ShadowLink: paused') untrue.push(`bar said ${bar.text}`);
+            await new Promise((resolve) => { setTimeout(resolve, 40); });
+          }
+        })();
+
+        assert.equal(await until(() => transport.synced, 40_000), true,
+          'a healthy CURRENT server serving /_mux, behind a path that merely costs '
+          + '2,600 ms, never opened a socket at all — the ceiling clamps the dial '
+          + `bound at 2,100 ms and the session dies silent. mux=${proxy.counts.mux} `
+          + `opened=${proxy.counts.muxOpened} abandoned=${link.stats.dialsAbandoned} `
+          + `refused=${link.stats.dialsRefused} probes=${probes}`);
+        await watching;
+
+        assert.ok(proxy.counts.muxOpened >= 1, 'the tree synced without the mux ever opening');
+        assert.ok(link.stats.framesIn > 0, 'the link opened but carried nothing');
+        assert.ok(link.stats.dialsAbandoned >= 3,
+          `only ${link.stats.dialsAbandoned} dials ran out — the ladder never walked past `
+          + 'its shipped rungs, so this run did not test the ceiling at all');
+
+        // Nothing was condemned, and nothing was said. A path that is merely slow
+        // produces no evidence about the route, and the absence of evidence is what
+        // this branch spent five rounds refusing to conclude from.
+        assert.equal(link.stats.dialsRefused, 0, 'the path was blamed for this client\'s deadline');
+        assert.equal(link.routeRefused, false, 'a run of deadlines became a run of refusals');
+        assert.equal(link.unsupportedReason, null, 'a slow path was condemned');
+        assert.deepEqual(notices, [], 'a slow path produced a user-facing notice');
+        assert.equal(probes, 0, 'a probe was built for a route that was merely slow');
+        assert.equal(proxy.counts.others, 0,
+          'the per-room route was dialled, so this run reached the tree by the '
+          + 'fallback rather than by the mux the ladder was supposed to open');
+        assert.deepEqual(untrue, [],
+          `the bar said something untrue while the slow path was still connecting: ${untrue.join('; ')}`);
+
+        // And once it is up it is an ordinary healthy session: the ladder is back at
+        // its first rung, so the wait is paid once rather than carried.
+        assert.equal(link.dialTimeoutMs, 700, 'the open socket did not reset the ladder');
+        assert.equal(barFor(link, { witness: transport, ready: true }).text, 'ShadowLink: synced');
       } finally {
         transport.destroy(); link.destroy(); tree.doc.destroy();
         await proxy.stop();
