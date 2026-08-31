@@ -904,17 +904,32 @@ test('the unserved sentence is retracted the moment the path refuses a dial', ()
   link.destroy();
 });
 
-test('a condemned link stops saying nothing is coming back on it', () => {
+test('a condemned link stops saying nothing is coming back on it', async () => {
   // Once the verdict has fired the mux is not what carries the tree, so "nothing
   // is syncing while that is true" is false and the fallback's own sentence is the
-  // one that belongs on the bar. Reachable now that the unserved fact and the
-  // verdict can be reached in either order.
-  const { link } = makeLink({ unreachableDials: 2 });
-  link.subscribe('_tree', { onPayload: () => undefined });
+  // one that belongs on the bar.
+  //
+  // ⚠ THE ORDERING HERE IS THE REACHABLE ONE, and it is `not-a-frame` rather than
+  // `unreachable` deliberately. The `unreachable` verdict is always reached
+  // THROUGH a refused dial, and a refused dial retracts the fact one line before
+  // it reports — so that composition can never leave a condemned link still
+  // claiming the route delivers nothing, and a test asserting it would be pinning
+  // an unreachable state. This one is reachable and is exactly `80l` composed
+  // with `80g`: the route goes deaf, the fact is recorded, the server is rolled
+  // back to a pre-P3 build on the same port, and its first message settles it in
+  // one round trip with no failed dial anywhere.
+  const { link, mux } = makeLink({ unreachableDials: 2 });
+  link.subscribe('_tree', collector());
   link.connect();
   link.noteRouteUnserved();
-  assert.equal(link.routeUnserved, true);
-  link.markUnsupported('unreachable');
+  assert.equal(link.routeUnserved, true, 'the bridge could not record what it proved');
+  assert.equal(link.stats.dialsRefused, 0, 'a refused dial retracted the fact instead');
+
+  // The peer is now an old server, and says so in its first message.
+  mux.sockets[0].onmessage?.({ data: Uint8Array.from([0, 0, 1, 0]) });
+  await Promise.resolve();
+  assert.equal(link.unsupportedReason, 'not-a-frame', 'the rollback was never detected');
+  assert.equal(link.stats.dialsRefused, 0, 'a refused dial got in and did the retracting');
   assert.equal(link.routeUnserved, false,
     'a session on the fallback was told nothing was syncing');
   link.destroy();
