@@ -161,14 +161,30 @@
 // dials that could not become a verdict because a verdict needs a SYNCED probe,
 // no notice, and a tree that never synced.
 //
-// So the probe now carries the link's own two bounds and neither is new: the dial
-// deadline (`MUX_CONNECT_TIMEOUT_MS` on `MUX_DIAL_PATIENCE`'s ladder) and the
-// silence bound once open (`MUX_IDLE_TIMEOUT_MS`). On expiry it is DISCARDED AND
-// REBUILT — a retry, never a conclusion, because a probe that expired witnessed
-// nothing and an absence is what this file refuses to conclude from everywhere
-// else. The sentence and the fallback both survive the replacement: the sentence
-// is a live read that goes true again when a replacement syncs, and the verdict
-// is taken against whichever probe is answering at the moment a refusal lands.
+// So the probe now carries two bounds: the dial deadline (`MUX_CONNECT_TIMEOUT_MS`
+// on `MUX_DIAL_PATIENCE`'s ladder) and the silence bound once open
+// (`MUX_IDLE_TIMEOUT_MS`). On expiry it is DISCARDED AND REBUILT — a retry, never
+// a conclusion, because a probe that expired witnessed nothing and an absence is
+// what this file refuses to conclude from everywhere else. The sentence and the
+// fallback both survive the replacement: the sentence is a live read that goes
+// true again when a replacement syncs, and the verdict is taken against whichever
+// probe is answering at the moment a refusal lands.
+//
+// ⚠ BUT THEY ARE NOT THE LINK'S TWO BOUNDS, AND ONE ROUND WAS SPENT LEARNING IT.
+// Borrowing the link's CEILING as well as its ladder converted slow into dead: a
+// per-room handshake costing more than the top rung never produced a synced probe
+// at all, so the sentence, the verdict, the notice and the tree went down on a
+// path that pre-slice-2 master merely took 13 s over. The link bounds its dial so
+// it can RETRY; the probe exists to WITNESS. `probeDialPatience` carries the
+// distinction and the measurement: the silence bound stays exactly as it was,
+// and the dial's never stops widening.
+//
+// ⚠ AND A PROVIDER THAT DOES NOT OWN ITS DOC CANNOT CLEAN UP AFTER AN
+// `Awareness`. `WebsocketProvider.destroy()` never destroys the one it built, and
+// this is the plugin's one provider teardown handed a doc that outlives it — so
+// the rebuild loop above accrued a 3-second interval and a `Y.Doc` observer per
+// replacement until `LegacyTreeTransport.destroy` and the session-long shared
+// `Awareness` in `legacyConfig` closed it. Both carry the numbers.
 //
 // The one thing still remembered is the verdict, and only because it is a fact
 // about a MESSAGE rather than a belief about a route: a pre-P3 server said
@@ -180,6 +196,7 @@
 // therefore deletable in one piece.
 
 import type * as Y from 'yjs';
+import * as awarenessProtocol from 'y-protocols/awareness';
 import { WebsocketProvider } from 'y-websocket';
 
 import {
@@ -229,6 +246,15 @@ export interface LegacyTreeConfig {
   serverKey: string;
   workspaceId: string;
   room?: string;
+  /**
+   * An `Awareness` to BORROW rather than build, and it exists because of what
+   * `y-websocket` does not do on the way out — see `LegacyTreeTransport.destroy`.
+   *
+   * Omitted (`main.ts`, the compatibility lever, the structural harness) the
+   * transport builds one and destroys it. Supplied (`FallbackTreeTransport`, for
+   * every probe it will ever build) one object serves the whole session.
+   */
+  awareness?: awarenessProtocol.Awareness;
 }
 
 /**
@@ -281,11 +307,19 @@ export interface RouteWitness {
 export class LegacyTreeTransport implements TreeTransport {
   private readonly provider: WebsocketProvider;
 
+  /**
+   * Whether the `Awareness` behind the provider is this object's to destroy —
+   * `MuxRoom`'s own `ownsAwareness`, for the same reason and with the same rule.
+   */
+  private readonly ownsAwareness: boolean;
+
   constructor(config: LegacyTreeConfig, doc: Y.Doc) {
+    this.ownsAwareness = config.awareness === undefined;
     this.provider = new WebsocketProvider(config.serverUrl, config.room ?? TREE_ROOM, doc, {
       connect: true,
       params: { t: config.serverKey, w: config.workspaceId },
       disableBc: true,
+      ...(config.awareness === undefined ? {} : { awareness: config.awareness }),
     });
   }
 
@@ -331,9 +365,43 @@ export class LegacyTreeTransport implements TreeTransport {
     return () => { this.provider.off('status', listener); };
   }
 
+  /**
+   * ⚠ `WebsocketProvider.destroy()` DOES NOT DESTROY THE `Awareness` IT BUILT,
+   * and this is the one provider teardown in the plugin where that matters.
+   *
+   * y-websocket clears its own two intervals, drops its process exit handler and
+   * unhooks its own two listeners — and never touches `this.awareness`. The
+   * `y-protocols` `Awareness` it constructs when no `awareness` option is passed
+   * holds a 3-second `setInterval` and a `doc.on('destroy')` listener. Everywhere
+   * else that is harmless, because every other provider in this plugin OWNS its
+   * doc and destroys it, and `doc.destroy()` is what fires the `Awareness`'s own
+   * teardown. This one is HANDED the tree doc, which outlives it by the session.
+   *
+   * Measured on the branch before this line existed, one shared doc, no server
+   * needed because the constructor is what takes the resources: 40 build/destroy
+   * cycles left 40 `Y.Doc` 'destroy' observers and 40 live `Timeout`s after all
+   * 40 had been destroyed — slope 1.000 per cycle on both lines, nothing
+   * reclaimed. On the sixth round that was one leaked `Awareness` per session,
+   * because the probe was built once; the rebuild loop turned it into an accrual.
+   *
+   * ⚠ AND DESTROYING ONE PER PROBE ONLY FIXES HALF OF IT. `y-protocols` registers
+   * its `doc.on('destroy')` with an anonymous closure it never unregisters, so an
+   * `Awareness` BUILT per probe leaves one observer per probe even when it is
+   * destroyed — measured, same rig: timers flat at 0 across 40 cycles, observers
+   * still 1.000 per cycle. The other half is `FallbackTreeTransport` handing every
+   * probe ONE `Awareness` through `config.awareness`, which is what `ownsAwareness`
+   * is reading. This branch is what a `LegacyTreeTransport` built DIRECTLY needs —
+   * the compatibility lever, `fallBack`'s no-probe path, the structural harness.
+   */
   destroy(): void {
     try {
       this.provider.destroy();
+    } catch {
+      /* already gone */
+    }
+    if (!this.ownsAwareness) return;
+    try {
+      this.provider.awareness.destroy();
     } catch {
       /* already gone */
     }
@@ -386,6 +454,25 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
   private releaseProbe: (() => void) | null = null;
 
   /**
+   * ONE `Awareness` for every probe this object will ever build, and for the
+   * legacy transport if it ends up building one.
+   *
+   * ⚠ IT IS HERE BECAUSE THE REBUILD LOOP MADE A ONE-OFF INTO AN ACCRUAL.
+   * `LegacyTreeTransport.destroy`'s header carries the measurement and the
+   * y-websocket / y-protocols mechanics; the part that belongs to THIS object is
+   * that destroying one `Awareness` per probe still leaves one `doc.on('destroy')`
+   * closure per probe behind, because y-protocols never unregisters it. One
+   * object for the session leaves one, whatever the route does.
+   *
+   * ⚠ LAZY, so a healthy session pays nothing. It is built by `legacyConfig()`,
+   * which is reached only from `startProbe` and `fallBack` — and `startProbe` is
+   * reachable only from a report, so a session whose mux is serving never
+   * constructs an `Awareness`, arms no interval and adds no observer to the tree
+   * doc, exactly as it never arms a watch.
+   */
+  private probeAwareness: awarenessProtocol.Awareness | null = null;
+
+  /**
    * The probe's own dial deadline and silence bound — the link's, applied to the
    * one long-lived object on this branch that never had them.
    *
@@ -417,13 +504,19 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
   private probePhase: 'dialing' | 'open' | 'synced' = 'dialing';
 
   /**
-   * How many of the probe's dials in a row produced no open socket, indexing
-   * `MUX_DIAL_PATIENCE` — the link's ladder, not a second one.
+   * How many of the probe's dials in a row produced no open socket. It indexes
+   * `MUX_DIAL_PATIENCE` while it is on it and then keeps going — see
+   * `probeDialPatience`, which is where the ceiling used to be.
    *
    * ⚠ IT IS PATIENCE, NEVER MEASUREMENT, and `MUX_CONNECT_TIMEOUT_MS`'s header is
    * the reason: a deadline this client chose is a statement about its own patience
    * and is not evidence about the path. Nothing here is compared with anything,
-   * and nothing here reaches a verdict. It resets on any probe that opens.
+   * and nothing here reaches a verdict.
+   *
+   * It is put back to zero by a probe that OPENS, in `probeTick`, exactly as
+   * `noteSocketOpen` does for the link: patience belongs to a run of failures and
+   * is never carried into a later one. The other end a run can have — a frame on
+   * `/_mux` — needs no reset and must not have one; the reason is at `onServed`.
    */
   private probeDialRung = 0;
 
@@ -483,6 +576,18 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
     // frame that meant each redial destroyed the probe before it could answer:
     // measured, a fresh `WebsocketProvider` built every 1.6 s, for ever, while
     // the user was told nothing at all.
+    // ⚠ AND `probeDialRung = 0` DOES NOT BELONG HERE, WHICH IS MEASURED RATHER
+    // THAN ASSUMED. A reviewer asked for it: `discardProbe` on this path leaves
+    // the rung where it was, and a rung carried into a later question now costs
+    // minutes rather than a clamped 12 s. It was written, and it would not die
+    // under mutation — `MuxLink.reportRoute` opens with `if (this.routeEverServed)
+    // return`, and `routeEverServed` is the flag this very handler runs behind and
+    // that no reconnect clears. So the route that releases the probe is the route
+    // that can never report again, `decide` is never re-entered, and `startProbe`
+    // has no second caller. The only two ways into a probe are the first report of
+    // a session, where the rung is already zero, and `replaceProbe`, which is the
+    // run the rung is counting. A dead line that reads as a guarantee is worse
+    // than a note saying why none is needed.
     this.releaseServed = link.onServed(() => { this.discardProbe(); });
   }
 
@@ -549,6 +654,17 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
     this.discardProbe();
     this.releaseConnected();
     this.active.destroy();
+    // ⚠ AFTER `active`, NEVER BEFORE. On the `unreachable` path `active` IS the
+    // adopted probe, and it is holding this object's `Awareness`: destroying the
+    // shared one first would pull it out from under a provider that has not shut
+    // down yet. Nothing else on this branch owns it, so this is where it ends.
+    const awareness = this.probeAwareness;
+    this.probeAwareness = null;
+    try {
+      awareness?.destroy();
+    } catch {
+      /* already gone */
+    }
     this.connectedHandlers.clear();
     this.wakeSwapWaiters();
   }
@@ -659,7 +775,7 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
    * being able to answer it is replaced. Never concluded from — see `replaceProbe`.
    */
   private startProbe(): void {
-    const probe = this.makeLegacy(this.config, this.doc);
+    const probe = this.makeLegacy(this.legacyConfig(), this.doc);
     this.probe = probe;
     this.releaseProbe = probe.onConnected(() => {
       if (this.destroyed || this.legacy) return;
@@ -676,17 +792,24 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
     if (this.probe === probe) this.armProbeWatch();
   }
 
+  /** The legacy config plus the one `Awareness` every provider here shares. */
+  private legacyConfig(): LegacyTreeConfig {
+    this.probeAwareness ??= new awarenessProtocol.Awareness(this.doc);
+    return { ...this.config, awareness: this.probeAwareness };
+  }
+
   /**
-   * THE TWO BOUNDS THE LINK ALREADY HAS, READ OFF THE ONLY TWO THINGS A
-   * `TreeTransport` SHOWS.
+   * TWO BOUNDS, READ OFF THE ONLY TWO THINGS A `TreeTransport` SHOWS.
    *
-   * A `dialing` probe is one whose socket has not opened, and `MuxLink`'s
-   * `armConnectTimeout` is the same statement about the same path: hold the
-   * attempt open for `MUX_CONNECT_TIMEOUT_MS`, widened by `MUX_DIAL_PATIENCE`
-   * each time the last one ran out, reset by any socket that opens. An `open`
-   * probe that has not handshaked is `MuxLink`'s deaf socket, and gets the same
-   * `MUX_IDLE_TIMEOUT_MS`. A `synced` probe is answering the question it was
-   * built to answer and is bounded by nothing at all — it is the evidence.
+   * A `dialing` probe is one whose socket has not opened: it gets
+   * `MUX_CONNECT_TIMEOUT_MS` on `MUX_DIAL_PATIENCE`'s rungs and then on
+   * `probeDialPatience`'s doubling, reset by any socket that opens. That is the
+   * link's ladder without the link's ceiling, and the header on
+   * `probeDialPatience` is why the difference is the whole of one blocker. An
+   * `open` probe that has not handshaked is `MuxLink`'s deaf socket exactly, and
+   * gets the same `MUX_IDLE_TIMEOUT_MS` with no widening at all. A `synced` probe
+   * is answering the question it was built to answer and is bounded by nothing —
+   * it is the evidence.
    *
    * ⚠ ONE POLL RATHER THAN TWO ARMED TIMERS, and that is `armIdleWatch`'s shape
    * for `armIdleWatch`'s reason: the phase can change under a timer without
@@ -735,8 +858,60 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
   private boundFor(phase: 'dialing' | 'open' | 'synced'): number {
     if (phase === 'synced') return 0;
     if (phase === 'open') return this.probeIdleMs;
-    const rung = Math.min(this.probeDialRung, MUX_DIAL_PATIENCE.length - 1);
-    return this.probeDialMs * (MUX_DIAL_PATIENCE[rung] ?? 1);
+    return this.probeDialMs * this.probeDialPatience();
+  }
+
+  /**
+   * THE LADDER, CONTINUED RATHER THAN CLAMPED — and this is the correction that
+   * the instruction which produced the clamp needed as much as the code did.
+   *
+   * ⚠ THE LINK AND THE PROBE DO NOT HAVE THE SAME JOB. The link bounds its dial
+   * so that it can stop waiting and RETRY; a dial it gives up on costs it a rung
+   * of backoff and nothing else, because the route it wants is still there to be
+   * dialled again. The probe exists to WITNESS whether the other route answers,
+   * and the sentence, the verdict, the notice and the tree itself all rest on a
+   * probe that SYNCS. So borrowing `MUX_DIAL_PATIENCE`'s clamp — 4 s, 8 s, 12 s
+   * and then 12 s for ever — turned SLOW into DEAD: a per-room handshake costing
+   * more than the top rung could never produce a synced probe at all.
+   *
+   * Measured on the branch that clamped it, real `server/index.js` behind a real
+   * TCP proxy that 404s `/_mux` and forwards every OTHER route in full 13 s late
+   * — a tether, a cold-start backend, a captive portal in front of a proxy that
+   * does not know the route: seven probe dials on the 4 / 8 / 12 / 12 … ladder,
+   * NOT ONE of which ever completed its upstream connection, and across 70 s no
+   * sentence, no verdict, no notice and a tree that never synced. That is
+   * verbatim the sentence that made the wedge a blocker, one step over. It is
+   * also a regression against pre-slice-2 master, where a plain per-room
+   * transport on the same path simply cost 13,022 ms — measured, same proxy.
+   *
+   * So the two bounds part company, along the line this file already draws:
+   *
+   *  * a socket that OPENED and delivers nothing is POSITIVE evidence of
+   *    uselessness, and keeps `MUX_IDLE_TIMEOUT_MS` exactly as it was. That is
+   *    the wedge the previous round closed, and it stays closed;
+   *  * a dial that has NEVER opened is the absence of evidence, which this file
+   *    concludes nothing from — so its bound has no ceiling. A bound is still
+   *    needed, because `y-websocket` cannot un-park a socket whose TCP handshake
+   *    completed and whose upgrade was never answered; it simply never stops
+   *    widening, so a wedged probe is replaced promptly at first and less eagerly
+   *    as the evidence for "this path is merely slow" accumulates.
+   *
+   * The ladder walks `MUX_DIAL_PATIENCE` and then DOUBLES: 4 s, 8 s, 12 s, 24 s,
+   * 48 s, 96 s and on. Doubling rather than adding one more rung each time,
+   * because the total wait before a path costing D is witnessed is then O(D)
+   * rather than O(D² / `MUX_CONNECT_TIMEOUT_MS`) — at a 60 s handshake that is
+   * the difference between a couple of minutes and most of an hour. No new
+   * constant: the shipped rungs are still exactly `MUX_DIAL_PATIENCE`.
+   *
+   * The multiplier is finite at every rung anything can reach: the rung only
+   * advances when a bound has ELAPSED, so arriving at one whose bound is not a
+   * finite number of milliseconds would take longer than every bound before it
+   * put together.
+   */
+  private probeDialPatience(): number {
+    const top = MUX_DIAL_PATIENCE.length - 1;
+    if (this.probeDialRung <= top) return MUX_DIAL_PATIENCE[this.probeDialRung] ?? 1;
+    return (MUX_DIAL_PATIENCE[top] ?? 1) * 2 ** (this.probeDialRung - top);
   }
 
   /**
@@ -753,11 +928,21 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
    * answers.
    *
    * The cost, declared, because the header above declares the other half: a route
-   * that is dark in this particular way builds a provider on the tree doc every
-   * 4 s, then 8 s, then 12 s for ever — `MUX_DIAL_PATIENCE`'s top rung, and the
-   * same ladder the link walks on the same path. Each one is destroyed as the next
-   * is built, so it is churn rather than a leak, and a session-long wedge is what
-   * it buys out of.
+   * that is dark in this particular way builds a provider on the tree doc at 4 s,
+   * 8 s, 12 s, 24 s, 48 s, 96 s and on — `MUX_DIAL_PATIENCE` and then
+   * `probeDialPatience`'s doubling. About eight in the first ten minutes, and a
+   * handful an hour after that.
+   *
+   * ⚠ "CHURN RATHER THAN A LEAK" IS WHAT THIS PARAGRAPH USED TO SAY, AND IT WAS
+   * FALSE. The provider was destroyed; the `Awareness` it had built was not, so
+   * every replacement left a 3-second interval and a `Y.Doc` 'destroy' observer
+   * behind — measured, 40 of each after 40 build/destroy cycles, nothing
+   * reclaimed. The claim is corrected rather than quietly dropped, because a
+   * sentence a later round would cite as settled should be visibly retracted
+   * where it was made. What makes it true now is two things and neither is here:
+   * `LegacyTreeTransport.destroy` releases an `Awareness` it built, and
+   * `legacyConfig` hands every probe ONE for the whole session so that the
+   * observer y-protocols never unregisters is added once rather than per probe.
    */
   private replaceProbe(): void {
     this.discardProbe();
@@ -827,7 +1012,7 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
     this.releaseProbe?.();
     this.releaseProbe = null;
     this.active.destroy();
-    this.active = adopted ?? this.makeLegacy(this.config, this.doc);
+    this.active = adopted ?? this.makeLegacy(this.legacyConfig(), this.doc);
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
     if (this.wantsConnect) this.active.connect();
     this.wakeSwapWaiters();
