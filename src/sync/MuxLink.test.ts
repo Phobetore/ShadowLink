@@ -27,7 +27,7 @@ import {
   type MuxLinkConfig, type MuxRouteEvidence, type MuxSocket, type MuxUnsupportedReason,
 } from './MuxLink.ts';
 import {
-  MUX_RECONNECT_BACKOFF_MS, MUX_RECONNECT_JITTER, TREE_SYNC_TIMEOUT_MS,
+  MUX_DIAL_PATIENCE, MUX_RECONNECT_BACKOFF_MS, MUX_RECONNECT_JITTER, TREE_SYNC_TIMEOUT_MS,
 } from '../tree/constants.ts';
 
 // ---------------------------------------------------------------- fixtures
@@ -777,17 +777,159 @@ test('the dial deadline is a PATIENCE ladder, and it resets on any socket that o
   drain();                                             // the retry rung fires
   drain();                                             // and the second deadline elapses
   assert.equal(link.dialTimeoutMs, 12_000);
-  drain();                                             // rung, third dial
-  drain();                                             // third deadline elapses
-  assert.equal(link.dialTimeoutMs, 12_000, 'the ladder has no top rung');
+
+  // ⚠ AND IT DOES NOT STOP THERE, WHICH IS THE CORRECTION. This line used to read
+  // `assert.equal(link.dialTimeoutMs, 12_000, 'the ladder has no top rung')` — it
+  // PINNED the ceiling, so the defect had a passing test in front of it. A path
+  // whose upgrade costs more than the top rung could never complete a dial and the
+  // retry carried the same expired deadline, so the ladder re-ran the failure for
+  // ever. Measured at these shipped constants against a healthy CURRENT server
+  // behind a proxy that merely delayed each connection by 13 s: dead across 90 s,
+  // six abandoned dials, `framesIn` 0, no probe, no verdict, no notice — where
+  // pre-slice-2 master on the same path cost 13,280 ms. Past the shipped rungs the
+  // ladder DOUBLES, which is `probeDialPatience`'s shape for `probeDialPatience`'s
+  // reason: a dial that never opened is the absence of evidence.
+  const climbed: number[] = [];
+  for (let i = 0; i < 4; i += 1) {
+    drain();                                           // rung, next dial
+    drain();                                           // that deadline elapses
+    climbed.push(link.dialTimeoutMs);
+  }
+  assert.deepEqual(climbed, [24_000, 48_000, 96_000, 192_000],
+    'the ladder clamped instead of doubling past its shipped rungs, so a path '
+    + `slower than the top rung can never open a socket at all: ${climbed.join(', ')}`);
 
   // One socket that opens, and the patience is spent — a session that connected
-  // never carries a widened deadline into a later outage.
-  drain();                                             // rung, fourth dial
+  // never carries a widened deadline into a later outage, however far it climbed.
+  drain();                                             // rung, next dial
   const socket = made[made.length - 1];
-  assert.equal(made.length, 4, 'the ladder stopped dialling');
+  assert.equal(made.length, 7, 'the ladder stopped dialling');
   socket?.fire('open');
   assert.equal(link.dialTimeoutMs, 4_000, 'an open socket did not reset the ladder');
+});
+
+test('the ladder walks the SHIPPED rungs before it doubles, and doubles from the top one', () => {
+  // ⚠ THE CONSTANT IS STILL THE CONSTANT. `dialPatience` is three lines and two of
+  // them can go wrong quietly: skipping `MUX_DIAL_PATIENCE` and doubling from the
+  // first rung (4, 8, 16, 32 — plausible, and wrong at every rung the shipped list
+  // names), or doubling from the wrong end. The case above walks the ladder through
+  // the machine; this one reads it off the constant, so a change to
+  // `MUX_DIAL_PATIENCE` moves both together and neither can drift into a number
+  // somebody typed.
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 4_000,
+    random: () => 0.5,
+    openSocket: () => hangingSocket(),
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  const drain = (): void => {
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  };
+
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  const seen: number[] = [link.dialTimeoutMs];
+  for (let i = 0; i < 5; i += 1) { drain(); drain(); seen.push(link.dialTimeoutMs); }
+
+  const top = MUX_DIAL_PATIENCE[MUX_DIAL_PATIENCE.length - 1] ?? 1;
+  const expected = [
+    ...MUX_DIAL_PATIENCE.map((rung) => 4_000 * rung),
+    ...[1, 2, 3].map((n) => 4_000 * top * 2 ** n),
+  ].slice(0, seen.length);
+  assert.deepEqual(seen, expected,
+    `the ladder is not MUX_DIAL_PATIENCE and then a doubling of its top rung: ${seen.join(', ')}`);
+  // Every rung is a finite number of milliseconds a timer can actually be armed
+  // with — the argument that the doubling is safe rests on nothing else.
+  for (const ms of seen) assert.ok(Number.isFinite(ms) && ms > 0, `unusable rung ${ms}`);
+  link.destroy();
+});
+
+test('a path whose upgrade costs MORE than the top shipped rung still opens, and syncs', () => {
+  // ⚠ THE BLOCKER, AS A CASE. The three rungs above are the mechanism; this is the
+  // thing a person on a tether, a cold-start backend or a captive portal actually
+  // needs, and until now it could not happen at all. With a ceiling at the top
+  // rung, every dial on a path costing 13 s ran out at 12 s and the retry carried
+  // the same deadline — so the ladder re-ran the same failure for ever against a
+  // server that was up. Measured at fully shipped constants, real `server/index.js`
+  // behind a real TCP proxy forwarding every byte 13 s late: DEAD across 90 s, six
+  // abandoned dials, `framesIn` 0, no probe, no verdict, no notice — where
+  // pre-slice-2 master on the same path cost 13,280 ms. With the ladder continued:
+  // synced at 43,429 ms.
+  //
+  // Here the path is modelled rather than proxied, so the number is exact: a dial
+  // OPENS `PATH` ms after it was made, and the link's own deadline is what decides
+  // whether it lives that long. Nothing about the path changes during the run — it
+  // is merely slow from the first dial to the last.
+  const PATH = 13_000;
+  const clock = { t: 0 };
+  const timers = new Map<number, { fn: () => void; at: number }>();
+  let nextTimer = 0;
+  const dials: Array<{ at: number; socket: { readyState: number; onopen: ((e: unknown) => void) | null } }> = [];
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 4_000,
+    backoffMs: [1_000],
+    jitter: 0,
+    random: () => 0.5,
+    now: () => clock.t,
+    openSocket: () => {
+      const socket = { ...silentSocket(), readyState: 0 };
+      dials.push({ at: clock.t, socket });
+      return socket;
+    },
+    setTimer: (fn, ms) => { nextTimer += 1; timers.set(nextTimer, { fn, at: clock.t + ms }); return nextTimer; },
+    clearTimer: (handle) => { timers.delete(handle as number); },
+  });
+
+  /** Jump to the next thing that happens — an armed timer, or a socket arriving. */
+  const step = (): boolean => {
+    const live = dials.filter((d) => d.socket.readyState === 0);
+    const arrivals = live.map((d) => d.at + PATH);
+    const deadlines = [...timers.entries()].map(([id, t]) => ({ id, at: t.at }));
+    const next = Math.min(...arrivals, ...deadlines.map((d) => d.at));
+    if (!Number.isFinite(next)) return false;
+    clock.t = next;
+    // The path delivers first when both are due at the same instant: a socket that
+    // arrives exactly on the deadline is one this client did NOT have to abandon.
+    const arrived = live.find((d) => d.at + PATH === next);
+    if (arrived !== undefined) {
+      arrived.socket.readyState = 1;
+      arrived.socket.onopen?.({});
+      return true;
+    }
+    const due = deadlines.filter((d) => d.at === next);
+    for (const d of due) { const t = timers.get(d.id); timers.delete(d.id); t?.fn(); }
+    return true;
+  };
+
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  for (let i = 0; i < 200 && !link.connected; i += 1) {
+    if (!step()) break;
+  }
+
+  assert.equal(link.connected, true,
+    'a healthy path that merely costs 13 s never produced an open socket at all — '
+    + `${link.stats.dialsAbandoned} dials abandoned, ${dials.length} made, clock at ${clock.t} ms`);
+  assert.equal(link.stats.dialsRefused, 0, 'the path was blamed for a deadline this client set');
+  assert.equal(link.routeRefused, false,
+    'a run of this client\'s own deadlines became something a verdict could rest on');
+  // 4 s + 1 s + 8 s + 1 s + 12 s + 1 s = 27 s of walking the shipped rungs, then a
+  // 24 s rung that contains the 13 s the path costs. The ladder is what pays for
+  // the wait, and it pays once: an open socket puts it back to the first rung.
+  assert.equal(clock.t, 40_000, 'the link opened at an unexpected instant');
+  assert.equal(link.stats.dialsAbandoned, 3, 'the ladder took a different number of rungs');
+  assert.equal(link.dialTimeoutMs, 4_000, 'the open socket did not reset the ladder');
+  link.destroy();
 });
 
 test('a dial the CLIENT abandoned is never reported as a refusal', () => {
