@@ -765,6 +765,22 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
     this.startProbe();
   }
 
+  /**
+   * ⚠ THE `cancelProbeWatch()` BELOW SURVIVED THE MUTATION SWEEP, and it stays.
+   *
+   * Measured, one mutant at a time, tree asserted clean either side: removing it
+   * leaves all 1,039 unit cases and `80u` green, because every path out of here
+   * covers it somewhere else. On the rebuild path `startProbe` calls
+   * `armProbeWatch`, which cancels the stale handle itself; on the `onServed` and
+   * `destroy` paths `probeTick` returns early — `probe === null`, `destroyed` —
+   * and does not re-arm, so the stale watch fires once, unref'd, and stops.
+   *
+   * That is a property of three other methods rather than a guarantee, and what
+   * it would leave behind — a live timer holding a reference to a transport this
+   * object has let go of — is the exact shape the previous round's stranded
+   * provider started as. Ten of twelve mutants died; this is one of the two that
+   * did not, and it is recorded rather than deleted.
+   */
   private discardProbe(): void {
     this.cancelProbeWatch();
     const probe = this.probe;
@@ -797,11 +813,14 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
     //
     // ⚠ AND THE WATCH GOES FIRST. An adopted probe stops being a probe: it is the
     // transport now, its lifetime is the session's, and replacing it under the
-    // plugin would destroy the tree's own connection. `replaceProbe` also refuses
-    // once `legacy` is set, so this is the second of two guards — but the timer
-    // would otherwise outlive the question by the length of one poll, and a timer
-    // holding a reference to a transport that has been handed away is how the
-    // previous round's stranded provider started.
+    // plugin would destroy the tree's own connection.
+    //
+    // ⚠ THE SECOND SURVIVOR OF THE SWEEP, kept for the same reason as the one in
+    // `discardProbe`. `probeTick` returns early once `legacy` is set, so removing
+    // this line leaves every suite green — measured. It stays because a timer
+    // still polling a transport that has been handed to the plugin is a thing
+    // that must not exist, and because "some other method returns early" is a
+    // property of that method rather than a guarantee of this one.
     this.cancelProbeWatch();
     const adopted = this.probe;
     this.probe = null;
