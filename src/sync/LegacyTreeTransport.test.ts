@@ -96,6 +96,21 @@ class StubLegacy implements TreeTransport {
   giveUp(): void {
     for (const settle of [...this.waiters]) settle(false);
   }
+
+  /**
+   * Synced, without the `status: connected` transition.
+   *
+   * ⚠ NOT A CONVENIENCE. `arrive()` fires the bridge's own `onConnected`, which
+   * calls `link.connect({ immediate: true })` and can produce a fresh refused dial
+   * in the same synchronous turn — so a test using it cannot tell a verdict
+   * reached from THAT refusal apart from one reached by the probe's answer alone.
+   * This is the probe answering and nothing else happening.
+   */
+  syncOnly(): void {
+    this.synced = true;
+    this.connected = true;
+    for (const settle of [...this.waiters]) settle(true);
+  }
 }
 
 interface Harness {
@@ -560,7 +575,7 @@ function deafHarness(): {
   };
 }
 
-test('what a route producing nothing gets instead is the truth, and one probe', () => {
+test('what a route producing nothing gets instead is the truth, and one probe', async () => {
   // ⚠ THE HOLE DELETING THE LAST ABSENCE-VERDICT LEFT, filled without inferring
   // anything. Measured on the parent branch through a proxy that upgrades `/_mux`
   // for real and drops every server frame: 70 s, 3 sockets, 2 idle closures, 18
@@ -586,6 +601,17 @@ test('what a route producing nothing gets instead is the truth, and one probe', 
   // been answered, and a second permanent socket is the topology this slice
   // removes.
   assert.equal(h.made[0]?.destroyed, true, 'the probe was left running for ever');
+
+  // ⚠ AND ITS OWN ANSWER, ARRIVING AFTER IT WAS LET GO, BUILDS NOTHING. The
+  // report that recorded the fact and the probe's `whenSynced` settle in the same
+  // synchronous turn, so the `then` runs one microtask later against a bridge
+  // that has already moved on. Without the identity check it re-enters the
+  // decision with no probe and starts a fresh provider for a question that was
+  // answered a microtask ago.
+  await settle();
+  await settle();
+  assert.equal(h.made.length, 1,
+    `a probe that had been let go built ${h.made.length} providers on the tree doc`);
   h.dispose();
 });
 
@@ -763,6 +789,41 @@ test('a server that is merely DOWN is not demoted — the per-room route fails t
   assert.deepEqual(h.notices, [], 'an ordinary outage told the user their server is wrong');
   h.dispose();
 });
+
+test('the refused branch keeps its probe, so the next refusal has something to decide with',
+  async () => {
+    // ⚠ THE OTHER HALF OF THE CONCURRENCY RULE, and without it the rule costs the
+    // verdict rather than sharpening it. The probe's answer alone may not condemn
+    // the route, because every refusal behind it was counted before anyone knew
+    // the server was up. But letting the probe GO at that point means the next
+    // refusal arrives with nothing synced to weigh it against, so the bridge
+    // builds another provider, which answers, which is let go again — a provider
+    // per refused dial and a verdict that only ever lands by luck.
+    //
+    // So it waits. It does not wait long: a path refusing this route refuses the
+    // next dial too, and a path that stops refusing breaks the run.
+    const h = unreachableHarness();
+    h.mux.refuseConnect = true;
+    h.transport.connect();
+    h.fire();                                    // two refusals: a report, and a probe
+    assert.equal(h.made.length, 1, 'the per-room route was never tried');
+
+    h.made[0]?.syncOnly();                       // the probe answers, and only that
+    await settle();
+    await settle();
+    assert.equal(h.link.unsupportedReason, null,
+      'refusals counted before the server was known to be up were cashed in');
+    assert.equal(h.made[0]?.destroyed, false,
+      'the probe was let go while the path was still refusing the route');
+    assert.equal(h.made.length, 1, 'a provider was built for a refusal already reported');
+
+    h.fire();                                    // one more refusal, probe still synced
+    assert.equal(h.link.unsupportedReason, 'unreachable',
+      'a refusal reported while the probe was answering did not decide anything');
+    assert.deepEqual(h.notices, ['unreachable']);
+    assert.equal(h.made.length, 1, 'the verdict needed a second provider on the tree doc');
+    h.dispose();
+  });
 
 test('refusals gathered while the server was down are not cashed in by its recovery', async () => {
   // ⚠ MEASURED AS A NEW PERMANENT FALSE DEMOTION. A real `server/index.js`,
