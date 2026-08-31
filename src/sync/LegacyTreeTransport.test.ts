@@ -129,6 +129,19 @@ class StubLegacy implements TreeTransport {
   }
 
   /**
+   * The socket OPEN and the handshake never completing — a deaf per-room route,
+   * which is the probe's version of the failure `MUX_IDLE_TIMEOUT_MS` exists for.
+   *
+   * ⚠ IT FIRES `onConnected`, because that transition is real: this is a socket
+   * that opened. What never arrives is the sync, which is the only thing that
+   * makes the probe able to answer anything.
+   */
+  openOnly(): void {
+    this.connected = true;
+    for (const handler of [...this.handlers]) handler();
+  }
+
+  /**
    * Synced, without the `status: connected` transition.
    *
    * ⚠ NOT A CONVENIENCE. `arrive()` fires the bridge's own `onConnected`, which
@@ -1051,4 +1064,296 @@ test('the two verdicts get two sentences, and neither says the other one\'s thin
   assert.ok(LEGACY_SERVER_NOTICE.includes('restart Obsidian')
     || LEGACY_SERVER_NOTICE.includes('restart Obsidian.'),
     'the notice promises a repair the running session cannot make');
+});
+
+// ------------------------------------------------- the probe's own two bounds
+
+/**
+ * A harness whose PROBE clock is ours as well as the link's.
+ *
+ * ⚠ THE BRIDGE'S TIMERS ARE INJECTED ONLY HERE, and that is deliberate rather
+ * than lazy: every case above is about what the bridge DECIDES, and giving each
+ * of them a probe clock would make each of them also a case about how long a
+ * probe had been dialling. The shipped defaults are the link's own constants, so
+ * the cases that leave the seam empty get a real `setTimeout` no synchronous test
+ * ever reaches â€” exactly what they had before this round.
+ */
+function boundedHarness({
+  connectTimeoutMs = 4_000,
+  idleTimeoutMs = 30_000,
+}: { connectTimeoutMs?: number; idleTimeoutMs?: number } = {}): {
+  transport: TreeTransport & RouteWitness;
+  link: MuxLink;
+  made: StubLegacy[];
+  notices: MuxUnsupportedReason[];
+  refuse(value: boolean): void;
+  /** Wake the LINK's own machinery: one liveness cycle's worth of its timers. */
+  runLink(cycles: number): void;
+  /** Advance the shared clock by `ms`, firing the bridge's watch as it polls. */
+  advance(ms: number): void;
+  dispose(): void;
+} {
+  const clock = { t: 0 };
+  const linkTimers: Array<{ fn: () => void } | undefined> = [];
+  // A map rather than an array, because the watch re-arms on every poll and an
+  // index reused after a splice would let a stale `clearTimer` cancel a timer
+  // that has nothing to do with it.
+  const watchTimers = new Map<number, () => void>();
+  let nextWatchId = 0;
+  let refusing = false;
+  const link = new MuxLink({
+    ...CONFIG,
+    openSocket: (): MuxSocket => {
+      if (refusing) throw new Error('the path ended this dial');
+      const socket: MuxSocket = {
+        readyState: 1,                             // OPEN at once, and deaf for ever
+        bufferedAmount: 0,
+        send: () => undefined,
+        close: (): void => {
+          (socket as { readyState: number }).readyState = 3;
+          socket.onclose?.({});
+        },
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+        onerror: null,
+      };
+      return socket;
+    },
+    connectTimeoutMs: 0,
+    idleTimeoutMs: 30_000,
+    unreachableDials: 2,
+    random: () => 0.5,
+    now: () => clock.t,
+    setTimer: (fn) => { linkTimers.push({ fn }); return linkTimers.length - 1; },
+    clearTimer: (handle) => { linkTimers[handle as number] = undefined; },
+  });
+  const made: StubLegacy[] = [];
+  const doc = new Y.Doc();
+  const notices: MuxUnsupportedReason[] = [];
+  const transport = openTreeTransport(
+    link, doc, CONFIG, (reason) => notices.push(reason),
+    () => { const stub = new StubLegacy(); made.push(stub); return stub; },
+    {
+      connectTimeoutMs,
+      idleTimeoutMs,
+      now: () => clock.t,
+      setTimer: (fn) => { nextWatchId += 1; watchTimers.set(nextWatchId, fn); return nextWatchId; },
+      clearTimer: (handle) => { watchTimers.delete(handle as number); },
+    },
+  );
+  const firePolls = (): void => {
+    const due = [...watchTimers.values()];
+    watchTimers.clear();
+    for (const fn of due) fn();
+  };
+  return {
+    transport, link, made, notices,
+    refuse: (value: boolean): void => { refusing = value; },
+    runLink: (cycles: number): void => {
+      for (let i = 0; i < cycles; i += 1) {
+        clock.t += 3_000;
+        for (const timer of linkTimers.splice(0).filter((t) => t !== undefined)) timer.fn();
+        firePolls();
+      }
+    },
+    advance: (ms: number): void => {
+      // 250 ms is the watch's own poll floor, so this never steps over one.
+      for (let elapsed = 0; elapsed < ms; elapsed += 250) {
+        clock.t += 250;
+        firePolls();
+      }
+    },
+    dispose: (): void => { transport.destroy(); link.destroy(); doc.destroy(); },
+  };
+}
+
+/** The link reports, the bridge builds a probe, and that probe never opens. */
+function wedged(h: ReturnType<typeof boundedHarness>): void {
+  h.transport.connect();
+  h.runLink(11);
+  assert.equal(h.made.length, 1, 'the deaf route was never even looked into');
+  assert.equal(h.made[0]?.connected, false, 'the probe opened, so this is not the wedge');
+  assert.equal(h.made[0]?.synced, false, 'the probe answered, so this is not the wedge');
+}
+
+test('a probe whose dial never completes is REPLACED, not waited on for the session', () => {
+  // ⚠ THE DEFECT, AND IT IS THE LINK'S OWN LESSON ARRIVING ON THE OTHER SOCKET. A
+  // socket whose TCP handshake completes and whose upgrade is never answered sits
+  // in CONNECTING with `ws` non-null for ever: `y-websocket`'s watchdog is guarded
+  // by `wsconnected` and its reconnect runs out of `onclose`, so neither can fire.
+  //
+  // Measured against real processes at shipped constants, through a proxy that
+  // upgrades `/_mux` and swallows every frame while completing the TCP handshake
+  // on every other path and delivering nothing: the probe was built at 1,725 ms,
+  // the per-room route was HEALED in the same millisecond, and across 140 s the
+  // proxy saw ONE non-mux connection â€” the wedged one. No sentence, 390 refused
+  // `/_mux` dials that could not become a verdict, no notice, and a tree that
+  // never synced. The same run on this branch: sentence at 5,757 ms, verdict,
+  // notice and a synced tree at 7,492 ms.
+  const h = boundedHarness();
+  wedged(h);
+
+  h.advance(4_000);
+  assert.equal(h.made.length, 2, 'the wedged probe was held for the life of the session');
+  assert.equal(h.made[0]?.destroyed, true, 'the replaced probe kept its socket');
+  h.dispose();
+});
+
+test('the sentence survives a probe that has to be replaced', () => {
+  // ⚠ THE REPORTED HARM WAS NEVER THE PROVIDER, it is what goes down with it. The
+  // sentence is a live read of "a probe exists and is synced this instant", so a
+  // wedged probe makes it permanently false â€” and the sentence is what names the
+  // compatibility lever to a self-hoster who has no other way out.
+  const h = boundedHarness();
+  wedged(h);
+  assert.equal(saysUnserved(h.transport, h.link), false, 'a wedged probe said something');
+
+  h.advance(4_000);
+  h.made[1]?.syncOnly();                         // the replacement reaches the server
+  assert.equal(saysUnserved(h.transport, h.link), true,
+    'the sentence did not come back on a probe that could answer');
+  assert.equal(h.transport.serverAnswersElsewhere, true);
+  h.dispose();
+});
+
+test('the automatic fallback survives a probe that has to be replaced', () => {
+  // The verdict needs its two halves concurrent: a refusal reported JUST NOW, and
+  // a probe synced in the same turn. A wedged probe can never be the second half,
+  // so the demotion this bridge exists to make was unreachable for the session â€”
+  // measured as 390 refused dials against a null `unsupportedReason`.
+  const h = boundedHarness();
+  wedged(h);
+  h.advance(4_000);
+  h.made[1]?.syncOnly();
+
+  h.refuse(true);                                // the path starts 404-ing the route
+  h.runLink(14);
+
+  assert.ok(h.link.routeRefused, 'a run of refusals was not recognised as one');
+  assert.equal(h.link.unsupportedReason, 'unreachable',
+    'the verdict was still unreachable behind a probe that had been replaced');
+  assert.deepEqual(h.notices, ['unreachable']);
+  assert.equal(h.transport.synced, true, 'the tree did not end up on the route that works');
+  h.dispose();
+});
+
+test('an expired probe is a RETRY, and may never be a conclusion', () => {
+  // ⚠ THE RULE THE WHOLE BRANCH IS BUILT ON, applied to the one object that had no
+  // bound. `MUX_DETECT_TIMEOUT_MS` was deleted rather than retuned because a
+  // session-long verdict reached from an ABSENCE is false on any path slower than
+  // the guess; a probe that ran out of its own deadline witnessed nothing at all,
+  // which is the purest absence in the file. So expiry produces a new probe and
+  // NOTHING else: no report, no record, no notice, no demotion.
+  const h = boundedHarness();
+  wedged(h);
+
+  h.advance(60_000);                             // rung after rung, on a dark route
+  assert.ok(h.made.length >= 4, `the probe was retried ${h.made.length - 1} times, not at all`);
+  assert.equal(h.link.unsupportedReason, null,
+    'a probe that ran out of time condemned the route it was supposed to witness');
+  assert.deepEqual(h.notices, [], 'an absence of evidence was put in front of the user');
+  assert.equal(saysUnserved(h.transport, h.link), false,
+    'a probe that has never answered was allowed to say the server answers');
+  assert.equal(h.link.stats.dialsRefused, 0, 'the probe\'s own deadline reached the link');
+  h.dispose();
+});
+
+test('a probe that is OPEN and never speaks is replaced too', () => {
+  // The second bound, and it is `MUX_IDLE_TIMEOUT_MS` for `MUX_IDLE_TIMEOUT_MS`'s
+  // own reason: a socket can be OPEN and dead, `readyState` never moves, and a
+  // probe that opened but never handshaked answers exactly as little as one that
+  // never opened at all. The link closes such a socket and dials again; so does
+  // this, and for as long as the question is open.
+  const h = boundedHarness();
+  wedged(h);
+  h.advance(4_000);
+  h.made[1]?.openOnly();                         // the socket opens; the sync never comes
+
+  h.advance(20_000);
+  assert.equal(h.made.length, 2, 'the silence bound fired before the socket had gone quiet');
+  h.advance(12_000);
+  assert.equal(h.made.length, 3, 'a probe that opened and said nothing was kept for ever');
+  assert.equal(h.made[1]?.destroyed, true, 'the deaf probe kept its socket');
+  assert.equal(h.link.unsupportedReason, null, 'silence became a verdict again');
+  h.dispose();
+});
+
+test('a probe that is ANSWERING is bounded by nothing, because it is the evidence', () => {
+  // ⚠ THE COST THE PREVIOUS ROUND PAID AND THIS ONE MUST NOT REINTRODUCE. Deleting
+  // the `probeAnswered` latch once made every report build a fresh provider on the
+  // tree doc â€” one per `MUX_IDLE_TIMEOUT_MS` for ever on a dark route. A bound that
+  // also applied to a SYNCED probe would be that cadence back under a new name,
+  // and it would take the sentence down with it every time it fired.
+  const h = boundedHarness();
+  wedged(h);
+  h.advance(4_000);
+  h.made[1]?.syncOnly();
+  assert.equal(saysUnserved(h.transport, h.link), true);
+
+  h.advance(600_000);                            // ten minutes of a route still as dark
+  assert.equal(h.made.length, 2,
+    `a synced probe was rebuilt ${h.made.length - 1} times for one open question`);
+  assert.equal(h.made[1]?.destroyed, false, 'the evidence the sentence rests on was destroyed');
+  assert.equal(saysUnserved(h.transport, h.link), true,
+    'the sentence lapsed on a route that was still exactly as dark');
+  h.dispose();
+});
+
+test('the dial ladder is the link\'s: reset by a probe that opens, widened by one that does not',
+  () => {
+    // ⚠ PATIENCE, NEVER MEASUREMENT â€” `MUX_CONNECT_TIMEOUT_MS`'s own header. The
+    // deadline says how long this client will hold one attempt open, it is
+    // compared with nothing, and it resets on any socket that opens so that a
+    // session which once connected never carries a widened deadline into a later
+    // outage. `MUX_DIAL_PATIENCE` is [1, 2, 3]: 4 s, then 8 s, then 12 s.
+    const h = boundedHarness();
+    wedged(h);
+
+    h.advance(4_000);
+    assert.equal(h.made.length, 2, 'the first rung was not 4 s');
+    h.advance(4_000);
+    assert.equal(h.made.length, 2, 'the second rung was not widened at all');
+    h.advance(4_000);
+    assert.equal(h.made.length, 3, 'the second rung was not 8 s');
+
+    // A socket that OPENS puts the ladder back on its first rung, even though this
+    // one never syncs and is replaced by the other bound.
+    // One poll's slack: the phase change is NOTICED at the next poll, and that is
+    // where the silence clock starts. The watch reads state rather than being told.
+    h.made[2]?.openOnly();
+    h.advance(30_250);
+    assert.equal(h.made.length, 4, 'the silence bound did not replace the open probe');
+    h.advance(4_000);
+    assert.equal(h.made.length, 5, 'a probe that opened did not reset the dial ladder');
+    h.dispose();
+  });
+
+test('the watch does not outlive the probe, and never touches an adopted one', () => {
+  // ⚠ A TIMER THAT RE-ARMS ITSELF IS THE ONE THING THAT CAN OUTLIVE EVERYTHING
+  // ELSE, which is why `MuxLink.armIdleTick` unrefs and says so. Two ends here: a
+  // disposed transport must leave nothing polling, and an ADOPTED probe has
+  // stopped being a probe â€” replacing it would destroy the tree's own connection
+  // out from under the plugin.
+  const h = boundedHarness();
+  wedged(h);
+  h.advance(4_000);
+  h.made[1]?.syncOnly();
+  h.refuse(true);
+  h.runLink(14);
+  assert.equal(h.link.unsupportedReason, 'unreachable', 'the verdict never landed');
+  const adopted = h.made[1];
+  assert.equal(adopted?.destroyed, false, 'the probe was destroyed rather than adopted');
+
+  h.advance(600_000);
+  assert.equal(h.made.length, 2, 'the adopted transport was replaced as though still a probe');
+  assert.equal(adopted?.destroyed, false,
+    'the watch destroyed the transport the tree was syncing over');
+
+  h.transport.destroy();
+  const madeAtDispose = h.made.length;
+  h.advance(600_000);
+  assert.equal(h.made.length, madeAtDispose,
+    'a disposed transport went on building providers on a destroyed doc');
+  h.link.destroy();
 });
