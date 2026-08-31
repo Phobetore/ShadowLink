@@ -94,8 +94,34 @@ export interface BarState {
    * is here so the sentence can be specific rather than atmospheric.
    */
   unserved: { framesOut: number } | null;
-  /** The user has forced the compatibility connection for this vault. */
-  compatibility: boolean;
+  /** Which connection is actually carrying the tree, and which one was asked for. */
+  compatibility: BarCompatibility;
+}
+
+/**
+ * The compatibility connection, told apart from the setting that asks for it.
+ *
+ * ⚠ THE BAR USED TO REPORT THE SETTING, WHICH IS AN INTENTION. The transport is
+ * chosen once, when the runtime is built, so during the only window in which
+ * anybody throws this lever the two disagree — and the disclosure was false in
+ * both directions. Measured against a real deaf proxy: the lever thrown at
+ * 40,146 ms with no reload put one tooltip in front of the user telling them to
+ * turn the setting ON and, two lines later, that it was already in force and
+ * they could turn it off — while `MuxLink` was still the transport and still
+ * delivering nothing. Reversed, a session started in compatibility mode with the
+ * lever turned off at 20,138 ms silently dropped the only sentence that ever
+ * disclosed the cost, while `mux.stats.socketsOpened` was still 0.
+ *
+ * So all three facts travel, and each line below is true of exactly one of the
+ * four states they make.
+ */
+export interface BarCompatibility {
+  /** The per-note transport is what is carrying the tree RIGHT NOW. */
+  active: boolean;
+  /** What the setting says right now. An intention until the plugin reloads. */
+  requested: boolean;
+  /** What the setting said when the transport was built. */
+  chosen: boolean;
 }
 
 /**
@@ -144,6 +170,63 @@ export const COMPATIBILITY_LINE =
   + 'until you open them. Turn it off, then reload the plugin, to go back.';
 
 /**
+ * The lever has been thrown and has not taken effect yet.
+ *
+ * ⚠ THE MOST IMPORTANT OF THE FOUR, because it is the only one anybody reads
+ * while acting. The status bar's own sentence sends a stuck user to this setting;
+ * the transport is chosen once, when the plugin loads; so between the toggle and
+ * the reload the vault is in exactly the state the user thinks they have just
+ * left. Saying so is both true and the one thing they can act on.
+ */
+export const COMPATIBILITY_PENDING_LINE =
+  'ShadowLink is still using the multiplexed connection: "Use the compatibility '
+  + 'connection" was turned on after this session started, and the connection is chosen '
+  + 'once, when the plugin loads. Reload the plugin to apply it.';
+
+/**
+ * The lever was on when the session started and has since been turned off.
+ *
+ * ⚠ THE DANGEROUS HALF. The cost — unopened notes going stale — is still being
+ * paid, and the setting that used to disclose it now says the opposite, so the
+ * disclosure cannot come from the setting.
+ */
+export const COMPATIBILITY_STALE_LINE =
+  'ShadowLink is still using the compatibility connection: "Use the compatibility '
+  + 'connection" was turned off after this session started, and the connection is chosen '
+  + 'once, when the plugin loads. Notes you have not opened will stay out of date until '
+  + 'you open them. Reload the plugin to go back to the multiplexed one.';
+
+/**
+ * The plugin fell back on its own, and the setting was never involved.
+ *
+ * ⚠ THE SOFTWARE-THROWN LEVER GETS THE SAME DISCLOSURE AS THE USER-THROWN ONE.
+ * The session pays an identical cost either way; before this it got a
+ * fifteen-second Notice and then no persistent marker at all, because the bar
+ * read the setting rather than the transport. It names no cause, because the
+ * verdict that produced it already named one in its own Notice and this line
+ * outlives that Notice.
+ */
+export const COMPATIBILITY_FALLBACK_LINE =
+  'ShadowLink is using the compatibility connection for this session, because the '
+  + 'multiplexed one could not be used. Notes you have not opened will stay out of date '
+  + 'until you open them.';
+
+/**
+ * Which of the four sentences, if any, belongs under whatever the bar says.
+ *
+ * The order is the design: what is IN FORCE is what the user is living with, so
+ * it is decided first; the setting only picks which of the two in-force sentences
+ * — and, when nothing is in force, whether there is a pending one to report.
+ */
+export function compatibilityLine(state: BarCompatibility): string | null {
+  if (state.active) {
+    if (state.requested) return COMPATIBILITY_LINE;
+    return state.chosen ? COMPATIBILITY_STALE_LINE : COMPATIBILITY_FALLBACK_LINE;
+  }
+  return state.requested ? COMPATIBILITY_PENDING_LINE : null;
+}
+
+/**
  * What the status bar should say right now.
  *
  * Five states in order, and the order is the design: a transport that is
@@ -169,8 +252,9 @@ export const COMPATIBILITY_LINE =
  */
 export function statusLine(state: BarState): StatusLine {
   const line = barState(state);
-  if (!state.compatibility) return line;
-  return { text: line.text, tooltip: `${line.tooltip}\n${COMPATIBILITY_LINE}` };
+  const compatibility = compatibilityLine(state.compatibility);
+  if (compatibility === null) return line;
+  return { text: line.text, tooltip: `${line.tooltip}\n${compatibility}` };
 }
 
 function barState(state: BarState): StatusLine {

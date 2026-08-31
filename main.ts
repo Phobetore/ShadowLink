@@ -226,6 +226,24 @@ class SyncRuntime {
    */
   readonly mux: MuxLink;
   readonly treeLink: TreeTransport;
+
+  /**
+   * What the setting said WHEN THE TRANSPORT WAS BUILT, and whether the plugin
+   * has since fallen back on its own.
+   *
+   * ⚠ THE BAR REPORTS THESE, NEVER `settings.useCompatibilityConnection` ALONE.
+   * The transport is chosen once, in this constructor, so the setting is an
+   * intention from the moment it is touched until the plugin reloads — which is
+   * precisely the window in which somebody throws this lever. Measured: the lever
+   * thrown at 40,146 ms with no reload produced one tooltip telling the user to
+   * turn the setting on and, two lines later, that it was already in force;
+   * turned off at 20,138 ms it silently dropped the only sentence disclosing that
+   * unopened notes were going stale, while the mux had opened zero sockets.
+   * `compatibilityFellBack` is the same fact for the software-thrown lever, which
+   * costs the session exactly the same and used to be disclosed for 15 seconds.
+   */
+  private readonly compatibilityChosen: boolean;
+  private compatibilityFellBack = false;
   readonly session: WorkspaceSession;
   readonly queue: PublishQueue;
   readonly watcher: VaultWatcher;
@@ -451,7 +469,8 @@ class SyncRuntime {
     // than dialled, measured and second-guessed. `this.mux` is still constructed
     // (it opens nothing until `connect`) so that `dispose` and the slice-3
     // registry have one shape to reason about.
-    this.treeLink = this.plugin.settings.useCompatibilityConnection
+    this.compatibilityChosen = this.plugin.settings.useCompatibilityConnection;
+    this.treeLink = this.compatibilityChosen
       ? new LegacyTreeTransport(link, this.tree.doc)
       : openTreeTransport(
         this.mux,
@@ -461,7 +480,15 @@ class SyncRuntime {
         // server and a blocked route are different problems with different fixes,
         // and telling someone to update a server that is already current is worse
         // than saying nothing.
-        (reason) => { new Notice(legacyNoticeFor(reason), 15_000); },
+        //
+        // ⚠ AND RECORDED, because the Notice lasts fifteen seconds and the cost
+        // lasts the session. The bar's compatibility line is the same one the
+        // user-thrown lever gets, for the same reason: unopened notes go stale
+        // either way.
+        (reason) => {
+          this.compatibilityFellBack = true;
+          new Notice(legacyNoticeFor(reason), 15_000);
+        },
       );
     this.treeLink.connect();
 
@@ -752,9 +779,17 @@ class SyncRuntime {
    * `unserved` IS POLLED FROM THE LINK for the same reason both read-only reasons
    * are: it is a state that heals on its own the instant a frame arrives, and a
    * latched one-shot would leave "nothing is syncing" on the bar of a vault that
-   * had started syncing again. It is null in compatibility mode by construction —
-   * the mux is never dialled there — which is what stops the two lines
-   * contradicting each other.
+   * had started syncing again. It retracts itself on a refused dial and on the
+   * link being condemned as well, so it can no longer outlive the probe that
+   * earned it.
+   *
+   * ⚠ `compatibility` REPORTS THE TRANSPORT THAT WAS BUILT, NOT THE SETTING. The
+   * setting is what the user WANTS; the transport is what they HAVE, and the two
+   * disagree for the whole of the window in which anybody throws that lever,
+   * because it is read once in the constructor. So all three facts go to the bar
+   * and `format.ts` picks the sentence that is true of the pair — including the
+   * one nobody had before, which is that the toggle has been flipped and nothing
+   * will change until the plugin reloads.
    */
   status(): { text: string; tooltip: string } {
     return statusLine({
@@ -765,7 +800,11 @@ class SyncRuntime {
       pending: this.queue.pendingCount(),
       parked: this.queue.parked(),
       unserved: this.mux.routeUnserved ? { framesOut: this.mux.stats.framesOut } : null,
-      compatibility: this.plugin.settings.useCompatibilityConnection,
+      compatibility: {
+        active: this.compatibilityChosen || this.compatibilityFellBack,
+        requested: this.plugin.settings.useCompatibilityConnection,
+        chosen: this.compatibilityChosen,
+      },
       synced: () => syncedStatus(
         this.shareRoot,
         this.reconciler.deferredAttachments,

@@ -456,12 +456,17 @@ test('the compatibility setting picks the transport, ahead of any measurement (�
     '\n  constructor(private readonly plugin: ShadowLinkPlugin, deviceId: string) {',
     'main.ts no longer defines the runtime constructor',
   );
-  const choice = ctor.indexOf('this.treeLink =');
-  assert.ok(choice >= 0, 'main.ts no longer assigns the tree transport');
+  const choice = ctor.indexOf('this.compatibilityChosen =');
+  assert.ok(choice >= 0, 'main.ts no longer records which connection it is about to build');
   const decision = ctor.slice(choice, choice + 400);
   assert.ok(
     decision.includes('useCompatibilityConnection'),
     'the transport must be chosen from the persisted setting',
+  );
+  assert.ok(
+    decision.includes('this.treeLink = this.compatibilityChosen'),
+    'and it must branch on the value it recorded, so the bar and the transport can '
+    + 'never disagree about which connection was built',
   );
   assert.ok(
     decision.includes('new LegacyTreeTransport('),
@@ -486,6 +491,43 @@ test('the status bar reads the link\'s own unserved state and the setting (§4)'
     status.includes('useCompatibilityConnection'),
     'and it must say when the compatibility connection is in force — a lever whose '
     + 'effect is invisible is one the user forgets they pulled',
+  );
+});
+
+// ⚠ AND WHAT IT SAYS ABOUT THE LEVER MUST BE ABOUT THE TRANSPORT, NOT THE SETTING.
+// The transport is chosen once, in the runtime constructor, so the setting is an
+// intention from the moment it is touched until the plugin reloads — which is
+// exactly the window in which somebody throws it. Measured against a real deaf
+// proxy: thrown ON at 40,146 ms with no reload, the tooltip told the user both to
+// turn the setting on and that it was already in force while `MuxLink` was still
+// the transport; turned OFF at 20,138 ms, the only sentence disclosing that
+// unopened notes were going stale vanished while the mux had opened zero sockets.
+test('the bar is told which connection was BUILT, not only which one is set (§4)', () => {
+  const status = body(
+    '\n  status(): { text: string; tooltip: string } {',
+    'main.ts no longer defines status()',
+  );
+  const at = status.indexOf('compatibility:');
+  assert.ok(at >= 0, 'main.ts no longer tells the bar anything about the compatibility state');
+  const passed = status.slice(at, at + 260);
+  assert.ok(
+    passed.includes('this.compatibilityChosen'),
+    'the bar must be told what the runtime actually constructed; the setting alone is an '
+    + 'intention for the whole of the window in which the lever is thrown',
+  );
+  assert.ok(
+    passed.includes('this.compatibilityFellBack'),
+    'and whether the plugin fell back on its own — that session pays the identical cost '
+    + 'and used to get a fifteen-second Notice and no persistent marker at all',
+  );
+  // And the fallback has to actually record it, or the field is a decoration.
+  const ctor = block(
+    '\n  constructor(private readonly plugin: ShadowLinkPlugin, deviceId: string) {',
+    'main.ts no longer defines the runtime constructor',
+  );
+  assert.ok(
+    ctor.includes('this.compatibilityFellBack = true;'),
+    'nothing sets the fallback flag, so an automatic demotion is never disclosed',
   );
 });
 

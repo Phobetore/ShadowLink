@@ -9,8 +9,9 @@ import { fileURLToPath } from 'node:url';
 
 import type { ParkReason } from '../sync/PublishQueue.ts';
 import {
-  COMPATIBILITY_LINE, formatBytes, nothingToDownload, parkedLine, statusLine, syncedStatus,
-  unservedLine, type StatusLine,
+  COMPATIBILITY_FALLBACK_LINE, COMPATIBILITY_LINE, COMPATIBILITY_PENDING_LINE,
+  COMPATIBILITY_STALE_LINE, compatibilityLine, formatBytes, nothingToDownload, parkedLine,
+  statusLine, syncedStatus, unservedLine, type StatusLine,
 } from './format.ts';
 
 test('sizes read the way a person reads them', () => {
@@ -390,8 +391,11 @@ const bar = {
   parked: [] as ReadonlyArray<{ reason: ParkReason }>,
   synced: (): StatusLine => SYNCED,
   unserved: null as { framesOut: number } | null,
-  compatibility: false,
+  compatibility: { active: false, requested: false, chosen: false },
 };
+
+/** The lever on, in force, and nothing having changed since the plugin loaded. */
+const LEVER_ON = { active: true, requested: true, chosen: true };
 
 test('a paused share says so and says why, before anything else', () => {
   assert.deepEqual(
@@ -534,7 +538,7 @@ test('the compatibility connection is visible on every state, and says how to un
     { ...bar, ready: false },
     { ...bar, pending: 2 },
   ]) {
-    const line = statusLine({ ...state, compatibility: true });
+    const line = statusLine({ ...state, compatibility: LEVER_ON });
     assert.ok(line.tooltip.endsWith(COMPATIBILITY_LINE),
       `the compatibility line is missing from "${line.text}"`);
   }
@@ -544,7 +548,93 @@ test('the compatibility connection is visible on every state, and says how to un
 });
 
 test('compatibility off adds nothing at all', () => {
-  assert.deepEqual(statusLine({ ...bar, compatibility: false }), SYNCED);
+  assert.deepEqual(
+    statusLine({ ...bar, compatibility: { active: false, requested: false, chosen: false } }),
+    SYNCED,
+  );
+});
+
+// ------------------------------------ the lever, reported as what it actually did
+
+test('the bar reports the transport that was built, never the setting alone', () => {
+  // ⚠ MEASURED IN BOTH DIRECTIONS, against a real deaf proxy. The transport is
+  // chosen once, when the plugin loads, so from the moment the toggle is touched
+  // until the reload the setting is an INTENTION and the bar was reading it as a
+  // fact. Thrown ON at 40,146 ms with no reload, one tooltip told the user to
+  // turn the setting on and, two lines later, that it was already in force and
+  // they could turn it off — while `MuxLink` was still the transport and still
+  // delivering nothing, so a user who believed "is using" never reloaded. Turned
+  // OFF at 20,138 ms in a session that started in compatibility mode, the only
+  // sentence disclosing that unopened notes were going stale simply vanished,
+  // while `mux.stats.socketsOpened` was still 0.
+  assert.equal(
+    compatibilityLine({ active: false, requested: true, chosen: false }),
+    COMPATIBILITY_PENDING_LINE,
+    'a lever that has been thrown and has not taken effect said nothing at all',
+  );
+  assert.equal(
+    compatibilityLine({ active: true, requested: false, chosen: true }),
+    COMPATIBILITY_STALE_LINE,
+    'a cost still being paid lost the only sentence that disclosed it',
+  );
+  assert.equal(
+    compatibilityLine({ active: true, requested: true, chosen: true }), COMPATIBILITY_LINE,
+  );
+  assert.equal(
+    compatibilityLine({ active: false, requested: false, chosen: false }), null,
+  );
+});
+
+test('every compatibility sentence names what to do, and none contradicts another', () => {
+  // The two that describe a disagreement between the setting and the transport
+  // must both say the same thing about how to end it, because that is the whole
+  // of what the user can do about it.
+  for (const line of [COMPATIBILITY_PENDING_LINE, COMPATIBILITY_STALE_LINE]) {
+    assert.match(line, /Reload the plugin/, 'a line about a stale choice named no way out');
+    assert.match(line, /chosen\s*once, when the plugin loads/,
+      'it never says WHY the setting has not taken effect');
+  }
+  // …and neither of them may claim the state the other one describes.
+  assert.equal(/is using the compatibility connection/.test(COMPATIBILITY_PENDING_LINE), false,
+    'the pending line claims a fix is already in force');
+  assert.equal(/still using the multiplexed/.test(COMPATIBILITY_STALE_LINE), false,
+    'the stale line claims the mux is carrying a session that is not on it');
+  // The cost is named wherever it is being paid, and only there.
+  for (const line of [COMPATIBILITY_LINE, COMPATIBILITY_STALE_LINE, COMPATIBILITY_FALLBACK_LINE]) {
+    assert.match(line, /stay out of date until you open them/,
+      'a session paying the compatibility cost was not told what it costs');
+  }
+  assert.equal(/stay out of date/.test(COMPATIBILITY_PENDING_LINE), false,
+    'a session still on the mux was told it was paying the fallback\'s cost');
+});
+
+test('the fallback the software threw is disclosed like the one the user threw', () => {
+  // ⚠ THE SESSION PAYS THE IDENTICAL COST EITHER WAY. Before this the automatic
+  // fallback got a fifteen-second Notice and then no persistent marker at all,
+  // because the bar read the setting — which is false for a fallback nobody asked
+  // for. It names no cause: the verdict's own Notice already named one, and this
+  // line outlives it.
+  const line = statusLine({
+    ...bar, compatibility: { active: true, requested: false, chosen: false },
+  });
+  assert.equal(line.tooltip, `${SYNCED.tooltip}\n${COMPATIBILITY_FALLBACK_LINE}`);
+  for (const forbidden of [/older/, /update the server/i, /proxy/, /version/]) {
+    assert.equal(forbidden.test(COMPATIBILITY_FALLBACK_LINE), false,
+      `a persistent line diagnosed the deployment: ${String(forbidden)}`);
+  }
+});
+
+test('the pending line rides the unserved sentence, which is where it is wanted', () => {
+  // The state a user is in the instant after they follow the bar's own advice:
+  // the route is still delivering nothing, and the toggle they just flipped has
+  // not done anything yet. Both sentences are true and both are needed.
+  const line = statusLine({
+    ...bar,
+    unserved: { framesOut: 12 },
+    compatibility: { active: false, requested: true, chosen: false },
+  });
+  assert.equal(line.text, 'ShadowLink: not syncing');
+  assert.equal(line.tooltip, `${unservedLine(12)}\n${COMPATIBILITY_PENDING_LINE}`);
 });
 
 test('main.ts states the bar rather than composing it', () => {
