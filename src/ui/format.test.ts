@@ -505,6 +505,18 @@ test('the count in the sentence is the link\'s own, not a fixed phrase', () => {
   assert.match(unservedLine(184), /184 message\(s\)/);
 });
 
+test('a route that never opened at all does not report "0 messages"', () => {
+  // ⚠ TWO DEPLOYMENTS REACH THIS STATE. One upgrades the socket and swallows
+  // every frame; the other never answers the upgrade, so nothing was ever
+  // written. Measured on the second at 12,900 ms with `framesOut` still zero,
+  // where the counted sentence is true and reads as a bug.
+  const line = unservedLine(0);
+  assert.equal(/0 message\(s\)/.test(line), false);
+  assert.match(line, /not carried a single message, in either direction/);
+  assert.match(line, /can reach your server/);
+  assert.match(line, /"Use the compatibility connection"/);
+});
+
 test('no unserved state leaves every other line exactly as it was', () => {
   assert.deepEqual(statusLine({ ...bar, unserved: null }), SYNCED);
   assert.equal(statusLine({ ...bar, paused: 'stopped', unserved: null }).text,

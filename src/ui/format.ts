@@ -112,10 +112,19 @@ export interface BarState {
  * The last line is a CONDITIONAL naming a lever, not a diagnosis. A self-hoster
  * knows whether their deployment carries that route; this client does not, and
  * saying so is what makes the toggle findable at the moment it is wanted.
+ *
+ * ⚠ ZERO GETS ITS OWN CLAUSE. The two deployments that reach this state differ:
+ * one upgrades the socket and swallows every frame, the other never answers the
+ * upgrade at all — measured at 12,900 ms with `framesOut` still zero, where
+ * "0 message(s) have gone out on it and none have come back" is true and reads
+ * as a bug in the sentence.
  */
 export function unservedLine(framesOut: number): string {
+  const evidence = framesOut > 0
+    ? `${framesOut} message(s) have gone out on it and none have come back. `
+    : 'it has not carried a single message, in either direction. ';
   return 'ShadowLink can reach your server, but nothing is coming back on its multiplexed '
-    + `connection: ${framesOut} message(s) have gone out on it and none have come back. `
+    + `connection: ${evidence}`
     + 'Nothing is syncing while that is true.\n'
     + 'If your server, or something in front of it, does not carry that connection, turn on '
     + '"Use the compatibility connection" in ShadowLink\'s settings.';
