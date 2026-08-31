@@ -195,6 +195,18 @@ function harness({ legacy = false } = {}): Harness {
   };
 }
 
+/**
+ * `node:test`'s file-level `after`, reached off the `test` function itself.
+ *
+ * ⚠ NOT AN IMPORT, and the reason is the toolchain rather than taste: this repo
+ * pins `@types/node` at 16, which predates `node:test` having an `after` export,
+ * so `import { after }` type-checks as an error against a runtime that has it.
+ * The runtime object is the same function either way — Node hangs `after`,
+ * `before`, `describe` and `it` off the exported `test` — so this is the same
+ * hook, named where the types can see it.
+ */
+const afterAll = (test as unknown as { after: (fn: () => void) => void }).after;
+
 /** One microtask: what a deferred socket needs to open and greet. */
 const settle = (): Promise<void> => Promise.resolve();
 
@@ -1147,6 +1159,22 @@ function boundedHarness({
     watchTimers.clear();
     for (const fn of due) fn();
   };
+  // ⚠ DISPOSED EVEN WHEN THE TEST THAT BUILT IT THREW, and that is measured
+  // rather than tidy-minded. A failing assertion skips the `h.dispose()` at the
+  // end of its own body, which leaves a `MuxTreeTransport` and its room behind;
+  // under the mutation sweep the whole file then stopped exiting, and a suite
+  // that hangs instead of failing turns every mutant after it into a timeout.
+  // Registered once per harness, idempotent, so an explicit dispose still reads
+  // as the assertion it is.
+  let disposed = false;
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    transport.destroy();
+    link.destroy();
+    doc.destroy();
+  };
+  afterAll(dispose);
   return {
     transport, link, made, notices,
     refuse: (value: boolean): void => { refusing = value; },
@@ -1164,7 +1192,7 @@ function boundedHarness({
         firePolls();
       }
     },
-    dispose: (): void => { transport.destroy(); link.destroy(); doc.destroy(); },
+    dispose,
   };
 }
 
@@ -1355,5 +1383,5 @@ test('the watch does not outlive the probe, and never touches an adopted one', (
   h.advance(600_000);
   assert.equal(h.made.length, madeAtDispose,
     'a disposed transport went on building providers on a destroyed doc');
-  h.link.destroy();
+  h.dispose();
 });
