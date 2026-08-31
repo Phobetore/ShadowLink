@@ -133,7 +133,11 @@ export const MUX_CONNECT_TIMEOUT_MS = 4_000;
 
 /**
  * How the dial deadline grows over consecutive dials that produced no socket, as
- * multiples of `MUX_CONNECT_TIMEOUT_MS`: 4 s, then 8 s, then 12 s for ever.
+ * multiples of `MUX_CONNECT_TIMEOUT_MS`: 4 s, then 8 s, then 12 s — and then it
+ * goes on DOUBLING, 24 s, 48 s, 96 s and on, for as long as dials keep running
+ * out. These are the rungs; the continuation past them is the readers' own —
+ * `MuxLink.dialPatience` and `FallbackTreeTransport.probeDialPatience`, which are
+ * the same three lines for the same reason.
  *
  * ⚠ THIS IS PATIENCE, NOT MEASUREMENT, and the distinction is the round. Nothing
  * is timed and nothing is compared: the link simply holds the next attempt open
@@ -148,10 +152,23 @@ export const MUX_CONNECT_TIMEOUT_MS = 4_000;
  * 4.5 s, against the shipped server serving `/_mux` normally: at a fixed 4 s the
  * mux never opened at all.
  *
- * The top rung is deliberately UNDER `TREE_SYNC_TIMEOUT_MS`, so a bootstrap
- * always sees at least one completed dial inside its own window, and
- * `connect({ immediate: true })` may drop a dial that has already had the first
- * rung — so a widened deadline never becomes a person's wait.
+ * ⚠ AND THIS LIST USED TO BE READ WITH A CEILING — `[…][min(n, len - 1)]`, so
+ * 12 s for ever — which reintroduced the very defect it was written to fix, one
+ * order of magnitude up. A path costing more than the top rung can never complete
+ * a dial, and the retry carries the same expired deadline, so the ladder just
+ * re-runs the failure. Measured at these shipped constants against a healthy,
+ * current server behind a proxy that merely delayed each connection: 5 s synced
+ * at 10,174 ms and 13 s was DEAD across 90 s — six abandoned dials, no frame, no
+ * probe, no verdict, no notice, on a server that was up, where pre-slice-2 master
+ * on the same path simply cost 13,280 ms. There is no ceiling on either reader
+ * now, and there may not be one again: a dial that never opened is the ABSENCE of
+ * evidence, and nothing on this branch concludes from that. What bounds a socket
+ * that DID open and says nothing is `MUX_IDLE_TIMEOUT_MS`, which is positive
+ * evidence and is unchanged.
+ *
+ * A widened rung never becomes a person's wait: `connect({ immediate: true })`
+ * may drop a dial that has already had the first rung, so a bootstrap waits
+ * `MUX_CONNECT_TIMEOUT_MS` however far the ladder has climbed.
  */
 export const MUX_DIAL_PATIENCE = [1, 2, 3];
 

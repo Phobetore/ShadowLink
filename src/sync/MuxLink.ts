@@ -368,8 +368,9 @@ export class MuxLink {
   /**
    * Dials in a row this client ended at its own deadline. Reset by any open.
    *
-   * ⚠ IT DRIVES THE LADDER AND NOTHING ELSE. It picks the next rung of
-   * `MUX_DIAL_PATIENCE` and it is published as `stats.dialsAbandoned`, which is a
+   * ⚠ IT DRIVES THE LADDER AND NOTHING ELSE. It is the rung index `dialPatience`
+   * reads — `MUX_DIAL_PATIENCE` while it is on it, and then the doubling past its
+   * top — and it is published as `stats.dialsAbandoned`, which is a
    * current state anyone may read. It reaches no handler, no report and no
    * sentence: an expired deadline may make this client wait longer and try again,
    * and may be looked at, but it may not leave a conclusion about the route
@@ -484,9 +485,94 @@ export class MuxLink {
    */
   get dialTimeoutMs(): number {
     if (this.connectTimeoutMs <= 0) return 0;
-    const rungs = MUX_DIAL_PATIENCE;
-    const rung = rungs[Math.min(this.abandonedDials, rungs.length - 1)] ?? 1;
-    return this.connectTimeoutMs * rung;
+    return this.connectTimeoutMs * this.dialPatience();
+  }
+
+  /**
+   * THE LADDER, CONTINUED RATHER THAN CLAMPED — the same correction the probe's
+   * `probeDialPatience` took a round earlier, arriving here one level down.
+   *
+   * ⚠ THE CEILING TURNED SLOW INTO DEAD, AND IT DID IT SILENTLY. This ladder used
+   * to clamp at its top rung — 4 s, 8 s, 12 s and then 12 s for ever — on the
+   * argument that a dial the link gives up on costs it a rung of backoff and
+   * nothing else, "because the route it wants is still there to be dialled again".
+   * That argument is false above the ceiling: the retry carries the SAME expired
+   * deadline, so a path whose upgrade costs more than the top rung can never
+   * complete one, and the ladder just re-runs the failure for ever.
+   *
+   * Measured at fully shipped constants against a real, healthy, CURRENT
+   * `server/index.js` — one that serves `/_mux` perfectly — behind a real TCP
+   * proxy that forwards every byte of every route and merely delays each
+   * connection: a 5 s path synced at 10,174 ms; a 13 s path was DEAD across 90 s.
+   * Six abandoned dials, `framesIn` 0, no probe built, no verdict, no notice, and
+   * a tree that never synced. And because an abandoned dial may not condemn
+   * (fifth round, correctly) and breaks the refusal run, `routeRefused` never
+   * fires, so the bridge is never asked and there is nothing to tell the user.
+   * Dead and silent, on a server that is up.
+   *
+   * It was also a REGRESSION AGAINST MASTER on exactly the shape a tether, a
+   * cold-start backend or a captive portal produces: a pre-slice-2 per-room
+   * transport on that same 13 s path simply cost 13,280 ms.
+   *
+   * So the two bounds part company here exactly as they do in the bridge:
+   *
+   *  * a socket that OPENED and delivers nothing is POSITIVE evidence of
+   *    uselessness, and `MUX_IDLE_TIMEOUT_MS` still bounds it with no widening at
+   *    all — the liveness watchdog is untouched;
+   *  * a dial that has NEVER opened is the ABSENCE of evidence, which this file
+   *    concludes nothing from — so its bound has no ceiling. A bound is still
+   *    needed, because `open()` assigns `this.socket` before the socket opens and
+   *    a hung upgrade would otherwise park the link for ever with no timer armed;
+   *    it simply never stops widening, so a black hole is redialled promptly at
+   *    first and less eagerly as the evidence for "merely slow" accumulates.
+   *
+   * The ladder walks `MUX_DIAL_PATIENCE` and then DOUBLES: 4 s, 8 s, 12 s, 24 s,
+   * 48 s, 96 s and on — the probe's shape, for the probe's reason. Doubling rather
+   * than adding a rung, because the total wait before a path costing D is
+   * witnessed is then O(D) rather than O(D² / `MUX_CONNECT_TIMEOUT_MS`). No new
+   * constant: the shipped rungs are still exactly `MUX_DIAL_PATIENCE`.
+   *
+   * ⚠ AND AN UNBOUNDED RUNG DOES NOT MAKE A HEAL UNWITNESSABLE, which is the one
+   * property this change had to keep. Three things bound it, and none of them is
+   * a ceiling. Only an ABANDONED dial advances the rung, so a route that REFUSES
+   * — a 404, an RST, a drained load balancer — redials on
+   * `MUX_RECONNECT_BACKOFF_MS` every ≤5 s at whatever rung, for ever; any socket
+   * that opens puts the ladder back to the first rung, so a wide rung costs
+   * nothing on a path that works; and `connect({ immediate: true })` drops a dial
+   * that has had the first rung however wide the current one has grown, so
+   * anything user-visible waits `MUX_CONNECT_TIMEOUT_MS` and not a rung. What is
+   * left is the half-open unborn-socket shape alone — a TCP connection accepted
+   * and an upgrade never answered — where the wait is the current rung.
+   *
+   * Measured at shipped constants against a real server behind a path dark in
+   * exactly that way for five minutes, sitting on a 192 s rung, then healed. What
+   * the heal does to the socket already parked on that rung is what decides the
+   * answer, so all three were run rather than argued:
+   *
+   *  * the heal DROPS the parked connection — a proxy restarting, a captive portal
+   *    releasing, a load balancer draining back in: the close is a REFUSAL, which
+   *    redials on the backoff ladder and not on the rung. Tree synced **4,280 ms**
+   *    after the path came back;
+   *  * the heal COMPLETES the parked upgrade: **31 ms**, because the socket the
+   *    link is already holding is the one that opens;
+   *  * the heal forwards only NEW dials and leaves the parked one parked for ever
+   *    — the worst case, and the only one that pays the rung: **109,941 ms**, the
+   *    remainder of the 192 s rung it was sitting on.
+   *
+   * So the cost is real, it is bounded by the current rung, and it is paid only by
+   * a route that has been dark for minutes and heals in the one way that strands
+   * the socket. The clamped alternative, on the same rig, measured NEVER — at
+   * every rung, for as long as the session ran.
+   *
+   * The multiplier is finite at every rung anything can reach: a rung only
+   * advances when a bound has ELAPSED, so arriving at one whose bound is not a
+   * finite number of milliseconds would take longer than every bound before it
+   * put together.
+   */
+  private dialPatience(): number {
+    const top = MUX_DIAL_PATIENCE.length - 1;
+    if (this.abandonedDials <= top) return MUX_DIAL_PATIENCE[this.abandonedDials] ?? 1;
+    return (MUX_DIAL_PATIENCE[top] ?? 1) * 2 ** (this.abandonedDials - top);
   }
 
   get roomCount(): number {
