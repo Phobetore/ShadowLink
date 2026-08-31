@@ -333,6 +333,12 @@ function holdFirstFrameProxy({ listen, target, holdMs, onlyNth }) {
  */
 function deafMuxProxy({ listen, target }) {
   const live = [];
+  // Sockets whose TCP handshake completed and which will never be answered. Kept
+  // so `stop()` can close them, and COUNTED because "how many half-open sockets
+  // has this path produced, and how many has it since served" is the measurement
+  // case 80u is about.
+  const held = [];
+  const counts = { others: 0, othersHeld: 0, othersForwarded: 0 };
   // Mutable, because "the proxy was reloaded" is a real thing that happens to a
   // route that was deaf a moment ago, and it turns this shape into the refused
   // one WITH A HISTORY — which is the ordering no case covered.
@@ -351,11 +357,23 @@ function deafMuxProxy({ listen, target }) {
       // load balancer, a dead VPN, a captive portal. Nothing is refused, so no dial
       // reports, so nothing on the link can ever notice.
       if (state.holdingAll) return;
+      if (!isMux) counts.others += 1;
       // ⚠ EVERY OTHER ROUTE HELD, and `/_mux` still upgraded and still deaf. It
       // isolates the one retraction that has nothing to do with a refused dial:
       // the per-room probe the sentence rests on stops being able to answer, with
       // the mux route behaving exactly as it did before.
-      if (!isMux && state.holdingOthers) return;
+      //
+      // ⚠ AND IT IS ALSO THE HALF-OPEN SOCKET ITSELF. The TCP handshake completed
+      // — `net.createServer` accepted this connection — and nothing else ever
+      // will: no upstream connect, no byte, no FIN, no RST. A `WebSocket` on it
+      // stays in CONNECTING for ever, which is the state `y-websocket` has no way
+      // to leave. Case 80u heals the path afterwards, to prove something redials.
+      if (!isMux && state.holdingOthers) {
+        counts.othersHeld += 1;
+        held.push(client);
+        return;
+      }
+      if (!isMux) counts.othersForwarded += 1;
       // ⚠ A REFUSAL RUN WITH AN END TO IT. Counted rather than latched, because the
       // shape that stranded a probe is 404-then-black-hole: the run is gathered,
       // the probe is built, and then the path stops refusing without ever opening.
@@ -396,6 +414,8 @@ function deafMuxProxy({ listen, target }) {
     });
   });
   return {
+    /** What this path has done to the per-room route, for the cases that count it. */
+    counts,
     async start() {
       await new Promise((resolve) => server.listen(listen, '127.0.0.1', resolve));
       return `ws://127.0.0.1:${listen}`;
@@ -408,6 +428,13 @@ function deafMuxProxy({ listen, target }) {
     holdMux() { state.holdingMux = true; },
     /** From here on, accept every OTHER route's connection and never answer it. */
     holdOthers() { state.holdingOthers = true; },
+    /**
+     * The per-room route works again — and the sockets already half-open on it are
+     * LEFT half-open, because a firewall rule that stops matching does not go back
+     * and finish the connections it swallowed. That is the whole difficulty: the
+     * client is never told, so only its own bound can notice.
+     */
+    releaseOthers() { state.holdingOthers = false; },
     /** From here on the path is DARK: every connection accepted, none ever answered. */
     holdAll() { state.holdingAll = true; },
     /** One ordinary RST on every pair the proxy is carrying, `/_mux` included. */
@@ -419,6 +446,8 @@ function deafMuxProxy({ listen, target }) {
       live.length = 0;
     },
     async stop() {
+      for (const client of held) { try { client.destroy(); } catch { /* gone */ } }
+      held.length = 0;
       for (const { client, up } of live) {
         try { client.destroy(); } catch { /* gone */ }
         try { up.destroy(); } catch { /* gone */ }
@@ -559,6 +588,7 @@ export function registerMuxTreeCases(getServer, legacyPort) {
   const holdOtherPort = legacyPort + 15;
   const darkPort = legacyPort + 16;
   const strandPort = legacyPort + 17;
+  const wedgePort = legacyPort + 18;
 
   test('80a the shipped MuxLink carries _tree over the real server, and converges', async () => {
     const server = getServer();
@@ -1852,6 +1882,111 @@ export function registerMuxTreeCases(getServer, legacyPort) {
           'the one remedy the user has was not named where they are looking');
         assert.equal(bar.tooltip.includes('could not reach'), false,
           'the bar repeated the claim the plugin\'s own live provider disproves');
+      } finally {
+        transport.destroy(); link.destroy(); tree.doc.destroy();
+        await proxy.stop();
+      }
+    });
+
+  test('80u a probe wedged on a half-open socket is replaced, and the session recovers',
+    async () => {
+      // ⚠ THE LAST OBJECT ON THIS BRANCH WITH NO BOUND ON ITSELF. The probe was
+      // made session-long two rounds ago so that the sentence could be computed
+      // from it rather than remembered, and it was given neither of the two bounds
+      // the LINK had spent two rounds learning it needed on the same path. A
+      // per-room socket whose TCP handshake completes and whose upgrade is never
+      // answered — a firewall that swallows the SYN-ACK's successor, a proxy
+      // mid-reload, a backend listening but not yet serving — sits in CONNECTING
+      // for ever: `y-websocket`'s watchdog is guarded by `wsconnected` and its
+      // reconnect runs out of `onclose`, so neither can fire, and `setupWS`
+      // refuses to run again while `ws` is non-null.
+      //
+      // Measured on the parent through exactly this proxy at shipped constants,
+      // twice, identically: probe built at 1,725 / 1,722 ms onto a half-open
+      // socket, the per-room route HEALED in the same millisecond, and across
+      // 140 s the proxy saw ONE non-mux connection. `serverAnswersElsewhere` false
+      // throughout, 390 / 392 refused `/_mux` dials that could not become a verdict
+      // because a verdict needs a SYNCED probe, no notice, and a tree that never
+      // synced at all. The sentence and the automatic fallback both went down with
+      // the probe, which is the reported harm.
+      //
+      // On this branch the same run reached the sentence at 5,757 ms — the probe
+      // rebuilt at `MUX_CONNECT_TIMEOUT_MS`, 4,021 ms after the wedge — and the
+      // verdict, the notice and a synced tree at 7,492 ms.
+      const server = getServer();
+      const workspace = 'muxtree80u';
+      const proxy = deafMuxProxy({ listen: wedgePort, target: server.port });
+      const url = await proxy.start();
+      // The per-room route is a black hole BEFORE the probe is ever built, so the
+      // probe's very first dial is the wedged one.
+      proxy.holdOthers();
+      const tree = new TreeDoc();
+      const link = new MuxLink({
+        serverUrl: url,
+        serverKey: server.serverKey,
+        workspaceId: workspace,
+        openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+        idleTimeoutMs: 1_500,
+        backoffMs: [100],
+        jitter: 0,
+        unreachableDials: 2,
+      });
+      const notices = [];
+      const transport = openTreeTransport(
+        link, tree.doc,
+        { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
+        (reason) => notices.push(reason),
+        undefined,
+        // The probe's dial bound at a tenth of its shipped value, for the same
+        // reason every case here shortens the link's: the SHAPE is what is under
+        // test, and 80a-80t would take four minutes at shipped constants. The
+        // shipped value is what the measurement above ran at.
+        { connectTimeoutMs: 700 },
+      );
+      const paused = 'ShadowLink could not reach the workspace. Editing locally; sync is paused.';
+      try {
+        transport.connect({ immediate: true });
+
+        // The deaf `/_mux` route reports, the bridge builds its probe, and that
+        // probe's socket is accepted and then abandoned by the path.
+        assert.equal(await until(() => proxy.counts.othersHeld >= 1, 20_000), true,
+          'the probe never dialled the per-room route, so nothing is wedged');
+        assert.equal(proxy.counts.othersForwarded, 0,
+          'the per-room route answered, so this is not the half-open shape');
+
+        // And now the path is fine again. Nothing tells the client: the wedged
+        // socket is still open, still connecting, and still silent.
+        proxy.releaseOthers();
+
+        assert.equal(await until(() => saysUnserved(link, transport), 20_000), true,
+          'the wedged probe took the sentence down with it for the life of the run');
+        assert.ok(proxy.counts.othersForwarded >= 1,
+          'the sentence appeared without the probe ever having been replaced');
+        assert.equal(link.unsupportedReason, null,
+          'a probe that ran out of its own deadline condemned the route');
+        assert.deepEqual(notices, [],
+          'an absence of evidence was put in front of the user as a verdict');
+
+        const bar = barFor(link, { witness: transport, paused });
+        assert.equal(bar.text, 'ShadowLink: not syncing');
+        assert.match(bar.tooltip, /can reach your server/);
+        assert.match(bar.tooltip, /"Use the compatibility connection"/,
+          'the one remedy the user has was not named where they are looking');
+
+        // ⚠ AND THE AUTOMATIC FALLBACK IS ALIVE TOO, which is the other half of
+        // the reported harm. The verdict needs a refusal reported while a probe is
+        // SYNCED, so a wedged probe made the demotion unreachable for the session
+        // — 390 refused dials against a null verdict, measured. The replacement is
+        // a probe like any other, and the refusal run lands on it.
+        proxy.refuseMux();
+        assert.equal(await until(() => link.unsupportedReason !== null, 30_000), true,
+          'the demotion this bridge exists to make was still unreachable');
+        assert.equal(link.unsupportedReason, 'unreachable');
+        assert.deepEqual(notices, ['unreachable']);
+        assert.equal(await until(() => transport.synced, 20_000), true,
+          'the tree never reached the route that was working the whole time');
+        assert.equal(saysUnserved(link, transport), false,
+          'a session that had already fallen back was told nothing was syncing');
       } finally {
         transport.destroy(); link.destroy(); tree.doc.destroy();
         await proxy.stop();
