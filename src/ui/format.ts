@@ -87,15 +87,69 @@ export interface BarState {
   /** What §7.3 says once a pass has finished and nothing is pending. */
   synced: () => StatusLine;
   /**
-   * The server answers, and the multiplexed connection has delivered nothing.
-   * Null whenever that is not measurably the case.
+   * Everything the multiplexed route's sentence is computed from, read fresh.
    *
-   * `framesOut` is the count of messages this session has written into it, and it
-   * is here so the sentence can be specific rather than atmospheric.
+   * ⚠ FOUR CURRENT FACTS, NEVER A STORED CONCLUSION — see `MuxRouteFacts`.
    */
-  unserved: { framesOut: number } | null;
+  route: MuxRouteFacts;
   /** Which connection is actually carrying the tree, and which one was asked for. */
   compatibility: BarCompatibility;
+}
+
+/**
+ * The four things the multiplexed route's sentence is true of, all of them read
+ * at the moment the bar renders.
+ *
+ * ⚠ THIS USED TO BE A CONCLUSION THE LINK HELD, and replacing it with its inputs
+ * is the whole of this round. `MuxLink` was told "the server answers elsewhere",
+ * kept that, and `main.ts` asked it whether the sentence was still on. Five rounds
+ * were spent enumerating the moments the record had to be taken back, and the
+ * fifth still shipped a bar that read "ShadowLink can reach your server" for
+ * sixty seconds after the path to that server went dark — measured, statement at
+ * 45,170 ms, path black-holed and RST at 45,188 ms, still standing at 105,236 ms
+ * with `dialsRefused` 0 and the watchdog frozen, because every retraction needed
+ * the link to still be talking and a dark link says nothing.
+ *
+ * A statement recomputed from current facts cannot outlive its evidence: there is
+ * nothing remembered to go stale. Retraction is not a mechanism here, it is what
+ * happens when one of these four values changes.
+ */
+export interface MuxRouteFacts {
+  /**
+   * Is a probe on the per-room route answering RIGHT NOW?
+   *
+   * `LegacyTreeTransport`'s `RouteWitness`: a live provider exists and its
+   * `synced` is true this instant. y-websocket clears `synced` on close, so a
+   * killed server, a dropped association or a firewall DROP make this false by
+   * themselves.
+   */
+  serverAnswersElsewhere: boolean;
+  /** Frames the multiplexed route has delivered, this session. A count, not a claim. */
+  framesIn: number;
+  /** Frames written into it. Zero when no socket ever opened. */
+  framesOut: number;
+  /**
+   * Has the link been condemned?
+   *
+   * ⚠ THE ONE THING THAT IS STILL REMEMBERED, and only because it is a fact about
+   * a MESSAGE rather than a belief about a route: a pre-P3 server wrote
+   * `[0,0,1,0]`, or the path refused a run of dials while the probe was answering.
+   * Positive evidence keeps; an absence does not.
+   */
+  condemned: boolean;
+}
+
+/**
+ * Is the multiplexed route measurably delivering nothing while the server answers?
+ *
+ * Three live reads and no memory. `framesIn === 0` is "this route has never
+ * delivered anything" said as a count rather than as a latch; `condemned` retires
+ * the sentence once the fallback owns the tree, because "nothing is syncing while
+ * that is true" would then be false and the fallback's own line is the one that
+ * belongs on the bar.
+ */
+export function routeUnserved(facts: MuxRouteFacts): boolean {
+  return facts.serverAnswersElsewhere && facts.framesIn === 0 && !facts.condemned;
 }
 
 /**
@@ -139,11 +193,23 @@ export interface BarCompatibility {
  * knows whether their deployment carries that route; this client does not, and
  * saying so is what makes the toggle findable at the moment it is wanted.
  *
- * ⚠ ZERO GETS ITS OWN CLAUSE. The two deployments that reach this state differ:
- * one upgrades the socket and swallows every frame, the other never answers the
- * upgrade at all — measured at 12,900 ms with `framesOut` still zero, where
- * "0 message(s) have gone out on it and none have come back" is true and reads
- * as a bug in the sentence.
+ * ⚠ ZERO GETS ITS OWN CLAUSE, AND COMPUTING FROM CURRENT FACTS REVIVED IT. The
+ * two deployments that reach this state differ: one upgrades the socket and
+ * swallows every frame, the other never answers the upgrade at all, and for the
+ * second `framesOut` is zero because no socket ever opened — where "0 message(s)
+ * have gone out on it and none have come back" is true and reads as a bug in the
+ * sentence.
+ *
+ * The previous round flagged this clause as dead in the shipped wiring, on the
+ * argument that only a socket which opened and carried frames out could reach the
+ * state. That was true only of the path that RECORDED the state, and it stopped
+ * being true the moment the state became a live read: a probe that is answering
+ * beside a `/_mux` that never opens is now exactly the shape the clause is for.
+ * Measured against real processes, a proxy that 404s the first two `/_mux`
+ * upgrades and then black-holes every one after — `framesOut` 0, `socketsOpened`
+ * 8, probe synced — where the previous branch showed "could not reach the
+ * workspace" for 80 s while its own live provider was syncing with that server.
+ * The clause is killed by a probe, so it stays.
  */
 export function unservedLine(framesOut: number): string {
   const evidence = framesOut > 0
@@ -236,12 +302,19 @@ export function compatibilityLine(state: BarCompatibility): string | null {
  * compatibility line is appended to whichever of the five wins, because it is
  * true of all of them.
  *
- * ⚠ `unserved` OUTRANKS `paused`, and that is not a cosmetic ordering. In that
- * state the pause reads "ShadowLink could not reach the workspace", which is the
- * one thing measurement has ruled out: the server answered the probe. True but
- * thin beats false, and specific beats both — the user's actual complaint is
- * "nothing is syncing", and that sentence is available without inferring
- * anything.
+ * ⚠ `routeUnserved` OUTRANKS `paused`, and that is not a cosmetic ordering. In
+ * that state the pause reads "ShadowLink could not reach the workspace", which is
+ * the one thing measurement has ruled out: the server is answering the probe, as
+ * of this render. True but thin beats false, and specific beats both — the user's
+ * actual complaint is "nothing is syncing", and that sentence is available
+ * without inferring anything.
+ *
+ * ⚠ AND THE ORDERING IS ONLY SAFE BECAUSE THE CLAIM IS NOW LIVE. While the
+ * sentence was a stored record it could outrank the true one with evidence that
+ * had expired minutes earlier — measured at 60 s of "ShadowLink can reach your
+ * server" over a path that had been dark the whole time. A claim that stops being
+ * computable the instant the probe stops answering cannot suppress anything it
+ * has stopped being able to support.
  *
  * `pending` EXCLUDES parked entries, and that exclusion is the whole of §6.2.6:
  * an empty note and a `.md` file that is not text are refused over the state of
@@ -258,10 +331,10 @@ export function statusLine(state: BarState): StatusLine {
 }
 
 function barState(state: BarState): StatusLine {
-  if (state.unserved !== null) {
+  if (routeUnserved(state.route)) {
     return {
       text: 'ShadowLink: not syncing',
-      tooltip: unservedLine(state.unserved.framesOut),
+      tooltip: unservedLine(state.route.framesOut),
     };
   }
   if (state.paused !== null) return { text: 'ShadowLink: paused', tooltip: state.paused };

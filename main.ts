@@ -77,7 +77,7 @@ import { KeptFiles } from './src/sync/KeptFiles';
 // version after slice 8, this import and the `openTreeTransport` call below are
 // replaced by `new MuxTreeTransport(this.mux, this.tree.doc)` and the file goes.
 import {
-  LegacyTreeTransport, legacyNoticeFor, openTreeTransport,
+  LegacyTreeTransport, legacyNoticeFor, openTreeTransport, type RouteWitness,
 } from './src/sync/LegacyTreeTransport';
 import { MuxLink } from './src/sync/MuxLink';
 import type { TreeTransport } from './src/sync/TreeTransport';
@@ -226,6 +226,15 @@ class SyncRuntime {
    */
   readonly mux: MuxLink;
   readonly treeLink: TreeTransport;
+
+  /**
+   * The bridge, when there is one, as the thing that can answer "does the server
+   * answer on the per-room route right now".
+   *
+   * Null when the user has chosen the compatibility connection: there is no
+   * bridge and no mux route, so there is nothing to ask and nothing to say.
+   */
+  private readonly routeWitness: RouteWitness | null;
 
   /**
    * What the setting said WHEN THE TRANSPORT WAS BUILT, and whether the plugin
@@ -470,9 +479,11 @@ class SyncRuntime {
     // (it opens nothing until `connect`) so that `dispose` and the slice-3
     // registry have one shape to reason about.
     this.compatibilityChosen = this.plugin.settings.useCompatibilityConnection;
-    this.treeLink = this.compatibilityChosen
-      ? new LegacyTreeTransport(link, this.tree.doc)
-      : openTreeTransport(
+    if (this.compatibilityChosen) {
+      this.treeLink = new LegacyTreeTransport(link, this.tree.doc);
+      this.routeWitness = null;
+    } else {
+      const bridge = openTreeTransport(
         this.mux,
         this.tree.doc,
         link,
@@ -490,6 +501,11 @@ class SyncRuntime {
           new Notice(legacyNoticeFor(reason), 15_000);
         },
       );
+      this.treeLink = bridge;
+      // The same object under its other name: the bar asks it, live, whether the
+      // server is answering on the per-room route at the moment it renders.
+      this.routeWitness = bridge;
+    }
     this.treeLink.connect();
 
     this.bootstrap = new Bootstrap({
@@ -776,12 +792,25 @@ class SyncRuntime {
    * §7.4's local half has no remedy and so reaches the tooltip and stops. Passed
    * as a THUNK because three of the four branches never look at it.
    *
-   * `unserved` IS POLLED FROM THE LINK for the same reason both read-only reasons
-   * are: it is a state that heals on its own the instant a frame arrives, and a
-   * latched one-shot would leave "nothing is syncing" on the bar of a vault that
-   * had started syncing again. It retracts itself on a refused dial and on the
-   * link being condemned as well, so it can no longer outlive the probe that
-   * earned it.
+   * ⚠ `route` IS FOUR CURRENT FACTS, NOT A STATE THE LINK HOLDS, and that is this
+   * round. `this.mux.routeUnserved` used to be asked here — a conclusion the
+   * bridge had written onto the link some time earlier, which every round since
+   * has tried to give a complete set of retractions and every round has failed,
+   * because each retraction needs the link to still be talking and a path that
+   * goes dark says nothing. Measured on the previous branch: the sentence earned
+   * at 45,170 ms, the path black-holed and RST at 45,188 ms, and the bar still
+   * reading "ShadowLink can reach your server … 11 message(s) have gone out" at
+   * 105,236 ms, suppressing the one sentence that was true.
+   *
+   * So nothing is remembered. `serverAnswersElsewhere` is a live read of the
+   * bridge's probe (`RouteWitness` — a provider that exists and is synced THIS
+   * INSTANT); the counts are the link's own; `condemned` is the verdict, which is
+   * the only thing still kept and only because it is a fact about a message that
+   * arrived. `format.ts` composes them. A value recomputed on every poll cannot
+   * outlive its evidence.
+   *
+   * `routeWitness` is null in exactly one case: the user chose the compatibility
+   * connection, so there is no bridge, no mux and no route to say anything about.
    *
    * ⚠ `compatibility` REPORTS THE TRANSPORT THAT WAS BUILT, NOT THE SETTING. The
    * setting is what the user WANTS; the transport is what they HAVE, and the two
@@ -799,7 +828,12 @@ class SyncRuntime {
         || this.reconcileTimer !== null,
       pending: this.queue.pendingCount(),
       parked: this.queue.parked(),
-      unserved: this.mux.routeUnserved ? { framesOut: this.mux.stats.framesOut } : null,
+      route: {
+        serverAnswersElsewhere: this.routeWitness?.serverAnswersElsewhere === true,
+        framesIn: this.mux.stats.framesIn,
+        framesOut: this.mux.stats.framesOut,
+        condemned: this.mux.unsupportedReason !== null,
+      },
       compatibility: {
         active: this.compatibilityChosen || this.compatibilityFellBack,
         requested: this.plugin.settings.useCompatibilityConnection,

@@ -11,7 +11,8 @@ import type { ParkReason } from '../sync/PublishQueue.ts';
 import {
   COMPATIBILITY_FALLBACK_LINE, COMPATIBILITY_LINE, COMPATIBILITY_PENDING_LINE,
   COMPATIBILITY_STALE_LINE, compatibilityLine, formatBytes, nothingToDownload, parkedLine,
-  statusLine, syncedStatus, unservedLine, type StatusLine,
+  routeUnserved, statusLine, syncedStatus, unservedLine,
+  type MuxRouteFacts, type StatusLine,
 } from './format.ts';
 
 test('sizes read the way a person reads them', () => {
@@ -390,9 +391,22 @@ const bar = {
   pending: 0,
   parked: [] as ReadonlyArray<{ reason: ParkReason }>,
   synced: (): StatusLine => SYNCED,
-  unserved: null as { framesOut: number } | null,
+  route: {
+    serverAnswersElsewhere: false,
+    framesIn: 0,
+    framesOut: 0,
+    condemned: false,
+  } as MuxRouteFacts,
   compatibility: { active: false, requested: false, chosen: false },
 };
+
+/** The four facts that make the unserved sentence true, with `framesOut` free. */
+const DELIVERING_NOTHING = (framesOut: number): MuxRouteFacts => ({
+  serverAnswersElsewhere: true,
+  framesIn: 0,
+  framesOut,
+  condemned: false,
+});
 
 /** The lever on, in force, and nothing having changed since the plugin loaded. */
 const LEVER_ON = { active: true, requested: true, chosen: true };
@@ -476,7 +490,7 @@ test('a route delivering nothing says THAT, not "could not reach the workspace"'
     ...bar,
     paused: 'ShadowLink could not reach the workspace. Editing locally; sync is paused.',
     ready: false,
-    unserved: { framesOut: 18 },
+    route: DELIVERING_NOTHING(18),
   });
   assert.equal(line.text, 'ShadowLink: not syncing');
   assert.equal(line.tooltip, unservedLine(18));
@@ -522,9 +536,53 @@ test('a route that never opened at all does not report "0 messages"', () => {
 });
 
 test('no unserved state leaves every other line exactly as it was', () => {
-  assert.deepEqual(statusLine({ ...bar, unserved: null }), SYNCED);
-  assert.equal(statusLine({ ...bar, paused: 'stopped', unserved: null }).text,
-    'ShadowLink: paused');
+  assert.deepEqual(statusLine({ ...bar }), SYNCED);
+  assert.equal(statusLine({ ...bar, paused: 'stopped' }).text, 'ShadowLink: paused');
+});
+
+test('the sentence is a function of four current facts and holds no memory', () => {
+  // ⚠ THE ROUND, IN ONE TEST. Five rounds gave this sentence a stored home and
+  // then tried to enumerate every moment it had to be taken back; each round found
+  // a real retraction, shipped it, and left the same defect in a new fork, because
+  // every retraction needed the link to still be TALKING. A path that goes dark
+  // talks to nobody: measured on the previous branch, statement at 45,170 ms, path
+  // black-holed and RST at 45,188 ms, still on the bar at 105,236 ms with
+  // `dialsRefused` 0 and the watchdog frozen at one closure.
+  //
+  // There is nothing to retract here. Each fact is read where the bar is drawn,
+  // and flipping any one of them ends the sentence in the same statement that
+  // produced it.
+  const live = DELIVERING_NOTHING(11);
+  assert.equal(routeUnserved(live), true);
+
+  // The probe stops answering — a killed server, a dropped association, a DROP
+  // rule. No mechanism runs; the value is simply different on the next poll.
+  assert.equal(routeUnserved({ ...live, serverAnswersElsewhere: false }), false,
+    'the claim survived the evidence for it going away');
+  // A frame arrives: the clause that made it worth saying stops being true.
+  assert.equal(routeUnserved({ ...live, framesIn: 1 }), false,
+    'a route that delivered something still read as delivering nothing');
+  // A verdict: the fallback owns the tree, and its own line is the one that fits.
+  assert.equal(routeUnserved({ ...live, condemned: true }), false,
+    'a session that had already fallen back was told nothing was syncing');
+});
+
+test('a probe that is not answering cannot suppress the sentence that is true', () => {
+  // ⚠ THE PRECEDENCE FAILURE, AND WHY THE ORDERING IS SAFE AGAIN. `routeUnserved`
+  // outranks `paused`, so while it was a stored record it could hide "ShadowLink
+  // could not reach the workspace" using evidence that had expired a minute
+  // earlier — measured, 60 s of it over a path that was dark the whole time. A
+  // claim that stops being computable the instant the probe stops answering cannot
+  // hide anything it can no longer support.
+  const paused = 'ShadowLink could not reach the workspace. Editing locally; sync is paused.';
+  const dark = statusLine({
+    ...bar,
+    paused,
+    ready: false,
+    route: { ...DELIVERING_NOTHING(11), serverAnswersElsewhere: false },
+  });
+  assert.equal(dark.text, 'ShadowLink: paused');
+  assert.equal(dark.tooltip, paused);
 });
 
 // ------------------------------------------------------- the lever, made visible
@@ -630,7 +688,7 @@ test('the pending line rides the unserved sentence, which is where it is wanted'
   // not done anything yet. Both sentences are true and both are needed.
   const line = statusLine({
     ...bar,
-    unserved: { framesOut: 12 },
+    route: DELIVERING_NOTHING(12),
     compatibility: { active: false, requested: true, chosen: false },
   });
   assert.equal(line.text, 'ShadowLink: not syncing');

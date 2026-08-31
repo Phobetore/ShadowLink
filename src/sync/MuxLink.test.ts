@@ -24,7 +24,7 @@ import * as encoding from 'lib0/encoding';
 import { FakeMux } from './fakes.ts';
 import {
   MUX_DOC_ID, MuxLink, decodeMuxFrame, encodeMuxFrame,
-  type MuxLinkConfig, type MuxSocket, type MuxUnsupportedReason,
+  type MuxLinkConfig, type MuxRouteEvidence, type MuxSocket, type MuxUnsupportedReason,
 } from './MuxLink.ts';
 import {
   MUX_RECONNECT_BACKOFF_MS, MUX_RECONNECT_JITTER, TREE_SYNC_TIMEOUT_MS,
@@ -632,31 +632,40 @@ test('a message that is NOT a frame does not announce the route as served', () =
   assert.equal(link.unsupportedReason, 'not-a-frame');
 });
 
-test('noteRouteUnserved is a fact that a single frame retracts', () => {
-  // It is deliberately not a latch. The bridge records what it proved; the moment
-  // the route delivers anything, the sentence built on it stops being true and
-  // stops being said, with nothing to clear and nobody to clear it.
+test('the link records what arrived, and nothing it was TOLD about the route', () => {
+  // ⚠ `noteRouteUnserved` / `forgetRouteUnserved` / `routeUnserved` WERE HERE, and
+  // deleting them is this round. They were a belief about the route, stored on the
+  // link by the bridge and read back out by the status bar, and five rounds were
+  // spent trying to give it a complete set of retractions. Every one of them needed
+  // this link to still be TALKING — a frame needs a socket, a refused dial needs the
+  // path to actively reject, a condemnation needs a verdict — so a path that simply
+  // went dark left the sentence standing for as long as the session ran. Measured
+  // against real processes: earned at 45,170 ms, path black-holed and RST at
+  // 45,188 ms, still on the bar at 105,236 ms with `dialsRefused` 0.
+  //
+  // What is left is what this link can say about itself without inferring anything:
+  // counts of messages that actually moved, and a verdict something SAID. The
+  // sentence is composed from those where it is rendered (`src/ui/format.ts`).
   const { link, mux } = makeLink();
-  link.subscribe('_tree', collector());
+  link.subscribe('_tree', {
+    ...collector(),
+    onOpen: () => { link.send('_tree', bytes(0, 0)); },
+  });
   link.connect();
-  assert.equal(link.routeUnserved, false);
 
-  link.noteRouteUnserved();
-  assert.equal(link.routeUnserved, true, 'the bridge could not record what it proved');
+  for (const gone of ['noteRouteUnserved', 'forgetRouteUnserved', 'routeUnserved']) {
+    assert.equal(gone in link, false,
+      `the link took a conclusion about the route back onto itself: ${gone}`);
+  }
 
+  // The counts the sentence is computed from are counts of messages, and they move
+  // when a message moves and at no other time.
+  assert.ok(link.stats.framesOut > 0, 'the room never asked the route for anything');
+  const before = link.stats.framesIn;
   mux.sockets[0]?.push('_tree', bytes(0, 0));
+  assert.equal(link.stats.framesIn, before + 1, 'a frame that arrived was not counted as one');
   assert.equal(link.everServed, true);
-  assert.equal(link.routeUnserved, false, 'a route that answered still read as delivering nothing');
-});
-
-test('noteRouteUnserved cannot be recorded against a route that has already served', () => {
-  const { link, mux } = makeLink();
-  link.subscribe('_tree', collector());
-  link.connect();
-  mux.sockets[0]?.push('_tree', bytes(0, 0));
-
-  link.noteRouteUnserved();
-  assert.equal(link.routeUnserved, false, 'a proven route was described as delivering nothing');
+  link.destroy();
 });
 
 test('a link that asked NOTHING is not owed an answer either — no timer condemns it', () => {
@@ -823,7 +832,6 @@ test('a dial the CLIENT abandoned is never reported as a refusal', () => {
   assert.deepEqual(seen, [],
     `the client's own deadline reported on the route: ${JSON.stringify(seen)}`);
   assert.equal(link.unsupportedReason, null);
-  assert.equal(link.routeUnserved, false);
 });
 
 test('an abandoned dial breaks the refusal run, because "in a row" has to mean in a row', () => {
@@ -877,77 +885,34 @@ test('an abandoned dial breaks the refusal run, because "in a row" has to mean i
   link.destroy();
 });
 
-test('the unserved sentence is retracted the moment the path refuses a dial', () => {
-  // ⚠ MEASURED AS A FALSE SENTENCE OF THIS ROUND'S OWN MAKING. The fact was
-  // recorded once and never cleared: deaf route, statement latched at 30,360 ms,
-  // the server PROCESS killed at 45,000 ms, and from 45 s to 80 s the bar still
-  // read "ShadowLink can reach your server" while `dialsRefused` climbed to 11 and
-  // a control client on the same path could not reach the server at all. A dial
-  // the path has just refused is the newest thing known about this route, and it
-  // does not support a reachability claim made through a different one earlier.
+test('a refused dial no longer carries a retraction, because there is nothing to retract', () => {
+  // ⚠ THE FASTEST OF THE FOUR RETRACTIONS, DELETED WITH THE BELIEF IT RETRACTED.
+  // A refused dial used to clear "the server answers elsewhere" one line before it
+  // reported, and it was the only retraction that fired quickly — 1,855 ms against
+  // a real killed process. It was still not enough: it needs the path to ACTIVELY
+  // REJECT, and a firewall DROP, a drained load balancer or a dead VPN refuse
+  // nothing at all. What ends the sentence now is the probe's own `synced` going
+  // false, which happens on every one of those shapes without this file knowing
+  // they exist.
+  //
+  // What a refused dial still does is exactly what its own name says: count towards
+  // a contiguous run, and report it.
+  const seen: MuxRouteEvidence[] = [];
   const { link, mux, fire } = makeLink({ unreachableDials: 2 });
+  link.onUnreachable((evidence) => seen.push(evidence));
   link.subscribe('_tree', { onPayload: () => undefined });
   link.connect();
-  link.noteRouteUnserved();
-  assert.equal(link.routeUnserved, true, 'the bridge could not record what it proved');
 
   mux.refuseConnect = true;
   mux.dropSockets();
   fire();
-  assert.ok(link.stats.dialsRefused >= 1, 'no dial was actually refused');
-  assert.equal(link.routeUnserved, false,
-    'the bar went on claiming the server answers after the path said otherwise');
-
-  // And it can be recorded again: nothing about this is one-way either.
-  link.noteRouteUnserved();
-  assert.equal(link.routeUnserved, true, 'the fact became unrecordable for the session');
-  link.destroy();
-});
-
-test('a condemned link stops saying nothing is coming back on it', async () => {
-  // Once the verdict has fired the mux is not what carries the tree, so "nothing
-  // is syncing while that is true" is false and the fallback's own sentence is the
-  // one that belongs on the bar.
-  //
-  // ⚠ THE ORDERING HERE IS THE REACHABLE ONE, and it is `not-a-frame` rather than
-  // `unreachable` deliberately. The `unreachable` verdict is always reached
-  // THROUGH a refused dial, and a refused dial retracts the fact one line before
-  // it reports — so that composition can never leave a condemned link still
-  // claiming the route delivers nothing, and a test asserting it would be pinning
-  // an unreachable state. This one is reachable and is exactly `80l` composed
-  // with `80g`: the route goes deaf, the fact is recorded, the server is rolled
-  // back to a pre-P3 build on the same port, and its first message settles it in
-  // one round trip with no failed dial anywhere.
-  const { link, mux } = makeLink({ unreachableDials: 2 });
-  link.subscribe('_tree', collector());
-  link.connect();
-  link.noteRouteUnserved();
-  assert.equal(link.routeUnserved, true, 'the bridge could not record what it proved');
-  assert.equal(link.stats.dialsRefused, 0, 'a refused dial retracted the fact instead');
-
-  // The peer is now an old server, and says so in its first message.
-  mux.sockets[0].onmessage?.({ data: Uint8Array.from([0, 0, 1, 0]) });
-  await Promise.resolve();
-  assert.equal(link.unsupportedReason, 'not-a-frame', 'the rollback was never detected');
-  assert.equal(link.stats.dialsRefused, 0, 'a refused dial got in and did the retracting');
-  assert.equal(link.routeUnserved, false,
-    'a session on the fallback was told nothing was syncing');
-  link.destroy();
-});
-
-test('forgetRouteUnserved withdraws the fact without asserting anything else', () => {
-  // The bridge's own retraction, for the probe that will no longer answer. It
-  // says nothing about the server; it stops saying something.
-  const { link } = makeLink({ unreachableDials: 2 });
-  link.subscribe('_tree', { onPayload: () => undefined });
-  link.connect();
-  link.noteRouteUnserved();
-  link.forgetRouteUnserved();
-  assert.equal(link.routeUnserved, false, 'the fact outlived the probe that earned it');
-  assert.equal(link.unsupportedReason, null, 'a retraction became a verdict');
-  assert.equal(link.everServed, false, 'a retraction claimed the route had served');
-  link.noteRouteUnserved();
-  assert.equal(link.routeUnserved, true, 'a retracted fact could never be re-established');
+  fire();
+  assert.ok(link.stats.dialsRefused >= 2, 'no dial was actually refused');
+  assert.equal(link.routeRefused, true, 'a run of refusals was not recognised as one');
+  assert.deepEqual(seen, ['refused', 'refused'].slice(0, seen.length),
+    `a refused dial reported something other than a refusal: ${JSON.stringify(seen)}`);
+  assert.ok(seen.length >= 1, 'a run of refused dials reported nothing');
+  assert.equal(link.unsupportedReason, null, 'the link condemned its own route');
   link.destroy();
 });
 

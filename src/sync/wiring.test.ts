@@ -464,9 +464,14 @@ test('the compatibility setting picks the transport, ahead of any measurement (�
     'the transport must be chosen from the persisted setting',
   );
   assert.ok(
-    decision.includes('this.treeLink = this.compatibilityChosen'),
+    decision.includes('if (this.compatibilityChosen) {'),
     'and it must branch on the value it recorded, so the bar and the transport can '
     + 'never disagree about which connection was built',
+  );
+  assert.ok(
+    decision.includes('this.routeWitness = null'),
+    'and the compatibility branch has no bridge, so it must say so rather than leave '
+    + 'the bar reading a probe that does not exist',
   );
   assert.ok(
     decision.includes('new LegacyTreeTransport('),
@@ -475,18 +480,35 @@ test('the compatibility setting picks the transport, ahead of any measurement (�
   );
 });
 
-// The state the lever answers is POLLED, like both read-only reasons, because it
-// heals on its own the instant a frame arrives.
-test('the status bar reads the link\'s own unserved state and the setting (§4)', () => {
+// ⚠ THE STATE THE LEVER ANSWERS IS COMPUTED FROM CURRENT FACTS, NEVER READ BACK
+// FROM A RECORD. `this.mux.routeUnserved` used to be asked here — a conclusion the
+// bridge had written onto the link earlier, which five rounds tried and failed to
+// give a complete set of retractions, because every one of them needed the link to
+// still be talking and a path that goes dark says nothing. Measured on the previous
+// branch: earned at 45,170 ms, path black-holed and RST at 45,188 ms, still on the
+// bar at 105,236 ms with `dialsRefused` 0.
+test('the status bar computes the route\'s sentence from live facts (§4)', () => {
   const status = body(
     '\n  status(): { text: string; tooltip: string } {',
     'main.ts no longer defines status()',
   );
-  assert.ok(
-    status.includes('this.mux.routeUnserved'),
-    'the bar must read the link rather than latch a one-shot: this state stops being '
-    + 'true the moment the route delivers anything',
+  assert.equal(
+    status.includes('routeUnserved'), false,
+    'the bar must not read a conclusion the link holds; there is no such conclusion, '
+    + 'and every version of one has outlived its evidence',
   );
+  assert.ok(
+    status.includes('serverAnswersElsewhere: this.routeWitness?.serverAnswersElsewhere'),
+    'it must ask the bridge\'s probe whether the server is answering RIGHT NOW — a '
+    + 'live read is the only thing that cannot go stale',
+  );
+  for (const fact of ['this.mux.stats.framesIn', 'this.mux.stats.framesOut',
+    'this.mux.unsupportedReason !== null']) {
+    assert.ok(
+      status.includes(fact),
+      `and it must pass the current ${fact} rather than anything derived from it`,
+    );
+  }
   assert.ok(
     status.includes('useCompatibilityConnection'),
     'and it must say when the compatibility connection is in force — a lever whose '
