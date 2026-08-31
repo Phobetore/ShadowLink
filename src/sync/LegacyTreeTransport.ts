@@ -483,6 +483,17 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
    * What is left is one report doing one thing — build the probe if there is none
    * — and one verdict, taken only on a refusal, only while the probe is answering
    * and only while the run is still standing.
+   *
+   * ⚠ THE LAST TWO ARE BELT AND BRACES, and that is measured rather than assumed,
+   * exactly as `MuxLink.onMessage` records for its two `not-a-frame` clauses.
+   * `reportRoute` only ever delivers `'refused'` while `routeRefused` holds (the
+   * run is what emits it) and only ever delivers `'unanswered'` from a socket that
+   * OPENED, which reset `refusedDials` to zero — so each clause implies the other
+   * and neither is killable alone. Mutated out one at a time, the four unit suites
+   * stay green; mutated out TOGETHER, "the sentence is not remembered, so it does
+   * not have to be re-earned" fails, because a deaf route would then be condemned
+   * on the report that is supposed to describe it. Two guards, one reachable
+   * failure, both kept.
    */
   private decide(trigger: MuxRouteEvidence): void {
     if (this.legacy || this.destroyed) return;

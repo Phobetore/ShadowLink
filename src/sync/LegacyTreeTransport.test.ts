@@ -671,6 +671,28 @@ test('the sentence is not remembered, so it does not have to be re-earned', () =
   h.dispose();
 });
 
+test('the probe does not outlive the transport that owns it', () => {
+  // ⚠ THE COST OF MAKING THE PROBE THE EVIDENCE IS THAT IT IS NOW HELD, so the
+  // three places that end the question have to be the three places that let it go,
+  // and `destroy` is the one no shape of the network reaches. A survivor of the
+  // mutation sweep: removing `discardProbe()` from `destroy` left every suite
+  // green, and the cost is a live `WebsocketProvider` and its socket outliving a
+  // disposed runtime — on a plugin that is disabled, reloaded, or has its share
+  // reconfigured, which is the ordinary case rather than an exotic one.
+  const h = deafHarness();
+  h.transport.connect();
+  h.run(11);
+  h.made[0]?.syncOnly();
+  assert.equal(saysUnserved(h.transport, h.link), true, 'no probe was ever built to leak');
+
+  h.transport.destroy();
+  assert.equal(h.made[0]?.destroyed, true,
+    'the probe kept its socket open after the transport holding it was disposed');
+  assert.equal(h.transport.serverAnswersElsewhere, false,
+    'a destroyed transport still claimed to be watching the server answer');
+  h.link.destroy();
+});
+
 test('a probe that stops answering ends the sentence, with nothing retracting it', () => {
   // ⚠ THE DEFECT THIS ROUND EXISTS TO CLOSE, AND THE SHAPE ALL FIVE PREVIOUS ONES
   // MISSED. Every retraction ever added here needed the link to still be TALKING:

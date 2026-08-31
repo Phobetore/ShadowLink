@@ -1003,6 +1003,15 @@ export class MuxLink {
       const quiet = this.now() - this.lastInboundAt;
       if (quiet >= this.idleTimeoutMs) {
         this.stats.idleClosures += 1;
+        // ⚠ BELT AND BRACES, MEASURED. Each half is implied by the rest of the
+        // link and neither is killable on its own: any inbound at all makes this
+        // route either SERVED (a frame for a subscribed room) or CONDEMNED (a
+        // pre-P3 greeting), and `reportRoute` returns early on the first while the
+        // second stops the watchdog entirely; and `MuxRoom` handshakes on every
+        // open, so a socket that opened has always written. Mutated out one at a
+        // time the suites stay green. Both stay, because what they say — this
+        // socket was asked something and answered nothing — is the whole reason
+        // this line is allowed to report at all.
         const wroteAndHeardNothing = this.stats.framesOut > 0 && this.stats.framesIn === 0;
         this.closeCurrentSocket();
         // ⚠ REPORTED, NEVER CONCLUDED, and this is the shape the previous round
