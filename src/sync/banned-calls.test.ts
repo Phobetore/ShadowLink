@@ -308,9 +308,12 @@ const IN_MEMORY: Record<string, string[]> = {
   // room -> handler Map; the two handler Sets are observers.
   'src/sync/MuxLink.ts': [
     'this.rooms', 'this.statusHandlers', 'this.unsupportedHandlers',
-    // The observer set for "a dial produced no socket, again". A Set of
+    // The observer set for "this route has produced nothing, again". A Set of
     // callbacks, like the two beside it.
     'this.unreachableHandlers',
+    // And the one-shot observer set for "this route delivered a frame", cleared
+    // when it fires. Also callbacks; also nothing that can name a file.
+    'this.servedHandlers',
   ],
   // The room's observers, and the two listener Sets on the per-room socket view
   // `ProviderAck` is handed. Nothing here has a path.

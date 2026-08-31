@@ -592,6 +592,46 @@ test('a deaf socket on a route that HAS served says nothing at all', () => {
   assert.deepEqual(seen, [], 'a route that had served this link was reported');
 });
 
+test('onServed fires on a FRAME, never on a socket that merely opened', () => {
+  // ⚠ MEASURED AS A DEFECT. The bridge threw its probe away the moment the mux
+  // status went `connected`, on the argument that an open socket settles the
+  // question the probe was asking. It does not: against a real server behind a
+  // proxy that upgrades `/_mux` and drops every frame, the socket opened every
+  // 1.6 s, each open destroyed the probe before it could answer, and a fresh
+  // provider was built in its place for ever while the user was told nothing.
+  const { link, mux } = makeLink();
+  let served = 0;
+  link.onServed(() => { served += 1; });
+  link.subscribe('_tree', collector());
+  link.connect();
+  assert.equal(link.connected, true, 'the socket never opened');
+  assert.equal(served, 0, 'an open socket was read as a route that had delivered something');
+
+  mux.sockets[0]?.push('_tree', bytes(0, 0));
+  assert.equal(served, 1);
+
+  // Once per LINK, and a late arrival is told rather than left waiting for a
+  // transition it has already missed.
+  mux.sockets[0]?.push('_tree', bytes(0, 0));
+  assert.equal(served, 1, 'a second frame announced the route again');
+  let late = 0;
+  link.onServed(() => { late += 1; });
+  assert.equal(late, 1, 'a handler registered after the fact waits for ever');
+});
+
+test('a message that is NOT a frame does not announce the route as served', () => {
+  // The same clause that condemns a pre-P3 server: `onServed` sits on the far side
+  // of the decode, so the bytes an old server writes cannot be read as delivery.
+  const { link, mux } = makeLink();
+  let served = 0;
+  link.onServed(() => { served += 1; });
+  link.subscribe('_tree', collector());
+  link.connect();
+  mux.sockets[0]?.onmessage?.({ data: bytes(0x00, 0x00, 0x01, 0x00) });
+  assert.equal(served, 0, 'a pre-P3 greeting was counted as the route working');
+  assert.equal(link.unsupportedReason, 'not-a-frame');
+});
+
 test('noteRouteUnserved is a fact that a single frame retracts', () => {
   // It is deliberately not a latch. The bridge records what it proved; the moment
   // the route delivers anything, the sentence built on it stops being true and

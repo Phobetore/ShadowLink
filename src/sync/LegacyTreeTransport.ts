@@ -24,8 +24,9 @@
 // `unsupportedHandlers` / `onUnsupported` / `markUnsupported`;
 // `MuxRouteEvidence`, `unreachableHandlers` / `onUnreachable` / `reportRoute` and
 // the `cause` half of `noteFailedDial` with `refusedDials`, `routeRefused`,
-// `unreachableDials` and `routeEverServed`; `noteLegacyEvidence` and its
-// `external` option; `socketSpokeMux`; `MUX_UNREACHABLE_DIALS` in
+// `unreachableDials` and `routeEverServed`; `servedHandlers` / `onServed`;
+// `noteLegacyEvidence` and its `external` option; `socketSpokeMux`;
+// `MUX_UNREACHABLE_DIALS` in
 // `src/tree/constants.ts`; the legacy assertions in `MuxLink.test.ts`; the
 // structural cases 80c / 80f / 80g and `server/test/harness/legacy-server.mjs`
 // with `startServer`'s `entry` option. Call it a file deletion plus a few
@@ -113,6 +114,7 @@
 import type * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 
+import { TREE_SYNC_TIMEOUT_MS } from '../tree/constants.ts';
 import type { MuxLink, MuxUnsupportedReason } from './MuxLink.ts';
 import { MuxTreeTransport, TREE_ROOM, type TreeTransport } from './TreeTransport.ts';
 
@@ -282,7 +284,7 @@ class FallbackTreeTransport implements TreeTransport {
   private probeAnswered = false;
 
   private readonly releaseUnreachable: () => void;
-  private readonly releaseMuxStatus: () => void;
+  private readonly releaseServed: () => void;
 
   /** Handlers the plugin registered, re-registered on the transport that wins. */
   private readonly connectedHandlers = new Set<() => void>();
@@ -302,11 +304,13 @@ class FallbackTreeTransport implements TreeTransport {
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
     link.onUnsupported((reason) => { this.fallBack(reason); });
     this.releaseUnreachable = link.onUnreachable(() => { this.onUnreachable(); });
-    // A mux socket that opens settles the question the probe was asking, whatever
-    // the probe was about to say.
-    this.releaseMuxStatus = link.onStatus((status) => {
-      if (status === 'connected') this.discardProbe();
-    });
+    // ⚠ A FRAME settles the question the probe was asking — not a socket that
+    // merely opened. This used to key off the mux status going `connected`, and
+    // against a real proxy that upgrades `/_mux` and then drops every server
+    // frame that meant each redial destroyed the probe before it could answer:
+    // measured, a fresh `WebsocketProvider` built every 1.6 s, for ever, while
+    // the user was told nothing at all.
+    this.releaseServed = link.onServed(() => { this.discardProbe(); });
   }
 
   get synced(): boolean {
@@ -354,7 +358,7 @@ class FallbackTreeTransport implements TreeTransport {
   destroy(): void {
     this.destroyed = true;
     this.releaseUnreachable();
-    this.releaseMuxStatus();
+    this.releaseServed();
     this.discardProbe();
     this.releaseConnected();
     this.active.destroy();
@@ -412,6 +416,18 @@ class FallbackTreeTransport implements TreeTransport {
       this.link.connect({ immediate: true });
     });
     probe.connect();
+    // ⚠ AND ASK AGAIN THE MOMENT THE PROBE CAN ANSWER. The report that built it
+    // arrived before it had connected, so the decision has to be retaken — and
+    // waiting for the NEXT report costs a whole liveness cycle on a route that is
+    // deaf rather than closed. Measured against a real server behind a proxy that
+    // upgrades `/_mux` and drops every frame: the statement reached the status bar
+    // at 60,447 ms, two watchdog closures in, where the evidence was complete at
+    // 30,201 ms. `TREE_SYNC_TIMEOUT_MS` bounds the wait because it is already what
+    // everything else in the plugin gives this route; a probe that times out
+    // simply leaves the next failed dial to ask, exactly as before.
+    void probe.whenSynced(TREE_SYNC_TIMEOUT_MS)
+      .then((ok) => { if (ok) this.onUnreachable(); })
+      .catch(() => undefined);
   }
 
   private discardProbe(): void {
@@ -431,7 +447,7 @@ class FallbackTreeTransport implements TreeTransport {
     if (this.legacy || this.destroyed) return;
     this.legacy = true;
     this.releaseUnreachable();
-    this.releaseMuxStatus();
+    this.releaseServed();
     this.releaseConnected();
     // ⚠ ADOPT the probe rather than build a second provider. Two of them on one
     // `Y.Doc` is not a correctness problem — Yjs converges — but it is two

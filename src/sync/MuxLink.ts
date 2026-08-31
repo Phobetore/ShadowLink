@@ -277,6 +277,7 @@ export class MuxLink {
   private readonly statusHandlers = new Set<(status: MuxStatus) => void>();
   private readonly unsupportedHandlers = new Set<(reason: MuxUnsupportedReason) => void>();
   private readonly unreachableHandlers = new Set<(evidence: MuxRouteEvidence) => void>();
+  private readonly servedHandlers = new Set<() => void>();
 
   private attempt = 0;
   private retryHandle: unknown = null;
@@ -583,6 +584,29 @@ export class MuxLink {
     return () => { this.unreachableHandlers.delete(handler); };
   }
 
+  /**
+   * This route DELIVERED something. Fires at most once per link, immediately for
+   * a handler registered after the fact.
+   *
+   * ⚠ THE SETTLING EVENT IS A FRAME, NOT AN OPEN SOCKET, and that distinction
+   * cost a real defect. The bridge used to throw its probe away the moment the
+   * mux status went `connected`, on the argument that an open socket settles the
+   * question the probe was asking. It does not: a route can upgrade and then
+   * carry nothing, which is the exact shape the probe exists to describe.
+   * Measured against a real server behind a proxy that upgrades `/_mux` and drops
+   * every frame — the socket opened every 1.6 s, each open destroyed the probe
+   * before it could answer, and a fresh `WebsocketProvider` was built in its
+   * place for ever while the user was told nothing.
+   */
+  onServed(handler: () => void): () => void {
+    if (this.routeEverServed) {
+      handler();
+      return () => undefined;
+    }
+    this.servedHandlers.add(handler);
+    return () => { this.servedHandlers.delete(handler); };
+  }
+
   // ---------------------------------------------------------- lifecycle
 
   /**
@@ -660,6 +684,7 @@ export class MuxLink {
     this.statusHandlers.clear();
     this.unsupportedHandlers.clear();
     this.unreachableHandlers.clear();
+    this.servedHandlers.clear();
   }
 
   /**
@@ -804,7 +829,19 @@ export class MuxLink {
     // be a different process entirely.
     this.socketSpokeMux = true;
     // The route's own record, which no reconnect resets: see `routeEverServed`.
+    const first = !this.routeEverServed;
     this.routeEverServed = true;
+    if (first) {
+      const handlers = [...this.servedHandlers];
+      this.servedHandlers.clear();
+      for (const handler of handlers) {
+        try {
+          handler();
+        } catch {
+          /* an observer may not break the link */
+        }
+      }
+    }
 
     const handler = this.rooms.get(frame.room);
     if (handler === undefined) return;      // unsubscribed while in flight
