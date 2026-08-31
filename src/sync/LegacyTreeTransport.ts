@@ -34,12 +34,12 @@
 // find out. `everSubscribed` and the frame decoder stay: they are the link's.
 //
 // ⚠ TWO THINGS DO NOT GO WITH IT, and they are named here so nobody deletes them
-// with the bridge. `noteRouteUnserved` / `routeUnserved` describe a state of the
-// MUX — the server answers, this route delivers nothing — and the status bar
-// reads them whether or not a fallback exists; and the compatibility setting in
-// `src/types.ts` is what a self-hoster reaches for when it holds. Both outlive
-// this file, and after it goes the setting simply stops having a transport to
-// select and should be removed on its own, deliberately.
+// with the bridge. `noteRouteUnserved` / `forgetRouteUnserved` / `routeUnserved`
+// describe a state of the MUX — the server answers, this route delivers nothing —
+// and the status bar reads them whether or not a fallback exists; and the
+// compatibility setting in `src/types.ts` is what a self-hoster reaches for when
+// it holds. Both outlive this file, and after it goes the setting simply stops
+// having a transport to select and should be removed on its own, deliberately.
 //
 // ── WHY DETECTION IS NOT "DID THE SOCKET OPEN" ─────────────────────────────
 // Measured, not assumed. A server checked out from before any P3 work ACCEPTS
@@ -93,9 +93,10 @@
 //
 // ── AND WHAT REPLACES IT WHERE NOTHING WAS SAID ────────────────────────────
 // A black-holed upgrade and an arbitrarily slow path are one observation, so
-// neither gets a verdict. What they get instead is the truth and a lever. The
-// probe still runs — ignorance is a reason to LOOK — and when it syncs on a route
-// this one has never served, the bridge records that fact on the link
+// neither gets a verdict. What a route that has DELIVERED NOTHING THROUGH AN OPEN
+// SOCKET gets instead is the truth and a lever: the liveness watchdog closes a
+// socket that carried frames out and nothing back, the bridge probes the per-room
+// route, and when the probe syncs it records that fact on the link
 // (`noteRouteUnserved`) and drops the probe. Nothing is concluded about the
 // server's version, its age or the cause; the status bar says the server answers
 // and this route delivers nothing, and names the compatibility setting a
@@ -105,8 +106,27 @@
 // ever built, no verdict, and "ShadowLink could not reach the workspace" in front
 // of a user whose server a control client was syncing with.
 //
+// ⚠ AND A DIAL THAT NEVER OPENED GETS NEITHER, WHICH IS A NARROWING. A run of
+// dials this client abandoned used to report here too, and the sentence it
+// produced was permanent. Measured against a HEALTHY server serving `/_mux`
+// correctly behind a proxy that forwarded every byte and merely delayed each
+// connection by 13 s: "nothing is coming back on its multiplexed connection",
+// permanently, from 26,177 ms, with zero refused dials. The client's own deadline
+// is not an observation about the route, so it now buys a retry and nothing else
+// — and a black-holed upgrade, where no socket ever opens, is left saying only
+// what is true of it: this device could not reach the workspace.
+//
 // The link also stops reporting the evidence entirely once `/_mux` has served it
 // a frame. A route that has worked is never condemned by a later absence.
+//
+// ── AND EVERY DERIVED STATEMENT HAS A RETRACTION ───────────────────────────
+// The rule this file now lives by: a statement lasts exactly as long as the
+// evidence for it. "The server answers elsewhere" is withdrawn when the path
+// refuses a dial, when a rebuilt probe will no longer say it, when a frame
+// arrives on `/_mux`, and when the link is condemned. The `unreachable` verdict
+// needs a refusal reported WHILE the probe is answering, so refusals gathered
+// during an outage cannot be cashed in by a recovery. And nothing here latches a
+// probe out of existence: every report may build one.
 // No `obsidian` import: the notice is a STRING this module owns, and `main.ts`
 // puts it in front of the user. That keeps the whole bridge headless and
 // therefore deletable in one piece.
@@ -115,7 +135,7 @@ import type * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 
 import { TREE_SYNC_TIMEOUT_MS } from '../tree/constants.ts';
-import type { MuxLink, MuxUnsupportedReason } from './MuxLink.ts';
+import type { MuxLink, MuxRouteEvidence, MuxUnsupportedReason } from './MuxLink.ts';
 import { MuxTreeTransport, TREE_ROOM, type TreeTransport } from './TreeTransport.ts';
 
 /**
@@ -273,15 +293,29 @@ class FallbackTreeTransport implements TreeTransport {
   private releaseProbe: (() => void) | null = null;
 
   /**
-   * The probe has answered the only question it was asked, and the answer was
-   * "the server is reachable, and this route still is not". Latched so a route
-   * that stays dark does not build a fresh `WebsocketProvider` every thirty
-   * seconds for the life of the session.
+   * ⚠ A `probeAnswered` LATCH USED TO LIVE HERE, and deleting it is half this
+   * round. It was set the first time the probe answered "the server is reachable
+   * and this route still is not", and it was never cleared — so `startProbe`
+   * returned immediately for the rest of the session, `this.probe` stayed null
+   * for ever, and `onUnreachable` could never get past its own null check. Two
+   * measured consequences, both permanent for the session:
    *
-   * It is never cleared, and it does not need to be: `MuxLink` stops reporting
-   * the moment the route serves a frame, so nothing asks again.
+   *  * the sentence the answer produced went on being displayed after the server
+   *    process was KILLED — measured, latched at 30,360 ms, server killed at
+   *    45,000 ms, bar still reading "ShadowLink can reach your server" at 80 s
+   *    while a control client on the same path could not reach it at all;
+   *  * `markUnsupported('unreachable')` became unreachable — measured, a route
+   *    that went deaf and was then 404'd reported unserved at 1,609 ms and then
+   *    sat through 25 s and 368 REFUSED dials with `routeRefused` true,
+   *    `unsupportedReason` null and the tree never synced, where the same probe
+   *    on the parent branch reached the verdict in 248 ms.
+   *
+   * What replaces it is the cadence of the reports themselves. Only two things
+   * report now — a refusal run, and a deaf socket closed by the liveness watchdog
+   * — and the refusal case KEEPS its probe rather than rebuilding one, so a dark
+   * route builds at most one provider per `MUX_IDLE_TIMEOUT_MS`. That is the
+   * price of a sentence that is re-earned instead of remembered.
    */
-  private probeAnswered = false;
 
   private readonly releaseUnreachable: () => void;
   private readonly releaseServed: () => void;
@@ -303,7 +337,7 @@ class FallbackTreeTransport implements TreeTransport {
     this.active = new MuxTreeTransport(link, doc, config.room ?? TREE_ROOM);
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
     link.onUnsupported((reason) => { this.fallBack(reason); });
-    this.releaseUnreachable = link.onUnreachable(() => { this.onUnreachable(); });
+    this.releaseUnreachable = link.onUnreachable((evidence) => { this.decide(evidence); });
     // ⚠ A FRAME settles the question the probe was asking — not a socket that
     // merely opened. This used to key off the mux status going `connected`, and
     // against a real proxy that upgrades `/_mux` and then drops every server
@@ -378,35 +412,53 @@ class FallbackTreeTransport implements TreeTransport {
    * `link.routeRefused` is true only when the PATH ended them — a 404 at the
    * upgrade, an RST, a refused connection — which is the network saying this route
    * is not served, and is the last thing left that may condemn it. Everything
-   * else is a dial this client abandoned or a socket that opened and never spoke,
-   * and both of those are indistinguishable from a path that is merely slow.
-   * Measured: at twice the probe's own connect as the bound, a variable-latency
-   * path still reached a permanent false `unreachable` at 14,527 ms against a
-   * server serving `/_mux` normally. There is no fair threshold, so there is no
-   * threshold.
+   * else is a socket that opened and never spoke, which is indistinguishable from
+   * a path that is merely slow. Measured: at twice the probe's own connect as the
+   * bound, a variable-latency path still reached a permanent false `unreachable`
+   * at 14,527 ms against a server serving `/_mux` normally. There is no fair
+   * threshold, so there is no threshold.
+   *
+   * ⚠ AND THE VERDICT NEEDS THE TWO HALVES TO BE CONCURRENT, which is what
+   * `trigger` is for. A verdict says "the server answers AND this path refuses
+   * this route" — one sentence about one moment. `'refused'` means a refusal was
+   * reported just now; `'probe-answered'` means the probe has only this instant
+   * finished its own handshake, and every refusal behind it was counted before
+   * anybody knew whether the server was even up. Cashing those in is a false
+   * demotion, measured: a real server stopped before the client starts and
+   * restarted D ms later, then serving `/_mux` normally for the rest of the run,
+   * produced a permanent `unreachable` and the proxy-blaming notice on 5 of 12
+   * outage lengths and 5 of 5 repeats at D = 2,000 ms — the notice firing at
+   * 9,264 ms while the dial that was going to succeed was still in flight. The
+   * parent needed a fresh report after the probe had connected, which a
+   * recovering path does not produce; that implicit guard is now written down.
+   *
+   * The refused branch therefore KEEPS its probe and waits for the next refusal,
+   * rather than concluding or letting go. It does not wait long: a path that is
+   * refusing this route refuses the next dial too, and one that stops refusing
+   * breaks the run (`MuxLink.noteFailedDial`), which drops this branch and takes
+   * the other one.
    *
    * The other branch is not silence. It records the fact on the link so the
    * status bar can state it, and drops the probe: one transport, one socket, and
    * a user who is told what is true rather than guessed at.
    */
-  private onUnreachable(): void {
+  private decide(trigger: MuxRouteEvidence | 'probe-answered'): void {
     if (this.legacy || this.destroyed) return;
-    if (this.probe === null) {
+    const probe = this.probe;
+    if (probe === null) {
       this.startProbe();
       return;
     }
-    if (!this.probe.synced) return;
+    if (!probe.synced) return;
     if (this.link.routeRefused) {
-      this.link.markUnsupported('unreachable');
+      if (trigger === 'refused') this.link.markUnsupported('unreachable');
       return;
     }
     this.link.noteRouteUnserved();
-    this.probeAnswered = true;
     this.discardProbe();
   }
 
   private startProbe(): void {
-    if (this.probeAnswered) return;
     const probe = this.makeLegacy(this.config, this.doc);
     this.probe = probe;
     this.releaseProbe = probe.onConnected(() => {
@@ -423,10 +475,27 @@ class FallbackTreeTransport implements TreeTransport {
     // upgrades `/_mux` and drops every frame: the statement reached the status bar
     // at 60,447 ms, two watchdog closures in, where the evidence was complete at
     // 30,201 ms. `TREE_SYNC_TIMEOUT_MS` bounds the wait because it is already what
-    // everything else in the plugin gives this route; a probe that times out
-    // simply leaves the next failed dial to ask, exactly as before.
+    // everything else in the plugin gives this route.
+    //
+    // ⚠ AND A PROBE THAT DOES NOT ANSWER RETRACTS WHAT AN EARLIER ONE ESTABLISHED.
+    // This is the same rule pointed the other way: "ShadowLink can reach your
+    // server" is a claim about the server, so it may only stand while a probe
+    // will still say so. A rebuilt probe that cannot sync inside the window is
+    // the negative evidence, and the fact goes — leaving the bar to say the thing
+    // that is true instead ("could not reach the workspace"), which is exactly
+    // what a killed server, a dropped Wi-Fi association or a closed laptop lid
+    // produces. Nothing is concluded from the failure; the plugin merely stops
+    // asserting what it can no longer show.
     void probe.whenSynced(TREE_SYNC_TIMEOUT_MS)
-      .then((ok) => { if (ok) this.onUnreachable(); })
+      .then((ok) => {
+        if (this.destroyed || this.legacy || this.probe !== probe) return;
+        if (ok) {
+          this.decide('probe-answered');
+          return;
+        }
+        this.link.forgetRouteUnserved();
+        this.discardProbe();
+      })
       .catch(() => undefined);
   }
 

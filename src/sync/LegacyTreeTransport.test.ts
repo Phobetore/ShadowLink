@@ -23,11 +23,13 @@ import assert from 'node:assert/strict';
 import * as Y from 'yjs';
 
 import { FakeMux } from './fakes.ts';
-import { MuxLink, type MuxSocket, type MuxUnsupportedReason } from './MuxLink.ts';
+import {
+  MuxLink, encodeMuxFrame, type MuxSocket, type MuxUnsupportedReason,
+} from './MuxLink.ts';
 import {
   LEGACY_SERVER_NOTICE, MUX_UNREACHABLE_NOTICE, legacyNoticeFor, openTreeTransport,
 } from './LegacyTreeTransport.ts';
-import type { TreeTransport } from './TreeTransport.ts';
+import { TREE_ROOM, type TreeTransport } from './TreeTransport.ts';
 
 // ---------------------------------------------------------------- fixtures
 
@@ -81,6 +83,18 @@ class StubLegacy implements TreeTransport {
     this.connected = true;
     for (const settle of [...this.waiters]) settle(true);
     for (const handler of [...this.handlers]) handler();
+  }
+
+  /**
+   * Its window elapsing with no handshake — the per-room route not answering
+   * either, which is what a stopped server looks like from the bridge.
+   *
+   * The bridge treats this as NEGATIVE evidence and retracts whatever an earlier
+   * probe established, so it needs to be reachable without waiting out a real
+   * `TREE_SYNC_TIMEOUT_MS`.
+   */
+  giveUp(): void {
+    for (const settle of [...this.waiters]) settle(false);
   }
 }
 
@@ -575,6 +589,113 @@ test('what a route producing nothing gets instead is the truth, and one probe', 
   h.dispose();
 });
 
+test('the sentence is re-earned every liveness cycle, never remembered', () => {
+  // ⚠ THE PRICE OF DELETING THE LATCH, PAID DELIBERATELY AND BOUNDED. The bridge
+  // used to answer this question once per session and keep the answer for ever,
+  // which is how the bar went on reading "ShadowLink can reach your server" for
+  // 35 s after the server process was killed. So the answer expires with the
+  // evidence and the next report asks again — and only two things report now, so
+  // "again" is at most one provider per `MUX_IDLE_TIMEOUT_MS`, not one per dial.
+  const h = deafHarness();
+  h.transport.connect();
+  h.run(11);
+  h.made[0]?.arrive();
+  h.run(11);
+  assert.equal(h.link.routeUnserved, true);
+  const afterFirst = h.made.length;
+
+  h.run(22);                                     // two more cycles of the same silence
+  assert.ok(h.made.length > afterFirst, 'the sentence was remembered rather than re-earned');
+  assert.ok(h.made.length <= h.link.stats.idleClosures,
+    `a dark route built ${h.made.length} providers for ${h.link.stats.idleClosures} closures`);
+  h.dispose();
+});
+
+test('a probe that will no longer answer retracts what an earlier one established', async () => {
+  // ⚠ MEASURED, and it is the ordinary case rather than an exotic one: a server
+  // restarting, a laptop closing, a Wi-Fi association dropping. Deaf route,
+  // statement latched at 30,360 ms, the server PROCESS killed at 45,000 ms, and
+  // the bar still reading "ShadowLink can reach your server, but nothing is coming
+  // back … 11 message(s) have gone out" at 80 s, while a control client on the
+  // same path could not reach the server at all. The true sentence —
+  // "ShadowLink could not reach the workspace" — was suppressed by an outranking
+  // claim that measurement had stopped supporting 35 s earlier.
+  const h = deafHarness();
+  h.transport.connect();
+  h.run(11);
+  h.made[0]?.arrive();
+  h.run(11);
+  assert.equal(h.link.routeUnserved, true);
+
+  // The next cycle asks again, and this time the per-room route will not answer.
+  h.run(11);
+  const latest = h.made[h.made.length - 1];
+  assert.notEqual(latest, h.made[0], 'the bridge never asked a second time');
+  latest?.giveUp();                              // its window elapses with no handshake
+  await settle();
+  await settle();
+
+  assert.equal(h.link.routeUnserved, false,
+    'the sentence outlived the probe it rested on, and hid the one that was true');
+  assert.equal(latest?.destroyed, true, 'the probe that could not answer was left running');
+  assert.equal(h.link.unsupportedReason, null, 'a retraction became a verdict');
+  h.dispose();
+});
+
+test('the sentence is retracted the moment the path refuses a dial', () => {
+  // The other retraction, and the faster one: a refusal is the newest thing known
+  // about this route and it does not support a reachability claim made through a
+  // different route earlier. Same measurement as above — `dialsRefused` climbed to
+  // 11 while the bar claimed the server was answering.
+  const h = deafHarness();
+  h.transport.connect();
+  h.run(11);
+  h.made[0]?.arrive();
+  h.run(11);
+  assert.equal(h.link.routeUnserved, true);
+
+  h.refuse(true);                                // the server, or the path, is gone
+  h.run(14);                                     // the deaf socket closes and the dials fail
+  assert.ok(h.link.stats.dialsRefused >= 1, 'no dial was actually refused');
+  assert.equal(h.link.routeUnserved, false,
+    'the bar went on claiming the server answers after the path said otherwise');
+  assert.equal(h.link.unsupportedReason, null,
+    'a server that is merely gone was condemned as a blocked route');
+  assert.deepEqual(h.notices, []);
+  h.dispose();
+});
+
+test('a route that went deaf and is THEN refused still reaches the verdict', () => {
+  // ⚠ A REGRESSION AGAINST THE PARENT, MEASURED WITH ONE PROBE ON BOTH. A proxy
+  // that upgrades `/_mux` and swallows every server frame, then reloads into
+  // 404-ing it and RSTs the live pairs — which is what a proxy reload does. On the
+  // parent the refusal phase reached `unreachable` in 248 ms with the notice and a
+  // synced tree; on this branch the deaf phase's answer latched the bridge shut
+  // and 25 s and 368 refused dials later the verdict was still null, with
+  // `routeRefused` true the whole time. Nothing may become unreachable for a
+  // session because of the order two shapes arrived in.
+  const h = deafHarness();
+  h.transport.connect();
+  h.run(11);
+  h.made[0]?.arrive();
+  h.run(11);
+  assert.equal(h.link.routeUnserved, true, 'the deaf phase never reported at all');
+  const afterDeaf = h.made.length;
+
+  h.refuse(true);                                // the proxy is reloaded: 404 and RST
+  h.run(14);                                     // the deaf socket closes and the dials fail
+  assert.ok(h.link.routeRefused, 'a run of refusals was not recognised as one');
+  assert.ok(h.made.length > afterDeaf, 'the bridge was latched shut by its own earlier answer');
+
+  h.made[h.made.length - 1]?.arrive();           // the per-room route still works
+  assert.equal(h.link.unsupportedReason, 'unreachable');
+  assert.deepEqual(h.notices, ['unreachable']);
+  assert.equal(h.transport.synced, true, 'the tree did not end up on the route that works');
+  assert.equal(h.link.routeUnserved, false,
+    'a session that had already fallen back was told nothing was syncing');
+  h.dispose();
+});
+
 test('a socket that OPENS but never speaks does not settle the probe\'s question', () => {
   // ⚠ MEASURED AS A DEFECT, against a real server behind a proxy that upgrades
   // `/_mux` and drops every server frame: the bridge discarded its probe on the
@@ -641,6 +762,90 @@ test('a server that is merely DOWN is not demoted — the per-room route fails t
   assert.equal(h.made[0]?.destroyed, true, 'the probe was left running beside a working mux');
   assert.deepEqual(h.notices, [], 'an ordinary outage told the user their server is wrong');
   h.dispose();
+});
+
+test('refusals gathered while the server was down are not cashed in by its recovery', async () => {
+  // ⚠ MEASURED AS A NEW PERMANENT FALSE DEMOTION. A real `server/index.js`,
+  // stopped before the client starts and restarted D ms later, then serving
+  // `/_mux` normally for the whole run: a false `unreachable` and the
+  // proxy-blaming notice on 5 of 12 outage lengths and on 5 of 5 repeats at
+  // D = 2,000 ms, where the parent branch produced 0 of 12. The trigger was not a
+  // fresh failure — traced at D = 7,000 ms, the notice fired at 9,264 ms while the
+  // dial that was about to succeed was still in flight — it was the probe's
+  // re-ask cashing in a refusal count gathered entirely while the server was down.
+  //
+  // A verdict is one sentence about one moment: the server answers AND this path
+  // refuses this route. So the refusal has to be reported while the probe is
+  // answering, and a probe that has only just finished its own handshake settles
+  // nothing about dials that failed before anyone knew the server was up.
+  const timers: Array<{ fn: () => void } | undefined> = [];
+  const sockets: MuxSocket[] = [];
+  let down = true;
+  const link = new MuxLink({
+    ...CONFIG,
+    openSocket: (): MuxSocket => {
+      if (down) throw new Error('the server is not listening');
+      // Back, and this dial is IN FLIGHT: accepted, not yet open. That is the
+      // state the recovering path is actually in when the probe answers.
+      const socket: MuxSocket = {
+        readyState: 0,
+        bufferedAmount: 0,
+        send: () => undefined,
+        close: () => undefined,
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+        onerror: null,
+      };
+      sockets.push(socket);
+      return socket;
+    },
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 0,
+    unreachableDials: 2,
+    random: () => 0.5,
+    setTimer: (fn) => { timers.push({ fn }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  const made: StubLegacy[] = [];
+  const doc = new Y.Doc();
+  const notices: MuxUnsupportedReason[] = [];
+  const transport = openTreeTransport(
+    link, doc, CONFIG, (reason) => notices.push(reason),
+    () => { const stub = new StubLegacy(); made.push(stub); return stub; },
+  );
+  const fire = (): void => {
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  };
+
+  transport.connect();
+  fire();
+  assert.equal(link.routeRefused, true, 'the outage did not produce a run of refused dials');
+  assert.equal(made.length, 1, 'the bridge never went to look');
+
+  down = false;                                   // the server is back, on both routes
+  made[0]?.arrive();                              // and the probe finally says so
+  await settle();
+  await settle();
+
+  assert.equal(link.unsupportedReason, null,
+    'an outage that ended was read as a route the path refuses');
+  assert.deepEqual(notices, [], 'the user was told to reconfigure a proxy that is fine');
+  assert.equal(link.routeUnserved, false,
+    'a route with a dial in flight was already described as delivering nothing');
+  assert.ok(sockets.length >= 1, 'the recovery never produced a dial at all');
+
+  // And the dial that was in flight opens and serves, which ends the question.
+  sockets[sockets.length - 1]?.onopen?.();
+  assert.equal(link.routeRefused, false, 'an open socket did not clear the run');
+  sockets[sockets.length - 1]?.onmessage?.({
+    data: encodeMuxFrame(TREE_ROOM, new Uint8Array([0, 0])),
+  });
+  assert.equal(link.everServed, true, 'the route served and nothing recorded it');
+  assert.equal(made[0]?.destroyed, true, 'the probe was left running beside a working mux');
+  assert.equal(link.unsupportedReason, null);
+  assert.deepEqual(notices, []);
+  transport.destroy(); link.destroy(); doc.destroy();
 });
 
 test('the two verdicts get two sentences, and neither says the other one\'s thing', () => {
