@@ -553,7 +553,7 @@ export class MuxLink {
    *    releasing, a load balancer draining back in: the close is a REFUSAL, which
    *    redials on the backoff ladder and not on the rung. Tree synced **4,280 ms**
    *    after the path came back;
-   *  * the heal COMPLETES the parked upgrade: **31 ms**, because the socket the
+   *  * the heal COMPLETES the parked upgrade: **22 ms**, because the socket the
    *    link is already holding is the one that opens;
    *  * the heal forwards only NEW dials and leaves the parked one parked for ever
    *    — the worst case, and the only one that pays the rung: **109,941 ms**, the
