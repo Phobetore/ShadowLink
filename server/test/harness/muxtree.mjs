@@ -397,6 +397,62 @@ function deafMuxProxy({ listen, target }) {
 }
 
 /**
+ * A TCP proxy that forwards everything, but takes `delayMs` to connect the
+ * `/_mux` route upstream and nothing at all on every other path.
+ *
+ * ⚠ IT MAKES AN ORDERING DETERMINISTIC THAT IS OTHERWISE A RACE. The defect it
+ * exists for needs the bridge's per-room probe to finish its handshake while a
+ * mux dial is still in flight and a refusal count gathered during an outage is
+ * still standing. Against a plain restart that ordering depends on where
+ * y-websocket's own backoff happens to be — measured, deterministic at an 8,000 ms
+ * outage and absent at 7,500 and 8,500 — which is a real defect and a terrible
+ * regression test. Here the route that has to be slower simply is.
+ */
+function slowMuxProxy({ listen, target, delayMs }) {
+  const live = [];
+  const server = net.createServer((client) => {
+    client.on('error', () => undefined);
+    client.once('data', (first) => {
+      const head = first.toString('latin1').split('\r\n')[0] ?? '';
+      const wait = head.includes(' /_mux') ? delayMs : 0;
+      const queued = [first];
+      let up = null;
+      client.on('data', (b) => {
+        if (up === null) { queued.push(b); return; }
+        try { up.write(b); } catch { /* gone */ }
+      });
+      setTimeout(() => {
+        up = net.connect(target, '127.0.0.1', () => {
+          for (const b of queued.splice(0)) { try { up.write(b); } catch { /* gone */ } }
+        });
+        live.push({ client, up });
+        up.on('error', () => undefined);
+        up.on('data', (b) => { try { client.write(b); } catch { /* gone */ } });
+        const bye = () => {
+          try { client.destroy(); } catch { /* gone */ }
+          try { up.destroy(); } catch { /* gone */ }
+        };
+        client.on('close', bye);
+        up.on('close', bye);
+      }, wait);
+    });
+  });
+  return {
+    async start() {
+      await new Promise((resolve) => server.listen(listen, '127.0.0.1', resolve));
+      return `ws://127.0.0.1:${listen}`;
+    },
+    async stop() {
+      for (const { client, up } of live) {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      }
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+/**
  * The bar, exactly as `main.ts` composes it, for a session in this state.
  *
  * ⚠ `compatibility` IS THREE FACTS, not the setting. `main.ts` reads the setting
@@ -441,6 +497,7 @@ export function registerMuxTreeCases(getServer, legacyPort) {
   const killProxyPort = legacyPort + 11;
   const reloadPort = legacyPort + 12;
   const outagePort = legacyPort + 13;
+  const outageProxyPort = legacyPort + 14;
 
   test('80a the shipped MuxLink carries _tree over the real server, and converges', async () => {
     const server = getServer();
@@ -1451,7 +1508,11 @@ export function registerMuxTreeCases(getServer, legacyPort) {
     const workspace = 'muxtree80q';
     const first = await startServer({ port: outagePort });
     const { serverKey, dir } = first;
-    const url = `ws://127.0.0.1:${outagePort}`;
+    // The per-room route comes back at once and `/_mux` takes two seconds, which
+    // is what makes the ordering the defect needs happen every time rather than
+    // when y-websocket's backoff lands right. See `slowMuxProxy`.
+    const proxy = slowMuxProxy({ listen: outageProxyPort, target: outagePort, delayMs: 2_000 });
+    const url = await proxy.start();
     await first.stop();                          // down before the client starts
 
     const tree = new TreeDoc();
@@ -1472,14 +1533,15 @@ export function registerMuxTreeCases(getServer, legacyPort) {
     let second = null;
     try {
       transport.connect({ immediate: true });
-      // Long enough for the refusals to build a run AND for the bridge to have a
-      // probe of its own in flight, which is the concurrency the defect abused.
-      assert.equal(await until(() => link.routeRefused, 10_000), true,
+      assert.equal(await until(() => link.routeRefused, 20_000), true,
         'the outage produced no run of refused dials, so this proves nothing');
-      await sleep(2_000);
 
       second = await startServer({ port: outagePort, dir });
-      assert.equal(await until(() => link.everServed, 20_000), true,
+      // The probe answers first, on a route that is up; the mux dial that is going
+      // to succeed is still in flight; and the refusals behind it were all counted
+      // while nobody knew whether the server existed. On the parent's rule that is
+      // the whole of a verdict.
+      assert.equal(await until(() => link.everServed, 30_000), true,
         'the mux never came back on a server that is serving /_mux normally');
       assert.equal(link.unsupportedReason, null,
         'refusals gathered while the server was down were cashed in by its recovery');
@@ -1491,6 +1553,7 @@ export function registerMuxTreeCases(getServer, legacyPort) {
       assert.equal(barFor(link, { ready: true }).text, 'ShadowLink: synced');
     } finally {
       transport.destroy(); link.destroy(); tree.doc.destroy();
+      await proxy.stop();
       if (second !== null) await second.stop();
       first.cleanup();
     }
