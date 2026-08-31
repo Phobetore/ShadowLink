@@ -339,6 +339,11 @@ export class MuxLink {
    * What IS available without any inference is what this records: the server
    * answers, and this route has never delivered anything. The user gets that
    * sentence and a lever, not a guess about their deployment.
+   *
+   * ⚠ RECORDED, NOT LATCHED. It used to be set once and never cleared, which made
+   * it exactly the kind of statement this file spends three headers refusing —
+   * one that outlives what justified it. Its retractions are listed on
+   * `routeUnserved`, which is the only thing that reads it.
    */
   private serverAnswersElsewhere = false;
 
@@ -470,11 +475,23 @@ export class MuxLink {
    * TRUE while the server is known to answer elsewhere and this route has still
    * delivered nothing. What the status bar says out loud; never a verdict.
    *
-   * It clears itself the moment a frame arrives, because `routeEverServed` is
-   * what it is asserted against — nothing here latches on its own.
+   * ⚠ IT LIVES EXACTLY AS LONG AS THE EVIDENCE FOR IT, and all three retractions
+   * are here rather than scattered:
+   *  * a FRAME arrives — `routeEverServed`, and the whole sentence stops being
+   *    true in the clause that made it worth saying;
+   *  * the path REFUSES a dial — `noteFailedDial` drops the recorded fact,
+   *    because the newest thing known about this route does not support a
+   *    reachability claim made earlier through a different one;
+   *  * the link is CONDEMNED — after a verdict the mux is not what carries the
+   *    tree, so "nothing is syncing while that is true" would be false; the
+   *    fallback's own sentence is the one that belongs on the bar.
+   * The bridge adds a fourth from outside (`forgetRouteUnserved`) for the probe
+   * that no longer answers.
    */
   get routeUnserved(): boolean {
-    return this.serverAnswersElsewhere && !this.routeEverServed;
+    return this.serverAnswersElsewhere
+      && !this.routeEverServed
+      && this.unsupported === null;
   }
 
   /**
@@ -734,6 +751,23 @@ export class MuxLink {
   noteRouteUnserved(): void {
     if (this.destroyed || this.routeEverServed) return;
     this.serverAnswersElsewhere = true;
+  }
+
+  /**
+   * Withdraw that record: nothing current supports it any more.
+   *
+   * ⚠ THE OTHER HALF OF `noteRouteUnserved`, and it exists because a sentence
+   * that outlives its evidence is the defect this round is closing. The bridge
+   * calls it when a probe it rebuilt to re-earn the fact does not answer inside
+   * `TREE_SYNC_TIMEOUT_MS` — the server was answering when the fact was recorded
+   * and is not answering now, so the bar must stop claiming reachability and let
+   * the sentence that IS true ("could not reach the workspace") through.
+   *
+   * It is not a verdict in the other direction either: it asserts nothing about
+   * the server, it only stops asserting something.
+   */
+  forgetRouteUnserved(): void {
+    this.serverAnswersElsewhere = false;
   }
 
   // ---------------------------------------------------------- internals
@@ -1143,6 +1177,15 @@ export class MuxLink {
     if (cause === 'refused') {
       this.stats.dialsRefused += 1;
       this.refusedDials += 1;
+      // ⚠ RETRACTION, and it is the whole of what stops "ShadowLink can reach
+      // your server" outliving the server. That sentence rests on a probe that
+      // synced SOME TIME AGO; a dial the path has just refused is the newest
+      // thing anyone knows about this route, and it does not support it. So the
+      // recorded fact goes and the bridge is left to earn it again — measured on
+      // the parent, where killing the server process at 45,000 ms left the bar
+      // claiming reachability through 80 s while a control client could not
+      // reach the server at all and `dialsRefused` climbed to 11.
+      this.serverAnswersElsewhere = false;
       if (this.refusedDials >= this.unreachableDials) this.reportRoute('refused');
       return;
     }

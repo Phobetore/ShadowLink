@@ -877,6 +877,65 @@ test('an abandoned dial breaks the refusal run, because "in a row" has to mean i
   link.destroy();
 });
 
+test('the unserved sentence is retracted the moment the path refuses a dial', () => {
+  // ⚠ MEASURED AS A FALSE SENTENCE OF THIS ROUND'S OWN MAKING. The fact was
+  // recorded once and never cleared: deaf route, statement latched at 30,360 ms,
+  // the server PROCESS killed at 45,000 ms, and from 45 s to 80 s the bar still
+  // read "ShadowLink can reach your server" while `dialsRefused` climbed to 11 and
+  // a control client on the same path could not reach the server at all. A dial
+  // the path has just refused is the newest thing known about this route, and it
+  // does not support a reachability claim made through a different one earlier.
+  const { link, mux, fire } = makeLink({ unreachableDials: 2 });
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  link.noteRouteUnserved();
+  assert.equal(link.routeUnserved, true, 'the bridge could not record what it proved');
+
+  mux.refuseConnect = true;
+  mux.dropSockets();
+  fire();
+  assert.ok(link.stats.dialsRefused >= 1, 'no dial was actually refused');
+  assert.equal(link.routeUnserved, false,
+    'the bar went on claiming the server answers after the path said otherwise');
+
+  // And it can be recorded again: nothing about this is one-way either.
+  link.noteRouteUnserved();
+  assert.equal(link.routeUnserved, true, 'the fact became unrecordable for the session');
+  link.destroy();
+});
+
+test('a condemned link stops saying nothing is coming back on it', () => {
+  // Once the verdict has fired the mux is not what carries the tree, so "nothing
+  // is syncing while that is true" is false and the fallback's own sentence is the
+  // one that belongs on the bar. Reachable now that the unserved fact and the
+  // verdict can be reached in either order.
+  const { link } = makeLink({ unreachableDials: 2 });
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  link.noteRouteUnserved();
+  assert.equal(link.routeUnserved, true);
+  link.markUnsupported('unreachable');
+  assert.equal(link.routeUnserved, false,
+    'a session on the fallback was told nothing was syncing');
+  link.destroy();
+});
+
+test('forgetRouteUnserved withdraws the fact without asserting anything else', () => {
+  // The bridge's own retraction, for the probe that will no longer answer. It
+  // says nothing about the server; it stops saying something.
+  const { link } = makeLink({ unreachableDials: 2 });
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  link.noteRouteUnserved();
+  link.forgetRouteUnserved();
+  assert.equal(link.routeUnserved, false, 'the fact outlived the probe that earned it');
+  assert.equal(link.unsupportedReason, null, 'a retraction became a verdict');
+  assert.equal(link.everServed, false, 'a retraction claimed the route had served');
+  link.noteRouteUnserved();
+  assert.equal(link.routeUnserved, true, 'a retracted fact could never be re-established');
+  link.destroy();
+});
+
 test('connect({ immediate }) jumps a dial that has already had the first rung', () => {
   // ⚠ MEASURED AS INERT. `open()` assigns `this.socket` before the socket opens
   // and `connect()` returns early while one exists, so a dial parked on a widened
