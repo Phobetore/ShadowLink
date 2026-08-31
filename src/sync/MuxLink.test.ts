@@ -1027,6 +1027,76 @@ test('an abandoned dial breaks the refusal run, because "in a row" has to mean i
   link.destroy();
 });
 
+test('a REFUSAL does not shrink the ladder back, so an alternating path still climbs', () => {
+  // ⚠ THE HALF THAT IS NOT SYMMETRIC, AND A MUTATION SWEEP FOUND IT UNCOVERED. An
+  // abandoned dial breaks the refusal run — the case above — because "in a row"
+  // has to mean in a row. The reverse is deliberately NOT true: a refusal leaves
+  // the patience ladder exactly where it is, because patience is about how long to
+  // hold one dial open and a refusal says nothing about that.
+  //
+  // It matters more now than it did, which is why it is pinned rather than merely
+  // written down. With the ceiling gone the ladder is the only thing that lets a
+  // slow path ever open, and a path that ALTERNATES — a 404 or an RST from one
+  // hop, a 13 s connect from the next — is the ordinary shape of a proxy in front
+  // of a cold-start backend. If a refusal reset the rung, such a path could never
+  // gather two abandoned dials in a row, the ladder would sit on its first rung
+  // for ever, and the blocker would be back with the fix still in the file.
+  //
+  // The sweep's mutant is one added line in `noteFailedDial`'s refused branch. It
+  // survived every suite before this case existed.
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  let mode: 'refuse' | 'hang' = 'hang';
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    openSocket: () => {
+      if (mode === 'refuse') throw new Error('the path ended this dial');
+      return hangingSocket();
+    },
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 4_000,
+    unreachableDials: 99,                    // no verdict may land inside this case
+    random: () => 0.5,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  const drain = (): void => {
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  };
+
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();                            // dial 1 hangs
+  drain();                                   // …and is abandoned at 4 s
+  assert.equal(link.dialTimeoutMs, 8_000, 'the first abandoned dial did not widen the ladder');
+
+  mode = 'refuse';
+  drain();                                   // the retry rung fires, and the path says no
+  assert.ok(link.stats.dialsRefused >= 1, 'the path never actually refused a dial');
+  assert.equal(link.dialTimeoutMs, 8_000,
+    'a refusal shrank the ladder back, so a path that alternates between refusing and '
+    + 'being slow can never gather the patience to outlast its own latency');
+
+  mode = 'hang';
+  drain();                                   // the retry rung fires, dial 2 hangs
+  drain();                                   // …and is abandoned
+  assert.equal(link.dialTimeoutMs, 12_000, 'the ladder did not go on climbing across a refusal');
+
+  mode = 'refuse';
+  drain();
+  assert.equal(link.dialTimeoutMs, 12_000, 'a second refusal shrank the ladder back');
+
+  // And it keeps climbing past the shipped rungs, which is the whole point: this is
+  // the path shape that has to reach a rung wide enough to contain its own latency.
+  mode = 'hang';
+  drain();
+  drain();
+  assert.equal(link.dialTimeoutMs, 24_000,
+    'an alternating path never reached the doubling, so it could never open at all');
+  assert.equal(link.unsupportedReason, null, 'something was condemned inside this case');
+  link.destroy();
+});
+
 test('a refused dial no longer carries a retraction, because there is nothing to retract', () => {
   // ⚠ THE FASTEST OF THE FOUR RETRACTIONS, DELETED WITH THE BELIEF IT RETRACTED.
   // A refused dial used to clear "the server answers elsewhere" one line before it

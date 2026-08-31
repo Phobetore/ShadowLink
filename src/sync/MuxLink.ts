@@ -871,6 +871,14 @@ export class MuxLink {
     this.socketOpened = true;
     this.cancelConnectTimeout();
     this.lastInboundAt = this.now();
+    // ⚠ AND THIS IS WHY THE UNCAPPED LADDER CANNOT REACH THE SILENCE BOUND. Three
+    // lines above is the only reset, and this is `armIdleWatch`'s ONLY caller — so
+    // `abandonedDials` is provably 0 at every instant the idle watch is armed, and
+    // `MUX_IDLE_TIMEOUT_MS` is multiplied by nothing however far the dial ladder
+    // had climbed. A sweep mutant that widened the silence bound by `dialPatience()`
+    // survived every suite, and it survived because it is EQUIVALENT: at this call
+    // site that factor is exactly 1 and can be nothing else. The two bounds are
+    // separate by construction and not merely by convention.
     this.armIdleWatch();
     // Every subscribed room re-handshakes, in subscription order. I24: the room
     // asks from the state vector of the bytes it holds, and nothing is marked
@@ -1227,6 +1235,15 @@ export class MuxLink {
    * long to hold a dial open, and shrinking it back while dials are still failing
    * is what makes a 404 behind nine seconds of latency alternate for ever between
    * a deadline and an answer without ever gathering two answers in a row.
+   *
+   * ⚠ THAT ASYMMETRY MATTERS MORE NOW THAN WHEN IT WAS WRITTEN, and a mutation
+   * sweep found it uncovered. With the ceiling gone, the ladder is the only thing
+   * that lets a slow path open at all — so on a path that ALTERNATES between
+   * refusing and being slow, which is the ordinary shape of a proxy in front of a
+   * cold-start backend, a refusal that reset the rung would keep the ladder on its
+   * first rung for ever and the dead-and-silent session would be back with the fix
+   * still in the file. It is pinned now, by "a REFUSAL does not shrink the ladder
+   * back, so an alternating path still climbs".
    */
   private noteFailedDial(cause: MuxRouteEvidence): void {
     this.stats.dialsFailed += 1;
