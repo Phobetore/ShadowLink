@@ -346,13 +346,23 @@ export class MuxLink {
   private lastInboundAt = 0;
 
   /**
-   * Dials in a row the PATH ended without opening. Reset by any open.
+   * Dials in a row the PATH ended without opening. Reset by any open, and by any
+   * dial this client abandoned.
    *
    * ⚠ Separate from `abandonedDials` because only this one may reach a verdict.
    */
   private refusedDials = 0;
 
-  /** Dials in a row this client ended at its own deadline. Reset by any open. */
+  /**
+   * Dials in a row this client ended at its own deadline. Reset by any open.
+   *
+   * ⚠ IT DRIVES THE LADDER AND NOTHING ELSE. It picks the next rung of
+   * `MUX_DIAL_PATIENCE` and it is published as `stats.dialsAbandoned`, which is a
+   * current state anyone may read. It reaches no handler, no report and no
+   * sentence: an expired deadline may make this client wait longer and try again,
+   * and may be looked at, but it may not leave a conclusion about the route
+   * behind it.
+   */
   private abandonedDials = 0;
 
   /** When the dial in flight was started, so `immediate` knows what it has had. */
@@ -446,6 +456,11 @@ export class MuxLink {
   /**
    * TRUE while enough dials IN A ROW have been ended by the path, on a route that
    * has never served. The one thing the bridge may turn into a verdict.
+   *
+   * ⚠ IN A ROW MEANS IN A ROW. The run is broken by a socket that opens and by a
+   * dial this client abandoned, so what this reports is a contiguous stretch of
+   * the path saying no — not a tally of refusals with the client's own deadlines
+   * interleaved through it.
    */
   get routeRefused(): boolean {
     return !this.routeEverServed && this.refusedDials >= this.unreachableDials;
@@ -569,15 +584,18 @@ export class MuxLink {
    * something that can also try the per-room route — the bridge — can tell them
    * apart, which is why this reports rather than concludes.
    *
-   * ⚠ THREE SHAPES REACH IT, and the third is new. A run of dials the path
-   * REFUSED; a run this client ABANDONED at its own deadline; and a socket that
-   * OPENED, was written to and was closed by the liveness watchdog having said
-   * nothing, on a route that has never served. The last two carry `'unanswered'`
-   * and can never end in a verdict — but they still have to be reported, because
-   * the previous round deleted the absence-verdict and deleted the
-   * evidence-gathering with it, and the black-holed route it left behind built no
-   * probe, reached no conclusion and told the user nothing for as long as the
-   * plugin ran.
+   * ⚠ TWO SHAPES REACH IT, AND BOTH ARE SOMETHING THAT HAPPENED. A run of dials
+   * the path REFUSED, which carries `'refused'` and is the only one that may end
+   * in a verdict; and a socket that OPENED, was written to and was closed by the
+   * liveness watchdog having said nothing, on a route that has never served,
+   * which carries `'unanswered'` and may only ever be described.
+   *
+   * ⚠ A THIRD USED TO, AND IT WAS A BACK DOOR. A run of dials this client
+   * abandoned at its own deadline reported here too, and through the bridge it
+   * reached a permanent user-facing sentence about the route with no socket, no
+   * frame and no byte behind it. See `noteFailedDial` for what that measured
+   * against a healthy server behind 13 s of latency. Nothing an expired deadline
+   * touches reports here any more.
    */
   onUnreachable(handler: (evidence: MuxRouteEvidence) => void): () => void {
     this.unreachableHandlers.add(handler);
@@ -1098,6 +1116,27 @@ export class MuxLink {
    * A dial produced no socket. `cause` is WHO ended it, and that is the whole of
    * what separates a report the bridge may conclude from one it may only
    * describe.
+   *
+   * ⚠ AN ABANDONED DIAL REACHES NOTHING AT ALL FROM HERE, and that deletion is
+   * this round's. It used to count towards the same threshold and call
+   * `reportRoute('unanswered')`, which is a permanent user-facing statement about
+   * the route reached with no socket, no frame and no byte — only this client's
+   * own expired deadlines. That is the mechanism the previous round was created to
+   * remove, taking a back door one level down. Measured against a HEALTHY shipped
+   * server serving `/_mux` correctly, behind a transparent proxy forwarding every
+   * byte of every route and merely delaying each connection by 13 s: the bar
+   * latched permanently at 26,177 ms to "nothing is coming back on its multiplexed
+   * connection", with `dialsRefused` 0, `dialsAbandoned` 5 and a route that was
+   * carrying the connection perfectly well. The deadline elapsing is a reason to
+   * dial again — nothing more.
+   *
+   * ⚠ AND IT BREAKS THE REFUSAL RUN, because `routeRefused` says "in a row" and
+   * has to mean it. A dial this client ended is not the path saying no, so it
+   * interrupts the evidence exactly as a successful open does. The ladder's own
+   * count is deliberately NOT reset by a refusal in return: patience is about how
+   * long to hold a dial open, and shrinking it back while dials are still failing
+   * is what makes a 404 behind nine seconds of latency alternate for ever between
+   * a deadline and an answer without ever gathering two answers in a row.
    */
   private noteFailedDial(cause: MuxRouteEvidence): void {
     this.stats.dialsFailed += 1;
@@ -1109,7 +1148,7 @@ export class MuxLink {
     }
     this.stats.dialsAbandoned += 1;
     this.abandonedDials += 1;
-    if (this.abandonedDials >= this.unreachableDials) this.reportRoute('unanswered');
+    this.refusedDials = 0;
   }
 
   /**

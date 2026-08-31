@@ -165,16 +165,25 @@ export const MUX_DIAL_PATIENCE = [1, 2, 3];
  * down fails dials the same way — so it is reported rather than latched, and the
  * bridge is what decides, by checking whether the per-room route works.
  *
- * ⚠ WHAT ENDED THE DIAL IS PART OF THE EVIDENCE, and that is what this round
- * added. A dial the PATH ended — an error, a close, a 404 at the upgrade — is
- * something the network said, and enough of those on a route that has never
- * served is what the bridge may still turn into a verdict. A dial THIS CLIENT
- * ended at its own deadline says only that the deadline elapsed, and may never
- * condemn anything: measured, a path drawing 75% of its connections from
- * 5.5–8.5 s and 25% from 1.2–2.2 s produced a permanent false demotion against a
- * server serving `/_mux` normally, at 14,527 ms, with a sentence blaming a proxy
- * that was forwarding every path. Both kinds still count towards ASKING the
- * bridge to look, because ignorance is a reason to gather evidence.
+ * ⚠ WHAT ENDED THE DIAL IS PART OF THE EVIDENCE. A dial the PATH ended — an
+ * error, a close, a 404 at the upgrade — is something the network said, and
+ * enough of those IN A ROW on a route that has never served is what the bridge
+ * may still turn into a verdict. A dial THIS CLIENT ended at its own deadline
+ * says only that the deadline elapsed, and may never condemn anything: measured,
+ * a path drawing 75% of its connections from 5.5–8.5 s and 25% from 1.2–2.2 s
+ * produced a permanent false demotion against a server serving `/_mux` normally,
+ * at 14,527 ms, with a sentence blaming a proxy that was forwarding every path.
+ *
+ * ⚠ AND ONLY ONE KIND COUNTS HERE NOW. Abandoned dials used to count towards
+ * this threshold too, on the argument that ignorance is a reason to gather
+ * evidence. It is — but the evidence-gathering ended in a permanent sentence
+ * about the route, so the argument bought a second stopwatch a level down.
+ * Measured against a healthy server serving `/_mux` correctly behind a proxy that
+ * forwarded every byte and merely delayed each connection by 13 s: a permanent
+ * "nothing is coming back on its multiplexed connection" at 26,177 ms, with zero
+ * refused dials and a route that carried the connection perfectly. An abandoned
+ * dial now drives the ladder and the retry, and reaches nothing else; it also
+ * BREAKS the refusal run, because "in a row" has to mean in a row.
  */
 export const MUX_UNREACHABLE_DIALS = 2;
 

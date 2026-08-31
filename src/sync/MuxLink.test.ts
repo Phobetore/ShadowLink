@@ -813,10 +813,68 @@ test('a dial the CLIENT abandoned is never reported as a refusal', () => {
   assert.ok(link.stats.dialsAbandoned >= 2, 'no dial actually ran out of time');
   assert.equal(link.stats.dialsRefused, 0, 'a deadline was counted as a refusal');
   assert.equal(link.routeRefused, false, 'a run of deadlines became something a verdict may rest on');
-  assert.ok(seen.length > 0, 'a route producing nothing was never reported at all');
-  assert.deepEqual([...new Set(seen)], ['unanswered'],
-    `the evidence named a refusal that never happened: ${JSON.stringify(seen)}`);
+  // ⚠ AND IT REPORTS NOTHING AT ALL, which is the back door this round shut. A
+  // run of expired deadlines used to reach `onUnreachable`, and through the bridge
+  // a PERMANENT user-facing sentence about the route — with no socket, no frame
+  // and no byte behind it. Measured against a healthy server serving `/_mux`
+  // correctly behind a proxy that forwarded every byte and merely delayed each
+  // connection by 13 s: "nothing is coming back on its multiplexed connection",
+  // permanently, from 26,177 ms, `dialsRefused` 0, `dialsAbandoned` 5.
+  assert.deepEqual(seen, [],
+    `the client's own deadline reported on the route: ${JSON.stringify(seen)}`);
   assert.equal(link.unsupportedReason, null);
+  assert.equal(link.routeUnserved, false);
+});
+
+test('an abandoned dial breaks the refusal run, because "in a row" has to mean in a row', () => {
+  // ⚠ `routeRefused` IS THE LAST THING THAT MAY CONDEMN A ROUTE, so what it counts
+  // has to be what its own sentence says. Before this it meant "since the last
+  // open", so a path that alternated between refusing a dial and outlasting one
+  // reached the verdict on two refusals with the client's own deadlines threaded
+  // through them. A refusal does NOT reset the ladder in return: patience is about
+  // how long to hold a dial open, and shrinking it back while dials are still
+  // failing is what makes a 404 behind nine seconds of latency alternate for ever.
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  let refuse = true;
+  const link = new MuxLink({
+    serverUrl: 'ws://host:1234',
+    serverKey: KEY,
+    workspaceId: WORKSPACE,
+    openSocket: () => {
+      if (refuse) throw new Error('the path ended this dial');
+      return hangingSocket();
+    },
+    idleTimeoutMs: 0,
+    connectTimeoutMs: 4_000,
+    unreachableDials: 2,
+    random: () => 0.5,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  const run = (): void => {
+    for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+  };
+  link.subscribe('_tree', { onPayload: () => undefined });
+  link.connect();
+  run();
+  assert.equal(link.routeRefused, true, 'two refusals in a row were not recognised as a run');
+
+  // One dial this client gives up on, and the run is over.
+  refuse = false;
+  run();                                    // the hanging dial is armed …
+  run();                                    // … and abandoned at its own deadline
+  assert.ok(link.stats.dialsAbandoned >= 1, 'no dial actually ran out of time');
+  assert.equal(link.routeRefused, false,
+    'a deadline was allowed to sit inside a run of refusals and be counted as one');
+  assert.ok(link.dialTimeoutMs > 4_000,
+    'the refusals shrank the ladder back, so a slow path can never outlast a rung');
+
+  // And the run can be rebuilt from scratch, because nothing here is one-way.
+  refuse = true;
+  run();
+  run();
+  assert.equal(link.routeRefused, true, 'a broken run could never be started again');
+  link.destroy();
 });
 
 test('connect({ immediate }) jumps a dial that has already had the first rung', () => {

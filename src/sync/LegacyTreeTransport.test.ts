@@ -456,58 +456,52 @@ test('a dial NOBODY refused is never a verdict, however many of them there are',
 
   assert.ok(h.link.stats.dialsAbandoned >= 2, 'no dial actually ran out of time');
   assert.equal(h.link.stats.dialsRefused, 0, 'the hanging dial was read as a refusal');
-  assert.equal(h.made.length, 1, 'a route producing nothing was never even looked into');
-
-  // And the probe answering does NOT unlock a verdict, because what it answers is
-  // "the server is reachable", not "this route is refused".
-  h.made[0]?.arrive();
-  for (let i = 0; i < 6; i += 1) h.fire();
+  // ⚠ AND IT REACHES NOTHING AT ALL — not a verdict, and not a sentence either.
+  // The abandoned run used to build a probe and, through it, a permanent
+  // user-facing statement about the route with no socket, no frame and no byte
+  // behind it. Measured against a HEALTHY server serving `/_mux` correctly behind
+  // a proxy forwarding every byte and merely delaying each connection by 13 s: a
+  // permanent "nothing is coming back on its multiplexed connection" from
+  // 26,177 ms, `dialsRefused` 0, the route carrying the connection perfectly.
+  // The cost is named where it lands: a black-holed upgrade now says only the
+  // thing that is true of it, which is that this device could not reach the
+  // workspace.
+  assert.equal(h.made.length, 0,
+    'the client\'s own deadline sent the bridge looking for something to say');
+  assert.equal(h.link.routeUnserved, false, 'a deadline produced a sentence about the route');
   assert.equal(h.link.unsupportedReason, null, 'a stopwatch condemned the route after all');
   assert.deepEqual(h.notices, [], 'the user was told their server was wrong');
   h.dispose();
 });
 
-test('what a route producing nothing gets instead is the truth, and one probe', () => {
-  // ⚠ THE HOLE DELETING THE LAST ABSENCE-VERDICT LEFT, filled without inferring
-  // anything. Measured on the parent branch through a proxy that upgrades `/_mux`
-  // for real and drops every server frame: 70 s, 3 sockets, 2 idle closures, 18
-  // frames out, 0 in, NO PROBE EVER BUILT, no verdict, the tree never synced, and
-  // a status bar reading "ShadowLink could not reach the workspace" against a
-  // server a control client was syncing with on the per-room route.
-  const h = unreachableHarness({ connectTimeoutMs: 40, hang: true });
-  h.transport.connect();
-  for (let i = 0; i < 4; i += 1) h.fire();
-  assert.equal(h.link.routeUnserved, false, 'the fact was recorded before it was known');
-
-  h.made[0]?.arrive();                           // the server DOES answer, elsewhere
-  for (let i = 0; i < 4; i += 1) h.fire();
-
-  assert.equal(h.link.routeUnserved, true,
-    'the one thing measurement establishes here was never recorded');
-  assert.equal(h.link.unsupportedReason, null, 'a fact was allowed to become a verdict');
-  assert.deepEqual(h.notices, []);
-  // ONE probe, and it is gone: the question it was built to answer has been
-  // answered, and a second permanent socket is the topology this slice removes.
-  assert.equal(h.made[0]?.destroyed, true, 'the probe was left running for ever');
-  for (let i = 0; i < 10; i += 1) h.fire();
-  assert.equal(h.made.length, 1,
-    `a dark route built ${h.made.length} providers on the tree doc`);
-  h.dispose();
-});
-
-test('a socket that OPENS but never speaks does not settle the probe\'s question', () => {
-  // ⚠ MEASURED AS A DEFECT, against a real server behind a proxy that upgrades
-  // `/_mux` and drops every server frame: the bridge discarded its probe on the
-  // mux status going `connected`, the socket opened every 1.6 s, each open
-  // destroyed the probe before it could answer, and a fresh `WebsocketProvider`
-  // was built in its place for ever while the user was told nothing at all. An
-  // open socket settles nothing here; a FRAME does.
+/**
+ * A route that UPGRADES and then says nothing: the socket opens at once and is
+ * deaf for ever, the clock is ours, and `refuse` flips the path to ending every
+ * dial — which is what a proxy reload, or a server that has stopped, looks like
+ * from in here.
+ *
+ * This is the shape the honest sentence is built for, and since this round it is
+ * the ONLY shape that reaches it: a socket that opened and carried frames out is
+ * something that happened, where a dial that never opened is only a deadline.
+ */
+function deafHarness(): {
+  transport: TreeTransport;
+  link: MuxLink;
+  made: StubLegacy[];
+  notices: MuxUnsupportedReason[];
+  sockets: MuxSocket[];
+  refuse(value: boolean): void;
+  run(cycles: number): void;
+  dispose(): void;
+} {
   const clock = { t: 0 };
   const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
   const sockets: MuxSocket[] = [];
+  let refusing = false;
   const link = new MuxLink({
     ...CONFIG,
     openSocket: (): MuxSocket => {
+      if (refusing) throw new Error('the path ended this dial');
       const socket: MuxSocket = {
         readyState: 1,                             // OPEN at once, and deaf for ever
         bufferedAmount: 0,
@@ -539,30 +533,65 @@ test('a socket that OPENS but never speaks does not settle the probe\'s question
     link, doc, CONFIG, (reason) => notices.push(reason),
     () => { const stub = new StubLegacy(); made.push(stub); return stub; },
   );
-  const run = (cycles: number): void => {
-    for (let i = 0; i < cycles; i += 1) {
-      clock.t += 3_000;
-      for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
-    }
+  return {
+    transport, link, made, notices, sockets,
+    refuse: (value: boolean): void => { refusing = value; },
+    run: (cycles: number): void => {
+      for (let i = 0; i < cycles; i += 1) {
+        clock.t += 3_000;
+        for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+      }
+    },
+    dispose: (): void => { transport.destroy(); link.destroy(); doc.destroy(); },
   };
+}
 
-  transport.connect();
-  assert.ok(link.stats.framesOut > 0, 'the room never asked the route for anything');
-  run(11);                                         // one full idle cycle of silence
+test('what a route producing nothing gets instead is the truth, and one probe', () => {
+  // ⚠ THE HOLE DELETING THE LAST ABSENCE-VERDICT LEFT, filled without inferring
+  // anything. Measured on the parent branch through a proxy that upgrades `/_mux`
+  // for real and drops every server frame: 70 s, 3 sockets, 2 idle closures, 18
+  // frames out, 0 in, NO PROBE EVER BUILT, no verdict, the tree never synced, and
+  // a status bar reading "ShadowLink could not reach the workspace" against a
+  // server a control client was syncing with on the per-room route.
+  const h = deafHarness();
+  h.transport.connect();
+  assert.ok(h.link.stats.framesOut > 0, 'the room never asked the route for anything');
+  h.run(11);                                     // one full idle cycle of silence
+  assert.equal(h.link.stats.idleClosures, 1, 'the deaf socket was never closed');
+  assert.equal(h.made.length, 1, 'a deaf route was never even looked into');
+  assert.equal(h.link.routeUnserved, false, 'the fact was recorded before it was known');
 
-  assert.equal(link.stats.idleClosures, 1, 'the deaf socket was never closed');
-  assert.equal(made.length, 1, 'a deaf route was never even looked into');
-  assert.ok(sockets.length >= 2, 'the ladder never redialled');
-  assert.equal(made[0]?.destroyed, false,
+  h.made[0]?.arrive();                           // the server DOES answer, elsewhere
+  h.run(11);
+
+  assert.equal(h.link.routeUnserved, true,
+    'the one thing measurement establishes here was never recorded');
+  assert.equal(h.link.unsupportedReason, null, 'a fact was allowed to become a verdict');
+  assert.deepEqual(h.notices, []);
+  // ONE probe at a time, and it is gone: the question it was built to answer has
+  // been answered, and a second permanent socket is the topology this slice
+  // removes.
+  assert.equal(h.made[0]?.destroyed, true, 'the probe was left running for ever');
+  h.dispose();
+});
+
+test('a socket that OPENS but never speaks does not settle the probe\'s question', () => {
+  // ⚠ MEASURED AS A DEFECT, against a real server behind a proxy that upgrades
+  // `/_mux` and drops every server frame: the bridge discarded its probe on the
+  // mux status going `connected`, the socket opened every 1.6 s, each open
+  // destroyed the probe before it could answer, and a fresh `WebsocketProvider`
+  // was built in its place for ever while the user was told nothing at all. An
+  // open socket settles nothing here; a FRAME does.
+  const h = deafHarness();
+  h.transport.connect();
+  h.run(11);                                     // one full idle cycle of silence
+
+  assert.equal(h.link.stats.idleClosures, 1, 'the deaf socket was never closed');
+  assert.equal(h.made.length, 1, 'a deaf route was never even looked into');
+  assert.ok(h.sockets.length >= 2, 'the ladder never redialled');
+  assert.equal(h.made[0]?.destroyed, false,
     'a socket that merely opened threw the probe away before it could answer');
-
-  made[0]?.arrive();
-  run(11);
-  assert.equal(link.routeUnserved, true, 'the probe answered and nothing recorded it');
-  assert.equal(link.unsupportedReason, null);
-  assert.deepEqual(notices, []);
-  assert.equal(made.length, 1, `a dark route built ${made.length} providers on the tree doc`);
-  transport.destroy(); link.destroy(); doc.destroy();
+  h.dispose();
 });
 
 test('a REFUSED route still reaches the verdict, and that is the only thing that does', () => {
