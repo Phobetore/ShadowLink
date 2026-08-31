@@ -333,11 +333,20 @@ function holdFirstFrameProxy({ listen, target, holdMs, onlyNth }) {
  */
 function deafMuxProxy({ listen, target }) {
   const live = [];
+  // Mutable, because "the proxy was reloaded" is a real thing that happens to a
+  // route that was deaf a moment ago, and it turns this shape into the refused
+  // one WITH A HISTORY — which is the ordering no case covered.
+  const state = { refusing: false };
   const server = net.createServer((client) => {
     client.on('error', () => undefined);
     client.once('data', (first) => {
       const head = first.toString('latin1').split('\r\n')[0] ?? '';
       const isMux = head.includes(' /_mux');
+      if (isMux && state.refusing) {
+        client.write('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+        client.end();
+        return;
+      }
       const up = net.connect(target, '127.0.0.1', () => { up.write(first); });
       live.push({ client, up });
       up.on('error', () => undefined);
@@ -367,6 +376,16 @@ function deafMuxProxy({ listen, target }) {
       await new Promise((resolve) => server.listen(listen, '127.0.0.1', resolve));
       return `ws://127.0.0.1:${listen}`;
     },
+    /** From here on, 404 the `/_mux` upgrade instead of upgrading it and going deaf. */
+    refuseMux() { state.refusing = true; },
+    /** One ordinary RST on every pair the proxy is carrying, `/_mux` included. */
+    cutAll() {
+      for (const { client, up } of live) {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      }
+      live.length = 0;
+    },
     async stop() {
       for (const { client, up } of live) {
         try { client.destroy(); } catch { /* gone */ }
@@ -377,8 +396,20 @@ function deafMuxProxy({ listen, target }) {
   };
 }
 
-/** The bar, exactly as `main.ts` composes it, for a session in this state. */
-function barFor(link, { paused = null, ready = false, compatibility = false } = {}) {
+/**
+ * The bar, exactly as `main.ts` composes it, for a session in this state.
+ *
+ * ⚠ `compatibility` IS THREE FACTS, not the setting. `main.ts` reads the setting
+ * once, when it builds the transport, so `active` is what is carrying the tree,
+ * `chosen` is what the setting said when that happened, and `requested` is what it
+ * says now — and the last two disagree for the whole of the window in which
+ * anybody throws the lever.
+ */
+function barFor(link, {
+  paused = null,
+  ready = false,
+  compatibility = { active: false, requested: false, chosen: false },
+} = {}) {
   return statusLine({
     paused,
     ready,
@@ -406,6 +437,10 @@ export function registerMuxTreeCases(getServer, legacyPort) {
   const deafPort = legacyPort + 7;
   const holePort = legacyPort + 8;
   const leverPort = legacyPort + 9;
+  const killPort = legacyPort + 10;
+  const killProxyPort = legacyPort + 11;
+  const reloadPort = legacyPort + 12;
+  const outagePort = legacyPort + 13;
 
   test('80a the shipped MuxLink carries _tree over the real server, and converges', async () => {
     const server = getServer();
@@ -1141,14 +1176,26 @@ export function registerMuxTreeCases(getServer, legacyPort) {
       }
     });
 
-  test('80m a black-holed /_mux upgrade gets the same statement, and no verdict', async () => {
-    // ⚠ A DELIBERATE CHANGE OF BEHAVIOUR, recorded here with its cost. On the
-    // parent branch this shape produced `unreachable` at 12,993 ms and the tree
-    // synced over the adopted legacy probe. That verdict rested entirely on dials
-    // the CLIENT ended, and a variable-latency path serving `/_mux` normally
-    // produced dials of exactly the same shape — measured, a permanent false
-    // demotion at 14,527 ms. The two are one observation, so neither is a verdict
-    // any more, and this one gets the truthful statement and the lever instead.
+  test('80m a black-holed /_mux upgrade says only what is true of it: nothing', async () => {
+    // ⚠ A DELIBERATE NARROWING, RECORDED HERE WITH BOTH ITS COSTS, and it has now
+    // been narrowed twice. On the parent branch this shape produced `unreachable`
+    // at 12,993 ms and the tree synced over the adopted legacy probe; that verdict
+    // rested entirely on dials the CLIENT ended, and a variable-latency path
+    // serving `/_mux` normally produced dials of exactly the same shape — a
+    // permanent false demotion at 14,527 ms. So the verdict went.
+    //
+    // What replaced it was the honest statement, reached from the same expired
+    // deadlines — and that was the same mistake one level down. Measured against a
+    // HEALTHY server serving `/_mux` correctly behind a proxy forwarding every
+    // byte and merely delaying each connection by 13 s: "ShadowLink can reach your
+    // server, but nothing is coming back on its multiplexed connection",
+    // permanently, from 26,177 ms, `dialsRefused` 0. A deadline is not an
+    // observation about the route in either direction.
+    //
+    // So this shape now gets no verdict, no statement and no probe. What the user
+    // sees is the read-only sentence, which is true: this device could not reach
+    // the workspace. The lever is still in Settings under "This device", and 80n
+    // proves it works on exactly this shape.
     const server = getServer();
     const workspace = 'muxtree80m';
     const proxy = hostileProxy({ listen: holePort, target: server.port, mode: 'blackhole' });
@@ -1174,23 +1221,26 @@ export function registerMuxTreeCases(getServer, legacyPort) {
     try {
       transport.connect({ immediate: true });
 
-      assert.equal(await until(() => link.routeUnserved, 20_000), true,
-        'an upgrade that is never answered produced no statement');
+      // Long enough for four rungs of the ladder on this proxy, which is what used
+      // to be enough for the verdict AND for the statement.
+      assert.equal(await until(() => link.stats.dialsAbandoned >= 4, 20_000), true,
+        'no dial actually ran out of time, so this proves nothing');
+      assert.equal(link.stats.dialsRefused, 0, 'the path refused something after all');
+      assert.equal(link.routeRefused, false);
       assert.equal(link.unsupportedReason, null,
         'a run of the client\'s own deadlines condemned the route');
+      assert.equal(link.routeUnserved, false,
+        'a run of the client\'s own deadlines produced a sentence about the route');
       assert.deepEqual(notices, [],
         `the user was told about their server from a stopwatch: ${JSON.stringify(notices)}`);
-      assert.equal(link.stats.dialsRefused, 0, 'the path refused something after all');
-      assert.ok(link.stats.dialsAbandoned >= 2, 'no dial actually ran out of time');
-      assert.equal(link.routeRefused, false);
+      assert.equal(link.stats.socketsOpened > 0, true, 'no dial was ever made');
+      assert.equal(link.stats.framesOut, 0, 'a socket opened, so this is the wrong shape');
 
-      const bar = barFor(link);
-      assert.equal(bar.text, 'ShadowLink: not syncing');
-      assert.match(bar.tooltip, /"Use the compatibility connection"/);
-      // Nothing was ever written here — no socket opened — so the sentence takes
-      // its other clause rather than reporting "0 message(s)".
-      assert.equal(link.stats.framesOut, 0);
-      assert.match(bar.tooltip, /not carried a single message/);
+      // And what the user sees is the read-only sentence, unimproved and true.
+      const paused = 'ShadowLink could not reach the workspace. Editing locally; sync is paused.';
+      const bar = barFor(link, { paused });
+      assert.equal(bar.text, 'ShadowLink: paused');
+      assert.equal(bar.tooltip, paused);
     } finally {
       transport.destroy(); link.destroy(); tree.doc.destroy();
       await proxy.stop();
@@ -1229,16 +1279,222 @@ export function registerMuxTreeCases(getServer, legacyPort) {
         );
 
         // And it says so, on every state, including this one.
-        const bar = barFor(null, { ready: true, compatibility: true });
+        const bar = barFor(null, {
+          ready: true,
+          compatibility: { active: true, requested: true, chosen: true },
+        });
         assert.equal(bar.text, 'ShadowLink: synced');
         assert.match(bar.tooltip, /using the compatibility connection/);
         assert.match(bar.tooltip, /Turn it off/);
+
+        // ⚠ AND THE INSTANT AFTER THE TOGGLE, THE BAR SAYS WHAT IS ACTUALLY
+        // RUNNING. The transport is chosen once, when the plugin loads, so the
+        // setting is an intention until the reload — and this session is still on
+        // the connection it built, whichever way the toggle has just gone.
+        // Measured on the parent's wiring: thrown on at 40,146 ms with no reload,
+        // one tooltip told the user to turn the setting on and that it was already
+        // in force; turned off at 20,138 ms, the sentence disclosing the cost
+        // simply vanished from a session still paying it.
+        const justTurnedOff = barFor(null, {
+          ready: true,
+          compatibility: { active: true, requested: false, chosen: true },
+        });
+        assert.match(justTurnedOff.tooltip, /still using the compatibility connection/,
+          'a session still on the compatibility connection stopped disclosing it');
+        assert.match(justTurnedOff.tooltip, /Reload the plugin/);
+
+        const justTurnedOn = barFor(null, {
+          ready: true,
+          compatibility: { active: false, requested: true, chosen: false },
+        });
+        assert.match(justTurnedOn.tooltip, /still using the multiplexed connection/,
+          'a session still on the mux claimed the fix was already in force');
+        assert.match(justTurnedOn.tooltip, /Reload the plugin to apply it/);
       } finally {
         transport.destroy();
         peerLink.destroy(); peer.destroy(); tree.doc.destroy();
         await proxy.stop();
       }
     });
+
+  test('80o the sentence is retracted when the server it claims is reachable dies',
+    async () => {
+      // ⚠ MEASURED AS A FALSE SENTENCE OF THIS ROUND'S OWN MAKING, and the
+      // ordinary case rather than an exotic one: a server restarting, a laptop
+      // closing, a Wi-Fi association dropping. Deaf `/_mux`, statement latched at
+      // 30,360 ms, the server PROCESS killed at 45,000 ms — and from 45 s to 80 s
+      // the bar still read "ShadowLink can reach your server, but nothing is
+      // coming back … 11 message(s) have gone out on it", while `dialsRefused`
+      // climbed to 11 and a control per-room client could not reach the server at
+      // all. It also OUTRANKS `paused`, so it hid the sentence that had just
+      // become true. This case owns its own server because it kills it.
+      const own = await startServer({ port: killPort });
+      const workspace = 'muxtree80o';
+      const proxy = deafMuxProxy({ listen: killProxyPort, target: killPort });
+      const url = await proxy.start();
+      const tree = new TreeDoc();
+      const link = new MuxLink({
+        serverUrl: url,
+        serverKey: own.serverKey,
+        workspaceId: workspace,
+        openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+        idleTimeoutMs: 1_500,
+        backoffMs: [100],
+        jitter: 0,
+        unreachableDials: 2,
+      });
+      const notices = [];
+      const transport = openTreeTransport(
+        link, tree.doc,
+        { serverUrl: url, serverKey: own.serverKey, workspaceId: workspace },
+        (reason) => notices.push(reason),
+      );
+      try {
+        transport.connect({ immediate: true });
+        assert.equal(await until(() => link.routeUnserved, 20_000), true,
+          'the deaf route never produced the statement this case is about retracting');
+
+        const paused = 'ShadowLink could not reach the workspace. Editing locally; sync is paused.';
+        assert.equal(barFor(link, { paused }).text, 'ShadowLink: not syncing');
+
+        // The server goes away. Nothing about the route changes; what changes is
+        // that the claim the sentence rests on has stopped being true.
+        await own.stop();
+
+        assert.equal(await until(() => link.stats.dialsRefused > 0, 20_000), true,
+          'the dead server produced no refused dial, so this proves nothing');
+        assert.equal(await until(() => !link.routeUnserved, 10_000), true,
+          'the bar went on claiming a dead server was reachable');
+        assert.equal(link.unsupportedReason, null,
+          'a server that is merely gone was condemned as a blocked route');
+        assert.deepEqual(notices, [],
+          `the user was told about their deployment: ${JSON.stringify(notices)}`);
+
+        // And the sentence that IS true is no longer suppressed.
+        const bar = barFor(link, { paused });
+        assert.equal(bar.text, 'ShadowLink: paused');
+        assert.equal(bar.tooltip, paused);
+      } finally {
+        transport.destroy(); link.destroy(); tree.doc.destroy();
+        await proxy.stop();
+        await own.stop();
+        own.cleanup();
+      }
+    });
+
+  test('80p a route that went deaf and is THEN refused still reaches the verdict', async () => {
+    // ⚠ A REGRESSION AGAINST THE PARENT, MEASURED WITH THE SAME PROBE ON BOTH, and
+    // the ordering is what a proxy reload does rather than anything exotic. On the
+    // parent the deaf phase produced no report, so the refusal phase reached
+    // `unreachable` in 248 ms with the notice and a synced tree; on this branch's
+    // first cut the deaf phase's answer latched the bridge shut and 25 s and 368
+    // REFUSED dials later `unsupportedReason` was still null with `routeRefused`
+    // true the whole time. Nothing may become unreachable for a session because of
+    // the order two shapes arrived in.
+    const server = getServer();
+    const workspace = 'muxtree80p';
+    const proxy = deafMuxProxy({ listen: reloadPort, target: server.port });
+    const url = await proxy.start();
+    const tree = new TreeDoc();
+    const link = new MuxLink({
+      serverUrl: url,
+      serverKey: server.serverKey,
+      workspaceId: workspace,
+      openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+      idleTimeoutMs: 1_500,
+      backoffMs: [100],
+      jitter: 0,
+      unreachableDials: 2,
+    });
+    const notices = [];
+    const transport = openTreeTransport(
+      link, tree.doc,
+      { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
+      (reason) => notices.push(reason),
+    );
+    try {
+      transport.connect({ immediate: true });
+      assert.equal(await until(() => link.routeUnserved, 20_000), true,
+        'the deaf phase never reported, so the ordering this case is about never happened');
+
+      // The proxy is reloaded into the OTHER misconfiguration: 404 on `/_mux`,
+      // every other path still forwarded, and the live pairs RST.
+      proxy.refuseMux();
+      proxy.cutAll();
+
+      assert.equal(await until(() => link.unsupportedReason === 'unreachable', 20_000), true,
+        'a route the path is now refusing could not be condemned, because an earlier '
+        + 'answer had shut the only door to the verdict');
+      assert.deepEqual(notices, ['unreachable']);
+      assert.ok(link.stats.dialsRefused >= 2, 'the verdict rested on something else');
+      assert.equal(await until(() => transport.synced, 20_000), true,
+        'the tree never reached the route that works');
+      assert.equal(link.routeUnserved, false,
+        'a session that had already fallen back was still told nothing was syncing');
+    } finally {
+      transport.destroy(); link.destroy(); tree.doc.destroy();
+      await proxy.stop();
+    }
+  });
+
+  test('80q a server that was down when the client started is not demoted for it', async () => {
+    // ⚠ MEASURED AS A NEW PERMANENT FALSE DEMOTION, and it is a plain restart: a
+    // real `server/index.js` stopped before the client starts and restarted D ms
+    // later, then serving `/_mux` normally for the rest of the run. A false
+    // `unreachable` and the proxy-blaming notice on 5 of 12 outage lengths and on
+    // 5 of 5 repeats at D = 2,000 ms, where the parent produced 0 of 12 — the
+    // notice firing while the dial that was about to succeed was still in flight,
+    // on refusals counted entirely while the server was down.
+    //
+    // A verdict is one sentence about one moment: the server answers AND this path
+    // refuses this route. Nothing here ever observes both at once.
+    const workspace = 'muxtree80q';
+    const first = await startServer({ port: outagePort });
+    const { serverKey, dir } = first;
+    const url = `ws://127.0.0.1:${outagePort}`;
+    await first.stop();                          // down before the client starts
+
+    const tree = new TreeDoc();
+    const link = new MuxLink({
+      serverUrl: url,
+      serverKey,
+      workspaceId: workspace,
+      openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+      backoffMs: [150],
+      jitter: 0,
+      unreachableDials: 2,
+    });
+    const notices = [];
+    const transport = openTreeTransport(
+      link, tree.doc, { serverUrl: url, serverKey, workspaceId: workspace },
+      (reason) => notices.push(reason),
+    );
+    let second = null;
+    try {
+      transport.connect({ immediate: true });
+      // Long enough for the refusals to build a run AND for the bridge to have a
+      // probe of its own in flight, which is the concurrency the defect abused.
+      assert.equal(await until(() => link.routeRefused, 10_000), true,
+        'the outage produced no run of refused dials, so this proves nothing');
+      await sleep(2_000);
+
+      second = await startServer({ port: outagePort, dir });
+      assert.equal(await until(() => link.everServed, 20_000), true,
+        'the mux never came back on a server that is serving /_mux normally');
+      assert.equal(link.unsupportedReason, null,
+        'refusals gathered while the server was down were cashed in by its recovery');
+      assert.deepEqual(notices, [],
+        `the user was told to reconfigure a proxy that is fine: ${JSON.stringify(notices)}`);
+      assert.equal(await until(() => transport.synced, 20_000), true,
+        'the tree never synced over the route that works');
+      assert.equal(link.routeUnserved, false, 'a working route was described as delivering nothing');
+      assert.equal(barFor(link, { ready: true }).text, 'ShadowLink: synced');
+    } finally {
+      transport.destroy(); link.destroy(); tree.doc.destroy();
+      if (second !== null) await second.stop();
+      first.cleanup();
+    }
+  });
 
   return {
     async start() {
