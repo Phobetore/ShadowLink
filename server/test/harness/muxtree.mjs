@@ -336,12 +336,17 @@ function deafMuxProxy({ listen, target }) {
   // Mutable, because "the proxy was reloaded" is a real thing that happens to a
   // route that was deaf a moment ago, and it turns this shape into the refused
   // one WITH A HISTORY — which is the ordering no case covered.
-  const state = { refusing: false };
+  const state = { refusing: false, holdingOthers: false };
   const server = net.createServer((client) => {
     client.on('error', () => undefined);
     client.once('data', (first) => {
       const head = first.toString('latin1').split('\r\n')[0] ?? '';
       const isMux = head.includes(' /_mux');
+      // ⚠ EVERY OTHER ROUTE HELD, and `/_mux` still upgraded and still deaf. It
+      // isolates the one retraction that has nothing to do with a refused dial:
+      // the per-room probe that a recorded fact rests on stops being able to
+      // answer, with the mux route behaving exactly as it did before.
+      if (!isMux && state.holdingOthers) return;
       if (isMux && state.refusing) {
         client.write('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
         client.end();
@@ -378,6 +383,8 @@ function deafMuxProxy({ listen, target }) {
     },
     /** From here on, 404 the `/_mux` upgrade instead of upgrading it and going deaf. */
     refuseMux() { state.refusing = true; },
+    /** From here on, accept every OTHER route's connection and never answer it. */
+    holdOthers() { state.holdingOthers = true; },
     /** One ordinary RST on every pair the proxy is carrying, `/_mux` included. */
     cutAll() {
       for (const { client, up } of live) {
@@ -498,6 +505,7 @@ export function registerMuxTreeCases(getServer, legacyPort) {
   const reloadPort = legacyPort + 12;
   const outagePort = legacyPort + 13;
   const outageProxyPort = legacyPort + 14;
+  const holdOtherPort = legacyPort + 15;
 
   test('80a the shipped MuxLink carries _tree over the real server, and converges', async () => {
     const server = getServer();
@@ -1488,6 +1496,12 @@ export function registerMuxTreeCases(getServer, legacyPort) {
         'the tree never reached the route that works');
       assert.equal(link.routeUnserved, false,
         'a session that had already fallen back was still told nothing was syncing');
+      // The third retraction, read where the user reads it: after the fallback the
+      // mux is not what carries the tree, so "nothing is syncing" would be false.
+      const bar = barFor(link, { ready: true });
+      assert.equal(bar.text, 'ShadowLink: synced');
+      assert.equal(bar.tooltip.includes('nothing is coming back'), false,
+        'a synced session was told its multiplexed connection was delivering nothing');
     } finally {
       transport.destroy(); link.destroy(); tree.doc.destroy();
       await proxy.stop();
@@ -1558,6 +1572,64 @@ export function registerMuxTreeCases(getServer, legacyPort) {
       first.cleanup();
     }
   });
+
+  test('80r the statement goes when the probe that earned it can no longer answer',
+    async () => {
+      // ⚠ THE ONE RETRACTION A REFUSED DIAL DOES NOT COVER, isolated. Here the mux
+      // route behaves exactly as it did when the statement was recorded — it still
+      // upgrades, it is still deaf, nothing is refused — and what changes is that
+      // the per-room route the claim "ShadowLink can reach your server" rests on
+      // stops answering. That claim is about the SERVER, so it may only stand
+      // while a probe will still say so; a rebuilt probe that cannot sync inside
+      // `TREE_SYNC_TIMEOUT_MS` is the negative evidence, and the plugin stops
+      // asserting what it can no longer show rather than concluding anything new.
+      const server = getServer();
+      const workspace = 'muxtree80r';
+      const proxy = deafMuxProxy({ listen: holdOtherPort, target: server.port });
+      const url = await proxy.start();
+      const tree = new TreeDoc();
+      const link = new MuxLink({
+        serverUrl: url,
+        serverKey: server.serverKey,
+        workspaceId: workspace,
+        openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+        idleTimeoutMs: 1_500,
+        backoffMs: [100],
+        jitter: 0,
+        unreachableDials: 2,
+      });
+      const notices = [];
+      const transport = openTreeTransport(
+        link, tree.doc,
+        { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
+        (reason) => notices.push(reason),
+      );
+      const paused = 'ShadowLink could not reach the workspace. Editing locally; sync is paused.';
+      try {
+        transport.connect({ immediate: true });
+        assert.equal(await until(() => link.routeUnserved, 20_000), true,
+          'the deaf route never produced the statement this case is about retracting');
+        assert.equal(barFor(link, { paused }).text, 'ShadowLink: not syncing');
+
+        proxy.holdOthers();
+        const refusedBefore = link.stats.dialsRefused;
+
+        // One liveness cycle rebuilds the probe; its own window is what expires.
+        assert.equal(await until(() => !link.routeUnserved, TREE_SYNC_TIMEOUT_MS + 15_000), true,
+          'the bar went on claiming a server that had stopped answering was reachable');
+        assert.equal(link.stats.dialsRefused, refusedBefore,
+          'the route was refused after all, so this proves the other retraction');
+        assert.equal(link.unsupportedReason, null, 'a retraction became a verdict');
+        assert.deepEqual(notices, []);
+
+        const bar = barFor(link, { paused });
+        assert.equal(bar.text, 'ShadowLink: paused');
+        assert.equal(bar.tooltip, paused);
+      } finally {
+        transport.destroy(); link.destroy(); tree.doc.destroy();
+        await proxy.stop();
+      }
+    });
 
   return {
     async start() {
