@@ -59,6 +59,12 @@ class StubLegacy implements TreeTransport {
       };
       this.waiters.add(settle);
       const timer = setTimeout(() => settle(this.synced), ms);
+      // ⚠ UNREF'd, and it is the bridge that made this matter. `startProbe` now
+      // asks its probe `whenSynced(TREE_SYNC_TIMEOUT_MS)`, so every case where the
+      // probe never arrives leaves a fifteen-second REF'd timer holding the test
+      // process open long after its assertions are done — which is exactly the
+      // shape a previous round wrote down as "the suite hangs".
+      (timer as unknown as { unref?: () => void }).unref?.();
     });
   }
 
@@ -487,6 +493,76 @@ test('what a route producing nothing gets instead is the truth, and one probe', 
   assert.equal(h.made.length, 1,
     `a dark route built ${h.made.length} providers on the tree doc`);
   h.dispose();
+});
+
+test('a socket that OPENS but never speaks does not settle the probe\'s question', () => {
+  // ⚠ MEASURED AS A DEFECT, against a real server behind a proxy that upgrades
+  // `/_mux` and drops every server frame: the bridge discarded its probe on the
+  // mux status going `connected`, the socket opened every 1.6 s, each open
+  // destroyed the probe before it could answer, and a fresh `WebsocketProvider`
+  // was built in its place for ever while the user was told nothing at all. An
+  // open socket settles nothing here; a FRAME does.
+  const clock = { t: 0 };
+  const timers: Array<{ fn: () => void; ms: number } | undefined> = [];
+  const sockets: MuxSocket[] = [];
+  const link = new MuxLink({
+    ...CONFIG,
+    openSocket: (): MuxSocket => {
+      const socket: MuxSocket = {
+        readyState: 1,                             // OPEN at once, and deaf for ever
+        bufferedAmount: 0,
+        send: () => undefined,
+        close: (): void => {
+          (socket as { readyState: number }).readyState = 3;
+          socket.onclose?.({});
+        },
+        onopen: null,
+        onmessage: null,
+        onclose: null,
+        onerror: null,
+      };
+      sockets.push(socket);
+      return socket;
+    },
+    connectTimeoutMs: 0,
+    idleTimeoutMs: 30_000,
+    unreachableDials: 2,
+    random: () => 0.5,
+    now: () => clock.t,
+    setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length - 1; },
+    clearTimer: (handle) => { timers[handle as number] = undefined; },
+  });
+  const made: StubLegacy[] = [];
+  const doc = new Y.Doc();
+  const notices: MuxUnsupportedReason[] = [];
+  const transport = openTreeTransport(
+    link, doc, CONFIG, (reason) => notices.push(reason),
+    () => { const stub = new StubLegacy(); made.push(stub); return stub; },
+  );
+  const run = (cycles: number): void => {
+    for (let i = 0; i < cycles; i += 1) {
+      clock.t += 3_000;
+      for (const timer of timers.splice(0).filter((t) => t !== undefined)) timer.fn();
+    }
+  };
+
+  transport.connect();
+  assert.ok(link.stats.framesOut > 0, 'the room never asked the route for anything');
+  run(11);                                         // one full idle cycle of silence
+
+  assert.equal(link.stats.idleClosures, 1, 'the deaf socket was never closed');
+  assert.equal(made.length, 1, 'a deaf route was never even looked into');
+  assert.ok(sockets.length >= 2, 'the ladder never redialled');
+  assert.equal(made[0]?.destroyed, false,
+    'a socket that merely opened threw the probe away before it could answer');
+
+  made[0]?.arrive();
+  run(11);
+  assert.equal(link.routeUnserved, true, 'the probe answered and nothing recorded it');
+  assert.equal(link.unsupportedReason, null);
+  assert.deepEqual(notices, []);
+  assert.equal(made.length, 1, `a dark route built ${made.length} providers on the tree doc`);
+  transport.destroy(); link.destroy(); doc.destroy();
 });
 
 test('a REFUSED route still reaches the verdict, and that is the only thing that does', () => {
