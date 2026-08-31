@@ -538,6 +538,26 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
   private readonly releaseUnreachable: () => void;
   private readonly releaseServed: () => void;
 
+  /**
+   * ⚠ THE THIRD REGISTRATION, WHICH USED TO BE THE ONE WITHOUT A RELEASE. An
+   * accumulation audit counted it: `link.onUnsupported(...)` returns a disposer
+   * and the constructor dropped it, so after `transport.destroy()` the link still
+   * held one handler retaining the dead transport, released only when the LINK was
+   * destroyed. Inert today — `fallBack` returns early once `destroyed` — and
+   * bounded at one per transport, because every current wiring destroys link and
+   * transport together. It is fixed anyway: a wiring that rebuilt the transport on
+   * a persistent link would retain one dead transport per rebuild, and "the other
+   * object's lifetime happens to cover ours" is a property of that wiring rather
+   * than a guarantee of this one.
+   *
+   * Released in `destroy` and nowhere else, deliberately. `fallBack` releases the
+   * other three because each of them can still fire afterwards; this one cannot.
+   * `noteLegacyEvidence` latches `unsupported` and returns early for ever, so the
+   * handler is dispatched at most once per link, and a transport that has fallen
+   * back is alive rather than dead — there is nothing being retained.
+   */
+  private readonly releaseUnsupported: () => void;
+
   /** Handlers the plugin registered, re-registered on the transport that wins. */
   private readonly connectedHandlers = new Set<() => void>();
   private releaseConnected: () => void;
@@ -568,7 +588,7 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
       ?? ((handle): void => { clearTimeout(handle as ReturnType<typeof setTimeout>); });
     this.active = new MuxTreeTransport(link, doc, config.room ?? TREE_ROOM);
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
-    link.onUnsupported((reason) => { this.fallBack(reason); });
+    this.releaseUnsupported = link.onUnsupported((reason) => { this.fallBack(reason); });
     this.releaseUnreachable = link.onUnreachable((evidence) => { this.decide(evidence); });
     // ⚠ A FRAME settles the question the probe was asking — not a socket that
     // merely opened. This used to key off the mux status going `connected`, and
@@ -649,6 +669,7 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
 
   destroy(): void {
     this.destroyed = true;
+    this.releaseUnsupported();
     this.releaseUnreachable();
     this.releaseServed();
     this.discardProbe();

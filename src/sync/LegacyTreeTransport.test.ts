@@ -1552,3 +1552,40 @@ test('the watch does not outlive the probe, and never touches an adopted one', (
     'a disposed transport went on building providers on a destroyed doc');
   h.dispose();
 });
+
+test('destroy releases all THREE registrations it made on the link, not two of them', () => {
+  // ⚠ THE ONE REGISTRATION OF THREE WITHOUT A RELEASE, found by counting rather
+  // than by reading. The constructor takes a disposer from `onUnsupported`,
+  // `onUnreachable` and `onServed`; it kept the last two in fields and DROPPED the
+  // first, so after `transport.destroy()` the link still held one handler closing
+  // over the dead transport, freed only when the LINK was destroyed.
+  //
+  // Inert as shipped, and honestly so: `fallBack` returns early once `destroyed`,
+  // and every current wiring destroys link and transport together, so it was
+  // bounded at one per transport and nothing could feel it. It is fixed because a
+  // wiring that rebuilt the transport on a persistent link would retain one dead
+  // transport per rebuild, and because "the other object's lifetime happens to
+  // cover ours" is a property of that wiring rather than a guarantee of this one.
+  //
+  // The counts are read off the link's own sets for the same reason the `Y.Doc`
+  // observer count is read off `_observers`: the retention IS the count, and there
+  // is no public way to ask.
+  type Held = {
+    unsupportedHandlers: Set<unknown>;
+    unreachableHandlers: Set<unknown>;
+    servedHandlers: Set<unknown>;
+  };
+  const h = boundedHarness();
+  const held = h.link as unknown as Held;
+  const sizes = (): number[] => [
+    held.unsupportedHandlers.size, held.unreachableHandlers.size, held.servedHandlers.size,
+  ];
+
+  assert.deepEqual(sizes(), [1, 1, 1],
+    'the transport did not register the three handlers this case is about');
+
+  h.transport.destroy();
+  assert.deepEqual(sizes(), [0, 0, 0],
+    'a destroyed transport is still held by the link through one of its handlers');
+  h.dispose();
+});
