@@ -20,6 +20,7 @@
 // more interesting than that. See case 80d.
 
 import * as Y from 'yjs';
+import * as awarenessProtocol from 'y-protocols/awareness';
 import net from 'node:net';
 import { WebSocket } from 'ws';
 import { dirname, join } from 'node:path';
@@ -2274,7 +2275,7 @@ export function registerMuxTreeCases(getServer, legacyPort) {
       await proxy.stop();
     });
 
-  test('80x a LegacyTreeTransport that BUILT its own Awareness takes it down with it',
+  test('80x the Awareness is released by whoever BUILT it, and by nobody else',
     async () => {
       // ⚠ THE BRANCH 80w CANNOT REACH, and the mutation sweep is what found that
       // out. Through the bridge every probe is handed the session's `Awareness`, so
@@ -2313,6 +2314,40 @@ export function registerMuxTreeCases(getServer, legacyPort) {
         assert.ok(leaked <= 2,
           `six built-and-destroyed providers left ${leaked} live Timeouts on a doc they do `
           + 'not own — WebsocketProvider.destroy() does not destroy the Awareness it built');
+
+        // ⚠ AND THE OTHER SIDE OF THE SAME FLAG, which the mutation sweep is what
+        // asked for: a BORROWED `Awareness` must survive the transport that
+        // borrowed it, because on the shipped path it is the session's and the
+        // next probe is about to be handed the very same object. Without this,
+        // `ownsAwareness = true` survives every suite — the tree does not need
+        // awareness to sync, so a probe quietly tearing down the session's one
+        // shows up nowhere until something starts using it.
+        const shared = new awarenessProtocol.Awareness(tree.doc);
+        let released = false;
+        shared.on('destroy', () => { released = true; });
+        try {
+          for (let i = 0; i < 2; i += 1) {
+            const borrower = new LegacyTreeTransport(
+              {
+                serverUrl: `ws://127.0.0.1:${server.port}`,
+                serverKey: server.serverKey,
+                workspaceId: workspace,
+                awareness: shared,
+              },
+              tree.doc,
+            );
+            borrower.connect();
+            assert.equal(await borrower.whenSynced(TREE_SYNC_TIMEOUT_MS), true,
+              `borrower ${i} never synced, so this run measured nothing`);
+            borrower.destroy();
+            assert.equal(released, false,
+              `borrower ${i} destroyed an Awareness it was lent — the next probe would be `
+              + 'handed one whose heartbeat has been stopped');
+          }
+        } finally {
+          shared.destroy();
+        }
+        assert.equal(released, true, 'the owner could not release it either');
       } finally {
         tree.doc.destroy();
       }
