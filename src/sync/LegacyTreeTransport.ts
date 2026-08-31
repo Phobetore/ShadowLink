@@ -141,6 +141,35 @@
 // cannot outlive its evidence, and retraction stops being a mechanism that can be
 // incomplete: it is what happens when the value changes.
 //
+// ── AND THE PROBE IS BOUNDED LIKE THE LINK, BECAUSE IT IS A SOCKET LIKE THE ────
+// ── LINK'S ────────────────────────────────────────────────────────────────────
+// ⚠ NOTHING STORED IS NOT THE SAME AS NOTHING STUCK. Making the probe the
+// standing evidence made it a session-long object on the darkest route in the
+// system, and it was given no bound of its own — while the link, on the same
+// path, had spent two rounds learning that a socket which is OPEN but dead is the
+// failure that hides, and a socket that never opens at all is the failure that
+// hides better. `y-websocket` does not cover the second: its watchdog is guarded
+// by `wsconnected` and its reconnect runs out of `onclose`, so a TCP handshake
+// that completes and an upgrade that is never answered park `ws` non-null in
+// CONNECTING for ever, which is precisely the state `setupWS` refuses to re-enter.
+//
+// Measured against real processes at shipped constants, through a proxy that
+// upgrades `/_mux` and swallows every frame while completing the TCP handshake on
+// every other path and delivering nothing: probe built at 1,725 ms onto a
+// half-open socket, the per-room route healed in the same millisecond, and across
+// 140 s the proxy saw ONE non-mux connection. No sentence, 390 refused `/_mux`
+// dials that could not become a verdict because a verdict needs a SYNCED probe,
+// no notice, and a tree that never synced.
+//
+// So the probe now carries the link's own two bounds and neither is new: the dial
+// deadline (`MUX_CONNECT_TIMEOUT_MS` on `MUX_DIAL_PATIENCE`'s ladder) and the
+// silence bound once open (`MUX_IDLE_TIMEOUT_MS`). On expiry it is DISCARDED AND
+// REBUILT — a retry, never a conclusion, because a probe that expired witnessed
+// nothing and an absence is what this file refuses to conclude from everywhere
+// else. The sentence and the fallback both survive the replacement: the sentence
+// is a live read that goes true again when a replacement syncs, and the verdict
+// is taken against whichever probe is answering at the moment a refusal lands.
+//
 // The one thing still remembered is the verdict, and only because it is a fact
 // about a MESSAGE rather than a belief about a route: a pre-P3 server said
 // `[0,0,1,0]`, or the path refused a run of dials while the probe was answering.
@@ -153,6 +182,9 @@
 import type * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 
+import {
+  MUX_CONNECT_TIMEOUT_MS, MUX_DIAL_PATIENCE, MUX_IDLE_TIMEOUT_MS,
+} from '../tree/constants.ts';
 import type { MuxLink, MuxRouteEvidence, MuxUnsupportedReason } from './MuxLink.ts';
 import { MuxTreeTransport, TREE_ROOM, type TreeTransport } from './TreeTransport.ts';
 
@@ -197,6 +229,26 @@ export interface LegacyTreeConfig {
   serverKey: string;
   workspaceId: string;
   room?: string;
+}
+
+/**
+ * The seam the probe's two bounds are driven through, and NOTHING else.
+ *
+ * ⚠ IT CARRIES NO CONSTANT OF ITS OWN. Both defaults are the link's — the same
+ * dial deadline and the same silence bound, because the probe and the link are
+ * two sockets to the same server over the same path, and a probe judged on its
+ * own numbers would be a second set of thresholds to keep honest. `MuxLinkConfig`
+ * has the identical four fields for the identical reason: a test that owns the
+ * clock, and a structural case that wants the shape at a tenth of the wall time.
+ */
+export interface ProbeWatchConfig {
+  /** First rung of the probe's dial deadline. Zero disables the dial bound. */
+  connectTimeoutMs?: number;
+  /** How long a CONNECTED probe may stay unsynced. Zero disables that bound. */
+  idleTimeoutMs?: number;
+  now?: () => number;
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
 }
 
 /**
@@ -313,8 +365,11 @@ export function openTreeTransport(
   // drive the shipped switcher rather than a copy of it.
   makeLegacy: (config: LegacyTreeConfig, doc: Y.Doc) => TreeTransport
   = (c, d) => new LegacyTreeTransport(c, d),
+  // The probe's two bounds and the clock they are measured on. Empty everywhere
+  // but the tests: `main.ts` gets the link's own constants and the real timer.
+  watch: ProbeWatchConfig = {},
 ): TreeTransport & RouteWitness {
-  return new FallbackTreeTransport(link, doc, config, onLegacy, makeLegacy);
+  return new FallbackTreeTransport(link, doc, config, onLegacy, makeLegacy, watch);
 }
 
 class FallbackTreeTransport implements TreeTransport, RouteWitness {
@@ -329,6 +384,48 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
    */
   private probe: TreeTransport | null = null;
   private releaseProbe: (() => void) | null = null;
+
+  /**
+   * The probe's own dial deadline and silence bound — the link's, applied to the
+   * one long-lived object on this branch that never had them.
+   *
+   * ⚠ THE FAILURE THAT HIDES IS A SOCKET THAT IS NOT DEAD BUT UNBORN, and this is
+   * the second time this branch has met it. The link learned it two rounds ago and
+   * answered with `MUX_CONNECT_TIMEOUT_MS` plus a watchdog; the probe was made
+   * session-long in the same round and got neither, on the darkest route in the
+   * system. `y-websocket` cannot cover it: its own watchdog is guarded by
+   * `wsconnected`, and its reconnect loop runs out of `onclose` — so a socket
+   * whose TCP handshake completed and whose upgrade is never answered sits in
+   * CONNECTING with `ws` non-null for ever, which is exactly the state in which
+   * `setupWS` refuses to run again.
+   *
+   * Measured against real processes, shipped constants, a proxy that upgrades
+   * `/_mux` and swallows every frame while completing the TCP handshake on every
+   * other path and delivering nothing: the probe was built at 1,725 ms, the
+   * per-room route was healed in the same millisecond, and across 140 s the proxy
+   * saw ONE non-mux connection — the wedged one. `serverAnswersElsewhere` false
+   * throughout, 390 refused `/_mux` dials that could not be turned into a verdict
+   * because the verdict needs a synced probe, no notice, and a tree that never
+   * synced at all. The sentence and the automatic fallback went down with it.
+   */
+  private probeWatchHandle: unknown = null;
+
+  /** When the probe's CURRENT phase began, which is what both bounds measure. */
+  private probeWatchSince = 0;
+
+  /** The phase that stamp belongs to, so a change of phase restarts its clock. */
+  private probePhase: 'dialing' | 'open' | 'synced' = 'dialing';
+
+  /**
+   * How many of the probe's dials in a row produced no open socket, indexing
+   * `MUX_DIAL_PATIENCE` — the link's ladder, not a second one.
+   *
+   * ⚠ IT IS PATIENCE, NEVER MEASUREMENT, and `MUX_CONNECT_TIMEOUT_MS`'s header is
+   * the reason: a deadline this client chose is a statement about its own patience
+   * and is not evidence about the path. Nothing here is compared with anything,
+   * and nothing here reaches a verdict. It resets on any probe that opens.
+   */
+  private probeDialRung = 0;
 
   /**
    * ⚠ A `probeAnswered` LATCH USED TO LIVE HERE, and then a rebuild-every-cycle
@@ -355,13 +452,27 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
   /** Woken when the transport is swapped, so an in-flight `whenSynced` re-asks. */
   private readonly swapWaiters = new Set<() => void>();
 
+  /** The probe's two bounds and its clock, defaulted to the link's own. */
+  private readonly probeDialMs: number;
+  private readonly probeIdleMs: number;
+  private readonly now: () => number;
+  private readonly setTimer: (fn: () => void, ms: number) => unknown;
+  private readonly clearTimer: (handle: unknown) => void;
+
   constructor(
     private readonly link: MuxLink,
     private readonly doc: Y.Doc,
     private readonly config: LegacyTreeConfig,
     private readonly onLegacy: ((reason: MuxUnsupportedReason) => void) | undefined,
     private readonly makeLegacy: (config: LegacyTreeConfig, doc: Y.Doc) => TreeTransport,
+    watch: ProbeWatchConfig,
   ) {
+    this.probeDialMs = watch.connectTimeoutMs ?? MUX_CONNECT_TIMEOUT_MS;
+    this.probeIdleMs = watch.idleTimeoutMs ?? MUX_IDLE_TIMEOUT_MS;
+    this.now = watch.now ?? Date.now;
+    this.setTimer = watch.setTimer ?? ((fn, ms): unknown => setTimeout(fn, ms));
+    this.clearTimer = watch.clearTimer
+      ?? ((handle): void => { clearTimeout(handle as ReturnType<typeof setTimeout>); });
     this.active = new MuxTreeTransport(link, doc, config.room ?? TREE_ROOM);
     this.releaseConnected = this.active.onConnected(() => { this.fireConnected(); });
     link.onUnsupported((reason) => { this.fallBack(reason); });
@@ -539,6 +650,13 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
    * the tree doc for the session. That is what the previous round paid every
    * `MUX_IDLE_TIMEOUT_MS` for a sentence it re-earned and then remembered anyway;
    * one that is never remembered needs its evidence to stay alive instead.
+   *
+   * ⚠ AND SESSION-LONG IS NOT UNBOUNDED, which is what this round adds. "Kept up
+   * while the question is open" was implemented as "kept whatever it is doing",
+   * and a probe stuck on a half-open socket is doing nothing and will never stop.
+   * `armProbeWatch` is what makes the lifetime belong to the question rather than
+   * to the object: while the probe answers it is left alone, and when it stops
+   * being able to answer it is replaced. Never concluded from — see `replaceProbe`.
    */
   private startProbe(): void {
     const probe = this.makeLegacy(this.config, this.doc);
@@ -549,10 +667,106 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
       // than letting it sit out a backoff rung and lose by default.
       this.link.connect({ immediate: true });
     });
+    this.probePhase = 'dialing';
+    this.probeWatchSince = this.now();
     probe.connect();
+    // `connect` can fire `onConnected` in this turn, which dials the link, which
+    // can reach a verdict, which ADOPTS this probe — so the watch is armed only
+    // if the object is still a probe by the time the dial returns.
+    if (this.probe === probe) this.armProbeWatch();
+  }
+
+  /**
+   * THE TWO BOUNDS THE LINK ALREADY HAS, READ OFF THE ONLY TWO THINGS A
+   * `TreeTransport` SHOWS.
+   *
+   * A `dialing` probe is one whose socket has not opened, and `MuxLink`'s
+   * `armConnectTimeout` is the same statement about the same path: hold the
+   * attempt open for `MUX_CONNECT_TIMEOUT_MS`, widened by `MUX_DIAL_PATIENCE`
+   * each time the last one ran out, reset by any socket that opens. An `open`
+   * probe that has not handshaked is `MuxLink`'s deaf socket, and gets the same
+   * `MUX_IDLE_TIMEOUT_MS`. A `synced` probe is answering the question it was
+   * built to answer and is bounded by nothing at all — it is the evidence.
+   *
+   * ⚠ ONE POLL RATHER THAN TWO ARMED TIMERS, and that is `armIdleWatch`'s shape
+   * for `armIdleWatch`'s reason: the phase can change under a timer without
+   * anything telling this object — `y-websocket` closes and redials on its own —
+   * so a deadline armed for the phase that was true when it was set would be
+   * measuring a phase that has since ended. The stamp moves with the phase, so
+   * every bound is measured from the moment its own phase began.
+   */
+  private armProbeWatch(): void {
+    this.cancelProbeWatch();
+    const bounds = [this.probeDialMs, this.probeIdleMs].filter((ms) => ms > 0);
+    if (bounds.length === 0) return;
+    const poll = Math.max(250, Math.round(Math.min(...bounds) / 10));
+    // ⚠ UNREF'd, for `armIdleTick`'s reason. This re-arms itself for as long as a
+    // dark route holds a probe, so it is the one timer on this branch that can be
+    // the last handle in a process and keep it alive for ever. Obsidian's loop is
+    // held open by Obsidian; a test run's is not.
+    const handle = this.setTimer(() => { this.probeTick(); }, poll);
+    (handle as { unref?: () => void } | null)?.unref?.();
+    this.probeWatchHandle = handle;
+  }
+
+  private probeTick(): void {
+    this.probeWatchHandle = null;
+    const probe = this.probe;
+    if (this.destroyed || this.legacy || probe === null) return;
+    const phase = probe.synced ? 'synced' : probe.connected ? 'open' : 'dialing';
+    if (phase !== this.probePhase) {
+      this.probePhase = phase;
+      this.probeWatchSince = this.now();
+      // A socket that OPENED starts the ladder over, exactly as `noteSocketOpen`
+      // does for the link: patience belongs to a run of failures and is never
+      // carried into a later one.
+      if (phase !== 'dialing') this.probeDialRung = 0;
+    }
+    const bound = this.boundFor(phase);
+    if (bound > 0 && this.now() - this.probeWatchSince >= bound) {
+      if (phase === 'dialing') this.probeDialRung += 1;
+      this.replaceProbe();
+      return;
+    }
+    this.armProbeWatch();
+  }
+
+  /** How long the probe may stay in `phase`. Zero means "as long as it likes". */
+  private boundFor(phase: 'dialing' | 'open' | 'synced'): number {
+    if (phase === 'synced') return 0;
+    if (phase === 'open') return this.probeIdleMs;
+    const rung = Math.min(this.probeDialRung, MUX_DIAL_PATIENCE.length - 1);
+    return this.probeDialMs * (MUX_DIAL_PATIENCE[rung] ?? 1);
+  }
+
+  /**
+   * The probe ran out of its bound: throw it away and build another.
+   *
+   * ⚠ A RETRY, AND IT MAY NEVER BE ANYTHING ELSE. The probe exists to WITNESS
+   * whether the other route answers; a probe that expired witnessed nothing, and
+   * an absence of evidence is what this whole branch spent five rounds refusing to
+   * conclude from — `MUX_DETECT_TIMEOUT_MS` was deleted rather than retuned for
+   * exactly this, and `decide` still forks on what ENDED a dial rather than on how
+   * long one took. So nothing here reports, records, condemns or calls
+   * `markUnsupported`: `serverAnswersElsewhere` simply reads false while there is
+   * no synced probe, which is true, and goes true again the moment a replacement
+   * answers.
+   *
+   * The cost, declared, because the header above declares the other half: a route
+   * that is dark in this particular way builds a provider on the tree doc every
+   * 4 s, then 8 s, then 12 s for ever — `MUX_DIAL_PATIENCE`'s top rung, and the
+   * same ladder the link walks on the same path. Each one is destroyed as the next
+   * is built, so it is churn rather than a leak, and a session-long wedge is what
+   * it buys out of.
+   */
+  private replaceProbe(): void {
+    this.discardProbe();
+    if (this.destroyed || this.legacy) return;
+    this.startProbe();
   }
 
   private discardProbe(): void {
+    this.cancelProbeWatch();
     const probe = this.probe;
     this.probe = null;
     this.releaseProbe?.();
@@ -565,6 +779,12 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
     }
   }
 
+  private cancelProbeWatch(): void {
+    if (this.probeWatchHandle === null) return;
+    this.clearTimer(this.probeWatchHandle);
+    this.probeWatchHandle = null;
+  }
+
   private fallBack(reason: MuxUnsupportedReason): void {
     if (this.legacy || this.destroyed) return;
     this.legacy = true;
@@ -574,6 +794,15 @@ class FallbackTreeTransport implements TreeTransport, RouteWitness {
     // ⚠ ADOPT the probe rather than build a second provider. Two of them on one
     // `Y.Doc` is not a correctness problem — Yjs converges — but it is two
     // sockets, two handshakes and two things to tear down for one job.
+    //
+    // ⚠ AND THE WATCH GOES FIRST. An adopted probe stops being a probe: it is the
+    // transport now, its lifetime is the session's, and replacing it under the
+    // plugin would destroy the tree's own connection. `replaceProbe` also refuses
+    // once `legacy` is set, so this is the second of two guards — but the timer
+    // would otherwise outlive the question by the length of one poll, and a timer
+    // holding a reference to a transport that has been handed away is how the
+    // previous round's stranded provider started.
+    this.cancelProbeWatch();
     const adopted = this.probe;
     this.probe = null;
     this.releaseProbe?.();
