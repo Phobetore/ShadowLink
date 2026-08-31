@@ -160,7 +160,7 @@ export const MUX_CONNECT_TIMEOUT_MS = 4_000;
  * current server behind a proxy that merely delayed each connection: 5 s synced
  * at 10,174 ms and 13 s was DEAD across 90 s — six abandoned dials, no frame, no
  * probe, no verdict, no notice, on a server that was up, where pre-slice-2 master
- * on the same path simply cost 13,280 ms. There is no ceiling on either reader
+ * on the same path simply cost 13,244 ms. There is no ceiling on either reader
  * now, and there may not be one again: a dial that never opened is the ABSENCE of
  * evidence, and nothing on this branch concludes from that. What bounds a socket
  * that DID open and says nothing is `MUX_IDLE_TIMEOUT_MS`, which is positive

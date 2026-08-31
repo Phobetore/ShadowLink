@@ -2237,7 +2237,7 @@ export function registerMuxTreeCases(getServer, legacyPort) {
       // TCP proxy forwarding every byte of every route and merely delaying each
       // connection: D=5 s synced at 10,174 ms; D=13 s DEAD across 90 s — six
       // abandoned dials, `framesIn` 0, `probesBuilt` 0, verdict null, notices [].
-      // Pre-slice-2 master on that same 13 s path simply cost 13,280 ms, so it was
+      // Pre-slice-2 master on that same 13 s path simply cost 13,244 ms, so it was
       // a regression against master on exactly the tether / cold-start / captive
       // portal shape. With the ladder continued: synced at 43,429 ms.
       //

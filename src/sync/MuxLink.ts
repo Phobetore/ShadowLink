@@ -512,7 +512,7 @@ export class MuxLink {
    *
    * It was also a REGRESSION AGAINST MASTER on exactly the shape a tether, a
    * cold-start backend or a captive portal produces: a pre-slice-2 per-room
-   * transport on that same 13 s path simply cost 13,280 ms.
+   * transport on that same 13 s path simply cost 13,244 ms.
    *
    * So the two bounds part company here exactly as they do in the bridge:
    *

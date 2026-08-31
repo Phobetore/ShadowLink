@@ -786,7 +786,7 @@ test('the dial deadline is a PATIENCE ladder, and it resets on any socket that o
   // ever. Measured at these shipped constants against a healthy CURRENT server
   // behind a proxy that merely delayed each connection by 13 s: dead across 90 s,
   // six abandoned dials, `framesIn` 0, no probe, no verdict, no notice — where
-  // pre-slice-2 master on the same path cost 13,280 ms. Past the shipped rungs the
+  // pre-slice-2 master on the same path cost 13,244 ms. Past the shipped rungs the
   // ladder DOUBLES, which is `probeDialPatience`'s shape for `probeDialPatience`'s
   // reason: a dial that never opened is the absence of evidence.
   const climbed: number[] = [];
@@ -859,7 +859,7 @@ test('a path whose upgrade costs MORE than the top shipped rung still opens, and
   // server that was up. Measured at fully shipped constants, real `server/index.js`
   // behind a real TCP proxy forwarding every byte 13 s late: DEAD across 90 s, six
   // abandoned dials, `framesIn` 0, no probe, no verdict, no notice — where
-  // pre-slice-2 master on the same path cost 13,280 ms. With the ladder continued:
+  // pre-slice-2 master on the same path cost 13,244 ms. With the ladder continued:
   // synced at 43,429 ms.
   //
   // Here the path is modelled rather than proxied, so the number is exact: a dial
