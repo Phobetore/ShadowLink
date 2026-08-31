@@ -458,6 +458,110 @@ function deafMuxProxy({ listen, target }) {
 }
 
 /**
+ * A TCP proxy that 404s `/_mux` and forwards every OTHER route IN FULL, `delayMs`
+ * late — a tether, a cold-start backend, a captive portal in front of a reverse
+ * proxy that was never told about the multiplexed path.
+ *
+ * ⚠ IT IS THE ONE SHAPE A CEILING ON THE PROBE'S PATIENCE TURNS FROM SLOW INTO
+ * DEAD. Nothing here is broken: every byte of the per-room route arrives, and a
+ * plain `LegacyTreeTransport` on this path simply costs `delayMs`. What decides
+ * whether the session syncs at all is whether the probe is ever given a dial
+ * deadline wide enough to contain that handshake — which is what case 80v asks.
+ */
+function slowRoomProxy({ listen, target, delayMs }) {
+  const live = [];
+  const counts = { mux: 0, others: 0, othersOpened: 0 };
+  // ⚠ `/_mux` STARTS DEAF RATHER THAN REFUSED, and the ordering is the reason.
+  // A route that 404s from the first dial has a refusal run standing the whole
+  // time, so the verdict lands in the same turn the replacement probe syncs and
+  // the probe is adopted before anything can read the sentence off it — measured
+  // as a flake: `dials=4 opened=1 verdict=unreachable` with the sentence never
+  // observed. Deaf first (which reports, and so builds a probe, without a refusal
+  // run) and refused afterwards, exactly as case 80u sequences it.
+  const state = { refusing: false };
+  const server = net.createServer((client) => {
+    client.on('error', () => undefined);
+    client.once('data', (first) => {
+      const head = first.toString('latin1').split('\r\n')[0] ?? '';
+      const isMux = head.includes(' /_mux');
+      if (isMux) {
+        counts.mux += 1;
+        if (state.refusing) {
+          client.write('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+          client.end();
+          return;
+        }
+        const up = net.connect(target, '127.0.0.1', () => { up.write(first); });
+        live.push({ client, up });
+        up.on('error', () => undefined);
+        client.on('data', (b) => { try { up.write(b); } catch { /* gone */ } });
+        let upgraded = false;
+        up.on('data', (b) => {
+          if (upgraded) return;                    // every server frame dies here
+          const text = b.toString('latin1');
+          const end = text.indexOf('\r\n\r\n');
+          if (text.startsWith('HTTP/1.1 101') && end >= 0) {
+            upgraded = true;
+            try { client.write(b.subarray(0, end + 4)); } catch { /* gone */ }
+            return;
+          }
+          try { client.write(b); } catch { /* gone */ }
+        });
+        const byeMux = () => {
+          try { client.destroy(); } catch { /* gone */ }
+          try { up.destroy(); } catch { /* gone */ }
+        };
+        client.on('close', byeMux);
+        up.on('close', byeMux);
+        return;
+      }
+      counts.others += 1;
+      // Held rather than dropped: the bytes the client already sent are replayed
+      // upstream when the connection is finally made, so the handshake is merely
+      // LATE and never damaged.
+      const queued = [first];
+      let up = null;
+      client.on('data', (b) => {
+        if (up === null) { queued.push(b); return; }
+        try { up.write(b); } catch { /* gone */ }
+      });
+      const timer = setTimeout(() => {
+        up = net.connect(target, '127.0.0.1', () => {
+          counts.othersOpened += 1;
+          for (const b of queued.splice(0)) { try { up.write(b); } catch { /* gone */ } }
+        });
+        live.push({ client, up });
+        up.on('error', () => undefined);
+        up.on('data', (b) => { try { client.write(b); } catch { /* gone */ } });
+        const bye = () => {
+          try { client.destroy(); } catch { /* gone */ }
+          try { up.destroy(); } catch { /* gone */ }
+        };
+        client.on('close', bye);
+        up.on('close', bye);
+      }, delayMs);
+      client.on('close', () => clearTimeout(timer));
+    });
+  });
+  return {
+    counts,
+    async start() {
+      await new Promise((resolve) => server.listen(listen, '127.0.0.1', resolve));
+      return `ws://127.0.0.1:${listen}`;
+    },
+    /** From here on, 404 the `/_mux` upgrade — the verdict's other half. */
+    refuseMux() { state.refusing = true; },
+    async stop() {
+      for (const { client, up } of live) {
+        try { client.destroy(); } catch { /* gone */ }
+        try { up.destroy(); } catch { /* gone */ }
+      }
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+/**
  * A TCP proxy that forwards everything, but takes `delayMs` to connect the
  * `/_mux` route upstream and nothing at all on every other path.
  *
@@ -589,6 +693,8 @@ export function registerMuxTreeCases(getServer, legacyPort) {
   const darkPort = legacyPort + 16;
   const strandPort = legacyPort + 17;
   const wedgePort = legacyPort + 18;
+  const slowRoomPort = legacyPort + 19;
+  const accruePort = legacyPort + 20;
 
   test('80a the shipped MuxLink carries _tree over the real server, and converges', async () => {
     const server = getServer();
@@ -1990,6 +2096,225 @@ export function registerMuxTreeCases(getServer, legacyPort) {
       } finally {
         transport.destroy(); link.destroy(); tree.doc.destroy();
         await proxy.stop();
+      }
+    });
+
+  test('80v a per-room handshake slower than the top rung still reaches a synced probe',
+    async () => {
+      // ⚠ THE SEVENTH ROUND'S FIX, ONE STEP OVER. Bounding the probe's dial closed
+      // the wedge; borrowing the LINK's ceiling with it converted slow into dead.
+      // `MUX_DIAL_PATIENCE` clamps at its top rung, so at shipped constants a
+      // per-room handshake costing more than 12 s could never produce a synced
+      // probe — and the sentence, the verdict, the notice and the tree all rest on
+      // one that syncs. The link may clamp: a dial it abandons costs it a rung of
+      // backoff and the route is still there to dial again. The probe may not: it
+      // exists to WITNESS, and a witness that is always interrupted witnesses
+      // nothing.
+      //
+      // Measured on the parent at fully shipped constants, real server behind this
+      // proxy at 13 s: seven probe dials on the 4 / 8 / 12 / 12 … ladder, NOT ONE
+      // of which ever completed its upstream connection, and across 70 s no
+      // sentence, no verdict, no notice and a tree that never synced — verbatim
+      // the sentence that made the wedge a blocker. At 25 s, ten dials across
+      // 110 s and the same nothing. Pre-slice-2 master on the same 13 s path
+      // simply cost 13,022 ms, so it was a regression against master as well.
+      //
+      // Here, same script and same shipped constants: 13 s path — sentence at
+      // 38,580 ms, verdict, notice and a synced tree at 39,615 ms; 25 s path —
+      // 74,471 / 75,266 / 75,267 ms. A 6 s path, inside the old ladder, is
+      // untouched: 11,247 / 12,053 / 12,054 ms here against 11,245 / 12,435 /
+      // 12,436 ms on the parent.
+      //
+      // This case is that shape at a tenth of the dial bound, the way every case
+      // here shortens the link's: 700 ms rungs give a top SHIPPED rung of 2,100 ms,
+      // and the path costs 2,600 ms — outside it, and reachable only because the
+      // ladder goes on doubling.
+      const server = getServer();
+      const workspace = 'muxtree80v';
+      const proxy = slowRoomProxy({
+        listen: slowRoomPort, target: server.port, delayMs: 2_600,
+      });
+      const url = await proxy.start();
+      const tree = new TreeDoc();
+      const link = new MuxLink({
+        serverUrl: url,
+        serverKey: server.serverKey,
+        workspaceId: workspace,
+        openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+        idleTimeoutMs: 1_500,
+        backoffMs: [100],
+        jitter: 0,
+        unreachableDials: 2,
+      });
+      const notices = [];
+      const transport = openTreeTransport(
+        link, tree.doc,
+        { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
+        (reason) => notices.push(reason),
+        undefined,
+        { connectTimeoutMs: 700 },
+      );
+      const paused = 'ShadowLink could not reach the workspace. Editing locally; sync is paused.';
+      try {
+        transport.connect({ immediate: true });
+
+        assert.equal(await until(() => saysUnserved(link, transport), 40_000), true,
+          'a per-room route that answers in 2,600 ms never produced a synced probe — '
+          + 'the ceiling clamps the dial bound at 2,100 ms and the session dies slow. '
+          + `dials=${proxy.counts.others} opened=${proxy.counts.othersOpened} `
+          + `mux404=${proxy.counts.mux} verdict=${link.unsupportedReason}`);
+        assert.ok(proxy.counts.othersOpened >= 1,
+          'the sentence appeared without the per-room route ever having been served');
+        assert.ok(proxy.counts.others >= 4,
+          `only ${proxy.counts.others} per-room dials — the ladder never walked past its `
+          + 'shipped rungs, so this run did not test the ceiling at all');
+
+        const bar = barFor(link, { witness: transport, paused });
+        assert.equal(bar.text, 'ShadowLink: not syncing');
+        assert.match(bar.tooltip, /can reach your server/);
+        assert.match(bar.tooltip, /"Use the compatibility connection"/,
+          'the lever was not named to a user whose only route is the slow one');
+
+        // And the automatic fallback lands on the replacement, exactly as it does
+        // for the wedge: the verdict needs a refusal reported while a probe is
+        // SYNCED, and until now this path has been deaf rather than refusing.
+        proxy.refuseMux();
+        assert.equal(await until(() => link.unsupportedReason !== null, 30_000), true,
+          'the demotion was unreachable on a path that is merely slow');
+        assert.equal(link.unsupportedReason, 'unreachable');
+        assert.deepEqual(notices, ['unreachable']);
+        assert.equal(await until(() => transport.synced, 20_000), true,
+          'the tree never reached the route that was answering all along');
+      } finally {
+        transport.destroy(); link.destroy(); tree.doc.destroy();
+        await proxy.stop();
+      }
+    });
+
+  test('80w rebuilt probes accrue nothing on the tree doc — one Awareness for the session',
+    async () => {
+      // ⚠ "EACH IS DESTROYED AS THE NEXT IS BUILT, SO IT IS CHURN AND NOT A LEAK"
+      // WAS FALSE. `WebsocketProvider.destroy()` clears its own intervals and
+      // listeners and never calls `this.awareness.destroy()`; the `y-protocols`
+      // `Awareness` it builds holds a 3-second `setInterval` and a
+      // `doc.on('destroy')` listener. Everywhere else in this plugin that is
+      // harmless, because every other provider owns its doc and destroys it, which
+      // fires the `Awareness`'s own teardown. `LegacyTreeTransport` is the ONE
+      // provider teardown handed a doc it does not own — the shared tree doc, which
+      // lives for the session — so every probe teardown left both behind. On the
+      // sixth round that was one per session; the rebuild loop made it an accrual.
+      //
+      // Measured through the SHIPPED bridge, 40 rebuilt probes on one doc: the
+      // parent went 1 -> 41 `Y.Doc` 'destroy' observers and 1 -> 42 live
+      // `Timeout`s, with 41 and 40 still standing after `transport.destroy()`.
+      // Here: 1 -> 2 and 1 -> 3, and 2 / 0 after teardown. In isolation, 40 direct
+      // build/destroy cycles left 40 of each on the parent and 0 timers here.
+      //
+      // ⚠ AND DESTROYING ONE PER PROBE ONLY FIXES THE TIMER. y-protocols registers
+      // that `doc.on('destroy')` with an anonymous closure it never unregisters, so
+      // an `Awareness` BUILT per probe leaves one observer per probe even when it
+      // is destroyed. Hence one object for the session, handed to every probe —
+      // which is the identity this case checks first.
+      const server = getServer();
+      const workspace = 'muxtree80w';
+      const proxy = deafMuxProxy({ listen: accruePort, target: server.port });
+      const url = await proxy.start();
+      proxy.holdOthers();                          // the per-room route never answers
+      const tree = new TreeDoc();
+      // Yjs exposes no observer count, so the leak is read where it lives. The
+      // live-`Timeout` count beside it is public API, and is the half a user feels.
+      const observers = () => tree.doc._observers?.get('destroy')?.size ?? 0;
+      const timers = () => process.getActiveResourcesInfo().filter((h) => h === 'Timeout').length;
+      const link = new MuxLink({
+        serverUrl: url,
+        serverKey: server.serverKey,
+        workspaceId: workspace,
+        openSocket: (u) => { const s = new WebSocket(u); s.on('error', () => undefined); return s; },
+        idleTimeoutMs: 1_500,
+        backoffMs: [100],
+        jitter: 0,
+        unreachableDials: 2,
+      });
+      const handed = [];
+      const beforeTimers = timers();
+      const transport = openTreeTransport(
+        link, tree.doc,
+        { serverUrl: url, serverKey: server.serverKey, workspaceId: workspace },
+        () => undefined,
+        (config, doc) => { handed.push(config.awareness); return new LegacyTreeTransport(config, doc); },
+        { connectTimeoutMs: 300 },
+      );
+      // Sampled AFTER construction and before any probe: `MuxTreeTransport` builds
+      // a `MuxRoom`, which owns an `Awareness` of its own on this doc and adds the
+      // observer that goes with it. What this case measures is what the PROBES add
+      // on top of that, which must not depend on how many of them there are.
+      const beforeObservers = observers();
+      try {
+        transport.connect({ immediate: true });
+        assert.equal(await until(() => handed.length >= 5, 40_000), true,
+          `only ${handed.length} probes were built, so nothing accrued to measure`);
+        for (const [i, awareness] of handed.entries()) {
+          assert.equal(awareness === handed[0], true,
+            `probe ${i} was handed an Awareness of its own rather than the session's`);
+        }
+        assert.equal(observers() - beforeObservers, 1,
+          `${handed.length} probes added ${observers() - beforeObservers} 'destroy' observers `
+          + 'to a doc that lives for the session — one per probe is the accrual itself');
+      } finally {
+        transport.destroy(); link.destroy();
+      }
+      await sleep(500);
+      const leakedTimers = timers() - beforeTimers;
+      assert.ok(leakedTimers <= 2,
+        `${handed.length} rebuilt probes left ${leakedTimers} live Timeouts behind after `
+        + 'teardown — the provider was destroyed and the Awareness it built was not');
+      assert.equal(observers() - beforeObservers, 1,
+        'the session Awareness was not the only thing left on the doc');
+      tree.doc.destroy();
+      await proxy.stop();
+    });
+
+  test('80x a LegacyTreeTransport that BUILT its own Awareness takes it down with it',
+    async () => {
+      // ⚠ THE BRANCH 80w CANNOT REACH, and the mutation sweep is what found that
+      // out. Through the bridge every probe is handed the session's `Awareness`, so
+      // `ownsAwareness` is false on that path and its teardown never runs. The
+      // branch is entered where a `LegacyTreeTransport` is built DIRECTLY — which
+      // is the compatibility lever in `main.ts`, and case 80n above. One per
+      // session rather than one per probe, but a class that only cleans up after
+      // itself when somebody else remembers to share an object with it is a class
+      // that will leak the moment it is reused.
+      //
+      // Six real providers, one shared doc, a real server, and the count that is
+      // public API. Against the teardown before this round: six extra live
+      // `Timeout`s, exactly linear.
+      const server = getServer();
+      const workspace = 'muxtree80x';
+      const tree = new TreeDoc();
+      const timers = () => process.getActiveResourcesInfo().filter((h) => h === 'Timeout').length;
+      const before = timers();
+      try {
+        for (let i = 0; i < 6; i += 1) {
+          const transport = new LegacyTreeTransport(
+            {
+              serverUrl: `ws://127.0.0.1:${server.port}`,
+              serverKey: server.serverKey,
+              workspaceId: workspace,
+            },
+            tree.doc,
+          );
+          transport.connect();
+          assert.equal(await transport.whenSynced(TREE_SYNC_TIMEOUT_MS), true,
+            `provider ${i} never synced, so this run measured nothing`);
+          transport.destroy();
+        }
+        await sleep(500);
+        const leaked = timers() - before;
+        assert.ok(leaked <= 2,
+          `six built-and-destroyed providers left ${leaked} live Timeouts on a doc they do `
+          + 'not own — WebsocketProvider.destroy() does not destroy the Awareness it built');
+      } finally {
+        tree.doc.destroy();
       }
     });
 
