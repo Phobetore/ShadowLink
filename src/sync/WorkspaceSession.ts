@@ -128,7 +128,7 @@ export interface SessionProvider {
    * this session's turn in the room — the same object whose `destroy()` takes the
    * presence back out — so the arrival and the departure cannot end up written by
    * two different things against two different assumptions, which is exactly how a
-   * reopened note came to mount invisibly (P3 §6, I26).
+   * reopened note came to mount invisibly (P3 §6, I27).
    *
    * Called on EVERY mount, including a mount onto a room another consumer kept
    * alive, and it must succeed on all of them.
@@ -840,7 +840,7 @@ export class WorkspaceSession {
       // across this note being closed and reopened. Measured: the reopening user
       // was invisible to every peer for the life of the room entry, on both routes,
       // while their keystrokes flowed normally. The announcement and the departure
-      // are one object's business now (P3 §6, I26).
+      // are one object's business now (P3 §6, I27).
       provider.announcePresence({
         name: this.deps.userName,
         color: this.deps.userColor,

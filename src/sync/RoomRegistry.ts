@@ -40,7 +40,7 @@
 // guarantee costs on one of the two paths. `RoomConnection.flush` therefore takes
 // the number, and the two adapters below keep the two numbers they shipped with.
 //
-// ⚠ PRESENCE BELONGS TO THE SESSION, NOT TO A LEASE (P3 §6, I26).
+// ⚠ PRESENCE BELONGS TO THE SESSION, NOT TO A LEASE (P3 §6, I27).
 // The `Awareness` above is shared by every holder of a room, and there is exactly
 // ONE local state on it however many holders there are. So "who may write it" is
 // not a style question: a holder that nulls it speaks for all of them, and a
