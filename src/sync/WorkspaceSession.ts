@@ -87,11 +87,26 @@ import type { VaultPort } from './VaultPort.ts';
 // ============================================================ ports
 
 /**
- * The awareness surface the session needs. Structurally satisfied by
- * `y-protocols`' `Awareness`, which is what the real provider hands back.
+ * The awareness surface the EDITOR BINDING needs — what `yCollab` writes the
+ * cursor through. Structurally satisfied by `y-protocols`' `Awareness`, which is
+ * what the real provider hands back.
+ *
+ * ⚠ THE SESSION'S OWN PRESENCE NO LONGER GOES THROUGH HERE, and that is the point
+ * of the split. `setLocalStateField` is a MUTATION of a local state that must
+ * already exist — `y-protocols` returns silently when it is null — so it is the
+ * right call for the binding, which only ever adds a `cursor` to a state the
+ * session has just announced, and the wrong one for the announcement itself. See
+ * `SessionProvider.announcePresence`.
  */
 export interface SessionAwareness {
   setLocalStateField(field: string, value: unknown): void;
+}
+
+/** How this device appears to the room's other peers while a note is bound. */
+export interface PresenceUser {
+  readonly name: string;
+  readonly color: string;
+  readonly colorLight: string;
 }
 
 /**
@@ -104,6 +119,21 @@ export interface SessionProvider {
   readonly awareness: SessionAwareness;
   on(event: 'sync', handler: (isSynced: boolean) => void): void;
   off(event: 'sync', handler: (isSynced: boolean) => void): void;
+  /**
+   * Put this session in the room, so its peers can see it.
+   *
+   * ⚠ ASKED OF THE PROVIDER RATHER THAN OF THE AWARENESS, because on the shared
+   * topology the awareness is not this session's to write freely: it belongs to the
+   * room and outlives every mount onto it. The provider is the object whose life IS
+   * this session's turn in the room — the same object whose `destroy()` takes the
+   * presence back out — so the arrival and the departure cannot end up written by
+   * two different things against two different assumptions, which is exactly how a
+   * reopened note came to mount invisibly (P3 §6, I26).
+   *
+   * Called on EVERY mount, including a mount onto a room another consumer kept
+   * alive, and it must succeed on all of them.
+   */
+  announcePresence(user: PresenceUser): void;
   /**
    * Resolves true only once this connection's pending updates have been
    * acknowledged; false when that confirmation did not arrive. Mirrors
@@ -803,7 +833,15 @@ export class WorkspaceSession {
     // stopped saying `release(provider)`, the flag, and this comment.
     let kept = false;
     try {
-      provider.awareness.setLocalStateField('user', {
+      // ⚠ THROUGH THE PROVIDER, AND ON EVERY MOUNT. This used to be
+      // `provider.awareness.setLocalStateField('user', …)`, which announces nothing
+      // at all when the shared local state is null — and null is precisely what the
+      // PREVIOUS session's departure left on a room the publish queue kept alive
+      // across this note being closed and reopened. Measured: the reopening user
+      // was invisible to every peer for the life of the room entry, on both routes,
+      // while their keystrokes flowed normally. The announcement and the departure
+      // are one object's business now (P3 §6, I26).
+      provider.announcePresence({
         name: this.deps.userName,
         color: this.deps.userColor,
         colorLight: `${this.deps.userColor}33`,

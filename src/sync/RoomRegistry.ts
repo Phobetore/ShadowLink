@@ -40,6 +40,36 @@
 // guarantee costs on one of the two paths. `RoomConnection.flush` therefore takes
 // the number, and the two adapters below keep the two numbers they shipped with.
 //
+// ⚠ PRESENCE BELONGS TO THE SESSION, NOT TO A LEASE (P3 §6, I26).
+// The `Awareness` above is shared by every holder of a room, and there is exactly
+// ONE local state on it however many holders there are. So "who may write it" is
+// not a style question: a holder that nulls it speaks for all of them, and a
+// holder that cannot re-announce leaves the user editing invisibly.
+//
+// Measured, on real processes, before the rule below existed: with the publish
+// queue holding a room across a note being closed and REOPENED, the reopening user
+// was permanently invisible to every peer — on both routes, for the life of the
+// entry. The session's teardown nulled the shared local state, and its next mount
+// announced with `setLocalStateField`, which `y-protocols` makes a NO-OP when the
+// local state is null (`if (state !== null)`). Nothing went on the wire, no clock
+// advanced, and the 15 s renewal could not help because it re-sends only a state
+// that is not null. Master could not reach it: a note there had its own provider
+// and a fresh `Awareness` per open, whose constructor sets `{}`.
+//
+// The rule, and it runs in both directions:
+//
+//   * ANNOUNCING IS ALWAYS ALLOWED and names the announcer the room's presence
+//     holder — from null, from `{}`, or over a holder that leaked without
+//     withdrawing. A mount may never be refused by a departure that came before it.
+//   * WITHDRAWING IS THE HOLDER'S ALONE. A lease that never announced cannot null
+//     what another one announced, so the headless consumers — the publish queue and
+//     the reconciler, which set no cursor and have none to remove — cannot touch
+//     presence at all, whichever of them happens to release last.
+//
+// `RoomEntry` keeps the holder's identity and the two calls are the only writers of
+// the local state in this file; the room's own teardown is the third and it is the
+// awareness ending rather than another holder speaking for it.
+//
 // No `obsidian` import, no node builtins, and no transport: this file names what a
 // connection must be able to do and never builds one.
 
@@ -48,7 +78,9 @@ import * as awarenessProtocol from 'y-protocols/awareness';
 
 import { NOTE_SYNC_TIMEOUT_MS } from '../tree/constants.ts';
 import type { DocHandle, DocPort } from './DocPort.ts';
-import type { ProviderPort, SessionProvider, SessionRoom } from './WorkspaceSession.ts';
+import type {
+  PresenceUser, ProviderPort, SessionProvider, SessionRoom,
+} from './WorkspaceSession.ts';
 
 /** `ObsidianDocPort`'s shipped flush deadline, kept for the headless path. */
 const DOC_FLUSH_TIMEOUT_MS = 8_000;
@@ -101,6 +133,20 @@ export interface RoomLease {
   on(event: 'sync', handler: (isSynced: boolean) => void): void;
   off(event: 'sync', handler: (isSynced: boolean) => void): void;
   flush(ms: number): Promise<boolean>;
+  /**
+   * Put this client in the room, on THIS lease's behalf, and make this lease the
+   * room's presence holder.
+   *
+   * Writes the whole local state rather than a field, which is what makes a mount
+   * onto an entry somebody else kept alive work at all — see the header. Nothing
+   * refuses it: a departure that came before a mount may not outrank it.
+   */
+  announcePresence(user: PresenceUser): void;
+  /**
+   * Take this client back out of the room — and ONLY if this lease is the one that
+   * put it there. A borrower that announced nothing removes nothing.
+   */
+  withdrawPresence(): void;
   /** Give the reference back. Idempotent: borrowers release in a `finally`. */
   release(): void;
 }
@@ -132,6 +178,17 @@ class RoomEntry {
   private connection: RoomConnection = DEAD_CONNECTION;
 
   /**
+   * The ONE lease currently speaking for this client's presence here, or null.
+   *
+   * ⚠ THIS IS THE WHOLE OF THE HEADER'S RULE, and it is an identity check rather
+   * than a role check on purpose: what has to be impossible is one holder nulling
+   * the local state ANOTHER holder wrote, and the only thing that distinguishes
+   * them is which object announced. A borrower that never announced is never in
+   * this field and can therefore never take a cursor off the screen.
+   */
+  private presenceHolder: object | null = null;
+
+  /**
    * The borrowers' handlers, held HERE rather than on the connection.
    *
    * A swap destroys one connection and builds another; a handler registered on the
@@ -157,7 +214,27 @@ class RoomEntry {
     this.connection.on('sync', this.relay);
   }
 
-  /** Swap the route under a live room, keeping the document and the awareness. */
+  /**
+   * Swap the route under a live room, keeping the document and the awareness.
+   *
+   * ⚠ AND TOUCHING PRESENCE IN NEITHER DIRECTION, which is the third path the
+   * header's rule has to answer for. A swap is not a departure — the user has not
+   * left the note they are looking at — and it is not a mount either: the holder
+   * that announced is still holding, and its local state is still on the awareness
+   * this method deliberately does not replace. So the presence holder survives the
+   * swap along with everything else the borrowers can see.
+   *
+   * ⚠ ONE MEASURED CONSEQUENCE, RECORDED RATHER THAN FIXED HERE. If something ever
+   * DOES remove this client's state server-side across a swap, the re-announcement
+   * the new connection makes carries the SAME awareness clock, and a peer that has
+   * already seen that clock ignores it — measured at 15 s (`y-protocols`' renewal
+   * interval) before the cursor returns. A rig reproduced that by calling
+   * `switchTransport` on a healthy mux link; the shipped lever cannot, because
+   * `main.ts` only switches from `onUnsupported`, which fires after the link is
+   * already down and no leave is written. Re-stamping the local state here would
+   * close it, and it is not done in this round because it is a behaviour change on
+   * the fallback path with no reachable trigger.
+   */
   reopen(transport: RoomTransport): void {
     const previous = this.connection;
     previous.off('sync', this.relay);
@@ -188,6 +265,47 @@ class RoomEntry {
   }
 
   /**
+   * `holder` puts this client in the room, and becomes the one that may take it
+   * out again.
+   *
+   * ⚠ `setLocalState` AND NOT `setLocalStateField`, and the difference is the whole
+   * defect this method exists to close. `y-protocols`' field setter reads the local
+   * state first and returns silently when it is null — `if (state !== null)` — so a
+   * mount onto an entry whose presence a previous holder withdrew announced
+   * NOTHING: no wire traffic, no clock advance, and no way back for the life of the
+   * entry, because the 15 s renewal also re-sends only a non-null state. Slice 4
+   * makes that the ordinary case rather than a race, since rooms then rarely fall
+   * to zero refs and the shared `Awareness` is rarely rebuilt.
+   *
+   * Writing the state whole is also the right SEMANTICS here and not merely the
+   * working call: this is a mount, and everything the previous binding left on the
+   * shared local state — `y-codemirror.next` writes a `cursor` field addressing
+   * positions in an editor that is gone — must not survive into it.
+   */
+  claimPresence(holder: object, user: PresenceUser): void {
+    this.presenceHolder = holder;
+    try {
+      this.awareness.setLocalState({ user });
+    } catch {
+      /* an awareness that is already gone has nowhere to be */
+    }
+  }
+
+  /**
+   * `holder` leaves the room — if it is the holder that arrived.
+   *
+   * ⚠ THE GUARD IS THE POINT. Every borrower of a room releases in a `finally` and
+   * the headless ones outnumber the session; without this, the queue's own release
+   * would null a bound session's cursor, which is the ordinary case every time a
+   * note is open and its drain lands.
+   */
+  withdrawPresence(holder: object): void {
+    if (this.presenceHolder !== holder) return;
+    this.presenceHolder = null;
+    this.announceDeparture();
+  }
+
+  /**
    * Say this client is gone from the room, THROUGH the live connection.
    *
    * ⚠ IT HAS TO HAPPEN WHILE THERE IS STILL SOMETHING TO SAY IT ON. The awareness
@@ -200,7 +318,7 @@ class RoomEntry {
    * Idempotent by construction: `removeAwarenessStates` emits nothing for a client
    * whose state is already gone.
    */
-  announceDeparture(): void {
+  private announceDeparture(): void {
     try {
       awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'local');
     } catch {
@@ -230,6 +348,25 @@ class RoomEntry {
     // worth having: "the cursor goes before the room does" belongs to this file
     // rather than to what a server happens to do with a connection that closed.
     // The next transport added here will not necessarily have a socket to die.
+    //
+    // ⚠ AND THIS ONE IS UNGUARDED, WHICH IS NOT AN EXCEPTION TO THE HEADER'S RULE.
+    // The `Awareness` is about to be destroyed two steps down, so what runs here is
+    // the object ENDING and not another holder speaking for the session: there is
+    // nothing left for a later announcement to be invisible in, and the next
+    // `acquire` of this name builds a fresh `Awareness` whose constructor sets
+    // `{}`. The holder field is cleared with it so a lease that outlives the entry
+    // — `registry.destroy()` while a session still holds one, which is `main.ts`'s
+    // `dispose()` — cannot withdraw a presence that no longer exists.
+    //
+    // ⚠ THAT CLEARING IS EQUIVALENT, AND IT IS RECORDED RATHER THAN REMOVED, on the
+    // precedent this file already set for `awareness.destroy()` below. A mutation
+    // sweep found it surviving and it will: by the time a stale lease could reach
+    // `withdrawPresence`, the awareness holds no state for this client, so the
+    // removal it would make emits nothing and no peer can tell. It is kept because
+    // "the room's end takes the presence holder with it" is a property of THIS
+    // line, and "some later line happens to leave nothing to remove" is a property
+    // of those — the same call `LegacyTreeTransport` made for its two survivors.
+    this.presenceHolder = null;
     this.announceDeparture();
     this.connection.off('sync', this.relay);
     this.syncHandlers.clear();
@@ -430,9 +567,15 @@ export class RoomRegistry {
  * live lease and every member has to follow. `release` is one-shot per lease, so
  * a borrower closing twice — which every `finally` in this codebase does — cannot
  * take a reference somebody else is holding.
+ *
+ * ⚠ AND THE LEASE IS ITS OWN PRESENCE IDENTITY. `holder` is this lease and nothing
+ * else can be handed it, which is what makes "only the holder that announced may
+ * withdraw" a property rather than a convention: a second borrower calling
+ * `withdrawPresence()` presents a different object and the entry declines it.
  */
 function leaseOf(entry: RoomEntry, giveBack: () => void): RoomLease {
   let live = true;
+  const holder = {};
   return {
     room: entry.room,
     doc: entry.doc,
@@ -441,6 +584,10 @@ function leaseOf(entry: RoomEntry, giveBack: () => void): RoomLease {
     on: (_event, handler) => { entry.on(handler); },
     off: (_event, handler) => { entry.off(handler); },
     flush: (ms) => (live ? entry.flush(ms) : Promise.resolve(false)),
+    // A released lease announces nothing: the reference it would be speaking on
+    // behalf of is gone, and the entry may already belong to somebody else.
+    announcePresence: (user) => { if (live) entry.claimPresence(holder, user); },
+    withdrawPresence: () => { entry.withdrawPresence(holder); },
     release: () => {
       if (!live) return;
       live = false;
@@ -588,6 +735,22 @@ class LeaseProvider implements SessionProvider {
   }
 
   /**
+   * This session is in the room, and every peer is to be told so — on EVERY mount.
+   *
+   * ⚠ THE SESSION ANNOUNCES ITSELF; NOTHING ANNOUNCES IT FOR IT. The state used to
+   * be written straight onto `provider.awareness` from `WorkspaceSession.doOpen`
+   * with `setLocalStateField`, which is a no-op against the null the previous
+   * departure left — so a note reopened while the publish queue still held its room
+   * mounted invisibly, and stayed invisible for the life of the entry. This call
+   * and `destroy()` below are the same object's business precisely so the two
+   * cannot disagree about what they are writing into, and they are the only two
+   * things in the shipped client that move this session's presence.
+   */
+  announcePresence(user: PresenceUser): void {
+    this.lease.announcePresence(user);
+  }
+
+  /**
    * This session is done with the room — and the room may well not be done.
    *
    * ⚠ THE CURSOR GOES EVEN WHEN THE ROOM STAYS, which is the half a leave frame
@@ -604,21 +767,16 @@ class LeaseProvider implements SessionProvider {
    * Announced BEFORE the reference goes back: after it, the room may already be
    * torn down and there is no connection left to say it on.
    *
-   * Only the SESSION's port does this. `RegistryDocPort.close` deliberately does
-   * not: the headless path never sets a local state, so a removal from there would
-   * do nothing at all except on the one occasion it would do harm — wiping the
-   * cursor of a session that is bound to the same room right now.
+   * ⚠ AND IT WITHDRAWS THIS LEASE'S OWN ANNOUNCEMENT RATHER THAN WHATEVER IS
+   * THERE. The removal used to be written straight onto the shared `Awareness`
+   * from here, so any holder could null presence any other holder had written; it
+   * goes through the lease that made it now, and the entry declines a withdrawal
+   * from anything else. `RegistryDocPort` therefore cannot reach presence at all —
+   * it announces nothing, so it holds nothing to give back — which is what keeps a
+   * drain landing under an open note from wiping the cursor it is publishing for.
    */
   destroy(): void {
-    try {
-      awarenessProtocol.removeAwarenessStates(
-        this.lease.awareness,
-        [this.lease.doc.clientID],
-        'local',
-      );
-    } catch {
-      /* an awareness that is already gone has nothing to announce */
-    }
+    this.lease.withdrawPresence();
     this.lease.release();
   }
 }
