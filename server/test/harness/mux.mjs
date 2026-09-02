@@ -537,6 +537,18 @@ export class MuxClient {
     this.sendFrame(room, syncPayload(SYNC_STEP1, sv));
   }
 
+  /**
+   * Leave: a frame for `room` with an EMPTY payload.
+   *
+   * Written through `sendFrame` rather than through `encodeMuxLeave`, so what the
+   * suite exercises is the bytes a frame with no payload actually has rather than
+   * an encoder that could agree with the server about the wrong thing.
+   */
+  leave(room) {
+    this.sendFrame(room, new Uint8Array(0));
+    this.synced.delete(room);
+  }
+
   /** Push local state up as a plain update. */
   pushUpdate(room, update) {
     this.merge(room, update);

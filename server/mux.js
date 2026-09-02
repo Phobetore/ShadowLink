@@ -15,6 +15,15 @@
 // hash and CI runs it. The server relays rooms and stores snapshots; it does not
 // know what a note is.
 //
+// The ONE exception, added after slice 3 measured what its absence costs: a frame
+// whose payload is EMPTY is a LEAVE. That is still not interpreting a payload —
+// there is no payload — and it is the only verb this file has ever had. It exists
+// because the protocol could join a room and could not leave one, so a client that
+// closed a note stayed registered in that room for the life of its vault socket:
+// measured, 20 frames for a departed room after 20 peer edits, and a departed
+// user's cursor still on every peer's screen for 29.8 s against 0-1 ms on the
+// per-room route. See `MUX_LEAVE_PAYLOAD_BYTES`.
+//
 // The security shape, which is the whole point of the file. A mux socket is a
 // CAPABILITY AMPLIFIER: one authentication now unlocks many rooms where it used
 // to unlock exactly one. So the check that made a room name safe — `DOC_RE`,
@@ -30,6 +39,55 @@ import { isValidDocId } from './upgradeAuth.js';
 
 /** The docId that selects this route. Already matched by the upgrade's `DOC_RE`. */
 export const MUX_DOC_ID = '_mux';
+
+/**
+ * THE LEAVE, and it is the one verb the protocol was missing.
+ *
+ * A frame whose payload is EMPTY means "I am done with this room". Nothing else
+ * changes: the frame is `varString(room) + varUint8Array(payload)` exactly as it
+ * always was, `isValidDocId` still runs on the name before anything else looks at
+ * it, and the workspace still comes from the upgrade.
+ *
+ * ⚠ WHY AN EMPTY PAYLOAD IS A FREE SLOT RATHER THAN A GRAMMAR CHANGE. Every
+ * y-websocket message begins with a varuint message type, so the shortest one a
+ * client can legitimately send is a single byte; a zero-length payload has never
+ * meant anything. What it did before this line existed is worth stating exactly,
+ * because it is what makes the choice additive: the frame decoded, a room was
+ * opened for it if it did not exist, and the empty bytes reached
+ * `DocHub._onMessage`, where `readVarUint` on an empty decoder throws and
+ * `handleConnection`'s own try/catch swallows it. An inert byte sequence, in
+ * other words — so no client that exists can be sending one and meaning
+ * something else by it, and an older server handed one simply does nothing.
+ *
+ * ⚠ WHY IT MAY NOT OPEN A ROOM. The leave is handled BEFORE the lazy-open branch,
+ * so a leave naming a room this socket does not hold is dropped and counted. That
+ * is not tidiness: if it fell through to the open, a leave would be a way to make
+ * `DocHub` build a document — which is a capability, and the rule for this route
+ * is that an authenticated socket gains no new one. As written, the only thing a
+ * leave can do is CLOSE something this same socket already opened, which is
+ * strictly less than it could do before.
+ *
+ * ⚠ AND WHY IT IS NOT PACED. `MUX_CLOSE_FANOUT_CONCURRENCY` stages the close
+ * fan-out because dropping a socket closes every room at once; one leave is one
+ * room, exactly as a per-room socket's close has always been. Awaiting a gate
+ * here would make `onMessage` asynchronous, and an asynchronous `onMessage`
+ * reorders frames on a transport whose whole acknowledgement story (`ProviderAck`,
+ * invariant I17) rests on them being processed in the order they arrived. The
+ * snapshot write the leave triggers is still governed by `governSnapshotWrites`,
+ * which is where the descriptor budget actually belongs.
+ */
+export const MUX_LEAVE_PAYLOAD_BYTES = 0;
+
+/**
+ * The leave frame for `room`, exported so a client and every test write the same
+ * bytes rather than a second hand-rolled copy of them.
+ */
+export function encodeMuxLeave(room) {
+  const enc = encoding.createEncoder();
+  encoding.writeVarString(enc, room);
+  encoding.writeVarUint8Array(enc, new Uint8Array(0));
+  return encoding.toUint8Array(enc);
+}
 
 /**
  * Spec §8.1. Bounds a hostile fan-out — and note that the mux CHANGES the shape
@@ -504,6 +562,12 @@ export function attachMux(ws, {
     bytesIn: 0,
     bytesOut: 0,
     roomsOpened: 0,
+    /**
+     * Rooms this socket closed because the CLIENT asked, rather than because the
+     * socket went. The difference between the two is the whole point of the verb:
+     * one of them happens while the vault is still connected.
+     */
+    roomsLeft: 0,
     /** Every reason a frame did not reach a room. Each one is a refusal. */
     dropped: {
       malformed: 0,      // the frame did not decode
@@ -511,6 +575,13 @@ export function attachMux(ws, {
       capped: 0,         // MUX_MAX_ROOMS_PER_SOCKET
       afterClose: 0,     // the socket is gone; nothing may resurrect a room
       roomFailed: 0,     // hub.handleConnection threw for this room
+      /**
+       * A leave for a room this socket does not hold. Dropped rather than opened
+       * — see `MUX_LEAVE_PAYLOAD_BYTES` — and counted rather than silent, because
+       * a client leaving rooms it never joined is a client worth being able to
+       * see.
+       */
+      leaveUnknown: 0,
     },
     /**
      * The highest `ws.bufferedAmount` this socket ever reached. This is the
@@ -671,6 +742,28 @@ export function attachMux(ws, {
     // A name that fails is DROPPED, not sanitized: a sanitizer turns a hostile
     // name into some other room's name, which is a worse outcome than silence.
     if (!isValidDocId(room)) { stats.dropped.badRoom += 1; return; }
+
+    // ⚠ THE LEAVE, and it is BEFORE the lazy open on purpose: a leave may close a
+    // room this socket holds and may do nothing else. See `MUX_LEAVE_PAYLOAD_BYTES`
+    // for why an empty payload is the free slot, and why letting this fall through
+    // would hand an authenticated socket a way to make `DocHub` build a document.
+    //
+    // `shutdown()` is the SAME call the close fan-out makes per room, so what
+    // follows is `DocHub`'s ordinary departure path, untouched: `_closeConn`
+    // removes the awareness states this connection registered and broadcasts the
+    // removal to the room's remaining peers, and flushes the snapshot when the
+    // last of them has gone. That is the whole of what a per-room socket's close
+    // has always done, reached without the socket having to die for it.
+    if (payload.byteLength === MUX_LEAVE_PAYLOAD_BYTES) {
+      const leaving = rooms.get(room);
+      if (leaving === undefined) { stats.dropped.leaveUnknown += 1; return; }
+      // `shutdown` contains its own errors and removes the room from the map
+      // through `_onGone` before any close handler runs, so a room that throws on
+      // the way out cannot leave itself behind.
+      leaving.shutdown();
+      stats.roomsLeft += 1;
+      return;
+    }
 
     let vconn = rooms.get(room);
     if (vconn === undefined) {

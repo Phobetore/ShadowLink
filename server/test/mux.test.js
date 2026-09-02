@@ -20,8 +20,9 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import * as Y from 'yjs';
+import * as awarenessProtocol from 'y-protocols/awareness';
 import {
-  attachMux, encodeMuxFrame, decodeMuxFrame, MUX_DOC_ID,
+  attachMux, encodeMuxFrame, decodeMuxFrame, encodeMuxLeave, MUX_DOC_ID,
   MUX_MAX_ROOMS_PER_SOCKET, MUX_MAX_BUFFERED_BYTES, MUX_BACKPRESSURE_GRACE_MS,
   MUX_HARD_BUFFERED_BYTES,
 } from '../mux.js';
@@ -1553,4 +1554,229 @@ test('the legacy per-room route is untouched: `_mux` is only special at the upgr
   } finally {
     await server.stop();
   }
+});
+
+// ============================================================ F. the leave
+
+test('a leave closes exactly one room and leaves the socket and its other rooms alone', () => {
+  // The verb the protocol did not have. Before it, `MuxLink.unsubscribe()`
+  // deleted a client-side map entry and put NOTHING on the wire, so a client that
+  // closed a note stayed registered in that room for the life of its vault
+  // socket. What has to be true of the fix is that it closes one room and is
+  // otherwise invisible: the socket survives, and so does every other room on it.
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, { hub, workspaceId: 'w1' });
+
+  ws.deliver('_tree', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  ws.deliver(`n_${NODE_ID}`, syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  assert.equal(mux.roomCount, 2);
+
+  ws.deliver(`n_${NODE_ID}`, new Uint8Array(0));
+
+  assert.equal(mux.roomCount, 1, 'the leave did not close the room');
+  assert.deepEqual(mux.roomNames(), ['_tree'], 'the leave closed the wrong room');
+  assert.equal(mux.stats.roomsLeft, 1);
+  assert.equal(mux.stats.dropped.leaveUnknown, 0);
+  assert.equal(ws.closed, false, 'the leave took the shared socket with it');
+  assert.equal(ws.terminated, false);
+
+  // The hub saw the ordinary departure — the same close a per-room socket's own
+  // close produces, and exactly once.
+  const entry = hub.connections.get(`w1/n_${NODE_ID}`);
+  assert.equal(entry.closed, true, 'the hub was never told the room ended');
+  assert.equal(entry.closeHandlerCalls, 1, 'the close handlers ran more than once');
+  assert.equal(hub.connections.get('w1/_tree').closed, false,
+    'a leave for one room ended another');
+
+  // And the surviving room still carries traffic in both directions.
+  const before = hub.connections.get('w1/_tree').received.length;
+  ws.deliver('_tree', syncPayload(SYNC.SYNC_UPDATE, updateFor('still here', 'a')));
+  assert.equal(hub.connections.get('w1/_tree').received.length, before + 1,
+    'the surviving room stopped receiving');
+  const sentBefore = ws.framesFor('_tree').length;
+  hub.push('w1/_tree', syncPayload(SYNC.SYNC_STEP2, EMPTY_SV));
+  assert.equal(ws.framesFor('_tree').length, sentBefore + 1,
+    'the surviving room stopped sending');
+});
+
+test('a leave may CLOSE a room and may not open one — it is not a capability', () => {
+  // ⚠ THE SECURITY SHAPE OF THE NEW VERB, and the reason it is handled before the
+  // lazy open rather than after it. If a leave fell through to the open branch it
+  // would be a way to make `DocHub` build a document for any name that passes
+  // `isValidDocId` — a new capability for an authenticated socket, which is the
+  // one thing this route may not grow. As written the only thing a leave can
+  // touch is a room this same socket already opened.
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, { hub, workspaceId: 'w1', maxRooms: 1 });
+
+  ws.deliver(`n_${NODE_ID}`, new Uint8Array(0));
+
+  assert.equal(mux.roomCount, 0, 'a leave opened a room');
+  assert.deepEqual(hub.docNames, [], 'the hub built a document for a room nobody joined');
+  assert.equal(mux.stats.roomsOpened, 0);
+  assert.equal(mux.stats.roomsLeft, 0, 'a room this socket never held was counted as left');
+  assert.equal(mux.stats.dropped.leaveUnknown, 1);
+  assert.equal(mux.stats.dropped.capped, 0, 'the leave consumed a room-cap slot');
+
+  // The one slot this socket has is still there to be used.
+  ws.deliver('_tree', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  assert.equal(mux.roomCount, 1);
+  assert.deepEqual(hub.docNames, ['w1/_tree']);
+});
+
+test('a leave faces the SAME room-name check every other frame faces', () => {
+  // The per-frame validation is the whole security core of this route (group B),
+  // and a new verb that skipped it would be a hole in exactly the place the mux
+  // moved the check to. A hostile name is refused as a NAME, before anything asks
+  // what the payload means.
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, { hub, workspaceId: 'w1' });
+
+  const hostile = ['../escape', 'a/b', '', 'x'.repeat(301), 'a b', '.', 'n_ü'];
+  for (const name of hostile) {
+    assert.equal(isValidDocId(name), false, `${JSON.stringify(name)} is not hostile`);
+    ws.deliver(name, new Uint8Array(0));
+  }
+
+  assert.equal(mux.stats.dropped.badRoom, hostile.length, 'a hostile name reached the leave');
+  assert.equal(mux.stats.dropped.leaveUnknown, 0,
+    'a name that fails validation was looked up as a room');
+  assert.equal(mux.roomCount, 0);
+  assert.deepEqual(hub.docNames, []);
+});
+
+test('a leave frees a room-cap slot, and a room left may be joined again', () => {
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, { hub, workspaceId: 'w1', maxRooms: 1 });
+
+  ws.deliver(`n_${NODE_ID}`, syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  ws.deliver('_tree', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  assert.equal(mux.stats.dropped.capped, 1, 'the cap stopped applying');
+
+  ws.deliver(`n_${NODE_ID}`, new Uint8Array(0));
+  ws.deliver('_tree', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  assert.equal(mux.roomCount, 1);
+  assert.deepEqual(mux.roomNames(), ['_tree'], 'the freed slot was not usable');
+
+  // Re-joining a room that was left builds a SECOND virtual connection, which is
+  // what a reopened note is: `roomsOpened` counts openings, not rooms.
+  ws.deliver('_tree', new Uint8Array(0));
+  ws.deliver(`n_${NODE_ID}`, syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+  assert.equal(mux.roomCount, 1);
+  assert.equal(mux.stats.roomsOpened, 3);
+  assert.equal(mux.stats.roomsLeft, 2);
+});
+
+test('a leave after the socket has gone may not resurrect a room', () => {
+  const ws = new FakeSocket();
+  const hub = new FlakyHub();
+  const mux = attachMux(ws, { hub, workspaceId: 'w1' });
+  ws.deliver('_tree', syncPayload(SYNC.SYNC_STEP1, EMPTY_SV));
+
+  ws.emit('close');
+  ws.deliver('_tree', new Uint8Array(0));
+
+  assert.equal(mux.stats.dropped.afterClose, 1);
+  assert.equal(mux.stats.roomsLeft, 0);
+  assert.equal(mux.stats.dropped.leaveUnknown, 0,
+    'a frame after the close was looked up instead of being refused outright');
+});
+
+test("a leave runs DocHub's ordinary departure path: the awareness goes and the snapshot lands", async () => {
+  // ⚠ THE POINT OF THE VERB, against the REAL `DocHub`. `_closeConn` removes the
+  // awareness states this connection registered and broadcasts the removal to the
+  // room's remaining peers, then flushes when the last of them has gone. That is
+  // what a per-room socket's close has always done; the leave is how a mux client
+  // reaches it without its vault socket having to die.
+  const server = await startMuxHub({ persistDebounceMs: 5_000 });
+  const room = `n_${NODE_ID}`;
+  const docName = `leaving/${room}`;
+  const leaver = new MuxClient(server.muxUrl('leaving'), { name: 'leaver' });
+  const stayer = new MuxClient(server.muxUrl('leaving'), { name: 'stayer' });
+  const doc = new Y.Doc();
+  const awareness = new awarenessProtocol.Awareness(doc);
+  try {
+    await leaver.connect();
+    await stayer.connect();
+    await leaver.syncAll([room]);
+    await stayer.syncAll([room]);
+
+    // The leaver announces a cursor, the way a bound editing session does.
+    awareness.setLocalState({ user: { name: 'Ada' } });
+    leaver.sendFrame(room, awarenessPayload(
+      awarenessProtocol.encodeAwarenessUpdate(awareness, [awareness.clientID]),
+    ));
+    const states = () => server.hub.docs.get(docName).awareness.getStates().size;
+    assert.equal(await until(() => states() === 1, 3_000), true,
+      'the cursor never reached the server');
+
+    leaver.pushUpdate(room, updateFor('written before leaving'));
+    assert.equal(
+      await until(() => server.hub.getText(docName) === 'written before leaving', 3_000),
+      true, 'the write never landed',
+    );
+    const seenBefore = stayer.awareness.length;
+
+    leaver.leave(room);
+
+    // The departure is broadcast, so a peer stops holding the cursor at once
+    // rather than waiting out the awareness protocol's 30-second sweep.
+    assert.equal(await until(() => states() === 0, 3_000), true,
+      'the departing cursor is still on the server');
+    assert.equal(await until(() => stayer.awareness.length > seenBefore, 3_000), true,
+      'the remaining peer was never told the cursor left');
+    assert.equal(server.muxes[0].stats.roomsLeft, 1);
+
+    // The leaver's other traffic is unaffected: the socket is still open and
+    // still carries whatever else it holds.
+    assert.equal(leaver.connected, true, 'the leave closed the vault socket');
+    await leaver.syncAll(['_tree']);
+
+    // ...and with the last peer gone, the snapshot lands rather than waiting for
+    // a debounce nothing will now trigger. The debounce here is 5 s, so a file on
+    // disk can only be the flush.
+    stayer.leave(room);
+    assert.equal(await until(() => server.hub.docs.get(docName).conns.size === 0, 3_000), true,
+      'the room still holds a connection');
+    await Promise.all([...server.hub._persistChain.values()]);
+    const snapshot = join(server.dir, 'yjs', `${docName}.bin`);
+    assert.equal(existsSync(snapshot), true,
+      'the last peer left and no snapshot was written — flush-on-last-peer-leave '
+      + 'is exactly the promptness the missing verb was defeating');
+  } finally {
+    awareness.destroy();
+    doc.destroy();
+    leaver.abort();
+    stayer.abort();
+    await server.stop();
+  }
+});
+
+test('an empty payload was inert before it was a verb, so nothing was speaking it', () => {
+  // The argument that this is additive rather than a grammar change, asserted
+  // rather than reasoned: every y-websocket message begins with a varuint message
+  // type, so the shortest one a client can legitimately write is one byte. A
+  // zero-length payload is therefore a sequence no correct client has ever sent.
+  for (const payload of [
+    syncPayload(SYNC.SYNC_STEP1, EMPTY_SV),
+    syncPayload(SYNC.SYNC_STEP2, EMPTY_SV),
+    syncPayload(SYNC.SYNC_UPDATE, updateFor('anything')),
+    awarenessPayload(new Uint8Array([1, 2, 3])),
+  ]) {
+    assert.equal(payload.byteLength > 0, true, 'a real payload can be empty');
+  }
+  // And the frame the verb rides on is the frame that always existed: the codec
+  // is unchanged, so a leave IS an ordinary frame with an empty payload.
+  const frame = encodeMuxLeave('_tree');
+  const decoded = decodeMuxFrame(frame);
+  assert.equal(decoded.room, '_tree');
+  assert.equal(decoded.payload.byteLength, 0);
+  assert.deepEqual(
+    Array.from(frame), Array.from(encodeMuxFrame('_tree', new Uint8Array(0))),
+    'the leave is not an ordinary frame with an empty payload',
+  );
 });
