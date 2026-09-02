@@ -93,6 +93,11 @@ class FakeConnection implements RoomConnection {
  */
 class FakeTransport implements RoomTransport {
   readonly opened: FakeConnection[] = [];
+  /**
+   * Rooms this transport REFUSES to open, which is not a hypothetical: the
+   * shipped `MuxLink.subscribe` throws on a room the link already holds.
+   */
+  readonly refuses = new Set<string>();
   private readonly docsPerRoom = new Map<string, Set<Y.Doc>>();
   private readonly awarenessPerRoom = new Map<string, Set<unknown>>();
 
@@ -101,6 +106,7 @@ class FakeTransport implements RoomTransport {
     doc: Y.Doc,
     awareness: awarenessProtocol.Awareness,
   ): RoomConnection {
+    if (this.refuses.has(room)) throw new Error(`${room} is already subscribed on this link`);
     let docs = this.docsPerRoom.get(room);
     if (docs === undefined) {
       docs = new Set<Y.Doc>();
@@ -401,6 +407,60 @@ test('switching to the transport already in use changes nothing', () => {
 
   assert.equal(mux.forRoom(ROOM).length, 1, 'no room was torn down and rebuilt for nothing');
   assert.equal(registry.connectionsReplaced, 0);
+
+  registry.destroy();
+});
+
+// ================================================================ a dial that throws
+
+test('a room whose transport refuses to open leaves nothing behind', () => {
+  // ⚠ NOT HYPOTHETICAL, AND THE FAILURE IS PERMANENT. `MuxLink.subscribe` throws
+  // on a room this link already holds. A half-built entry left in the map would be
+  // reused by every later `acquire` — a room connected to nothing, reporting
+  // `synced === false` for the rest of the session, with no way back — and it
+  // holds an `Awareness` whose 3-second interval keeps the process alive.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  transport.refuses.add(ROOM);
+
+  assert.throws(() => registry.acquire(ROOM), /already subscribed/);
+  assert.equal(registry.liveDocs(ROOM), 0, 'a room that never opened is not a live room');
+  assert.equal(registry.refs(ROOM), 0);
+  assert.deepEqual(registry.liveRooms(), []);
+
+  // And the room recovers the moment the transport will take it, rather than
+  // being stuck on whatever the failed attempt left in the map.
+  transport.refuses.delete(ROOM);
+  const lease = registry.acquire(ROOM);
+  assert.equal(registry.liveDocs(ROOM), 1);
+  assert.equal(transport.forRoom(ROOM).length, 1);
+  lease.release();
+
+  registry.destroy();
+});
+
+test('one room that cannot be reopened does not strand the rooms after it', () => {
+  // Per-room containment on the switch, `server/mux.js`'s rule applied on this
+  // side. What the failed room is left holding is the honest answer — not current,
+  // confirms nothing — which is the direction I3/I4 and I17 require.
+  const mux = new FakeTransport();
+  const legacy = new FakeTransport();
+  const registry = new RoomRegistry(mux);
+
+  const bad = registry.acquire(ROOM);
+  const good = registry.acquire(OTHER);
+  mux.live(ROOM)!.emitSync();
+  mux.live(OTHER)!.emitSync();
+  legacy.refuses.add(ROOM);
+
+  registry.switchTransport(legacy);
+
+  assert.equal(registry.connectionsReplaced, 2, 'both rooms were attempted');
+  assert.equal(registry.connectionsNotReplaced, 1);
+  assert.equal(bad.synced, false, 'a room with no connection is not current');
+  assert.equal(legacy.forRoom(OTHER).length, 1, 'the room after it was still moved');
+  legacy.live(OTHER)!.emitSync();
+  assert.equal(good.synced, true);
 
   registry.destroy();
 });

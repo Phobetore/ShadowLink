@@ -161,6 +161,12 @@ class RoomEntry {
   reopen(transport: RoomTransport): void {
     const previous = this.connection;
     previous.off('sync', this.relay);
+    // ⚠ DEAD BEFORE THE DIAL, not after it. If `transport.open` throws, the field
+    // must not still name a connection this method has already destroyed:
+    // `MuxRoom.synced` reads a latched flag and the LINK, neither of which its own
+    // `destroy()` clears, so a destroyed room on a live link answers `true` about a
+    // subscription it has already given up.
+    this.connection = DEAD_CONNECTION;
     try {
       previous.destroy();
     } catch {
@@ -226,6 +232,7 @@ export class RoomRegistry {
   private transport: RoomTransport;
   private destroyed = false;
   private reopens = 0;
+  private reopenFailures = 0;
 
   constructor(transport: RoomTransport) {
     this.transport = transport;
@@ -250,7 +257,20 @@ export class RoomRegistry {
       entry = new RoomEntry(room);
       this.entries.set(room, entry);
       this.built.set(room, (this.built.get(room) ?? 0) + 1);
-      entry.open(this.transport);
+      // ⚠ A DIAL THAT THROWS MUST NOT LEAVE THE ROOM IN THE MAP. `MuxLink.subscribe`
+      // throws on a room this link already holds, and a half-built entry left
+      // behind would be reused by every later `acquire` — a room permanently
+      // connected to nothing, reporting `synced === false` for the rest of the
+      // session with no way back. It also holds an `Awareness`, whose 3-second
+      // interval keeps the process alive; that is how a mutation of this very line
+      // hung `node --test` rather than failing it.
+      try {
+        entry.open(this.transport);
+      } catch (err) {
+        this.entries.delete(room);
+        entry.destroy();
+        throw err;
+      }
     }
     const held = entry;
     held.refs += 1;
@@ -277,7 +297,16 @@ export class RoomRegistry {
     if (next === this.transport) return;
     this.transport = next;
     for (const entry of this.entries.values()) {
-      entry.reopen(next);
+      // Per-room containment, `server/mux.js`'s rule applied on this side: one
+      // room that cannot be reopened may not strand the rooms after it in the
+      // map. What it leaves behind is the honest answer rather than a stale
+      // connection — `synced` false and `flush` false, which is the direction
+      // I3/I4 and I17 require — and the next pass finds it that way.
+      try {
+        entry.reopen(next);
+      } catch {
+        this.reopenFailures += 1;
+      }
       this.reopens += 1;
     }
   }
@@ -316,6 +345,11 @@ export class RoomRegistry {
   /** How many connections `switchTransport` has replaced, in total. */
   get connectionsReplaced(): number {
     return this.reopens;
+  }
+
+  /** How many of those could not be reopened. A room left honestly unsynced. */
+  get connectionsNotReplaced(): number {
+    return this.reopenFailures;
   }
 
   get isDestroyed(): boolean {

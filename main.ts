@@ -288,6 +288,9 @@ class SyncRuntime {
   /** Releases the tree's reconnect subscription. Set in `start`, called in `dispose`. */
   private releaseTreeConnected: (() => void) | null = null;
 
+  /** Releases the registry's subscription to the link's verdict. Called in `dispose`. */
+  private releaseRoomFallback: (() => void) | null = null;
+
   /** Chained so two `status: connected` transitions cannot run bootstrap twice at once. */
   private reconnectChain: Promise<void> = Promise.resolve();
   private booted = false;
@@ -391,7 +394,14 @@ class SyncRuntime {
     // `onUnsupported` fires at most once per link and fires IMMEDIATELY for a
     // handler registered after the verdict, so a fallback that has already happened
     // still moves the rooms.
-    this.mux.onUnsupported(() => {
+    //
+    // ⚠ AND THE DISPOSER IS KEPT. `MuxLink.destroy()` clears its handler sets, and
+    // every current wiring destroys the link and the registry together — which is
+    // exactly the argument the ninth round rejected for `FallbackTreeTransport`'s
+    // third registration ("the other object's lifetime happens to cover ours" is a
+    // property of that wiring rather than a guarantee of this one). Released in
+    // `dispose`, and nowhere else: this handler can still fire until then.
+    this.releaseRoomFallback = this.mux.onUnsupported(() => {
       this.rooms.switchTransport(new LegacyRoomTransport(link));
     });
 
@@ -748,6 +758,8 @@ class SyncRuntime {
     }
     this.releaseTreeConnected?.();
     this.releaseTreeConnected = null;
+    this.releaseRoomFallback?.();
+    this.releaseRoomFallback = null;
     try {
       this.treeLink.destroy();
     } catch {
