@@ -321,7 +321,10 @@ const IN_MEMORY: Record<string, string[]> = {
     'ackStatus', 'this.statusHandlers', 'this.syncHandlers',
     'this.closeListeners', 'this.messageListeners',
   ],
-  'src/sync/ObsidianDocPort.ts': ['this.live', 'this.rooms'],
+  // P3 slice 3. `this.entries` is the registry's room -> entry Map and
+  // `this.live` is one port's handle -> lease Map; `this.syncHandlers` is a room
+  // entry's observer Set, cleared on teardown. None of the three can name a file.
+  'src/sync/RoomRegistry.ts': ['this.entries', 'this.live', 'this.syncHandlers'],
   'src/sync/ProviderAck.ts': ['this.listeners'],
   // `parkedStat` is an in-memory Map of what a parked entry's file looked like,
   // so `repark` can answer with one `stat` instead of a pass. `blockedNodes` is

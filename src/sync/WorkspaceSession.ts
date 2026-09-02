@@ -70,7 +70,6 @@
 // characters" and "mounted correctly" were the same assertion in every test.
 
 import * as Y from 'yjs';
-import { WebsocketProvider } from 'y-websocket';
 import { yCollab } from 'y-codemirror.next';
 import { Compartment, Transaction } from '@codemirror/state';
 import type { Extension } from '@codemirror/state';
@@ -83,7 +82,6 @@ import {
 import { deriveTree } from '../tree/TreeIndex.ts';
 import type { TreeDoc } from '../tree/TreeDoc.ts';
 import type { DeviceState } from './DeviceState.ts';
-import { ProviderAck } from './ProviderAck.ts';
 import type { VaultPort } from './VaultPort.ts';
 
 // ============================================================ ports
@@ -112,13 +110,37 @@ export interface SessionProvider {
    * `DocPort.flush` and exists for the same reason (I17).
    */
   flush(): Promise<boolean>;
-  disconnect(): void;
+  /**
+   * This session is done with the room.
+   *
+   * ⚠ IT RELEASES A REFERENCE; IT DOES NOT NECESSARILY CLOSE ANYTHING. The room's
+   * document is `RoomRegistry`'s and the publish queue may be holding the same
+   * one, so the connection goes when the LAST borrower lets go — which is what
+   * this call was already doing on the shipped topology, where the session was
+   * simply always the only holder of its own private document.
+   */
   destroy(): void;
 }
 
+/**
+ * What the session is handed for one room: the document AND the connection.
+ *
+ * ⚠ THE DOCUMENT COMES FROM THE PORT, AND THAT IS THE WHOLE OF SLICE 3 AS FAR AS
+ * THIS FILE IS CONCERNED. It used to be `new Y.Doc()` two lines above the connect,
+ * which meant one client could hold two documents for one room — the session's and
+ * `ObsidianDocPort`'s — and `insertIfEmpty`'s emptiness check, which IS invariant
+ * I5's mechanism, was being asked of two documents that could each answer "empty".
+ * There is no parameter here through which a caller could supply a second one.
+ */
+export interface SessionRoom {
+  /** The room's shared document. Released by `provider.destroy()`, never destroyed here. */
+  readonly doc: Y.Doc;
+  readonly provider: SessionProvider;
+}
+
 export interface ProviderPort {
-  /** Create AND start a provider for `room`, bound to `doc`. */
-  connect(room: string, doc: Y.Doc): SessionProvider;
+  /** Borrow `room`: its one document, and a live connection to it. */
+  connect(room: string): SessionRoom;
 }
 
 /**
@@ -761,8 +783,11 @@ export class WorkspaceSession {
     }
     if (token !== this.token) return;
 
-    const doc = new Y.Doc();
-    const provider = this.deps.providers.connect(`n_${nodeId}`, doc);
+    // ONE document per room, borrowed rather than built (P3 §1.1). The room is
+    // still `n_<nodeId>`, and `release` still gives it back the instant this
+    // session is done with it — what changed is that the publish queue and the
+    // reconciler now borrow the SAME one instead of opening a second.
+    const { doc, provider } = this.deps.providers.connect(`n_${nodeId}`);
     provider.awareness.setLocalStateField('user', {
       name: this.deps.userName,
       color: this.deps.userColor,
@@ -773,9 +798,9 @@ export class WorkspaceSession {
     // The token check comes FIRST. A superseded open that tested `synced` first
     // would emit a misleading "this note is not syncing" notice about a note the
     // user already navigated away from.
-    if (token !== this.token) { release(provider, doc); return; }
+    if (token !== this.token) { release(provider); return; }
     if (!synced) {
-      release(provider, doc);
+      release(provider);
       this.localOnly(notePath, 'Offline — this note is not syncing.');
       return;
     }
@@ -796,7 +821,7 @@ export class WorkspaceSession {
       // `decide` encodes this rule too, so the table is the whole of I19; it is
       // ALSO here so the editor is never even read for a note this device has no
       // business writing into.
-      release(provider, doc);
+      release(provider);
       this.localOnly(notePath, 'Waiting for the author to upload this note.');
       return;
     }
@@ -844,7 +869,7 @@ export class WorkspaceSession {
     // The target must still be the file the user is looking at. Between the first
     // await and here the user may have switched notes without a newer `open()`
     // having reached us yet.
-    if (this.deps.activePath() !== notePath) { release(provider, doc); return; }
+    if (this.deps.activePath() !== notePath) { release(provider); return; }
 
     // THE DECISION AND ITS APPLICATION, and on three of the five arms there is no
     // `await` between them.
@@ -861,7 +886,7 @@ export class WorkspaceSession {
     let preserved: string[] = [];
     for (let attempt = 0; attempt < 2; attempt++) {
       const B = this.deps.editor.bufferOf(notePath);
-      if (B === null) { release(provider, doc); return; }      // arm 0: no bindable leaf
+      if (B === null) { release(provider); return; }      // arm 0: no bindable leaf
       buffer = B;
       // A string comparison, deliberately: this sits between `bufferOf` and
       // `apply`, where there is no `await` to be raced.
@@ -869,7 +894,7 @@ export class WorkspaceSession {
       const foreign = B !== '' && prior !== null && prior.nodeId !== nodeId && prior.text === B;
       const plan = decide(B, shared, localText, own, seeded, foreign);
       if (plan.kind === 'local-only') {
-        release(provider, doc);
+        release(provider);
         this.localOnly(notePath, plan.reason);
         return;
       }
@@ -888,12 +913,12 @@ export class WorkspaceSession {
             // NO BIND. A bind after a failed preservation lets Obsidian save the
             // shared text over bytes nothing holds. `preserveCopy` has already
             // said so, naming the note and the reason (I15).
-            release(provider, doc);
+            release(provider);
             return;
           }
           if (dest !== '') preserved.push(dest);
         }
-        if (token !== this.token) { release(provider, doc); return; }
+        if (token !== this.token) { release(provider); return; }
       }
       const planned: MountPlan = plan.kind === 'converge-up'
         ? { kind: 'converge-up', expect: B, edit: plan.edit }
@@ -903,13 +928,13 @@ export class WorkspaceSession {
       mounted = this.deps.editor.apply(notePath, text, provider.awareness, planned);
       if (mounted.stale !== true) break;
     }
-    if (mounted === undefined) { release(provider, doc); return; }
+    if (mounted === undefined) { release(provider); return; }
     if (mounted.ok) {
       this.active = { nodeId, notePath, doc, provider };
       // The gate has just proved the editor holds exactly this, so it is the
       // one string this session knows a leaf is displaying. See `lastBound`.
       this.lastBound = { nodeId, text: text.toString() };
-    } else release(provider, doc);
+    } else release(provider);
 
     // BELT AND BRACES: what the apply ACTUALLY displaced, when that is not the
     // buffer the decision was made about.
@@ -1216,7 +1241,7 @@ export class WorkspaceSession {
     } catch {
       /* the view is already gone; nothing left to unbind */
     }
-    release(session.provider, session.doc);
+    release(session.provider);
     // `openNodeId()` is null from here, so the queue's I7 deferral has just
     // lifted. Telling it now rather than letting the 30-second tick find out is
     // the difference between a note publishing when the user closes it and half
@@ -1628,98 +1653,43 @@ export class CodeMirrorBinding implements EditorBinding {
   }
 }
 
-/** How long `flush()` waits for the server's acknowledgement before giving up. */
-const FLUSH_TIMEOUT_MS = 5_000;
-
 /**
- * y-websocket behind `ProviderPort`.
+ * ⚠ THE PROVIDER THIS FILE USED TO BUILD IS GONE, and its absence is slice 3.
  *
- * The room is a single URL segment and the workspace travels as the `w` query
- * parameter, matching `server/upgradeAuth.js`; that also avoids depending on how
- * y-websocket encodes a room name containing a slash.
+ * `WebsocketProviderPort` and `WebsocketSessionProvider` lived here: one
+ * `WebsocketProvider` on its own socket, per open note, over a `Y.Doc` this file
+ * had just constructed. Both moved into `RoomRegistry` and the transports behind
+ * it (P3 spec §5.1, "Loses: provider construction and lifecycle"), because the
+ * document was the problem rather than the socket: while it was built here, the
+ * publish queue could hold a SECOND document for the same room and neither could
+ * see the other. The 5,000 ms flush deadline they carried moved with them and is
+ * unchanged — see `SESSION_FLUSH_TIMEOUT_MS` in `RoomRegistry.ts`.
+ *
+ * What did NOT move is anything above this line. The five-arm table, the bind
+ * gate, `affixEdit`, `repairLineEndings`, the open token and the publisher are
+ * exactly as they were; this file simply stopped owning a socket.
  */
-export class WebsocketProviderPort implements ProviderPort {
-  constructor(
-    private readonly config: { serverUrl: string; serverKey: string; workspaceId: string },
-  ) {}
-
-  connect(room: string, doc: Y.Doc): SessionProvider {
-    const provider = new WebsocketProvider(this.config.serverUrl, room, doc, {
-      connect: true,
-      params: { t: this.config.serverKey, w: this.config.workspaceId },
-      disableBc: true,
-    });
-    return new WebsocketSessionProvider(provider, doc);
-  }
-}
-
-class WebsocketSessionProvider implements SessionProvider {
-  /** The same round trip `ObsidianDocPort` uses, on the same terms (I17). */
-  private readonly ack: ProviderAck;
-
-  constructor(private readonly provider: WebsocketProvider, doc: Y.Doc) {
-    this.ack = new ProviderAck(provider, doc);
-  }
-
-  get synced(): boolean {
-    return this.provider.synced;
-  }
-
-  get awareness(): SessionAwareness {
-    return this.provider.awareness;
-  }
-
-  on(event: 'sync', handler: (isSynced: boolean) => void): void {
-    this.provider.on(event, handler);
-  }
-
-  off(event: 'sync', handler: (isSynced: boolean) => void): void {
-    this.provider.off(event, handler);
-  }
-
-  /**
-   * A genuine server acknowledgement — the same one `ObsidianDocPort.flush`
-   * awaits, through the same `ProviderAck`.
-   *
-   * This used to return `provider.synced` once `bufferedAmount` reached zero,
-   * which is "the bytes left this process" and, worse, a flag that LATCHES after
-   * the first sync. Its result sets `s` on the node, which is the exact watermark
-   * `DocPort.flush` exists to protect: a peer materializing a file from an `s = 1`
-   * node that the server never received writes an empty note and never re-fetches
-   * it. The publish queue's `pending` entry made that a recoverable window rather
-   * than permanent loss, but the window had no business existing on the path every
-   * user takes on every note they open.
-   */
-  flush(): Promise<boolean> {
-    return this.ack.flush(FLUSH_TIMEOUT_MS);
-  }
-
-  disconnect(): void {
-    this.provider.disconnect();
-  }
-
-  destroy(): void {
-    this.ack.destroy();
-    this.provider.destroy();
-  }
-}
 
 // ============================================================ helpers
 
-/** Release a provider and its document. Never throws: teardown is not optional. */
-function release(provider: SessionProvider, doc: Y.Doc): void {
-  try {
-    provider.disconnect();
-  } catch {
-    /* already gone */
-  }
+/**
+ * Give the room back. Never throws: teardown is not optional.
+ *
+ * ⚠ IT NO LONGER DESTROYS THE DOCUMENT, and that is not a leak — it is the point
+ * of slice 3. The document belongs to `RoomRegistry`, which destroys it when the
+ * LAST borrower releases; on the shipped topology this session was always the only
+ * borrower of its own private document, so the moment of teardown is unchanged in
+ * every case where it was ever observable. What is new is the case where it should
+ * never have happened: the publish queue holding the same room.
+ *
+ * `disconnect()` went with it, for the same reason. A shared connection is not
+ * this session's to take down, and `destroy()` — which is now "release my
+ * reference" — is what the previous call pair amounted to when the session was
+ * the only holder.
+ */
+function release(provider: SessionProvider): void {
   try {
     provider.destroy();
-  } catch {
-    /* already gone */
-  }
-  try {
-    doc.destroy();
   } catch {
     /* already gone */
   }

@@ -82,7 +82,11 @@ import {
 import { MuxLink } from './src/sync/MuxLink';
 import type { TreeTransport } from './src/sync/TreeTransport';
 import { ObsidianBlobPort } from './src/sync/ObsidianBlobPort';
-import { ObsidianDocPort } from './src/sync/ObsidianDocPort';
+import { LegacyRoomTransport } from './src/sync/ObsidianDocPort';
+import { MuxRoomTransport } from './src/sync/MuxRoomTransport';
+import {
+  RegistryDocPort, RegistryProviderPort, RoomRegistry,
+} from './src/sync/RoomRegistry';
 import { ObsidianStatePort, treeSnapshotKey } from './src/sync/ObsidianStatePort';
 import { ObsidianVaultPort } from './src/sync/ObsidianVaultPort';
 import { PublishQueue } from './src/sync/PublishQueue';
@@ -91,7 +95,7 @@ import type { DeferredAttachment, ReconcileCause } from './src/sync/Reconciler';
 import { Tickets } from './src/sync/Tickets';
 import { VaultWatcher } from './src/sync/VaultWatcher';
 import type { Kind } from './src/sync/VaultPort';
-import { CodeMirrorBinding, WorkspaceSession, WebsocketProviderPort } from './src/sync/WorkspaceSession';
+import { CodeMirrorBinding, WorkspaceSession } from './src/sync/WorkspaceSession';
 
 /** How often the status indicator re-reads both modules' read-only reasons. */
 const STATUS_POLL_MS = 1_000;
@@ -212,7 +216,17 @@ function toCause(reason: string): ReconcileCause {
  */
 class SyncRuntime {
   readonly vault: ObsidianVaultPort;
-  readonly docs: ObsidianDocPort;
+  /**
+   * ONE `Y.Doc` per room, borrowed by the editing session and by the headless
+   * publishes alike (P3 §1.1, slice 3).
+   *
+   * Before it, `WorkspaceSession` built a document per open note and
+   * `ObsidianDocPort` kept a separate pool, so one client could hold two documents
+   * for one room and neither could see the other. There is now one map, and the
+   * two consumers below are two views of it.
+   */
+  readonly rooms: RoomRegistry;
+  readonly docs: RegistryDocPort;
   readonly blobs: ObsidianBlobPort;
   readonly statePort: ObsidianStatePort;
   readonly state: DeviceState;
@@ -302,11 +316,86 @@ class SyncRuntime {
       console.error('[ShadowLink] a tree observer threw', err);
     };
 
-    this.docs = new ObsidianDocPort({
+    const link = {
       serverUrl: share.serverUrl,
       serverKey: share.serverKey,
       workspaceId: share.workspaceId,
+    };
+
+    // P3 slice 2 put `_tree` here; slice 3 puts every note's room here too, which
+    // is where the socket count actually falls. It is constructed before anything
+    // that borrows a room because the registry's transport is built over it, and
+    // it opens nothing until `connect`.
+    this.mux = new MuxLink(link);
+
+    // ⚠ THE USER'S OWN DECISION, TAKEN AHEAD OF THE CLIENT'S. A deployment can
+    // accept the `/_mux` upgrade and carry nothing on it, and from in here that
+    // is indistinguishable from a path that is slow — so when the person who
+    // knows their deployment has said so, the mux is never dialled at all rather
+    // than dialled, measured and second-guessed. `this.mux` is still constructed
+    // (it opens nothing until `connect`) so that `dispose` and the registry have
+    // one shape to reason about.
+    //
+    // ⚠ AND IT NOW PICKS TWO TRANSPORTS RATHER THAN ONE. From slice 3 the link
+    // carries every live note's room as well as `_tree`, so the lever has to move
+    // both. The branch immediately below chooses the TREE's transport — the value
+    // must stay next to the branch it drives, or the bar and the transport could
+    // disagree about which connection was built — and `this.rooms`, a few lines
+    // further down, takes the same answer for every note's room.
+    this.compatibilityChosen = this.plugin.settings.useCompatibilityConnection;
+    if (this.compatibilityChosen) {
+      this.treeLink = new LegacyTreeTransport(link, this.tree.doc);
+      this.routeWitness = null;
+    } else {
+      const bridge = openTreeTransport(
+        this.mux,
+        this.tree.doc,
+        link,
+        // Said once, and only the sentence that is true for THIS verdict: an old
+        // server and a blocked route are different problems with different fixes,
+        // and telling someone to update a server that is already current is worse
+        // than saying nothing.
+        //
+        // ⚠ AND RECORDED, because the Notice lasts fifteen seconds and the cost
+        // lasts the session. The bar's compatibility line is the same one the
+        // user-thrown lever gets, for the same reason: unopened notes go stale
+        // either way.
+        (reason) => {
+          this.compatibilityFellBack = true;
+          new Notice(legacyNoticeFor(reason), 15_000);
+        },
+      );
+      this.treeLink = bridge;
+      // The same object under its other name: the bar asks it, live, whether the
+      // server is answering on the per-room route at the moment it renders.
+      this.routeWitness = bridge;
+    }
+    this.treeLink.connect();
+
+    // ONE document per room, for the editing session and the headless publishes
+    // alike (P3 §1.1). Same answer as the branch above, and switchable for the
+    // same reason — see `onUnsupported` below.
+    this.rooms = new RoomRegistry(
+      this.compatibilityChosen
+        ? new LegacyRoomTransport(link)
+        : new MuxRoomTransport(this.mux),
+    );
+
+    // ⚠ THE SECOND SWITCH THE SPEC ASKED FOR BEFORE THIS SLICE FOUND IT (§4: "the
+    // bridge covers `_tree` and nothing else. From slice 3 the same `MuxLink`
+    // carries the session and note rooms, and an unsupported link makes `connect()`
+    // a permanent no-op for all of them — so either `RoomRegistry` grows a second
+    // switch or an old server loses note sync entirely"). This is that switch. The
+    // bridge moves the tree, this moves every note's room, and both keep their
+    // documents, so the fallback costs a re-handshake and nothing else.
+    // `onUnsupported` fires at most once per link and fires IMMEDIATELY for a
+    // handler registered after the verdict, so a fallback that has already happened
+    // still moves the rooms.
+    this.mux.onUnsupported(() => {
+      this.rooms.switchTransport(new LegacyRoomTransport(link));
     });
+
+    this.docs = new RegistryDocPort(this.rooms);
 
     // Attachments travel over HTTP to the server's content-addressed store, not
     // through Yjs (spec §1.1). Same host, same key, same workspace.
@@ -320,11 +409,9 @@ class SyncRuntime {
       vault: this.vault,
       state: this.state,
       tree: this.tree,
-      providers: new WebsocketProviderPort({
-        serverUrl: share.serverUrl,
-        serverKey: share.serverKey,
-        workspaceId: share.workspaceId,
-      }),
+      // The session borrows the room's document; it no longer builds one. The
+      // publish queue borrows the same one through `this.docs` above.
+      providers: new RegistryProviderPort(this.rooms),
       editor: plugin.editorBinding,
       shareRoot: () => this.shareRoot,
       activePath: () => app.workspace.getActiveFile()?.path ?? null,
@@ -457,56 +544,6 @@ class SyncRuntime {
       notice: (msg) => { new Notice(msg); },
     });
 
-    // P3 slice 2. `_tree` is the first — and, this slice, the only — room on the
-    // vault's shared socket. It is chosen because it is the least dangerous room
-    // in the system: no note content passes through it, so the reconnect ladder
-    // and the frame codec soak here before slice 3 puts prose on them.
-    this.mux = new MuxLink({
-      serverUrl: share.serverUrl,
-      serverKey: share.serverKey,
-      workspaceId: share.workspaceId,
-    });
-    const link = {
-      serverUrl: share.serverUrl,
-      serverKey: share.serverKey,
-      workspaceId: share.workspaceId,
-    };
-    // ⚠ THE USER'S OWN DECISION, TAKEN AHEAD OF THE CLIENT'S. A deployment can
-    // accept the `/_mux` upgrade and carry nothing on it, and from in here that
-    // is indistinguishable from a path that is slow — so when the person who
-    // knows their deployment has said so, the mux is never dialled at all rather
-    // than dialled, measured and second-guessed. `this.mux` is still constructed
-    // (it opens nothing until `connect`) so that `dispose` and the slice-3
-    // registry have one shape to reason about.
-    this.compatibilityChosen = this.plugin.settings.useCompatibilityConnection;
-    if (this.compatibilityChosen) {
-      this.treeLink = new LegacyTreeTransport(link, this.tree.doc);
-      this.routeWitness = null;
-    } else {
-      const bridge = openTreeTransport(
-        this.mux,
-        this.tree.doc,
-        link,
-        // Said once, and only the sentence that is true for THIS verdict: an old
-        // server and a blocked route are different problems with different fixes,
-        // and telling someone to update a server that is already current is worse
-        // than saying nothing.
-        //
-        // ⚠ AND RECORDED, because the Notice lasts fifteen seconds and the cost
-        // lasts the session. The bar's compatibility line is the same one the
-        // user-thrown lever gets, for the same reason: unopened notes go stale
-        // either way.
-        (reason) => {
-          this.compatibilityFellBack = true;
-          new Notice(legacyNoticeFor(reason), 15_000);
-        },
-      );
-      this.treeLink = bridge;
-      // The same object under its other name: the bar asks it, live, whether the
-      // server is answering on the per-room route at the moment it renders.
-      this.routeWitness = bridge;
-    }
-    this.treeLink.connect();
 
     this.bootstrap = new Bootstrap({
       state: this.state,
@@ -716,14 +753,20 @@ class SyncRuntime {
     } catch {
       /* already gone */
     }
-    // After the transport: destroying the link first would take the room's socket
-    // out from under a transport that is still unsubscribing from it.
+    // The port gives its handles back; the registry is what actually tears the
+    // rooms down, whoever is still holding one. BEFORE the link, for the same
+    // reason the tree's transport goes before it: a room unsubscribing from a
+    // socket that has already been destroyed is a teardown running against an
+    // object somebody else has already emptied.
+    this.docs.destroy();
+    this.rooms.destroy();
+    // After both transports: destroying the link first would take the socket out
+    // from under something that is still unsubscribing from it.
     try {
       this.mux.destroy();
     } catch {
       /* already gone */
     }
-    this.docs.destroy();
     try {
       this.tree.doc.destroy();
     } catch {

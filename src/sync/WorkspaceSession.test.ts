@@ -52,6 +52,7 @@ import {
   vouches,
   type MountResult,
   type ProviderPort,
+  type SessionRoom,
   type SessionAwareness,
   type SessionProvider,
   type WorkspaceSessionDeps,
@@ -105,7 +106,6 @@ class FakeAwareness implements SessionAwareness {
 class FakeProvider implements SessionProvider {
   synced = false;
   destroyed = false;
-  disconnected = false;
   flushes = 0;
   readonly awareness = new FakeAwareness();
 
@@ -118,6 +118,7 @@ class FakeProvider implements SessionProvider {
     readonly doc: Y.Doc,
     private readonly config: RoomConfig,
     private readonly rooms: Rooms | null = null,
+    private readonly giveBack: () => void = () => undefined,
   ) {}
 
   on(_event: 'sync', handler: (isSynced: boolean) => void): void {
@@ -136,22 +137,35 @@ class FakeProvider implements SessionProvider {
     return this.config.flushConfirmed;
   }
 
-  disconnect(): void {
-    this.disconnected = true;
-  }
-
+  /**
+   * The session is done with the room — a REFERENCE given back, not a socket
+   * closed. `destroyed` still says exactly what it always said about this
+   * provider; what is new is that the room's document may outlive it, because the
+   * publish queue may be holding the same one.
+   */
   destroy(): void {
+    if (this.destroyed) return;
     this.destroyed = true;
+    this.giveBack();
   }
 
-  /** Deliver the server's state and announce a GENUINE sync. */
+  /**
+   * Deliver the server's state and announce a GENUINE sync.
+   *
+   * ⚠ NO RELAY WHEN A `Rooms` IS IN PLAY, and that absence is slice 3. This used
+   * to call `rooms.join(room, doc)` — a real Yjs relay between the session's own
+   * document and the room's — because the session HAD its own document. It
+   * borrows the room's now, so there is nothing to relay between: `this.doc` IS
+   * `rooms.doc(this.room)`, and a test can no longer be written that passes
+   * because two copies each held the right string.
+   */
   emitSync(): void {
-    if (this.rooms !== null) {
-      this.rooms.join(this.room, this.doc);
-    } else if (this.config.remoteUpdate !== null) {
-      Y.applyUpdate(this.doc, this.config.remoteUpdate);
-    } else if (this.config.remote.length > 0 && this.doc.getText('content').length === 0) {
-      this.doc.getText('content').insert(0, this.config.remote);
+    if (this.rooms === null) {
+      if (this.config.remoteUpdate !== null) {
+        Y.applyUpdate(this.doc, this.config.remoteUpdate);
+      } else if (this.config.remote.length > 0 && this.doc.getText('content').length === 0) {
+        this.doc.getText('content').insert(0, this.config.remote);
+      }
     }
     this.synced = true;
     for (const handler of [...this.handlers]) handler(true);
@@ -185,13 +199,18 @@ class FakeProvider implements SessionProvider {
  * about a document the session had never seen.
  *
  * This is the document, for both. `Rooms` IS the `DocPort` the queue publishes
- * through, and a `FakeProviders` constructed over it relays the room's state
- * into the session's `Y.Doc` at sync and every update afterwards, in both
- * directions — a real Yjs relay, so `insertIfEmpty`'s I5 guard is the real one
- * and a double seed would show up as the concatenation it is.
+ * through, and a `FakeProviders` constructed over it hands the session THE SAME
+ * OBJECT — so `insertIfEmpty`'s I5 guard is the real one, asked of the one
+ * document that exists, and a double seed shows up as the concatenation it is.
+ *
+ * ⚠ THE RELAY IS GONE, AND ITS ABSENCE IS SLICE 3 (P3 §9: "`Rooms` drives both
+ * consumers"). This class used to `join` the session's private `Y.Doc` to the
+ * room's with a pair of update listeners, because the session built its own —
+ * which modelled the shipped defect faithfully and could therefore never fail on
+ * it. `RoomRegistry` removed the second document, so the fake has no second
+ * document to relay to, and "the session and the queue disagreed about what the
+ * room holds" stopped being a state this fake can even express.
  */
-const RELAY = Symbol('relay');
-
 class Rooms implements DocPort {
   readonly docs = new Map<string, Y.Doc>();
 
@@ -206,18 +225,6 @@ class Rooms implements DocPort {
 
   text(room: string): string {
     return this.doc(room).getText('content').toString();
-  }
-
-  /** Join a session's own `Y.Doc` to the room, the way a provider's sync does. */
-  join(room: string, local: Y.Doc): void {
-    const shared = this.doc(room);
-    Y.applyUpdate(local, Y.encodeStateAsUpdate(shared), RELAY);
-    local.on('update', (update: Uint8Array, origin: unknown) => {
-      if (origin !== RELAY) Y.applyUpdate(shared, update, RELAY);
-    });
-    shared.on('update', (update: Uint8Array, origin: unknown) => {
-      if (origin !== RELAY) Y.applyUpdate(local, update, RELAY);
-    });
   }
 
   // ---------------------------------------------------------- DocPort
@@ -240,23 +247,50 @@ class Rooms implements DocPort {
   close(): void { /* nothing to release */ }
 }
 
+/**
+ * `RoomRegistry`'s refcounting, in the shape a fake needs it.
+ *
+ * ⚠ IT HANDS THE DOCUMENT OUT RATHER THAN TAKING ONE, which is the port's new
+ * signature and the whole seam this slice moves: there is no parameter through
+ * which the session could supply a second document for a room. Two providers on
+ * one room name get one document and it goes when the second of them is released
+ * — exactly `RoomRegistry.acquire`/`release`, so a test written against this fake
+ * is asking the real question.
+ */
 class FakeProviders implements ProviderPort {
   readonly created: FakeProvider[] = [];
   private readonly configs = new Map<string, RoomConfig>();
+  /** ONE `Y.Doc` per room name while anybody holds it. */
+  private readonly held = new Map<string, { doc: Y.Doc; refs: number }>();
 
-  /** When set, every room is backed by one shared `Y.Doc` instead of `remote`. */
+  /** When set, every room is backed by the shared `Rooms` document. */
   constructor(private readonly rooms: Rooms | null = null) {}
 
   configure(room: string, over: Partial<RoomConfig>): void {
     this.configs.set(room, { ...this.configOf(room), ...over });
   }
 
-  connect(room: string, doc: Y.Doc): SessionProvider {
+  connect(room: string): SessionRoom {
     const config = this.configOf(room);
-    const provider = new FakeProvider(room, doc, config, this.rooms);
+    let entry = this.held.get(room);
+    if (entry === undefined) {
+      entry = { doc: this.rooms?.doc(room) ?? new Y.Doc(), refs: 0 };
+      this.held.set(room, entry);
+    }
+    const held = entry;
+    held.refs += 1;
+    const provider = new FakeProvider(room, held.doc, config, this.rooms, () => {
+      held.refs -= 1;
+      if (held.refs <= 0 && this.held.get(room) === held) this.held.delete(room);
+    });
     this.created.push(provider);
     if (config.mode === 'immediate') provider.emitSync();
-    return provider;
+    return { doc: held.doc, provider };
+  }
+
+  /** Live documents for `room`: zero or one, and never anything else. */
+  liveDocs(room: string): number {
+    return this.held.has(room) ? 1 : 0;
   }
 
   forRoom(room: string): FakeProvider[] {
