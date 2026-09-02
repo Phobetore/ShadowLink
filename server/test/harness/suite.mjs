@@ -21,6 +21,7 @@ import { Client, settleAll, SHARE_ROOT } from './client.mjs';
 import { DocLink, sleep } from './net.mjs';
 import { registerBlobCases } from './blobs.mjs';
 import { registerMuxTreeCases } from './muxtree.mjs';
+import { registerRoomCases } from './rooms.mjs';
 import { MuxClient, syncPayload, updateFor, SYNC, EMPTY_SV, until } from './mux.mjs';
 import { fold, isLive, relPath } from '../../../src/tree/paths.ts';
 import { deriveTree } from '../../../src/tree/TreeIndex.ts';
@@ -1141,17 +1142,23 @@ async function main() {
   // P3 slice 2. Its own process, because one of its cases needs a server from
   // BEFORE the mux route existed and a flag would prove nothing.
   const muxTree = registerMuxTreeCases(() => server, LEGACY_PORT);
+  // P3 slice 3. Its own pre-P3 process too, for the same reason: an old server
+  // ACCEPTS the mux upgrade, so "an old server keeps its note sync" can only be
+  // asked of that server's own bytes.
+  const rooms = registerRoomCases(() => server, LEGACY_PORT + 40);
 
   console.log('ShadowLink — structural end-to-end (P1 spec §10 Group C, P2 spec §11 Group C)\n');
   let summary = { failed: 1, passed: 0, skipped: 0 };
   try {
     server = await startServer({ port: PORT });
     await muxTree.start();
+    await rooms.start();
     summary = await run();
   } catch (err) {
     console.error(`✗ STRUCTURAL E2E FAILED to start: ${err?.stack ?? err}`);
   } finally {
     await muxTree.stop();
+    await rooms.stop();
     if (server !== null) {
       await server.stop();
       server.cleanup();
