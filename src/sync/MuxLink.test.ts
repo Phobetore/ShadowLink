@@ -223,8 +223,60 @@ test('sending on an unsubscribed handle is refused, and does not resurrect the r
   const subscription = link.subscribe('n_a', collector());
   link.connect();
   subscription.unsubscribe();
+
+  // ⚠ ONE frame went, and it is the LEAVE — the only thing an unsubscribe puts on
+  // the wire, and the thing whose absence cost this slice two measured
+  // regressions. Everything after it is still refused.
+  assert.deepEqual(
+    mux.sockets[0].sent.map((f) => ({ room: f.room, len: f.payload.byteLength })),
+    [{ room: 'n_a', len: 0 }],
+    'an unsubscribe wrote something other than exactly one leave',
+  );
+  assert.equal(link.stats.leavesSent, 1);
+
   assert.equal(subscription.send(bytes(1)), false);
-  assert.equal(mux.sockets[0].sent.length, 0);
+  assert.equal(mux.sockets[0].sent.length, 1, 'a released handle wrote after the leave');
+});
+
+test('a second unsubscribe leaves the room once, and a room re-taken since is not left by the old handle', () => {
+  // Both halves of the guard the leave now sits inside. Idempotence, because
+  // every borrower in this codebase releases in a `finally` and several reach it
+  // twice; and ownership, because a leave written by a stale handle would close
+  // the room the CURRENT subscriber is using — a fault the old map-delete could
+  // only ever have expressed locally.
+  const { link, mux } = makeLink();
+  const first = link.subscribe('n_a', collector());
+  link.connect();
+  first.unsubscribe();
+  first.unsubscribe();
+  assert.equal(link.stats.leavesSent, 1, 'a second unsubscribe left the room again');
+
+  const second = link.subscribe('n_a', collector());
+  first.unsubscribe();
+  assert.equal(link.stats.leavesSent, 1, 'a stale handle left a room it no longer holds');
+  assert.equal(link.roomCount, 1, 'a stale handle unsubscribed the current holder');
+  second.unsubscribe();
+  assert.equal(link.stats.leavesSent, 2);
+  assert.equal(mux.sockets[0].sent.filter((f) => f.payload.byteLength === 0).length, 2);
+});
+
+test('a room released while the link is DOWN sends no leave, and counts none', () => {
+  // ⚠ The server closed every room on that socket when it died, so there is
+  // nothing left to leave — and going through `send` anyway would tick
+  // `droppedOutbound`, turning "a write was lost" into a counter that fires on
+  // every ordinary teardown.
+  const { link, mux } = makeLink();
+  const subscription = link.subscribe('n_a', collector());
+  link.connect();
+  const socket = mux.sockets[0];
+  const before = link.stats.droppedOutbound;
+  socket.serverClose();
+
+  subscription.unsubscribe();
+  assert.equal(link.stats.leavesSent, 0, 'a leave was written onto a socket that is gone');
+  assert.equal(link.stats.droppedOutbound, before,
+    'an ordinary teardown was counted as a lost write');
+  assert.equal(link.roomCount, 0);
 });
 
 test('subscribing the same room twice on one link is a programming error, not a silent overwrite', () => {

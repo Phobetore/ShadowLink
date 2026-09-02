@@ -463,15 +463,29 @@ test('a flush that spans a reconnect FAILS — the new socket answers a differen
   }
 });
 
-test('a destroyed room flushes false and stops writing', async () => {
+test('a destroyed room flushes false and stops writing, having said goodbye exactly once', async () => {
   const mux = new FakeMux();
   const client = peer(mux);
   const socket = socketOf(client, mux);
   const before = socket.sent.length;
   client.room.destroy();
+
+  // ⚠ ONE frame, and it is the LEAVE. Destroying a room used to write nothing at
+  // all, which is precisely why the server went on relaying it: `unsubscribe()`
+  // deleted a client-side map entry and the wire heard nothing. The claim this
+  // case has always made — a destroyed room stops writing — is about everything
+  // AFTER the goodbye.
+  assert.equal(socket.sent.length, before + 1, 'destroy did not leave the room');
+  assert.deepEqual(
+    { room: socket.sent[before]?.room, len: socket.sent[before]?.payload.byteLength },
+    { room: '_tree', len: 0 },
+    'destroy wrote something that is not the leave',
+  );
+  const after = socket.sent.length;
+
   assert.equal(await client.room.flush(50), false);
   client.doc.getText('content').insert(0, 'after destroy');
-  assert.equal(socket.sent.length, before, 'a destroyed room still wrote to the wire');
+  assert.equal(socket.sent.length, after, 'a destroyed room still wrote to the wire');
   client.link.destroy();
   client.doc.destroy();
 });

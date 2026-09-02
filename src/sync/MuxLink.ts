@@ -23,6 +23,11 @@
 // suite is what keeps the two honest, because a codec that drifts is a codec that
 // silently addresses the wrong room.
 //
+// THE ONE FRAME THAT IS NOT A PAYLOAD: an EMPTY payload is a LEAVE. It is the
+// verb this protocol shipped without, and its absence was measured rather than
+// noticed — see `MuxSubscription.unsubscribe`. The grammar is unchanged; what
+// carries the meaning is a length no y-websocket message can have.
+//
 // No `obsidian` import, no node builtins.
 
 import {
@@ -48,6 +53,17 @@ export const MUX_DOC_ID = '_mux';
 
 /** `WebSocket.OPEN`, spelled out so this module needs no DOM constant at runtime. */
 const WS_OPEN = 1;
+
+/**
+ * The leave, as bytes: a frame with NO payload.
+ *
+ * The server half spells the same thing out in `server/mux.js`
+ * (`MUX_LEAVE_PAYLOAD_BYTES`, `encodeMuxLeave`). It is deliberately not a new
+ * field, a new tag or a new codec — the frame grammar is untouched, and what
+ * carries the meaning is a payload length no correct y-websocket message can
+ * have, because every one of those begins with a varuint message type.
+ */
+const EMPTY_PAYLOAD = new Uint8Array(0);
 
 // ============================================================ the frame codec
 
@@ -127,7 +143,22 @@ export interface MuxSubscription {
   readonly room: string;
   /** Write one y-websocket payload into this room. False if it did not go. */
   send(payload: Uint8Array): boolean;
-  /** Stop delivering, and forget this room. Idempotent. */
+  /**
+   * Leave this room: tell the SERVER, then stop delivering and forget it.
+   * Idempotent.
+   *
+   * ⚠ IT USED TO PUT NOTHING ON THE WIRE, and that was the missing half of the
+   * protocol. `server/mux.js` learned no room could ever be left, so `DocHub`
+   * kept this client registered in every room it had ever opened for the life of
+   * the vault socket. Two things were measured falling out of that against a real
+   * server: frames for a departed room going on arriving and being dropped
+   * client-side, counted nowhere (20 of them after 20 peer edits, with
+   * `droppedInbound` reading 0); and a departed user's cursor sitting on every
+   * peer's screen for 29.8 s — the awareness protocol's staleness sweep — against
+   * 0-1 ms on the per-room route, because `DocHub._closeConn`'s awareness removal
+   * only ever ran when a socket died, and on the mux the socket does not die when
+   * a note closes.
+   */
   unsubscribe(): void;
 }
 
@@ -400,6 +431,16 @@ export class MuxLink {
     droppedInbound: 0,
     /** Sends made while the link was down. */
     droppedOutbound: 0,
+    /**
+     * Rooms this link told the server it was leaving.
+     *
+     * Counted because "nothing went on the wire" is exactly the defect this
+     * replaces, and a count is the only thing that can tell a leave that was sent
+     * from a leave that was never owed. A teardown while the link is down sends
+     * none and increments nothing: the server closed those rooms when the socket
+     * did.
+     */
+    leavesSent: 0,
     reconnects: 0,
     /** Dials that never produced an open socket, of either kind. */
     dialsFailed: 0,
@@ -608,8 +649,12 @@ export class MuxLink {
         if (!live) return;
         live = false;
         // Only if it is still OURS: a resubscribe of the same name after this
-        // one was dropped must not be unsubscribed by the old handle.
-        if (this.rooms.get(room) === handler) this.rooms.delete(room);
+        // one was dropped must not be unsubscribed by the old handle — and it
+        // must not be LEFT by it either, which is why the leave sits inside this
+        // clause rather than beside it.
+        if (this.rooms.get(room) !== handler) return;
+        this.rooms.delete(room);
+        this.leave(room);
       },
     };
 
@@ -636,6 +681,26 @@ export class MuxLink {
     this.stats.framesOut += 1;
     this.stats.bytesOut += frame.byteLength;
     return true;
+  }
+
+  /**
+   * Tell the server this client is done with `room` — a frame with an EMPTY
+   * payload, which `server/mux.js` reads as the leave.
+   *
+   * ⚠ ONLY WHILE THE LINK IS UP, and the guard is not politeness. When the socket
+   * is down, every room on it has ALREADY been closed by the server's own fan-out
+   * on that socket's close, so there is nothing left to leave — and going through
+   * `send` anyway would count a `droppedOutbound` for a frame that was never owed,
+   * turning a counter that means "a write was lost" into one that ticks on every
+   * ordinary teardown.
+   *
+   * A leave that is refused mid-flight is not retried and does not need to be:
+   * the only way it can be refused is the socket going, and the socket going does
+   * the same job.
+   */
+  private leave(room: string): void {
+    if (!this.connected) return;
+    if (this.send(room, EMPTY_PAYLOAD)) this.stats.leavesSent += 1;
   }
 
   // ---------------------------------------------------------- observers

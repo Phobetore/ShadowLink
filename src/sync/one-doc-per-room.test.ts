@@ -456,3 +456,57 @@ test('a room the session closes and reopens is one document at a time', async ()
     s.destroy();
   }
 });
+
+test('a room the last borrower releases stops being relayed to this client', async () => {
+  // ⚠ THE FAN-OUT LEAK, pinned. `MuxLink.unsubscribe()` used to delete a
+  // client-side map entry and put nothing on the wire, so the server kept this
+  // client registered in every room it had ever opened for the life of the vault
+  // socket. Measured against a real server before the leave existed: 20 frames
+  // arriving for a departed room after 20 peer edits, silently dropped
+  // client-side and counted NOWHERE — `droppedInbound` read 0 throughout, because
+  // a straggler for a room we once subscribed is deliberately not evidence of
+  // anything. It grows with every note opened in a session.
+  const room = 'n_eeeeeeeeeeeeeeeeeeeeee';
+  const keep = 'n_ffffffffffffffffffffff';
+  const s = stack();
+  try {
+    // A second room, so the vault socket lives on exactly as it does in a vault
+    // whose tree is synced — the leak's own precondition.
+    const tree = s.providers.connect(keep);
+    const bound = s.providers.connect(room);
+    const socket = s.mux.liveSockets[0]!;
+    assert.equal(socket.hasRoom(room), true, 'the server never opened the room');
+
+    // A peer edit reaches this client while it holds the room.
+    s.mux.doc(room).getText('content').insert(0, 'from a peer');
+    assert.equal(bound.doc.getText('content').toString(), 'from a peer');
+
+    bound.provider.destroy();                       // the leaf closed
+    assert.equal(s.registry.liveDocs(room), 0);
+    assert.equal(socket.hasRoom(room), false,
+      'the server still holds a virtual connection for a room this client has left');
+    assert.equal(s.link.stats.leavesSent, 1, 'nothing went on the wire');
+
+    const framesBefore = s.link.stats.framesIn;
+    const droppedBefore = s.link.stats.droppedInbound;
+    for (let i = 0; i < 20; i++) {
+      const text = s.mux.doc(room).getText('content');
+      text.insert(text.length, `edit ${i}\n`);
+    }
+
+    assert.equal(s.link.stats.framesIn, framesBefore,
+      'frames are still arriving for a room this client left');
+    assert.equal(s.link.stats.droppedInbound, droppedBefore,
+      'and they were not counted anywhere either');
+
+    // The room that is still held is unaffected: a leave is one room's business.
+    s.mux.doc(keep).getText('content').insert(0, 'the tree moved');
+    assert.equal(tree.doc.getText('content').toString(), 'the tree moved',
+      'leaving one room stopped another');
+    assert.equal(s.mux.liveSockets.length, 1, 'the leave took the vault socket with it');
+
+    tree.provider.destroy();
+  } finally {
+    s.destroy();
+  }
+});

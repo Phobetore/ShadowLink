@@ -345,9 +345,13 @@ const IN_MEMORY: Record<string, string[]> = {
   // `YSyncPluginValue.update` performs on exactly the same object in production.
   // `cutRooms` and `heldRooms` are `FakeMux`'s per-room partition sets — the one
   // capability the P3 spec demands of this fake by name (§7).
+  // `updateHandlers` and `rooms` are `FakeMuxSocket`'s room -> `Y.Doc` listener map
+  // and its set of live rooms, and a delete from either is one virtual connection
+  // ending — which is what the mux's LEAVE has to be able to express in a fake if
+  // "the fan-out stopped" is to be a thing a test can see rather than assume.
   'src/sync/fakes.ts': [
     'this.open', 'this.entries', 'this.byFold', 'this.liveHandles', 'this.objects', 'bound.text',
-    'this.cutRooms', 'this.heldRooms',
+    'this.cutRooms', 'this.heldRooms', 'this.updateHandlers', 'this.rooms',
   ],
   'src/tree/TreeDoc.ts': ['m', 'this.subscribers'],
   'src/tree/TreeIndex.ts': ['derivedPath'],

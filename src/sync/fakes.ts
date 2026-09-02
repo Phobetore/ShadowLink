@@ -1535,6 +1535,16 @@ export class FakeMuxSocket {
 
   /** @internal */
   deliverToServer(room: string, payload: Uint8Array): void {
+    // ⚠ THE LEAVE, modelled where `server/mux.js` puts it: BEFORE the lazy open,
+    // so a leave for a room this socket does not hold opens nothing. A fake that
+    // opened one would make the shipped server's one security-relevant ordering
+    // untestable from this side, and would report a fan-out that had stopped when
+    // it had not.
+    if (payload.byteLength === 0) {
+      if (!this.rooms.has(room)) return;
+      this.leaveRoom(room);
+      return;
+    }
     if (!this.rooms.has(room)) this.openRoom(room);
     const doc = this.mux.doc(room);
     try {
@@ -1583,6 +1593,21 @@ export class FakeMuxSocket {
     };
     this.updateHandlers.set(room, handler);
     doc.on('update', handler);
+  }
+
+  /**
+   * The client left this room: stop relaying it here, exactly as
+   * `VirtualConn.shutdown` does on the real server.
+   *
+   * Taking the update handler off is the whole of the fan-out leak, expressed:
+   * without it this socket goes on being written to for a room nobody on this end
+   * is listening to any more.
+   */
+  private leaveRoom(room: string): void {
+    const handler = this.updateHandlers.get(room);
+    if (handler !== undefined) this.mux.doc(room).off('update', handler);
+    this.updateHandlers.delete(room);
+    this.rooms.delete(room);
   }
 
   /** @internal — the server writing one payload toward this client, gated. */
