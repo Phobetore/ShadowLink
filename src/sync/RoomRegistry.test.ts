@@ -55,12 +55,19 @@ class FakeConnection implements RoomConnection {
    * cursor was deleted locally a moment too late" are indistinguishable without
    * this, and the second one is the shipped defect.
    */
-  readonly awarenessOut: Array<{ removed: number[]; afterDestroy: boolean }> = [];
+  readonly awarenessOut: Array<
+    { added: number[]; updated: number[]; removed: number[]; afterDestroy: boolean }
+  > = [];
 
   private readonly onAwareness = (
     changes: { added: number[]; updated: number[]; removed: number[] },
   ): void => {
-    this.awarenessOut.push({ removed: [...changes.removed], afterDestroy: this.destroyed });
+    this.awarenessOut.push({
+      added: [...changes.added],
+      updated: [...changes.updated],
+      removed: [...changes.removed],
+      afterDestroy: this.destroyed,
+    });
   };
 
   constructor(
@@ -75,6 +82,19 @@ class FakeConnection implements RoomConnection {
   departuresOf(clientID: number): number {
     return this.awarenessOut
       .filter((u) => !u.afterDestroy && u.removed.includes(clientID)).length;
+  }
+
+  /**
+   * ARRIVALS of `clientID` — the other direction, and it needs its own counter for
+   * the same reason `departuresOf` did. "The local object holds a `user` again"
+   * and "a peer was told about it" are different sentences, and the second is the
+   * one a reopened note failed: `setLocalStateField` against a null local state
+   * mutates nothing, emits nothing, and leaves every assertion about the object
+   * itself perfectly true.
+   */
+  arrivalsOf(clientID: number): number {
+    return this.awarenessOut.filter((u) => !u.afterDestroy
+      && (u.added.includes(clientID) || u.updated.includes(clientID))).length;
   }
 
   on(_event: 'sync', handler: (isSynced: boolean) => void): void {
@@ -176,6 +196,10 @@ class FakeTransport implements RoomTransport {
 
 const ROOM = 'n_aaaaaaaaaaaaaaaaaaaaaa';
 const OTHER = 'n_bbbbbbbbbbbbbbbbbbbbbb';
+
+/** What `WorkspaceSession.doOpen` announces, in the shape it announces it. */
+const ADA = { name: 'Ada', color: '#ff0000', colorLight: '#ff000033' };
+const GRACE = { name: 'Grace', color: '#00ff00', colorLight: '#00ff0033' };
 
 // ================================================================ refcounting
 
@@ -760,7 +784,7 @@ test('the departing cursor goes out through the LIVE connection, before the room
 
   const { doc, provider } = providers.connect(ROOM);
   const connection = transport.live(ROOM)!;
-  provider.awareness.setLocalStateField('user', { name: 'Ada' });
+  provider.announcePresence(ADA);
   assert.equal(connection.awareness.getStates().size, 1);
 
   provider.destroy();
@@ -786,14 +810,14 @@ test('the room itself says goodbye, whoever was holding it and however it is let
 
   const released = registry.acquire(ROOM);
   const releasedConnection = transport.live(ROOM)!;
-  released.awareness.setLocalStateField('user', { name: 'Ada' });
-  released.release();
+  released.announcePresence(ADA);
+  released.release();                       // and NOT `withdrawPresence` first
   assert.equal(releasedConnection.departuresOf(released.doc.clientID), 1,
     'the last release tore the room down without telling the room\'s peers');
 
   const abandoned = registry.acquire(OTHER);
   const abandonedConnection = transport.live(OTHER)!;
-  abandoned.awareness.setLocalStateField('user', { name: 'Grace' });
+  abandoned.announcePresence(GRACE);
   registry.destroy();                                   // the plugin unloading
   assert.equal(abandonedConnection.departuresOf(abandoned.doc.clientID), 1,
     'a room held at unload left its cursor on every peer for the sweep to find');
@@ -817,7 +841,7 @@ test('the cursor goes even when the ROOM stays, which is the half no leave frame
   const { doc, provider } = providers.connect(ROOM);
   const held = docs.openHeadless(ROOM);
   const connection = transport.live(ROOM)!;
-  provider.awareness.setLocalStateField('user', { name: 'Ada' });
+  provider.announcePresence(ADA);
 
   provider.destroy();
 
@@ -845,7 +869,7 @@ test('the HEADLESS port announces nothing, so a publish cannot wipe a live curso
   const { doc, provider } = providers.connect(ROOM);
   const opened = await openSynced(docs, transport, ROOM);
   const connection = transport.live(ROOM)!;
-  provider.awareness.setLocalStateField('user', { name: 'Ada' });
+  provider.announcePresence(ADA);
 
   docs.close(opened.handle);
 
@@ -867,7 +891,7 @@ test('announcing a departure twice says it once, and a room nobody wrote a curso
     const a = providers.connect(ROOM);
     const b = providers.connect(ROOM);
     const connection = transport.live(ROOM)!;
-    a.provider.awareness.setLocalStateField('user', { name: 'Ada' });
+    a.provider.announcePresence(ADA);
 
     a.provider.destroy();
     a.provider.destroy();
@@ -912,7 +936,7 @@ test('a switchTransport does NOT announce a departure — the user has not left'
   const providers = new RegistryProviderPort(registry);
 
   const { doc, provider } = providers.connect(ROOM);
-  provider.awareness.setLocalStateField('user', { name: 'Ada' });
+  provider.announcePresence(ADA);
   const before = first.live(ROOM)!;
 
   registry.switchTransport(second);
@@ -924,6 +948,139 @@ test('a switchTransport does NOT announce a departure — the user has not left'
     'the new route is broadcasting a different Awareness');
 
   provider.destroy();
+  registry.destroy();
+});
+
+// ================================================================ the arrival
+
+test('a note REOPENED onto a room somebody else kept alive announces itself again', () => {
+  // ⚠ THE BLOCKER THIS CASE EXISTS FOR, and no lens that walked the invariants saw
+  // it: closing a note nulls the shared local state, and the reopen used to
+  // re-establish the cursor with `setLocalStateField` — which `y-protocols` makes a
+  // NO-OP when the state is null (`if (state !== null)`). So when the publish queue
+  // still held the room, the reopening user was invisible to every peer for the
+  // life of the entry, editing normally, with nothing to recover them: the 15 s
+  // renewal re-sends only a state that is not null, and only teardown cleared it.
+  // Measured against real processes at the time: the peer never saw the cursor
+  // again on either route, against 16 ms on master's own seam.
+  //
+  // Closing a note SCHEDULES its publish, so a quick reopen lands squarely in the
+  // window where the queue holds the room. Slice 4's subscribe-all makes it the
+  // ordinary case rather than a race.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  const providers = new RegistryProviderPort(registry);
+  const docs = new RegistryDocPort(registry, { syncTimeoutMs: 20 });
+
+  const held = docs.openHeadless(ROOM);                  // the queue takes the room
+  const first = providers.connect(ROOM);
+  const connection = transport.live(ROOM)!;
+  first.provider.announcePresence(ADA);
+  first.provider.destroy();
+  assert.equal(connection.destroyed, false, 'the queue was meant to keep the room');
+  assert.equal(connection.awareness.getLocalState(), null,
+    'the departure left something for the next mount to mutate');
+
+  const arrivals = connection.arrivalsOf(first.doc.clientID);
+  const again = providers.connect(ROOM);                  // the same note, reopened
+  assert.equal(again.doc, first.doc, 'a second document for one room');
+  again.provider.announcePresence(ADA);
+
+  assert.equal(connection.arrivalsOf(again.doc.clientID) - arrivals, 1,
+    'the reopening user announced nothing — every peer still has them gone');
+  assert.deepEqual(connection.awareness.getStates().get(again.doc.clientID), { user: ADA });
+
+  again.provider.destroy();
+  void held.then((opened) => { docs.close(opened.handle); });
+  registry.destroy();
+});
+
+test('the mount announces the state WHOLE, so nothing of the last binding survives it', () => {
+  // `y-codemirror.next` writes a `cursor` field into this same shared state, and it
+  // addresses positions in the editor that was open at the time. A mount that
+  // merged into what was there would hand every peer a caret pointing into a
+  // document this session is no longer bound to.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  const providers = new RegistryProviderPort(registry);
+
+  const { doc, provider } = providers.connect(ROOM);
+  const connection = transport.live(ROOM)!;
+  provider.announcePresence(ADA);
+  // The binding's half, written the way `yCollab` writes it — onto a state the
+  // session has just announced, which is the one thing the field setter is for.
+  provider.awareness.setLocalStateField('cursor', { anchor: 41, head: 41 });
+  assert.deepEqual(connection.awareness.getLocalState(),
+    { user: ADA, cursor: { anchor: 41, head: 41 } },
+    'the binding could not write a caret onto an announced state');
+
+  provider.announcePresence(GRACE);                      // a second mount, same room
+
+  assert.deepEqual(connection.awareness.getStates().get(doc.clientID), { user: GRACE },
+    'the new mount inherited the old binding\'s caret');
+
+  provider.destroy();
+  registry.destroy();
+});
+
+test('a borrower that announced nothing cannot take another\'s presence away', () => {
+  // ⚠ THE RULE IN ITS SECOND DIRECTION, and it is what makes the headless path
+  // structurally harmless rather than harmless by inspection. The publish queue and
+  // the reconciler hold ordinary leases; if a release could null the shared local
+  // state, the drain that lands under an open note — the ordinary case, every time
+  // — would wipe the cursor of the session it is publishing for.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  const providers = new RegistryProviderPort(registry);
+
+  const { doc, provider } = providers.connect(ROOM);
+  const other = registry.acquire(ROOM);
+  const connection = transport.live(ROOM)!;
+  provider.announcePresence(ADA);
+
+  // Asked at the seam a borrower actually has, not through a private field: the
+  // lease's own `withdrawPresence` is refused because this lease announced nothing.
+  other.withdrawPresence();
+  other.release();
+
+  assert.equal(connection.departuresOf(doc.clientID), 0,
+    'a borrower removed a cursor it never wrote');
+  assert.deepEqual(connection.awareness.getStates().get(doc.clientID), { user: ADA });
+
+  provider.destroy();
+  assert.equal(connection.departuresOf(doc.clientID), 1,
+    'and the holder that DID announce could no longer withdraw');
+  registry.destroy();
+});
+
+test('a stale provider\'s teardown cannot unsay what a newer one announced', () => {
+  // The same guard from the other side. `WorkspaceSession.doOpen` releases its
+  // lease in a `finally` on every path it does not keep, and a superseded open can
+  // reach that `finally` at any time; what it must never do is null the presence
+  // the open that superseded it has already announced.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  const providers = new RegistryProviderPort(registry);
+
+  const stale = providers.connect(ROOM);
+  const connection = transport.live(ROOM)!;
+  stale.provider.announcePresence(ADA);
+
+  const winner = providers.connect(ROOM);
+  winner.provider.announcePresence(GRACE);               // the newer mount takes over
+  stale.provider.destroy();                              // the superseded `finally`
+
+  assert.equal(connection.departuresOf(winner.doc.clientID), 0,
+    'a superseded open took the live session\'s cursor down with it');
+  assert.deepEqual(connection.awareness.getStates().get(winner.doc.clientID), { user: GRACE });
+
+  // Nor may it ARRIVE. A reference already given back speaks for nothing at all,
+  // in either direction — the entry it was taken on may since have been re-let.
+  stale.provider.announcePresence(ADA);
+  assert.deepEqual(connection.awareness.getStates().get(winner.doc.clientID), { user: GRACE },
+    'a provider that had already let go announced itself over the live session');
+
+  winner.provider.destroy();
   registry.destroy();
 });
 

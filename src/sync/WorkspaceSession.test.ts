@@ -96,10 +96,55 @@ interface RoomConfig {
   gateFlush: boolean;
 }
 
+/**
+ * `y-protocols`' local-state semantics, and the fake exists FOR them.
+ *
+ * ⚠ `setLocalStateField` DOES NOTHING WHEN THE LOCAL STATE IS NULL, exactly as the
+ * real `Awareness` does (`if (state !== null) { … }`). The previous fake was a bare
+ * `Map` that accepted every write, which is why a session announcing itself with
+ * the field setter looked correct in every one of 1,098 client cases while a real
+ * peer saw no cursor at all: the state a departure had removed could not be written
+ * back, and nothing here could say so.
+ *
+ * ⚠ AND ONE OF THESE IS SHARED BY EVERY PROVIDER FOR A ROOM, because that is what
+ * `RoomRegistry` does — the `Awareness` is the room's, not the mount's. A fake with
+ * one per provider cannot express the case this file's session-level tests are
+ * about: a note closed and REOPENED onto an entry somebody else kept alive.
+ */
 class FakeAwareness implements SessionAwareness {
-  readonly fields = new Map<string, unknown>();
+  /** null is a state a departure removed. A fresh `Awareness` constructs `{}`. */
+  state: Record<string, unknown> | null = {};
+
+  /** The one holder allowed to withdraw, mirroring `RoomEntry.presenceHolder`. */
+  private holder: object | null = null;
+
+  /** Every local state that actually went out, in order. Presence is an event. */
+  readonly writes: Array<Record<string, unknown> | null> = [];
+
   setLocalStateField(field: string, value: unknown): void {
-    this.fields.set(field, value);
+    if (this.state === null) return;                        // y-protocols' own guard
+    this.setLocalState({ ...this.state, [field]: value });
+  }
+
+  setLocalState(state: Record<string, unknown> | null): void {
+    this.state = state;
+    this.writes.push(state);
+  }
+
+  claim(holder: object, user: unknown): void {
+    this.holder = holder;
+    this.setLocalState({ user });
+  }
+
+  withdraw(holder: object): void {
+    if (this.holder !== holder) return;
+    this.holder = null;
+    this.setLocalState(null);
+  }
+
+  /** What a peer would be able to read off this state. */
+  get fields(): Map<string, unknown> {
+    return new Map(Object.entries(this.state ?? {}));
   }
 }
 
@@ -107,7 +152,7 @@ class FakeProvider implements SessionProvider {
   synced = false;
   destroyed = false;
   flushes = 0;
-  readonly awareness = new FakeAwareness();
+  readonly awareness: FakeAwareness;
 
   /** Resolved by `releaseFlush()` when the room is configured to gate flushes. */
   private flushGate: (() => void) | null = null;
@@ -119,7 +164,10 @@ class FakeProvider implements SessionProvider {
     private readonly config: RoomConfig,
     private readonly rooms: Rooms | null = null,
     private readonly giveBack: () => void = () => undefined,
-  ) {}
+    awareness: FakeAwareness = new FakeAwareness(),
+  ) {
+    this.awareness = awareness;
+  }
 
   on(_event: 'sync', handler: (isSynced: boolean) => void): void {
     this.handlers.add(handler);
@@ -138,14 +186,27 @@ class FakeProvider implements SessionProvider {
   }
 
   /**
+   * This session is in the room. Announced through the PROVIDER and written whole,
+   * which is what makes a mount onto a room somebody else kept alive work — see
+   * `FakeAwareness`.
+   */
+  announcePresence(user: { name: string; color: string; colorLight: string }): void {
+    this.awareness.claim(this, user);
+  }
+
+  /**
    * The session is done with the room — a REFERENCE given back, not a socket
    * closed. `destroyed` still says exactly what it always said about this
    * provider; what is new is that the room's document may outlive it, because the
    * publish queue may be holding the same one.
+   *
+   * It takes back the presence THIS provider announced and no other's, which is
+   * `LeaseProvider.destroy`'s rule.
    */
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.awareness.withdraw(this);
     this.giveBack();
   }
 
@@ -262,6 +323,17 @@ class FakeProviders implements ProviderPort {
   private readonly configs = new Map<string, RoomConfig>();
   /** ONE `Y.Doc` per room name while anybody holds it. */
   private readonly held = new Map<string, { doc: Y.Doc; refs: number }>();
+  /**
+   * ONE `Awareness` per room name, and it OUTLIVES every provider for it.
+   *
+   * ⚠ DELIBERATELY LONGER-LIVED THAN THE REAL ONE, which the registry rebuilds when
+   * a room falls to zero refs. Keeping it is what lets a session-level test ask the
+   * question a real peer asks — "reopen the note; can I see you?" — without the
+   * fake having to model a publish queue holding the room. A fake that is harder to
+   * satisfy than production is the safe direction here: the shipped defect was
+   * invisible precisely because the fake threw the shared object away.
+   */
+  private readonly presence = new Map<string, FakeAwareness>();
 
   /** When set, every room is backed by the shared `Rooms` document. */
   constructor(private readonly rooms: Rooms | null = null) {}
@@ -279,10 +351,15 @@ class FakeProviders implements ProviderPort {
     }
     const held = entry;
     held.refs += 1;
+    let shared = this.presence.get(room);
+    if (shared === undefined) {
+      shared = new FakeAwareness();
+      this.presence.set(room, shared);
+    }
     const provider = new FakeProvider(room, held.doc, config, this.rooms, () => {
       held.refs -= 1;
       if (held.refs <= 0 && this.held.get(room) === held) this.held.delete(room);
-    });
+    }, shared);
     this.created.push(provider);
     if (config.mode === 'immediate') provider.emitSync();
     return { doc: held.doc, provider };
@@ -291,6 +368,11 @@ class FakeProviders implements ProviderPort {
   /** Live documents for `room`: zero or one, and never anything else. */
   liveDocs(room: string): number {
     return this.held.has(room) ? 1 : 0;
+  }
+
+  /** The room's one `Awareness` — what a peer would be reading. */
+  presenceOn(room: string): FakeAwareness | undefined {
+    return this.presence.get(room);
   }
 
   forRoom(room: string): FakeProvider[] {
@@ -685,6 +767,61 @@ test('a provider that never syncs is torn down and seeds nothing (I4)', async ()
   assert.ok(h.notices.some((n) => n.includes('not syncing')), h.notices.join('|'));
 });
 
+// ================================================================ presence
+
+test('reopening the SAME note puts the user back in the room, not silently nowhere', async () => {
+  // ⚠ THE ROOM'S `Awareness` OUTLIVES THE MOUNT, which is what makes this a
+  // question at all. Closing the note removes this client's local state from it;
+  // the reopen used to re-establish the cursor with `setLocalStateField`, and
+  // `y-protocols` returns without writing when the state is null. Nothing went out,
+  // no clock moved, and the user edited a note every peer believed they had left —
+  // for the life of the room entry, since the 15 s renewal re-sends only a state
+  // that is not null. Closing a note schedules its publish, so the queue holding
+  // the room across a quick reopen is the ordinary sequence rather than a race.
+  const h = makeHarness();
+  const id = h.add('a.md', 'the real bytes', { owned: true });
+  h.providers.configure(`n_${id}`, { remote: 'the real bytes' });
+
+  await h.session.open(`${SHARE}/a.md`);
+  await h.session.open(null);                              // the leaf closes
+  const shared = h.providers.presenceOn(`n_${id}`)!;
+  assert.equal(shared.state, null, 'the departure left nothing for a peer to sweep');
+
+  await h.session.open(`${SHARE}/a.md`);                    // and the same note again
+
+  assert.deepEqual(shared.fields.get('user'), {
+    name: 'Ada', color: '#ff0000', colorLight: '#ff000033',
+  }, 'the reopened note is bound and editing, and no peer can see the user');
+  assert.deepEqual(shared.writes.at(-1), {
+    user: { name: 'Ada', color: '#ff0000', colorLight: '#ff000033' },
+  }, 'the announcement never reached the wire');
+  assert.equal(h.session.openNodeId(), id, 'the note did not reopen at all');
+});
+
+test('the departure is the mount\'s own, so an earlier one cannot silence a later', async () => {
+  // The rule's other direction at the session's own seam: `doOpen` releases its
+  // lease in a `finally` on every path it does not keep, and a superseded open
+  // reaches that `finally` after the open that superseded it has announced.
+  const h = makeHarness();
+  const id = h.add('a.md', 'the real bytes', { owned: true });
+  h.providers.configure(`n_${id}`, { remote: 'the real bytes' });
+
+  await h.session.open(`${SHARE}/a.md`);
+  const bound = h.providers.forRoom(`n_${id}`).at(-1)!;
+  const shared = h.providers.presenceOn(`n_${id}`)!;
+
+  // A second provider for the same room — what a superseded open leaves behind —
+  // torn down after the live one announced.
+  const stale = h.providers.connect(`n_${id}`).provider;
+  stale.destroy();
+
+  assert.equal(shared.state === null, false, 'a provider that announced nothing wiped the cursor');
+  assert.deepEqual(shared.fields.get('user'), {
+    name: 'Ada', color: '#ff0000', colorLight: '#ff000033',
+  });
+  assert.equal(bound.destroyed, false, 'the bound provider went with it');
+});
+
 // ================================================================ I5 — owner gate
 
 test('a device that does not own an unseeded node never seeds it (I5)', async () => {
@@ -717,6 +854,8 @@ test('the owner seeds an empty unseeded doc from the file being opened, then mar
   assert.deepEqual(provider.awareness.fields.get('user'), {
     name: 'Ada', color: '#ff0000', colorLight: '#ff000033',
   }, 'peers can see this cursor');
+  assert.equal(provider.awareness.writes.length, 1,
+    'the announcement was a local mutation rather than something a peer receives');
 
   // The seed came from the path being opened, not from an ambient editor.
   const reads = h.vault.callsTo('read').map((c) => c.args[0]);
