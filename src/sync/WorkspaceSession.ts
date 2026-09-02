@@ -788,237 +788,252 @@ export class WorkspaceSession {
     // session is done with it — what changed is that the publish queue and the
     // reconciler now borrow the SAME one instead of opening a second.
     const { doc, provider } = this.deps.providers.connect(`n_${nodeId}`);
-    provider.awareness.setLocalStateField('user', {
-      name: this.deps.userName,
-      color: this.deps.userColor,
-      colorLight: `${this.deps.userColor}33`,
-    });
-
-    const synced = await this.waitForSync(provider, this.syncTimeoutMs);
-    // The token check comes FIRST. A superseded open that tested `synced` first
-    // would emit a misleading "this note is not syncing" notice about a note the
-    // user already navigated away from.
-    if (token !== this.token) { release(provider); return; }
-    if (!synced) {
-      release(provider);
-      this.localOnly(notePath, 'Offline — this note is not syncing.');
-      return;
-    }
-
-    const text = doc.getText('content');
-    // (L) I18. Before ANY comparison, and before the mount can be asked to make
-    // an equality no configuration can satisfy. A document written by an older
-    // build can hold `\r`; both writers that put disk bytes into one normalize
-    // now, so this is a repair of history rather than an ongoing hazard.
-    this.repairLineEndings(text);
-    const seeded = this.deps.tree.get(nodeId)?.s === 1;
-    const own = this.deps.state.data.owned[nodeId] === true;
-
-    if (text.length === 0 && !seeded && !own) {
-      // I5. Not an error and not a failure: the author simply has not uploaded
-      // yet. Binding an empty document here would strand their content, because
-      // the first keystroke would make this device's empty doc the shared truth.
-      // `decide` encodes this rule too, so the table is the whole of I19; it is
-      // ALSO here so the editor is never even read for a note this device has no
-      // business writing into.
-      release(provider);
-      this.localOnly(notePath, 'Waiting for the author to upload this note.');
-      return;
-    }
-
-    /**
-     * `R`: the shared document, after the repair.
-     *
-     * FROM HERE TO `apply` THERE IS NO `await` ON ANY ARM THAT WRITES INTO THIS
-     * DOCUMENT, and that is a structural property this file is built around
-     * rather than a happy accident. A round that put a three-second poll between
-     * this read and the write measured the result: another writer landing in the
-     * window — a peer, or this device's own publish queue seeding the note from
-     * the file — left the converge-up edit computing `affixEdit('', B)` from an
-     * `R` that had stopped being empty, and inserted the buffer at position 0 of
-     * a document that already held content. That is the I5 concatenation, on a
-     * live provider, with `s` set and nothing said to the user.
-     */
-    const shared = text.toString();
-
-    // THE SEED ARM DOES NOT WAIT FOR THE DISK, AND THE ABSENCE IS THE DESIGN.
+    // ⚠ ONE RELEASE, STRUCTURALLY. This lease used to be given back at twelve
+    // separate return points with no `try`, so a throw anywhere between the dial
+    // and one of them — `editor.apply`, `preserveCopy`, `lostStrings`, `hashOf` —
+    // was swallowed by `open()`'s own `.catch` and leaked the reference until the
+    // plugin unloaded. The same shape predates this slice, when what leaked was a
+    // whole `WebsocketProvider`; what makes it worth closing now is that slice 4
+    // multiplies the holders, and that on the mux a leaked reference is a room the
+    // server keeps fanning out to.
     //
-    // A previous round put a bounded poll here — up to three seconds, one `stat`
-    // every hundred milliseconds — so that a user who had typed into a brand-new
-    // note before it finished opening would have their bytes on disk by the time
-    // arm 3 asked. Three separate failures came out of that one line and all
-    // three are properties of HAVING a wait rather than of how it was written:
-    //
-    //  - it put an `await` between the read of the shared document and the write
-    //    into it, so `R` became a snapshot up to three seconds old and the
-    //    converge-up edit was computed from it (see `shared` above);
-    //  - it was the only wait in this file a newer `open()` could not interrupt,
-    //    because it slept on a bare timer instead of registering in `waiters`,
-    //    so switching notes stalled for the full window and so did `destroy()`;
-    //  - it made a promise it could not keep. Obsidian's autosave debounce
-    //    restarts on every keystroke, so a user who types for longer than the
-    //    window — the ordinary thing to do after Cmd-N — reached the expiry with
-    //    a 0-byte file anyway, and the refusal that followed was measured ending
-    //    in a published prefix and a rollback of everything typed after it.
-    //
-    // So arm 3 decides from ONE INSTANT. A file with bytes authorises the seed;
-    // an empty file is local-only, touching neither side, until Obsidian saves
-    // and the drain publishes from the file (§6.2). No timer, no polling, and no
-    // number to tune.
+    // `kept` is set at the ONE place the session takes ownership, so the `finally`
+    // gives the room back on every other path — including the ones nobody wrote
+    // down. Everything below is unchanged: `git diff -w` shows only the lines that
+    // stopped saying `release(provider)`, the flag, and this comment.
+    let kept = false;
+    try {
+      provider.awareness.setLocalStateField('user', {
+        name: this.deps.userName,
+        color: this.deps.userColor,
+        colorLight: `${this.deps.userColor}33`,
+      });
 
-    // The target must still be the file the user is looking at. Between the first
-    // await and here the user may have switched notes without a newer `open()`
-    // having reached us yet.
-    if (this.deps.activePath() !== notePath) { release(provider); return; }
-
-    // THE DECISION AND ITS APPLICATION, and on three of the five arms there is no
-    // `await` between them.
-    //
-    // That is blocker 2 closed structurally rather than narrowed: the buffer is
-    // read, decided about and acted on inside one turn of the event loop, so
-    // there is no window in which a keystroke can be observed and then thrown
-    // away. The loop runs at most twice, and only for the `stale` answer that the
-    // no-await arms cannot produce — a can't-happen worth one comparison, because
-    // what it would otherwise write is a string nobody looked at into a document
-    // every peer reads.
-    let mounted: MountResult | undefined;
-    let buffer = '';
-    let preserved: string[] = [];
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const B = this.deps.editor.bufferOf(notePath);
-      if (B === null) { release(provider); return; }      // arm 0: no bindable leaf
-      buffer = B;
-      // A string comparison, deliberately: this sits between `bufferOf` and
-      // `apply`, where there is no `await` to be raced.
-      const prior = this.lastBound;
-      const foreign = B !== '' && prior !== null && prior.nodeId !== nodeId && prior.text === B;
-      const plan = decide(B, shared, localText, own, seeded, foreign);
-      if (plan.kind === 'local-only') {
-        release(provider);
-        this.localOnly(notePath, plan.reason);
+      const synced = await this.waitForSync(provider, this.syncTimeoutMs);
+      // The token check comes FIRST. A superseded open that tested `synced` first
+      // would emit a misleading "this note is not syncing" notice about a note the
+      // user already navigated away from.
+      if (token !== this.token) return;
+      if (!synced) {
+        this.localOnly(notePath, 'Offline — this note is not syncing.');
         return;
       }
-      if (plan.kind === 'take-shared') {
-        // PRESERVE FIRST, and this ordering is the whole of I1 on this arm. Both
-        // the buffer and the file are about to stop existing — the buffer is
-        // replaced with the shared text, and Obsidian then saves that over the
-        // file — so nothing is displaced until a copy of it is CONFIRMED on
-        // disk. The previous round preserved afterwards, on the strength of what
-        // the apply reported, which leaves a window between the replacement and
-        // a `vault.create` that throws in which the user's bytes are nowhere.
-        preserved = [];
-        for (const lost of await this.lostStrings(nodeId, B, localText, shared)) {
-          const dest = await this.preserveCopy(notePath, lost);
-          if (dest === null) {
-            // NO BIND. A bind after a failed preservation lets Obsidian save the
-            // shared text over bytes nothing holds. `preserveCopy` has already
-            // said so, naming the note and the reason (I15).
-            release(provider);
-            return;
-          }
-          if (dest !== '') preserved.push(dest);
-        }
-        if (token !== this.token) { release(provider); return; }
+
+      const text = doc.getText('content');
+      // (L) I18. Before ANY comparison, and before the mount can be asked to make
+      // an equality no configuration can satisfy. A document written by an older
+      // build can hold `\r`; both writers that put disk bytes into one normalize
+      // now, so this is a repair of history rather than an ongoing hazard.
+      this.repairLineEndings(text);
+      const seeded = this.deps.tree.get(nodeId)?.s === 1;
+      const own = this.deps.state.data.owned[nodeId] === true;
+
+      if (text.length === 0 && !seeded && !own) {
+        // I5. Not an error and not a failure: the author simply has not uploaded
+        // yet. Binding an empty document here would strand their content, because
+        // the first keystroke would make this device's empty doc the shared truth.
+        // `decide` encodes this rule too, so the table is the whole of I19; it is
+        // ALSO here so the editor is never even read for a note this device has no
+        // business writing into.
+        this.localOnly(notePath, 'Waiting for the author to upload this note.');
+        return;
       }
-      const planned: MountPlan = plan.kind === 'converge-up'
-        ? { kind: 'converge-up', expect: B, edit: plan.edit }
-        : plan.kind === 'agree'
-          ? { kind: 'agree', expect: B }
-          : { kind: 'take-shared', expect: B };
-      mounted = this.deps.editor.apply(notePath, text, provider.awareness, planned);
-      if (mounted.stale !== true) break;
-    }
-    if (mounted === undefined) { release(provider); return; }
-    if (mounted.ok) {
-      this.active = { nodeId, notePath, doc, provider };
-      // The gate has just proved the editor holds exactly this, so it is the
-      // one string this session knows a leaf is displaying. See `lastBound`.
-      this.lastBound = { nodeId, text: text.toString() };
-    } else release(provider);
 
-    // BELT AND BRACES: what the apply ACTUALLY displaced, when that is not the
-    // buffer the decision was made about.
-    //
-    // `take-shared` is the one arm with an await between reading the buffer and
-    // acting on it, and Obsidian's save of a dirty buffer is asynchronous — so
-    // from the user's first keystroke the EDITOR holds the newest copy of this
-    // note and the file does not, and only `apply` ever sees the copy it
-    // displaced. Owed on a REFUSAL too: the buffer is left holding the shared
-    // text either way, so those characters are exactly as gone as after a
-    // success.
-    //
-    // `displaced` is true here and false at the pre-write, and that is not a
-    // detail of wording: by this line the buffer already holds the shared text,
-    // so the reassurance the other call gives would be false in both halves.
-    let unsaved = false;
-    if (mounted.replaced !== undefined && mounted.replaced !== buffer) {
-      const dest = await this.preserveCopy(notePath, mounted.replaced, true);
-      if (dest === null) unsaved = true;
-      else if (dest !== '') preserved.push(dest);
-    }
+      /**
+       * `R`: the shared document, after the repair.
+       *
+       * FROM HERE TO `apply` THERE IS NO `await` ON ANY ARM THAT WRITES INTO THIS
+       * DOCUMENT, and that is a structural property this file is built around
+       * rather than a happy accident. A round that put a three-second poll between
+       * this read and the write measured the result: another writer landing in the
+       * window — a peer, or this device's own publish queue seeding the note from
+       * the file — left the converge-up edit computing `affixEdit('', B)` from an
+       * `R` that had stopped being empty, and inserted the buffer at position 0 of
+       * a document that already held content. That is the I5 concatenation, on a
+       * live provider, with `s` set and nothing said to the user.
+       */
+      const shared = text.toString();
 
-    // Said on a REFUSAL too, and for the same reason the copy is made on one: the
-    // buffer holds the shared text either way, so what it held before is just as
-    // gone. Silence there would leave the user looking at a note that changed
-    // under them with nothing to explain it and no idea a copy exists.
-    if (mounted.replaced !== undefined) {
-      this.reportTakeShared(notePath, preserved, mounted.ok, unsaved);
-    }
-    if (!mounted.ok) return;
+      // THE SEED ARM DOES NOT WAIT FOR THE DISK, AND THE ABSENCE IS THE DESIGN.
+      //
+      // A previous round put a bounded poll here — up to three seconds, one `stat`
+      // every hundred milliseconds — so that a user who had typed into a brand-new
+      // note before it finished opening would have their bytes on disk by the time
+      // arm 3 asked. Three separate failures came out of that one line and all
+      // three are properties of HAVING a wait rather than of how it was written:
+      //
+      //  - it put an `await` between the read of the shared document and the write
+      //    into it, so `R` became a snapshot up to three seconds old and the
+      //    converge-up edit was computed from it (see `shared` above);
+      //  - it was the only wait in this file a newer `open()` could not interrupt,
+      //    because it slept on a bare timer instead of registering in `waiters`,
+      //    so switching notes stalled for the full window and so did `destroy()`;
+      //  - it made a promise it could not keep. Obsidian's autosave debounce
+      //    restarts on every keystroke, so a user who types for longer than the
+      //    window — the ordinary thing to do after Cmd-N — reached the expiry with
+      //    a 0-byte file anyway, and the refusal that followed was measured ending
+      //    in a published prefix and a rollback of everything typed after it.
+      //
+      // So arm 3 decides from ONE INSTANT. A file with bytes authorises the seed;
+      // an empty file is local-only, touching neither side, until Obsidian saves
+      // and the drain publishes from the file (§6.2). No timer, no polling, and no
+      // number to tune.
 
-    // I6: the node goes live the moment it HAS content, and not before.
-    if (!seeded && own) {
-      if (text.length > 0) await this.publishFirstBytes(nodeId, text, provider, token);
-      else this.armPublisher(nodeId, text, provider, token);
+      // The target must still be the file the user is looking at. Between the first
+      // await and here the user may have switched notes without a newer `open()`
+      // having reached us yet.
+      if (this.deps.activePath() !== notePath) return;
+
+      // THE DECISION AND ITS APPLICATION, and on three of the five arms there is no
+      // `await` between them.
+      //
+      // That is blocker 2 closed structurally rather than narrowed: the buffer is
+      // read, decided about and acted on inside one turn of the event loop, so
+      // there is no window in which a keystroke can be observed and then thrown
+      // away. The loop runs at most twice, and only for the `stale` answer that the
+      // no-await arms cannot produce — a can't-happen worth one comparison, because
+      // what it would otherwise write is a string nobody looked at into a document
+      // every peer reads.
+      let mounted: MountResult | undefined;
+      let buffer = '';
+      let preserved: string[] = [];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const B = this.deps.editor.bufferOf(notePath);
+        if (B === null) return;      // arm 0: no bindable leaf
+        buffer = B;
+        // A string comparison, deliberately: this sits between `bufferOf` and
+        // `apply`, where there is no `await` to be raced.
+        const prior = this.lastBound;
+        const foreign = B !== '' && prior !== null && prior.nodeId !== nodeId && prior.text === B;
+        const plan = decide(B, shared, localText, own, seeded, foreign);
+        if (plan.kind === 'local-only') {
+          this.localOnly(notePath, plan.reason);
+          return;
+        }
+        if (plan.kind === 'take-shared') {
+          // PRESERVE FIRST, and this ordering is the whole of I1 on this arm. Both
+          // the buffer and the file are about to stop existing — the buffer is
+          // replaced with the shared text, and Obsidian then saves that over the
+          // file — so nothing is displaced until a copy of it is CONFIRMED on
+          // disk. The previous round preserved afterwards, on the strength of what
+          // the apply reported, which leaves a window between the replacement and
+          // a `vault.create` that throws in which the user's bytes are nowhere.
+          preserved = [];
+          for (const lost of await this.lostStrings(nodeId, B, localText, shared)) {
+            const dest = await this.preserveCopy(notePath, lost);
+            if (dest === null) {
+              // NO BIND. A bind after a failed preservation lets Obsidian save the
+              // shared text over bytes nothing holds. `preserveCopy` has already
+              // said so, naming the note and the reason (I15).
+              return;
+            }
+            if (dest !== '') preserved.push(dest);
+          }
+          if (token !== this.token) return;
+        }
+        const planned: MountPlan = plan.kind === 'converge-up'
+          ? { kind: 'converge-up', expect: B, edit: plan.edit }
+          : plan.kind === 'agree'
+            ? { kind: 'agree', expect: B }
+            : { kind: 'take-shared', expect: B };
+        mounted = this.deps.editor.apply(notePath, text, provider.awareness, planned);
+        if (mounted.stale !== true) break;
+      }
+      if (mounted === undefined) return;
+      if (mounted.ok) {
+        this.active = { nodeId, notePath, doc, provider };
+        kept = true;
+        // The gate has just proved the editor holds exactly this, so it is the
+        // one string this session knows a leaf is displaying. See `lastBound`.
+        this.lastBound = { nodeId, text: text.toString() };
+      }
+
+      // BELT AND BRACES: what the apply ACTUALLY displaced, when that is not the
+      // buffer the decision was made about.
+      //
+      // `take-shared` is the one arm with an await between reading the buffer and
+      // acting on it, and Obsidian's save of a dirty buffer is asynchronous — so
+      // from the user's first keystroke the EDITOR holds the newest copy of this
+      // note and the file does not, and only `apply` ever sees the copy it
+      // displaced. Owed on a REFUSAL too: the buffer is left holding the shared
+      // text either way, so those characters are exactly as gone as after a
+      // success.
+      //
+      // `displaced` is true here and false at the pre-write, and that is not a
+      // detail of wording: by this line the buffer already holds the shared text,
+      // so the reassurance the other call gives would be false in both halves.
+      let unsaved = false;
+      if (mounted.replaced !== undefined && mounted.replaced !== buffer) {
+        const dest = await this.preserveCopy(notePath, mounted.replaced, true);
+        if (dest === null) unsaved = true;
+        else if (dest !== '') preserved.push(dest);
+      }
+
+      // Said on a REFUSAL too, and for the same reason the copy is made on one: the
+      // buffer holds the shared text either way, so what it held before is just as
+      // gone. Silence there would leave the user looking at a note that changed
+      // under them with nothing to explain it and no idea a copy exists.
+      if (mounted.replaced !== undefined) {
+        this.reportTakeShared(notePath, preserved, mounted.ok, unsaved);
+      }
+      if (!mounted.ok) return;
+
+      // I6: the node goes live the moment it HAS content, and not before.
+      if (!seeded && own) {
+        if (text.length > 0) await this.publishFirstBytes(nodeId, text, provider, token);
+        else this.armPublisher(nodeId, text, provider, token);
+        if (token !== this.token) return;
+      }
+
+      // I17. A watermark names bytes that are simultaneously in the workspace and
+      // on THIS disk, and it may advance only once a write has returned. This
+      // method performs no disk write and can observe none, so the only string in
+      // it that this device is known to hold is `localText` — the bytes it read
+      // off its own disk a moment ago. Recording is therefore honest in exactly
+      // one case: when the workspace's text IS that string.
+      //
+      // It used to record `text.toString()` unconditionally, which is how vault A
+      // came to record vault B's file as its own base and vault B came to record
+      // the server's content it did not have. That is not cosmetic: §5.3's
+      // `proven` check reads this watermark to choose between the vault trash and
+      // a rescue.
+      //
+      // The divergent case deliberately records NOTHING and removes what it finds,
+      // because after the mount the disk holds a revision the workspace has moved
+      // past and the editor holds one the disk has not caught up with — there is
+      // no text that is on both. The evidence arrives at the next open of this
+      // note: `vault.read` returns the bytes Obsidian saved, they equal the shared
+      // text, and the watermark is recorded from a string this device read off its
+      // own disk. Absence in the meantime is the safe direction — an unproven note
+      // is rescued rather than trashed.
+      //
+      // The token is tested once more on the far side of the hash, because
+      // mounting is itself an observable event: a `file-open` fired by the dispatch
+      // above can supersede this session before the digest resolves, and recording
+      // a watermark for a session that is already being torn down would claim this
+      // device holds content it no longer has open.
+      const finalText = text.toString();
+      const sha256 = await hashOf(finalText);
       if (token !== this.token) return;
-    }
 
-    // I17. A watermark names bytes that are simultaneously in the workspace and
-    // on THIS disk, and it may advance only once a write has returned. This
-    // method performs no disk write and can observe none, so the only string in
-    // it that this device is known to hold is `localText` — the bytes it read
-    // off its own disk a moment ago. Recording is therefore honest in exactly
-    // one case: when the workspace's text IS that string.
-    //
-    // It used to record `text.toString()` unconditionally, which is how vault A
-    // came to record vault B's file as its own base and vault B came to record
-    // the server's content it did not have. That is not cosmetic: §5.3's
-    // `proven` check reads this watermark to choose between the vault trash and
-    // a rescue.
-    //
-    // The divergent case deliberately records NOTHING and removes what it finds,
-    // because after the mount the disk holds a revision the workspace has moved
-    // past and the editor holds one the disk has not caught up with — there is
-    // no text that is on both. The evidence arrives at the next open of this
-    // note: `vault.read` returns the bytes Obsidian saved, they equal the shared
-    // text, and the watermark is recorded from a string this device read off its
-    // own disk. Absence in the meantime is the safe direction — an unproven note
-    // is rescued rather than trashed.
-    //
-    // The token is tested once more on the far side of the hash, because
-    // mounting is itself an observable event: a `file-open` fired by the dispatch
-    // above can supersede this session before the digest resolves, and recording
-    // a watermark for a session that is already being torn down would claim this
-    // device holds content it no longer has open.
-    const finalText = text.toString();
-    const sha256 = await hashOf(finalText);
-    if (token !== this.token) return;
+      // "This workspace's document held these bytes." Recorded on EVERY bind,
+      // including the ones that record no watermark, because it makes no claim
+      // about any disk and so cannot go stale in the way `contentHash` can.
+      this.sharedSeen.set(nodeId, sha256);
 
-    // "This workspace's document held these bytes." Recorded on EVERY bind,
-    // including the ones that record no watermark, because it makes no claim
-    // about any disk and so cannot go stale in the way `contentHash` can.
-    this.sharedSeen.set(nodeId, sha256);
-
-    if (finalText !== localText) {
-      if (this.deps.state.data.contentHash[nodeId] !== undefined) {
-        delete this.deps.state.data.contentHash[nodeId];
+      if (finalText !== localText) {
+        if (this.deps.state.data.contentHash[nodeId] !== undefined) {
+          delete this.deps.state.data.contentHash[nodeId];
+          this.deps.state.schedulePersist();
+        }
+        return;
+      }
+      if (this.deps.tree.get(nodeId)?.s === 1) {
+        this.deps.state.data.contentHash[nodeId] = { sha256, len: finalText.length };
         this.deps.state.schedulePersist();
       }
-      return;
-    }
-    if (this.deps.tree.get(nodeId)?.s === 1) {
-      this.deps.state.data.contentHash[nodeId] = { sha256, len: finalText.length };
-      this.deps.state.schedulePersist();
+    } finally {
+      if (!kept) release(provider);
     }
   }
 

@@ -509,6 +509,55 @@ test('destroy tears the session down and releases the provider', async () => {
   assert.equal(h.editor.unmounts, 1);
 });
 
+test('a throw anywhere in the open still gives the room back', async () => {
+  // ⚠ THE LEASE DISCIPLINE, MADE STRUCTURAL. `doOpen` used to give the reference
+  // back at twelve separate return points with no `try`, so a throw between the
+  // dial and one of them was swallowed by `open()`'s own `.catch` and leaked the
+  // reference until the plugin unloaded. `editor.apply` is the reviewer's own
+  // named example, and it is a dependency, so it is the one that can be made to
+  // do it here.
+  //
+  // What leaks matters more than it used to. On the per-room topology it was one
+  // stranded `WebsocketProvider`; on the mux it is a room the SERVER keeps
+  // registered and keeps fanning out to, and a cursor that never leaves it.
+  const h = makeHarness();
+  const id = h.add('a.md', 'body', { s: 1, owned: true });
+  h.providers.configure(`n_${id}`, { remote: 'body' });
+  h.editor.apply = (): never => { throw new Error('the leaf went away mid-mount'); };
+
+  await h.session.open(`${SHARE}/a.md`);
+
+  assert.equal(h.providers.created.length, 1, 'the room was never taken');
+  assert.equal(h.providers.created[0].destroyed, true,
+    'a throw in the open leaked the room reference');
+  assert.equal(h.providers.liveDocs(`n_${id}`), 0, 'and the document with it');
+  assert.equal(h.session.openNodeId(), null, 'a failed open left a session behind');
+  assert.ok(h.notices.some((n) => n.includes('went away mid-mount')), h.notices.join('|'));
+});
+
+test('a throw AFTER the session takes the room does not give it back underneath it', async () => {
+  // The other half of the flag, and the one a bare `finally` would get wrong: past
+  // the hand-off the session owns the room, and `closeActive` is what returns it.
+  // Releasing here would leave `this.active` holding a provider that has already
+  // been destroyed — a bound editor writing into a document nothing is connected
+  // to, which is worse than the leak.
+  const h = makeHarness();
+  const id = h.add('a.md', 'body', { s: 1, owned: true });
+  h.providers.configure(`n_${id}`, { remote: 'body' });
+  const boom = new Error('the disk went away after the mount');
+  h.state.schedulePersist = (): never => { throw boom; };
+
+  await h.session.open(`${SHARE}/a.md`);
+
+  assert.equal(h.session.openNodeId(), id, 'the session lost a room it had bound');
+  assert.equal(h.providers.created[0].destroyed, false,
+    'the room was released out from under a bound editor');
+  assert.equal(h.providers.liveDocs(`n_${id}`), 1);
+
+  await h.session.destroy();
+  assert.equal(h.providers.created[0].destroyed, true, 'and it still goes on close');
+});
+
 // ================================================================ room resolution
 
 test('a path with no node yet falls back to local-only editing, never a guessed room', async () => {
