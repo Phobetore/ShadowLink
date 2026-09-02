@@ -773,6 +773,32 @@ test('the departing cursor goes out through the LIVE connection, before the room
   registry.destroy();
 });
 
+test('the room itself says goodbye, whoever was holding it and however it is let go', () => {
+  // ⚠ THE ENTRY'S OWN ANNOUNCEMENT, asked WITHOUT the session's port, because the
+  // session's release announces first and would hide this one entirely. Two ways
+  // a room reaches zero with a cursor still on it, and `main.ts` takes the second
+  // on every unload: `dispose()` runs `session.destroy()`, then `docs.destroy()`,
+  // then `rooms.destroy()` — and `mux.destroy()` only after those, precisely so a
+  // room still has a socket while it is being torn down. A lease that was leaked
+  // rather than released reaches zero the same way.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+
+  const released = registry.acquire(ROOM);
+  const releasedConnection = transport.live(ROOM)!;
+  released.awareness.setLocalStateField('user', { name: 'Ada' });
+  released.release();
+  assert.equal(releasedConnection.departuresOf(released.doc.clientID), 1,
+    'the last release tore the room down without telling the room\'s peers');
+
+  const abandoned = registry.acquire(OTHER);
+  const abandonedConnection = transport.live(OTHER)!;
+  abandoned.awareness.setLocalStateField('user', { name: 'Grace' });
+  registry.destroy();                                   // the plugin unloading
+  assert.equal(abandonedConnection.departuresOf(abandoned.doc.clientID), 1,
+    'a room held at unload left its cursor on every peer for the sweep to find');
+});
+
 test('the cursor goes even when the ROOM stays, which is the half no leave frame reaches', () => {
   // ⚠ THE CASE THAT IS NOT ABOUT THE MUX AT ALL. The `Awareness` is the
   // REGISTRY's, shared by both consumers, so the session's `user` state outlives

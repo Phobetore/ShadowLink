@@ -218,6 +218,18 @@ class RoomEntry {
     // removed it was `DocHub._closeConn` running on a socket's death, and on the
     // mux a note closing does not kill a socket. y-websocket's teardown
     // broadcasts a null state for exactly this reason.
+    //
+    // ⚠ AND NO REAL-SERVER CASE CAN KILL THIS LINE, which is recorded rather than
+    // fixed, on `LegacyTreeTransport`'s precedent for its two survivors. At
+    // refcount zero both shipped routes reach `DocHub._closeConn` a moment later
+    // anyway — the mux through the leave frame `connection.destroy()` writes, the
+    // compatibility route through its socket closing — and that removes the same
+    // states and fans them out. Mutated away, structural case 81f still passes.
+    // It is killable at the unit level, where the fake reports whether the removal
+    // reached the wire while there was still a wire, and that is the property
+    // worth having: "the cursor goes before the room does" belongs to this file
+    // rather than to what a server happens to do with a connection that closed.
+    // The next transport added here will not necessarily have a socket to die.
     this.announceDeparture();
     this.connection.off('sync', this.relay);
     this.syncHandlers.clear();
