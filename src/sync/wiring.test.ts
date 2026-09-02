@@ -698,3 +698,55 @@ test('both ends of the I7 publish deferral are wired to the session (§6.2)', ()
     'and closing a note must ask for the pass that publishes it',
   );
 });
+
+// ⚠ P3 SLICE 3, AND THIS IS THE ONE THING IN THE WIRING THAT FAILS SILENTLY. From
+// this slice the vault's one link carries every live note's room as well as
+// `_tree`, and a link the server condemns makes `connect()` a permanent no-op for
+// ALL of them. The bridge moves the tree either way — that is slice 2's, and it
+// has its own structural cases — so a client on a pre-P3 server would look
+// perfectly healthy in the status bar, keep its whole structural sync, and never
+// publish another note. Nothing type-checks this: `onUnsupported` is optional, and
+// a registry with no switch is a registry that compiles.
+test('an unsupported link moves the note rooms too, not just the tree (P3 §4)', () => {
+  const ctor = block(
+    '\n  constructor(private readonly plugin: ShadowLinkPlugin, deviceId: string) {',
+    'main.ts no longer defines the runtime constructor',
+  );
+  assert.ok(
+    /this\.mux\.onUnsupported\(/.test(ctor),
+    'main.ts must subscribe the room registry to the link\'s verdict, or an old '
+    + 'server keeps its tree and loses every note room',
+  );
+  const handler = ctor.slice(ctor.indexOf('this.mux.onUnsupported('), ctor.length);
+  assert.ok(
+    /this\.rooms\.switchTransport\(\s*new LegacyRoomTransport\(/.test(handler.slice(0, 300)),
+    'and the verdict must move the rooms onto the per-room route, which is the only '
+    + 'route such a server has',
+  );
+
+  // And the two halves must take the SAME answer from the lever, or the user
+  // turns the compatibility connection on and gets it for the tree alone.
+  assert.ok(
+    /this\.rooms = new RoomRegistry\(\s*this\.compatibilityChosen/.test(ctor),
+    'the registry must be built from the same recorded setting the tree transport '
+    + 'branches on',
+  );
+});
+
+// The registry is the ONE owner of a room's document, so the plugin must tear it
+// down. `RegistryDocPort.destroy()` only gives that port's own handles back — a
+// session still holding one would keep a socket subscription and a `Y.Doc` alive
+// past the runtime that built them.
+test('dispose tears the room registry down, and before the link (P3 §1.1)', () => {
+  const dispose = body('\n  async dispose(): Promise<void> {', 'main.ts no longer defines dispose');
+  const rooms = dispose.indexOf('this.rooms.destroy()');
+  const mux = dispose.indexOf('this.mux.destroy()');
+  assert.ok(rooms >= 0, 'the registry is never destroyed, so its rooms outlive the runtime');
+  assert.ok(mux >= 0, 'the link is never destroyed');
+  assert.ok(
+    rooms < mux,
+    'the rooms must go BEFORE the link they are subscribed to, for the same reason '
+    + 'the tree transport does: a room unsubscribing from a socket that has already '
+    + 'been destroyed is a teardown running against an emptied object',
+  );
+});

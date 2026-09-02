@@ -348,6 +348,36 @@ test('the session and the queue hold ONE document, ONE room and ONE socket', asy
   }
 });
 
+test('the cursor the session sets goes out on the room the registry opened', async () => {
+  // ⚠ THE AWARENESS HAS TO BE THE REGISTRY'S TOO, and a registry that owned the
+  // document while the transport built its own `Awareness` would look perfectly
+  // healthy: `lease.awareness` exists, `setLocalStateField` succeeds, and the
+  // object it wrote into is one nothing sends. The session hands exactly this
+  // object to `yCollab`, so the failure is "every remote cursor disappears", with
+  // no error anywhere.
+  //
+  // It is also what makes the transport swap survivable: `MuxRoom` and
+  // `WebsocketProvider` both destroy neither a document nor an `Awareness` they
+  // were handed, which is only safe because the registry built both.
+  const room = 'n_eeeeeeeeeeeeeeeeeeeeee';
+  const s = stack();
+  try {
+    const { provider } = s.providers.connect(room);
+    const before = s.mux.sockets[0].sent.filter((f) => f.room === room).length;
+
+    provider.awareness.setLocalStateField('user', { name: 'Ada', color: '#f00' });
+
+    const frames = s.mux.sockets[0].sent.filter((f) => f.room === room);
+    assert.ok(frames.length > before, 'setting a cursor wrote nothing to the room');
+    // Tag 1 is `MESSAGE_AWARENESS`, the same tag y-websocket writes.
+    assert.equal(frames.at(-1)!.payload[0], 1, 'the last frame was not an awareness update');
+
+    provider.destroy();
+  } finally {
+    s.destroy();
+  }
+});
+
 test('the census never exceeds one, through an adversarial interleaving', async () => {
   // Sixty acquires and releases across the two ports, in an order chosen to cross
   // every boundary the refcount has: both up, one down, both down, re-acquire,
