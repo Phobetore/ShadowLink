@@ -44,11 +44,38 @@ class FakeConnection implements RoomConnection {
 
   private readonly handlers = new Set<(isSynced: boolean) => void>();
 
+  /**
+   * Awareness updates this connection WOULD have put on the wire, each stamped
+   * with whether the connection was still alive at the time.
+   *
+   * ⚠ THE STAMP IS THE POINT. Both real transports write awareness from a `doc`-
+   * or `Awareness`-level update handler that goes away with the connection, so a
+   * removal made after `destroy()` reaches no peer at all — it just mutates a
+   * local object on its way to being thrown away. "The cursor left" and "the
+   * cursor was deleted locally a moment too late" are indistinguishable without
+   * this, and the second one is the shipped defect.
+   */
+  readonly awarenessOut: Array<{ removed: number[]; afterDestroy: boolean }> = [];
+
+  private readonly onAwareness = (
+    changes: { added: number[]; updated: number[]; removed: number[] },
+  ): void => {
+    this.awarenessOut.push({ removed: [...changes.removed], afterDestroy: this.destroyed });
+  };
+
   constructor(
     readonly room: string,
     readonly doc: Y.Doc,
     readonly awareness: awarenessProtocol.Awareness,
-  ) {}
+  ) {
+    this.awareness.on('update', this.onAwareness);
+  }
+
+  /** Removals of `clientID` this connection carried while it was still live. */
+  departuresOf(clientID: number): number {
+    return this.awarenessOut
+      .filter((u) => !u.afterDestroy && u.removed.includes(clientID)).length;
+  }
 
   on(_event: 'sync', handler: (isSynced: boolean) => void): void {
     this.handlers.add(handler);
@@ -69,6 +96,8 @@ class FakeConnection implements RoomConnection {
   destroy(): void {
     this.destroyed = true;
     this.handlers.clear();
+    // The wire goes with the connection, which is why the ordering above matters.
+    this.awareness.off('update', this.onAwareness);
   }
 
   /** A GENUINE handshake. Nothing else may set `synced` (I3/I4). */
@@ -713,6 +742,162 @@ test('the session\'s destroy is idempotent', () => {
   b.provider.destroy();
   assert.equal(registry.refs(ROOM), 0);
 
+  registry.destroy();
+});
+
+// ================================================================ the departure
+
+test('the departing cursor goes out through the LIVE connection, before the room does', () => {
+  // ⚠ THE ORDERING IS THE FIX. `RoomEntry.destroy` tears the connection down and
+  // then the `Awareness`, and `y-protocols` also destroys an `Awareness` from
+  // `doc.on('destroy')` — so every removal that happened by either of those routes
+  // happened with no connection left to carry it. Measured before this line: a
+  // peer went on showing the departed user's cursor for 29,842 ms, against 0-1 ms
+  // on the per-room route, waiting out the awareness protocol's staleness sweep.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  const providers = new RegistryProviderPort(registry);
+
+  const { doc, provider } = providers.connect(ROOM);
+  const connection = transport.live(ROOM)!;
+  provider.awareness.setLocalStateField('user', { name: 'Ada' });
+  assert.equal(connection.awareness.getStates().size, 1);
+
+  provider.destroy();
+
+  assert.equal(connection.departuresOf(doc.clientID), 1,
+    'the departure never reached the wire while there was a wire to reach');
+  assert.equal(connection.awareness.getStates().has(doc.clientID), false);
+  assert.equal(connection.destroyed, true, 'the room should have gone with the last lease');
+
+  registry.destroy();
+});
+
+test('the cursor goes even when the ROOM stays, which is the half no leave frame reaches', () => {
+  // ⚠ THE CASE THAT IS NOT ABOUT THE MUX AT ALL. The `Awareness` is the
+  // REGISTRY's, shared by both consumers, so the session's `user` state outlives
+  // the leaf closing whenever the publish queue is still holding the same room —
+  // and the room staying open is exactly the situation in which nothing else will
+  // ever remove it. Measured on BOTH routes before this: a peer held the cursor
+  // for the whole 45 s a rig was willing to watch, and would have held it for
+  // ever, because `y-protocols` renews a live local state every 15 s so the peer's
+  // 30 s sweep never fires. On master the session owned its own provider and its
+  // own socket, and closing the leaf closed it.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  const providers = new RegistryProviderPort(registry);
+  const docs = new RegistryDocPort(registry, { syncTimeoutMs: 20 });
+
+  const { doc, provider } = providers.connect(ROOM);
+  const held = docs.openHeadless(ROOM);
+  const connection = transport.live(ROOM)!;
+  provider.awareness.setLocalStateField('user', { name: 'Ada' });
+
+  provider.destroy();
+
+  assert.equal(connection.destroyed, false, 'the queue is still publishing through it');
+  assert.equal(connection.departuresOf(doc.clientID), 1,
+    'the leaf closed and the cursor stayed in a room the user has left');
+  assert.equal(connection.awareness.getStates().size, 0);
+
+  void held.then((opened) => { docs.close(opened.handle); });
+  registry.destroy();
+});
+
+test('the HEADLESS port announces nothing, so a publish cannot wipe a live cursor', async () => {
+  // The other side of the same coin, and the reason the announcement is on the
+  // session's port rather than on `release`. The publish path never sets a local
+  // state, so a removal from there would do nothing whatever — except on the one
+  // occasion it would do harm: a queue handle closing while a session is bound to
+  // the same room right now, which is the ordinary case every time a note is open
+  // and its drain lands.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  const providers = new RegistryProviderPort(registry);
+  const docs = new RegistryDocPort(registry, { syncTimeoutMs: 20 });
+
+  const { doc, provider } = providers.connect(ROOM);
+  const opened = await openSynced(docs, transport, ROOM);
+  const connection = transport.live(ROOM)!;
+  provider.awareness.setLocalStateField('user', { name: 'Ada' });
+
+  docs.close(opened.handle);
+
+  assert.equal(connection.departuresOf(doc.clientID), 0,
+    'the publish queue letting go removed the bound session\'s cursor');
+  assert.equal(connection.awareness.getStates().size, 1, 'the live cursor was wiped');
+
+  provider.destroy();
+  registry.destroy();
+});
+
+test('announcing a departure twice says it once, and a room nobody wrote a cursor into still says it', () => {
+  // Every borrower in this codebase releases in a `finally` and several reach it
+  // twice, so the announcement has to be as idempotent as the release it precedes.
+  const transport = new FakeTransport();
+  const registry = new RoomRegistry(transport);
+  const providers = new RegistryProviderPort(registry);
+  try {
+    const a = providers.connect(ROOM);
+    const b = providers.connect(ROOM);
+    const connection = transport.live(ROOM)!;
+    a.provider.awareness.setLocalStateField('user', { name: 'Ada' });
+
+    a.provider.destroy();
+    a.provider.destroy();
+    assert.equal(connection.departuresOf(a.doc.clientID), 1, 'the departure was announced twice');
+    b.provider.destroy();
+  } finally {
+    registry.destroy();
+  }
+
+  // ⚠ AND IT IS ANNOUNCED EVEN WHEN NOBODY SET A CURSOR, which is not an
+  // over-reach: `y-protocols`' `Awareness` constructor calls `setLocalState({})`,
+  // so a room ALWAYS holds an entry for its own client from the moment it exists.
+  // A peer's `states` map holds that entry too, and without the removal it would
+  // hold it for the full 30 s staleness sweep. y-websocket's own teardown
+  // broadcasts the null state unconditionally for the same reason.
+  const quiet = new FakeTransport();
+  const quietRegistry = new RoomRegistry(quiet);
+  const quietProviders = new RegistryProviderPort(quietRegistry);
+  try {
+    const silent = quietProviders.connect(OTHER);
+    const quietConnection = quiet.live(OTHER)!;
+    assert.equal(quietConnection.awareness.getStates().size, 1,
+      'a fresh Awareness stopped holding its own empty state');
+    silent.provider.destroy();
+    assert.equal(quietConnection.departuresOf(silent.doc.clientID), 1,
+      'a room with no cursor in it left its own entry behind on every peer');
+  } finally {
+    quietRegistry.destroy();
+  }
+});
+
+test('a switchTransport does NOT announce a departure — the user has not left', () => {
+  // ⚠ The one place the announcement must not fire. `reopen` destroys one
+  // connection and builds another under a LIVE lease, which is what an old server
+  // forces; a departure there would tell every peer the user closed a note they
+  // are still looking at, and the re-handshake would put the cursor back a moment
+  // later. The removal belongs to `RoomEntry.destroy` and to the session's own
+  // release, and to nothing else.
+  const first = new FakeTransport();
+  const second = new FakeTransport();
+  const registry = new RoomRegistry(first);
+  const providers = new RegistryProviderPort(registry);
+
+  const { doc, provider } = providers.connect(ROOM);
+  provider.awareness.setLocalStateField('user', { name: 'Ada' });
+  const before = first.live(ROOM)!;
+
+  registry.switchTransport(second);
+
+  assert.equal(before.departuresOf(doc.clientID), 0,
+    'the fallback told every peer the user had left the note they are editing');
+  assert.equal(before.awareness.getStates().size, 1, 'the switch dropped the local cursor');
+  assert.equal(second.live(ROOM)!.awareness, before.awareness,
+    'the new route is broadcasting a different Awareness');
+
+  provider.destroy();
   registry.destroy();
 });
 

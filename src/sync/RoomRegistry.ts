@@ -187,10 +187,38 @@ class RoomEntry {
     return this.connection.flush(ms);
   }
 
-  /** The connection, the awareness and the document, in that order, once. */
+  /**
+   * Say this client is gone from the room, THROUGH the live connection.
+   *
+   * ⚠ IT HAS TO HAPPEN WHILE THERE IS STILL SOMETHING TO SAY IT ON. The awareness
+   * update is written by the connection's own update handler, so a removal made
+   * after `connection.destroy()` — which is where `awareness.destroy()` sits, and
+   * what `y-protocols` reaches through `doc.on('destroy')` — has no socket to
+   * leave on and reaches no peer at all. That is why the ordering in `destroy()`
+   * below is load-bearing rather than tidy.
+   *
+   * Idempotent by construction: `removeAwarenessStates` emits nothing for a client
+   * whose state is already gone.
+   */
+  announceDeparture(): void {
+    try {
+      awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'local');
+    } catch {
+      /* an awareness that is already gone has nothing to announce */
+    }
+  }
+
+  /** The departure, then the connection, the awareness and the document, once. */
   destroy(): void {
     if (this.released) return;
     this.released = true;
+    // ⚠ FIRST, and the reason is measured. Without it a peer went on showing this
+    // user's cursor in a note they had closed for 29.8 s — the awareness
+    // protocol's own staleness sweep — because the only thing that had ever
+    // removed it was `DocHub._closeConn` running on a socket's death, and on the
+    // mux a note closing does not kill a socket. y-websocket's teardown
+    // broadcasts a null state for exactly this reason.
+    this.announceDeparture();
     this.connection.off('sync', this.relay);
     this.syncHandlers.clear();
     for (const step of [
@@ -547,7 +575,38 @@ class LeaseProvider implements SessionProvider {
     return this.lease.flush(this.flushTimeoutMs);
   }
 
+  /**
+   * This session is done with the room — and the room may well not be done.
+   *
+   * ⚠ THE CURSOR GOES EVEN WHEN THE ROOM STAYS, which is the half a leave frame
+   * cannot reach. The `Awareness` is the REGISTRY's now, shared by both consumers,
+   * so it outlives the leaf closing whenever the publish queue is still holding
+   * the same room — and the session's `user` state on it outlives the leaf with
+   * it. Measured against a real server, on BOTH routes: with the queue holding the
+   * room, a peer went on showing the departed user's cursor for the whole 45 s a
+   * rig was willing to watch, and it would have gone on for ever, because
+   * `y-protocols` renews a live local state every 15 s and so the peer's 30 s
+   * staleness sweep never fires. On master this could not happen — the session had
+   * its own private provider and its own socket, and closing the leaf closed it.
+   *
+   * Announced BEFORE the reference goes back: after it, the room may already be
+   * torn down and there is no connection left to say it on.
+   *
+   * Only the SESSION's port does this. `RegistryDocPort.close` deliberately does
+   * not: the headless path never sets a local state, so a removal from there would
+   * do nothing at all except on the one occasion it would do harm — wiping the
+   * cursor of a session that is bound to the same room right now.
+   */
   destroy(): void {
+    try {
+      awarenessProtocol.removeAwarenessStates(
+        this.lease.awareness,
+        [this.lease.doc.clientID],
+        'local',
+      );
+    } catch {
+      /* an awareness that is already gone has nothing to announce */
+    }
     this.lease.release();
   }
 }
