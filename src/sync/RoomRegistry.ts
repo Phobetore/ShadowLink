@@ -198,6 +198,16 @@ class RoomEntry {
       // ⚠ `WebsocketProvider.destroy()` does NOT destroy an `Awareness` it was
       // handed, and `MuxRoom` deliberately does not either when it did not build
       // one. Whoever built it destroys it, and here that is this object.
+      //
+      // ⚠ AND NO TEST CAN KILL THIS LINE, WHICH IS RECORDED RATHER THAN FIXED.
+      // A mutation sweep found it surviving, and it is EQUIVALENT: `y-protocols`
+      // registers `doc.on('destroy', () => this.destroy())`, so the step below
+      // tears the awareness down anyway. It is kept for the reason the loop it
+      // sits in exists — every step is wrapped, so a `doc.destroy()` that THROWS
+      // must not take the awareness's 3-second interval with it. "Some later line
+      // happens to do it too" is a property of that line rather than a guarantee
+      // of this one, which is the call `LegacyTreeTransport` already made for its
+      // two survivors.
       (): void => { this.awareness.destroy(); },
       (): void => { this.doc.destroy(); },
     ]) {

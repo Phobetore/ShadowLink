@@ -22,6 +22,7 @@
 
 import * as Y from 'yjs';
 import { WebSocket } from 'ws';
+import { WebsocketProvider } from 'y-websocket';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -295,6 +296,54 @@ export function registerRoomCases(getServer, basePort) {
       treeLink.destroy();
       rt.destroy();
       tree.doc.destroy();
+    }
+  });
+
+  test('81e the cursor set through a lease reaches a peer on EITHER route', async () => {
+    // ⚠ THE AWARENESS HAS TO BE THE REGISTRY'S ON BOTH ROUTES, and a transport that
+    // builds its own looks perfectly healthy from inside: `lease.awareness` exists,
+    // `setLocalStateField` succeeds, and the object it wrote into is one nothing
+    // sends. The failure is every remote cursor disappearing, with no error
+    // anywhere — and on the compatibility route it would appear only after a
+    // fallback, on somebody else's deployment.
+    //
+    // Found by a mutation sweep: the mux half was pinned by a unit case and the
+    // LEGACY half was not, and the mutant that lets `WebsocketProvider` build its
+    // own `Awareness` survived every suite. So it is asked the way a user would
+    // notice it — a second client, on the same room, on the same server.
+    const server = getServer();
+    const workspace = 'rooms81e';
+    const config = {
+      serverUrl: `ws://127.0.0.1:${server.port}`,
+      serverKey: server.serverKey,
+      workspaceId: workspace,
+    };
+    const registry = new RoomRegistry(new LegacyRoomTransport(config));
+    const providers = new RegistryProviderPort(registry);
+    const peerDoc = new Y.Doc();
+    const peer = new WebsocketProvider(config.serverUrl, ROOM, peerDoc, {
+      connect: true,
+      params: { t: config.serverKey, w: config.workspaceId },
+      disableBc: true,
+    });
+    try {
+      const { provider } = providers.connect(ROOM);
+      assert.equal(await until(() => peer.synced, 8_000), true, 'the peer never synced');
+
+      provider.awareness.setLocalStateField('user', { name: 'Ada', color: '#f00' });
+
+      const seen = async () => [...peer.awareness.getStates().values()]
+        .some((s) => s?.user?.name === 'Ada');
+      assert.equal(await until(seen, 8_000), true,
+        'the cursor never left the room the registry opened — the transport is '
+        + 'broadcasting an Awareness the session never wrote into');
+
+      provider.destroy();
+    } finally {
+      registry.destroy();
+      peer.destroy();
+      peer.awareness.destroy();
+      peerDoc.destroy();
     }
   });
 
