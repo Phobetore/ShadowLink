@@ -398,12 +398,23 @@ function shellQuote(arg) {
   return `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
-function runCommand(argv, raw) {
+/** A run that hit the deadline. Distinguished from a failure ON PURPOSE. */
+const EXIT_TIMEOUT = 124;
+
+function runCommand(argv, raw, timeoutMs) {
   const line = raw ?? argv.map(shellQuote).join(' ');
   say(`mutate: running  ${line}`);
   rule();
-  const result = spawnSync(line, { stdio: 'inherit', shell: true });
+  const result = spawnSync(line, { stdio: 'inherit', shell: true, timeout: timeoutMs });
   rule();
+  if (result.error?.code === 'ETIMEDOUT' || (result.signal !== null && timeoutMs !== undefined)) {
+    // A hung suite is not a caught mutant, and the difference is the whole point.
+    // Note what this does NOT do: `spawnSync` kills the shell it started, and on
+    // Windows `node --test` workers are grandchildren that may outlive it. If a
+    // probe times out, check for orphans before trusting the next one.
+    say(`mutate: the command did not finish within ${timeoutMs} ms.`);
+    return EXIT_TIMEOUT;
+  }
   if (result.error) {
     say(`mutate: the command could not be started: ${result.error.message}`);
     return 127;
@@ -433,6 +444,8 @@ mutate — apply one mutation, run a command against it, put the file back.
   --raw                 take --find/--replace literally, no escape handling
   --cmd "<line>"        run this raw shell line instead of a trailing -- command
   --expect killed|survived   what the command should do. Default: killed
+  --timeout <ms>        deadline for each run; a timeout is reported, never a kill
+  --no-control          skip the run on the unmutated file, and own the answer
 
 probe exits 0 when the command fails (the mutant was killed) and 1 when it
 passes (the mutant survived — that test does not bite). Refusals exit 2.
@@ -470,6 +483,9 @@ function parse(argv) {
       case '--cmd': options.cmd = take(bare); break;
       case '--expect': options.expect = take(bare); break;
       case '--raw': options.raw = true; break;
+      case '--timeout': options.timeout = take(bare); break;
+      // The control run is on by default; skipping it is a deliberate act.
+      case '--no-control': options.control = false; break;
       default:
         if (bare.startsWith('-') && bare !== '-') refuse(`unknown option ${bare}`, USAGE);
         options.positional.push(arg);
@@ -558,6 +574,38 @@ function main() {
   const hasCommand = options.cmd !== undefined || (options.command?.length ?? 0) > 0;
   if (!hasCommand) refuse('probe needs a command: put it after -- , or pass --cmd', USAGE);
 
+  // ------------------------------------------------------------------ control
+  //
+  // RUN THE COMMAND ON THE UNMUTATED FILE FIRST, and refuse if it does not pass.
+  //
+  // This closes the one failure mode this tool exists to prevent, and it closes
+  // the whole class rather than the instance that was reported. A probe answers
+  // "the command failed AFTER the mutation, therefore a test caught it" — which
+  // is only true if the command passed BEFORE it. Everything else that makes a
+  // command fail reads identically: a typo in the path, a suite that was already
+  // red, the wrong working directory, and — measured on this machine — a POSIX
+  // `VAR=x cmd` prefix handed to `cmd.exe`, which cannot parse it, fails, and was
+  // reported as MUTANT KILLED for a command that never ran.
+  //
+  // It costs one extra run of the command per probe. That is the price of the
+  // answer meaning what it says, and this tool is only worth having if it does.
+  const controlTimeout = options.timeout === undefined ? undefined : Number(options.timeout);
+  if (options.control !== false) {
+    say('mutate: control run, on the file as it stands, before touching it.');
+    const control = runCommand(options.command ?? [], options.cmd, controlTimeout);
+    if (control !== 0) {
+      refuse(
+        `the command does not pass on the UNMUTATED file (exit ${control})`,
+        'So a failure after the mutation would prove nothing: it already fails.',
+        control === EXIT_TIMEOUT
+          ? 'It timed out. Raise --timeout, or find why it hangs before probing.'
+          : 'Fix the command, the path or the suite first — then the probe means something.',
+        'Nothing was mutated. Pass --no-control to skip this, and own the answer.',
+      );
+    }
+    say('mutate: control passed. Applying the mutation.');
+  }
+
   mutate({ file, needle, replacement, expected });
 
   // The restore runs whatever happens — a failing command, a throw, or a Ctrl-C.
@@ -578,7 +626,7 @@ function main() {
 
   let status;
   try {
-    status = runCommand(options.command ?? [], options.cmd);
+    status = runCommand(options.command ?? [], options.cmd, controlTimeout);
   } finally {
     putBack();
   }
