@@ -51,6 +51,9 @@ const ROOM = 'n_AbCdEfGhIjKlMnOpQrStUv';
 /** A second room, so a case can keep the vault socket alive after the note goes. */
 const KEEP = 'n_KeepTheVaultSocketAliv';
 
+/** What `WorkspaceSession.doOpen` announces, in the shape it announces it. */
+const ADA = { name: 'Ada', color: '#ff0000', colorLight: '#ff000033' };
+
 async function until(predicate, ms) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
@@ -384,7 +387,7 @@ export function registerRoomCases(getServer, basePort) {
       const { provider } = providers.connect(ROOM);
       assert.equal(await until(() => peer.synced, 8_000), true, 'the peer never synced');
 
-      provider.awareness.setLocalStateField('user', { name: 'Ada', color: '#f00' });
+      provider.announcePresence(ADA);
 
       const seen = async () => [...peer.awareness.getStates().values()]
         .some((s) => s?.user?.name === 'Ada');
@@ -455,7 +458,7 @@ export function registerRoomCases(getServer, basePort) {
           // frame cannot reach: the room does not go, so nothing closes it.
           const held = holding ? await rt.docs.openHeadless(ROOM) : null;
 
-          bound.provider.awareness.setLocalStateField('user', { name: 'Ada', color: '#f00' });
+          bound.provider.announcePresence(ADA);
           const holdsAda = () => [...peer.awareness.getStates().values()]
             .some((s) => s?.user?.name === 'Ada');
           assert.equal(await until(holdsAda, 8_000), true,
@@ -542,6 +545,93 @@ export function registerRoomCases(getServer, basePort) {
       peer.destroy();
       peer.awareness.destroy();
       peerDoc.destroy();
+    }
+  });
+
+  test('81h a note REOPENED while another consumer holds the room is visible to a peer again', async () => {
+    // ⚠ THE ARRIVAL SIDE OF 81f, AND IT IS THE CASE 81f CANNOT REACH. Every rig
+    // this slice built opened a room once and watched it close; none of them opened
+    // it, closed it and opened it AGAIN, which is the ordinary thing a user does
+    // and the one sequence in which the departure and the announcement have to
+    // agree about what they are writing into.
+    //
+    // What it was, against this same server, before the announcement became the
+    // provider's own:
+    //
+    //   route          reopen, queue still holding the room
+    //   master seam                16 ms
+    //   compat            NEVER (watched 20 s, unbounded)
+    //   mux               NEVER (watched 20 s, unbounded)
+    //
+    // The mechanism is entirely client-side and nothing on the wire shows it: the
+    // session's teardown nulled the SHARED local state, and the next mount used
+    // `setLocalStateField`, which `y-protocols` makes a no-op when the state is
+    // null. So the reopening user edited normally — no keystroke was ever at risk —
+    // while every peer went on believing they had left, for the life of the room
+    // entry. Only a peer's view can see it; the local objects all look right.
+    const server = getServer();
+    for (const route of ['mux', 'compat']) {
+      const workspace = `rooms81h${route}`;
+      const config = {
+        serverUrl: `ws://127.0.0.1:${server.port}`,
+        serverKey: server.serverKey,
+        workspaceId: workspace,
+      };
+      const rt = route === 'mux' ? runtime(server, workspace) : compatRuntime(config);
+      const peerDoc = new Y.Doc();
+      const peer = new WebsocketProvider(config.serverUrl, ROOM, peerDoc, {
+        connect: true,
+        params: { t: config.serverKey, w: config.workspaceId },
+        disableBc: true,
+      });
+      const holdsAda = () => [...peer.awareness.getStates().values()]
+        .some((s) => s?.user?.name === 'Ada');
+      try {
+        if (rt.link !== null) rt.link.connect();
+        assert.equal(await until(() => peer.synced, 8_000), true, `${route}: the peer never synced`);
+
+        // The publish queue takes the room FIRST and never lets go, which is what
+        // closing a note actually schedules — so the entry survives the close and
+        // the reopen lands on the very same shared `Awareness`.
+        const held = await rt.docs.openHeadless(ROOM);
+        assert.equal(held.synced, true, `${route}: the queue's handle never synced`);
+
+        const first = rt.providers.connect(ROOM);
+        assert.equal(await until(() => first.provider.synced, 8_000), true,
+          `${route}: the session never synced`);
+        first.provider.announcePresence(ADA);
+        assert.equal(await until(holdsAda, 8_000), true,
+          `${route}: the cursor never reached the peer on the FIRST open`);
+
+        first.provider.destroy();                                  // the leaf closes
+        assert.equal(await until(() => !holdsAda(), 8_000), true,
+          `${route}: the departed cursor never left`);
+        assert.equal(rt.registry.liveDocs(ROOM), 1,
+          `${route}: the room went; the queue was meant to be holding it`);
+
+        // The same note, reopened onto the entry the queue kept alive.
+        const at = Date.now();
+        const again = rt.providers.connect(ROOM);
+        assert.equal(await until(() => again.provider.synced, 8_000), true,
+          `${route}: the reopened session never synced`);
+        assert.equal(again.doc, first.doc, `${route}: a second document for one room`);
+        again.provider.announcePresence(ADA);
+
+        const back = await until(holdsAda, 8_000);
+        const took = Date.now() - at;
+        assert.equal(back, true,
+          `${route}: a peer cannot see a user who reopened their own note ${took} ms ago — `
+          + 'they are editing, and invisible, for as long as this room entry lives');
+        assert.equal(took < 2_000, true, `${route}: the re-announcement took ${took} ms`);
+
+        again.provider.destroy();
+        rt.docs.close(held.handle);
+      } finally {
+        rt.destroy();
+        peer.destroy();
+        peer.awareness.destroy();
+        peerDoc.destroy();
+      }
     }
   });
 
