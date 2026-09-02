@@ -195,6 +195,47 @@ function explainNoMatch(text, needle, file) {
 
 // --------------------------------------------------------------------- backup
 
+/**
+ * WHERE EVERY BACKUP THIS TOOL HAS EVER MADE IS RECORDED, and why a scan alone
+ * is not enough.
+ *
+ * `sweep` walks a directory — the repository by default. But a probe is very
+ * often run against a file that is NOT under it: a git worktree beside the
+ * checkout, a scratch copy, another clone. Measured: apply a mutation to a file
+ * in a scratch directory and `sweep` from the repository root answers "no
+ * backups left behind" while the mutation sits on disk. That sentence is worse
+ * than no sentence, because the whole reason this tool exists is that a probe
+ * which quietly did nothing must never read as a passing test.
+ *
+ * So every backup is also written down here, and `sweep` reads the ledger in
+ * addition to walking. A restore that VERIFIES removes its line; anything left
+ * is a mutation that may still be applied, wherever it lives.
+ */
+const LEDGER = join(REPO_ROOT, 'tools', '.mutation-ledger');
+
+function ledgerRead() {
+  if (!existsSync(LEDGER)) return [];
+  return readFileSync(LEDGER, 'utf8').split(/\r?\n/).filter((line) => line !== '');
+}
+
+function ledgerWrite(paths) {
+  if (paths.length === 0) {
+    if (existsSync(LEDGER)) unlinkSync(LEDGER);
+    return;
+  }
+  writeFileSync(LEDGER, `${paths.join('\n')}\n`);
+}
+
+function ledgerAdd(backup) {
+  const paths = ledgerRead();
+  if (!paths.includes(backup)) paths.push(backup);
+  ledgerWrite(paths);
+}
+
+function ledgerDrop(backup) {
+  ledgerWrite(ledgerRead().filter((p) => p !== backup));
+}
+
 function backupPathFor(file) {
   return `${file}${BACKUP_SUFFIX}`;
 }
@@ -224,6 +265,7 @@ function makeBackup(file, original) {
     );
   }
   writeFileSync(backup, original, { flag: 'wx' });
+  ledgerAdd(backup);
   return backup;
 }
 
@@ -257,6 +299,7 @@ function restoreFromBackup(file) {
     process.exit(EXIT_REFUSED);
   }
   unlinkSync(backup);
+  ledgerDrop(backup);
   say(`mutate: restored ${shortPath(file)} (${original.length} bytes, verified)`);
 }
 
@@ -280,7 +323,11 @@ function walkForBackups(dir, out) {
 
 /** Called before every exit: a forgotten mutation must never sit in the tree quietly. */
 function reportLeftovers(root = REPO_ROOT) {
-  const found = walkForBackups(root, []);
+  // The walk finds backups under `root`; the ledger finds the ones that are not,
+  // which is the case this tool got wrong for three rounds of work.
+  const walked = walkForBackups(root, []);
+  const recorded = ledgerRead().filter((backup) => existsSync(backup));
+  const found = [...new Set([...walked, ...recorded])];
   if (found.length === 0) return 0;
   rule();
   say(`mutate: ${found.length} backup(s) LEFT BEHIND — a mutation may still be applied:`);
@@ -472,7 +519,11 @@ function main() {
   if (command === 'sweep') {
     const root = target === undefined ? REPO_ROOT : resolve(target);
     const left = reportLeftovers(root);
-    if (left === 0) say('mutate: no backups left behind.');
+    if (left === 0) {
+      // Name the scope. An unqualified all-clear is exactly the sentence that
+      // let three rounds believe a mutated worktree was clean.
+      say(`mutate: no backups left behind under ${shortPath(root)}, and none recorded elsewhere.`);
+    }
     process.exit(0);
   }
 
